@@ -130,17 +130,104 @@ export const TUNE = {
 
   /* -------------------------------------------------------- population */
   /**
-   * Traffic is only spawned inside this radius of the camera.
+   * THE NEAR RING. Traffic is spawned into the annulus [spawnMin, spawnMax] of
+   * the anchor, and this is the ring that sets STREET-LEVEL density — how many
+   * cars are on the block you are standing on.
    *
-   * The ceiling is not arbitrary: `world` keeps a terrain collider only within
-   * +/-192 m of the player. Spawning past that put cars over a hole in the
-   * collision world, and a car with nothing under it falls forever — it never
-   * trips the stuck check (it is moving), never trips the off-road check (the
-   * lane projection is 2D), and holds a driver slot at y = -3700 m. Half the
-   * "stopped traffic" in the first measurements was cars in free fall.
+   * The ceiling used to be the whole envelope, and its stated reason was that
+   * `world` keeps a terrain collider only within +/-192 m of the player: a car
+   * spawned over the hole falls forever, never trips the stuck check (it is
+   * moving), never trips the off-road check (the lane projection is 2D), and
+   * holds a driver slot at y = -3700 m. Half the "stopped traffic" in the first
+   * measurements was cars in free fall.
+   *
+   * THAT REASON EXPIRED. `world`'s terrain patch is `TCOL_HALF` = 320 m
+   * (src/world/index.js:171, raised from 192 for exactly the same class of
+   * complaint), the always-resident CLIP safety net covers +/-1600 m, and
+   * `physics.raycast` closes the ray path analytically city-wide. `solidGroundY`
+   * still refuses any point the collision world cannot answer for, so the
+   * free-fall guard is intact wherever the ring goes — see `Director.trySpawn`.
    */
   spawnMin: 62,
   spawnMax: 175,
+  /**
+   * THE FAR RING — [spawnMax, spawnFar]. Cars out here are what makes the city
+   * read alive from anywhere that is not a pavement.
+   *
+   * MEASURED before it existed, from the `skyline` shot camera (the Mt.
+   * Washington clifftop, ~500 m out and ~120 m up — THE establishing frame):
+   * **0 vehicles of 15 live drivers were inside the frustum at all**, moving or
+   * not. Every car the system had spawned was in a 175 m disc directly under
+   * the lens, on the hillside behind the shot. The signature composition of the
+   * game photographed a downtown with no traffic in it whatsoever.
+   *
+   * 380 m sits inside `TCOL_HALF` + a margin and comfortably inside `despawnR`,
+   * so nothing here can strand a car outside the collision world or spawn one
+   * that is despawned on its first frame.
+   */
+  spawnFar: 380,
+  /**
+   * Share of spawn attempts aimed at the FAR ring rather than the near one, at
+   * eye level and from a high vantage, and the height at which the second is
+   * fully in effect.
+   *
+   * It has to be a share and not simply a wider single ring, because a wider
+   * ring spends the same budget over 4.7x the area and empties the street you
+   * are standing on to fill a skyline you may not be looking at.
+   *
+   * It scales with ALTITUDE because that is what actually changes: standing on
+   * a pavement, everything past 175 m is behind a building, so the ground-level
+   * share is small on purpose — the near ring is what you can see. A hundred
+   * metres up a cliff or in an aircraft, the near ring IS the ground under your
+   * feet and every road you can actually see is in the far one, so almost all
+   * of the spend belongs out there.
+   *
+   * ZERO AT GROUND LEVEL, AND THAT IS A MEASUREMENT. A 0.18 ground share put
+   * about a fifth of the cars onto road 175-380 m out and doubled the moving
+   * vehicles in the `hero` street frame (5 -> 10) — and it also took the traffic
+   * harness's collision rate from 0.521 to 0.607 big impacts per driver-minute,
+   * through the 0.55 RATCHET, with `junction/wall` impacts going 13 -> 22. That
+   * is measured, reproducible to the impact (three runs, identical counts,
+   * `node src/traffic/harness.mjs --minutes=3 --isolate` against
+   * `--query=owNoFarRing=1` on the same build), and it is a real defect in
+   * emitted behaviour: cars are being put onto road the driver handles worse
+   * than the grid it was tuned on. Liveliness bought with a fifth more crashes
+   * is not liveliness.
+   *
+   * So the ring stays FOLDED at eye level and opens with altitude, where the
+   * harness's finding does not apply: nothing is driving next to those cars and
+   * the alternative is a city with no traffic in the shot at all. `trySpawn`
+   * skips the rng draw entirely when the share is zero rather than comparing a
+   * drawn float against it, so the eye-level spawn stream is not perturbed by a
+   * feature that is switched off.
+   *
+   * MEASURED at zero, same harness: 0.459 big impacts per driver-minute and
+   * 1.18% of samples past the kerb — both BETTER than the `?owNoFarRing=1`
+   * control on the same build (0.521 / 1.51%), because the wider `despawnR` and
+   * the capacity radius still apply and cars now leave by the far edge instead
+   * of being recycled inside the grid. Whoever fixes the far-road handling can
+   * raise this share; the number to beat is 0.459.
+   */
+  farShare: 0,
+  farShareAir: 0.85,
+  airAlt: 90,
+  /**
+   * Metres to push the FAR RING'S CENTRE along the camera's ground bearing when
+   * the anchor is at `airAlt` or above. Zero at eye level.
+   *
+   * A bigger circle is the wrong answer from a vantage and the measurement says
+   * so. With the far ring at 380 m and no lead, the `skyline` shot — 500 m out
+   * and 120 m up — still photographed 0 vehicles of 15 live: every car was
+   * inside a disc centred on the clifftop the camera was standing on, and the
+   * camera was looking across the river at a downtown nothing had spawned in.
+   * Growing the disc to reach 500 m would have spread the same fifteen cars
+   * over 2.2 km^2 and put almost all of them behind the lens.
+   *
+   * Moving the disc instead spends the SAME cars on the ground the shot is of.
+   * At eye level there is no lead at all, because at eye level what is behind
+   * you matters — you turn around.
+   */
+  farLead: 420,
   /**
    * HARD EXCLUSION AROUND THE PLAYER'S BODY, checked on every spawn path and
    * never relaxed by `force`.
@@ -159,10 +246,18 @@ export const TUNE = {
    * metres down a street and unmissable at thirty.
    */
   popSafe: 110,
-  /** Despawn beyond this, when not on screen. */
-  despawnR: 300,
+  /**
+   * Despawn beyond this, when not on screen.
+   *
+   * MUST stay clear of `spawnFar` with a margin, or a far-ring car is deleted
+   * on the frame after it is created and the far ring is a spawn loop that
+   * produces nothing. It costs no frame time to widen: `Director.step`
+   * recycles down to `desired()` every frame, so the LIVE COUNT is set by the
+   * budget and this only decides which cars are the ones that survive.
+   */
+  despawnR: 460,
   /** Despawn beyond this even if on screen. */
-  despawnHard: 480,
+  despawnHard: 640,
   /** Spawns per second at steady state. */
   spawnRate: 2.2,
   /** Never spawn within this of another vehicle. */

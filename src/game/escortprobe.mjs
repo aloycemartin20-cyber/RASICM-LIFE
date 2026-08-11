@@ -300,6 +300,23 @@ function bus() {
   };
 }
 
+/**
+ * `ui`, INCLUDING THE HALF OF IT THAT LIVES ON THE BUS.
+ *
+ * The result card is not something `game` hands to `ui` — it is something `ui`
+ * raises for ITSELF off `mission:complete` / `mission:fail`
+ * (`src/ui/index.js:874` and `:881`, each calling `this.card(...)`). A stand-in
+ * that implements only the `card()` method models half the subsystem, and the
+ * missing half is not inert: it is a SECOND card and a second `mission_pass` /
+ * `mission_fail` sting on every mission end in the shipped game, which this
+ * probe scored as one for as long as it only counted direct calls.
+ *
+ * Rule 12's stub lesson, exactly — a stub is an assertion that nothing
+ * downstream of it can be wrong. So `wire()` subscribes the same two handlers
+ * the real file does, and `cards` therefore counts EVERY card the player would
+ * see, whichever side raised it. `s.ui.cards.length === 1` at an end is then a
+ * claim about the screen rather than about one call site.
+ */
 function fakeUi() {
   return {
     cards: [], lines: [],
@@ -307,6 +324,26 @@ function fakeUi() {
     say(who, line) { this.lines.push({ who, line }); },
     setCharacter() {}, setMoney() {}, setStation() {}, setWaypoint() {},
     setObjectives() {}, clearObjective() {}, titleCard() {},
+    /**
+     * `src/ui/index.js`'s own two mission listeners, PLUS the `carded` guard
+     * `mission.js:_finish` publishes for them (see the note there — the two
+     * lines are not landed in `ui` yet, and this is what gates the contract in
+     * the meantime). An emitter that drew its own card stands the fallback
+     * down; `jobs._endLite`, which draws none, is unaffected.
+     */
+    wire(events) {
+      events.on('mission:complete', (e) => {
+        this.clearObjective();
+        if (e?.carded) return;
+        this.card('passed', e?.name ?? '');
+      });
+      events.on('mission:fail', (e) => {
+        this.clearObjective();
+        if (e?.carded) return;
+        this.card('failed', e?.reason ?? '');
+      });
+      return this;
+    },
   };
 }
 
@@ -327,8 +364,8 @@ function fakePeds() {
 
 function scene({ routing = true } = {}) {
   const save = blankSave();
-  const ui = fakeUi();
   const events = bus();
+  const ui = fakeUi().wire(events);
   const world = makeWorld(routing);
   const vehicles = makeVehicles();
   const peds = fakePeds();

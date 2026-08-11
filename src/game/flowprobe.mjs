@@ -1,0 +1,858 @@
+#!/usr/bin/env node
+/**
+ * GAME — THE FAILURE EDGES OF THE FIXED TRACKS.
+ *
+ *   node src/game/flowprobe.mjs
+ *   node src/game/flowprobe.mjs --verbose
+ *
+ * ────────────────────────────────────────────────────────────────────────────
+ * WHAT THIS EXISTS TO CATCH
+ *
+ * Every other game gate measures a chapter that GOES WELL. `escortprobe` drives
+ * a truck to a drop, `bossbarprobe` prices a bearing, `playtest` walks the
+ * story. Nothing measured the edges where a chapter is DECLARED LOST, and all
+ * four of the defects below lived there — invisible to a happy path, and each
+ * of them indistinguishable from a bug when it happened to a player:
+ *
+ *   1. `chase` failed on distance from frame one. The target spawns 180-320 m
+ *      out and flees at full throttle; the courtesy car is 10-45 m away and the
+ *      player is on foot at 1.72 m/s. The chapter could be lost before he
+ *      reached the car it told him to take.
+ *   2. `recover` failed the whole chapter the frame ANY marked car reported
+ *      `destroyed` — from 600 m away, off camera, hit by traffic. A FAILED card
+ *      for something the player never saw and could not have influenced.
+ *   3. `timedDeliver`'s clock was a hand-authored `baseTimer` per chapter, and
+ *      the two authored chapters disagree by a factor of six per metre of haul.
+ *   4. EVERY mission end raised the result card TWICE and struck its sting
+ *      twice, because `_finish` both emitted `mission:complete`/`mission:fail`
+ *      AND called `ui.card` itself, while `src/ui/index.js:874` and `:881`
+ *      raise a card off each of those events.
+ *
+ * ────────────────────────────────────────────────────────────────────────────
+ * WHY IT ASSERTS WHAT IT ASSERTS  (ARCHITECTURE.md rule 12)
+ *
+ * The runner and the tracks are REAL — `MissionRunner` and `TRACKS` are the
+ * shipped modules, driven through `WorldQuery` over the terrain and road graph
+ * `generateCity` actually emits. What is mocked is the fleet and the HUD, and
+ * both mocks are chosen so the thing under test still has to produce the
+ * artefact:
+ *
+ *   · the verdict is read off the EMITTED `mission:fail` / `mission:complete`
+ *     payloads on the bus and off the result card the fake `ui` receives —
+ *     never off `M.state`, which is the runner reporting on itself;
+ *   · the CARD COUNT includes the card `ui` raises for itself off the bus. A
+ *     stand-in that implements only `card()` models half of `src/ui/index.js`,
+ *     and the missing half IS the second card. `fakeUi().wire(events)`
+ *     subscribes the same two handlers the real file does;
+ *   · the timed-delivery rate is `M.timer` — the emitted clock — over a
+ *     distance THIS FILE measures between the car's emitted position and the
+ *     `POI` table's authored coordinate. `tracks.js` computes its own distance
+ *     from the spawn spot; dividing its clock by its own distance would compare
+ *     a number to itself and could not be anything but `DELIVER_RATE`.
+ *
+ * NEGATIVE CONTROLS, one per section, all of them real rather than synthetic:
+ *
+ *   1. the same chase staging with the arming latch forced on from frame one
+ *      (which is what the track did before) must fail immediately;
+ *   2. the same unwatched wreck, after the player has once been inside
+ *      `RECOVER_SEEN` of the car, must fail;
+ *   3. the two chapters' own authored `baseTimer` values, scored by the same
+ *      fairness test, must be rejected;
+ *   4. an extra `ui.card` call — which is exactly what `_finish` used to make
+ *      alongside the event — must take the count to two, so a green "exactly
+ *      one card" is a claim the counter can distinguish from a red one.
+ */
+
+import * as THREE from 'three';
+import { Terrain } from '../world/terrain.js';
+import { generateCity } from '../world/netgen.js';
+import { Router } from '../world/route.js';
+import { Rng } from '../core/rng.js';
+import { MissionRunner } from './mission.js';
+import { JobBoard } from './jobs.js';
+import { HostilePool } from './hostiles.js';
+import { WorldQuery } from './util.js';
+import { BOYZ, POI, R, DIFFS } from './data.js';
+import { blankSave } from './save.js';
+
+const VERBOSE = process.argv.includes('--verbose');
+const SEED = 0x5eed1234;
+
+let pass = 0, fail = 0;
+const rows = [];
+const check = (name, ok, detail) => {
+  ok ? pass++ : fail++;
+  rows.push({ ok: !!ok, name, detail: String(detail ?? '') });
+};
+
+/** Simulation step. 20 Hz, the same rate `escortprobe` drives at. */
+const DT = 0.05;
+const MAX_STEPS = Math.ceil(240 / DT);
+
+/**
+ * The two numbers `tracks.js` publishes and this file must NOT recompute from.
+ * They are quoted for the failure text only; every assertion derives its own.
+ */
+const EXPECT_RATE = 0.14;   // s per crow-flight metre — `tracks.DELIVER_RATE`
+/**
+ * How far apart two chapters' seconds-per-metre may be and still count as the
+ * same rate: 2%. Deliberately tight, because a shared formula makes them EQUAL
+ * — the measured spread is 0.0% — and the defect it replaced was 78% apart. A
+ * loose tolerance here would pass a per-chapter fudge factor.
+ */
+const RATE_TOL = 0.02;
+
+/* ========================================================================== */
+/* the world — the real one                                                   */
+/* ========================================================================== */
+
+const terrain = new Terrain({ cell: 8, extent: 1792 }).bake();
+const graph = generateCity(terrain, new Rng(SEED).fork().fork()).graph;
+
+/** The height a car at (x, z) rides at — the deck if it is on one. HARNESS. */
+function carY(x, z) {
+  const hit = graph.nearestEdge(x, z, 40);
+  const e = hit.edge;
+  if (!e) return terrain.heightAt(x, z);
+  const na = graph.nodes[e.a];
+  const nb = graph.nodes[e.b];
+  if (hit.dist > (e.width ?? 8) * 0.5 + 3) return terrain.heightAt(x, z);
+  return na.y + (nb.y - na.y) * (typeof hit.t === 'number' ? hit.t : 0.5);
+}
+
+function makeWorld() {
+  const router = new Router(graph);
+  return {
+    CITY_SIZE: 3584,
+    roads: graph,
+    heightAt: (x, z) => terrain.heightAt(x, z),
+    walkableHeightAt: (x, z) => terrain.heightAt(x, z),
+    isWater: (x, z) => terrain.isWater(x, z),
+    surfaceAt: (x, z) => (terrain.isWater(x, z) ? 'water' : 'asphalt'),
+    waterLevelAt: () => 0,
+    isOpen: () => true,
+    routeTo: (fx, fz, tx, tz, opts) => router.routeTo(fx, fz, tx, tz, opts),
+  };
+}
+
+/* ========================================================================== */
+/* the cars                                                                   */
+/* ========================================================================== */
+
+const CARS = {
+  truck: { top: 22, accel: 5.0, turn: 0.95, hp: 900, half: 1.1, comY: 0.7 },
+  van: { top: 26, accel: 6.0, turn: 1.0, hp: 900, half: 1.05, comY: 0.7 },
+  muscle: { top: 34, accel: 8.5, turn: 1.35, hp: 900, half: 0.95, comY: 0.5 },
+  sports: { top: 38, accel: 9.5, turn: 1.5, hp: 900, half: 0.92, comY: 0.45 },
+  sedan: { top: 30, accel: 7.0, turn: 1.2, hp: 900, half: 0.95, comY: 0.5 },
+};
+
+const _euler = new THREE.Euler(0, 0, 0, 'YXZ');
+
+function makeCar(type, x, y, z, yaw) {
+  const spec = CARS[type] ?? CARS.sedan;
+  const v = {
+    type,
+    spec: { ...spec, half: { x: spec.half }, comY: spec.comY },
+    position: new THREE.Vector3(x, y, z),
+    quaternion: new THREE.Quaternion(),
+    yaw,
+    speed: 0,
+    forwardSpeed: 0,
+    health: spec.hp,
+    maxHealth: spec.hp,
+    destroyed: false,
+    despawned: false,
+    inp: { throttle: 0, brake: 0, steer: 0, handbrake: false, boost: false },
+    driven: false,
+    setPose(pos, y2) {
+      this.position.copy(pos);
+      this.yaw = y2;
+      this.speed = 0;
+      this.forwardSpeed = 0;
+      this.quaternion.setFromEuler(_euler.set(0, y2, 0, 'YXZ'));
+    },
+  };
+  v.quaternion.setFromEuler(_euler.set(0, yaw, 0, 'YXZ'));
+  return v;
+}
+
+function stepCar(v, dt) {
+  if (v.destroyed || v.despawned) return;
+  const i = v.inp;
+  const s = CARS[v.type] ?? CARS.sedan;
+  if (!v.driven) { i.throttle = 0; i.brake = 0.25; i.steer = 0; }
+  const drag = 0.06 * v.speed + 0.004 * v.speed * v.speed;
+  v.speed += (i.throttle * s.accel * (i.boost ? 1.25 : 1) - i.brake * 10 - drag) * dt;
+  if (v.speed < 0) v.speed = 0;
+  const top = s.top * (i.boost ? 1.15 : 1);
+  if (v.speed > top) v.speed = top;
+  v.yaw += i.steer * s.turn * Math.min(1, v.speed / 7) * dt;
+  v.position.x += Math.sin(v.yaw) * v.speed * dt;
+  v.position.z += Math.cos(v.yaw) * v.speed * dt;
+  v.position.y = carY(v.position.x, v.position.z) + 0.6;
+  v.forwardSpeed = v.speed;
+  v.quaternion.setFromEuler(_euler.set(0, v.yaw, 0, 'YXZ'));
+  v.driven = false;
+}
+
+function makeVehicles() {
+  const sys = {
+    live: [],
+    spawn(type, pos, yaw = 0) {
+      const v = makeCar(type, pos.x, pos.y, pos.z, yaw);
+      sys.live.push(v);
+      return v;
+    },
+    setInput(v, inp) {
+      const i = v.inp;
+      i.throttle = inp.throttle;
+      i.brake = inp.brake;
+      i.steer = inp.steer;
+      i.handbrake = !!inp.handbrake;
+      i.boost = !!inp.boost;
+      v.driven = true;
+    },
+    damage(v, amount) {
+      if (!v || v.destroyed) return;
+      v.health -= amount;
+      if (v.health <= 0) { v.health = 0; v.destroyed = true; }
+    },
+    despawn(v) {
+      const i = sys.live.indexOf(v);
+      if (i >= 0) sys.live.splice(i, 1);
+      if (v) v.despawned = true;
+    },
+    waterHeightAt: () => 0,
+  };
+  return sys;
+}
+
+/* ========================================================================== */
+/* the rest of the harness                                                    */
+/* ========================================================================== */
+
+function bus() {
+  const map = new Map();
+  return {
+    on(k, fn) { (map.get(k) ?? map.set(k, new Set()).get(k)).add(fn); return () => map.get(k)?.delete(fn); },
+    off(k, fn) { map.get(k)?.delete(fn); },
+    emit(k, p) { for (const fn of [...(map.get(k) ?? [])]) fn(p); },
+  };
+}
+
+/**
+ * `ui`, INCLUDING THE HALF THAT LIVES ON THE BUS — see the header.
+ *
+ * `card()` also records the STING, because `src/ui/index.js:1081` plays
+ * `mission_pass` / `mission_fail` on every call and that is where the audible
+ * half of the double-fire was. `stings` therefore counts everything the player
+ * would hear at an end: the card's own, plus anything the runner plays through
+ * `wq.uiSfx` in the same frame.
+ */
+function fakeUi() {
+  return {
+    cards: [], stings: [], toasts: [],
+    card(kind, sub) {
+      this.cards.push({ kind, sub });
+      this.stings.push(kind === 'passed' ? 'mission_pass' : 'mission_fail');
+    },
+    notify(text, value, tone) { this.toasts.push({ text, value, tone }); },
+    say() {}, setCharacter() {}, setMoney() {}, setStation() {}, setWaypoint() {},
+    setObjectives() {}, clearObjective() {}, titleCard() {}, playScene() {},
+    /**
+     * `src/ui/index.js`'s own two mission listeners, PLUS the `carded` guard
+     * `mission.js:_finish` publishes for them. The guard is two lines and is
+     * not landed in `ui` yet — see the note in `_finish` — so this mock is what
+     * holds the contract, and the negative control below is what proves the
+     * mock is not just agreeing with itself: delete `carded` from the payload
+     * and the count goes to two, which is the shipped double.
+     */
+    wire(events) {
+      events.on('mission:complete', (e) => {
+        this.clearObjective();
+        if (e?.carded) return;
+        this.card('passed', e?.name ?? '');
+      });
+      events.on('mission:fail', (e) => {
+        this.clearObjective();
+        if (e?.carded) return;
+        this.card('failed', e?.reason ?? '');
+      });
+      return this;
+    },
+  };
+}
+
+function fakePeds() {
+  return {
+    spawned: [],
+    hostiles: { onKill: null, live: [], aliveCount: 0 },
+    spawnHostile(v, opts) {
+      const h = {
+        position: { x: v.x, y: v.y, z: v.z }, yaw: 0,
+        health: opts?.hp ?? 100, maxHealth: opts?.hp ?? 100, dead: false, active: true,
+      };
+      this.spawned.push(h);
+      return h;
+    },
+    despawnHostile(h) { if (h) h.active = false; },
+    clearHostiles() { for (const h of this.spawned) h.active = false; },
+    hurtHostile: () => false,
+  };
+}
+
+function scene({ difficulty = 'normal' } = {}) {
+  const save = blankSave();
+  const events = bus();
+  const ui = fakeUi().wire(events);
+  const world = makeWorld();
+  const vehicles = makeVehicles();
+  const peds = fakePeds();
+  const time = { raw: 0, elapsed: 0, dt: DT, scale: 1, frame: 0 };
+  const player = {
+    position: new THREE.Vector3(0, 0, 0),
+    inVehicle: false, vehicle: null, dead: false,
+    addTrauma() {}, applyDamage() {},
+    vehicles: { abort() { player.inVehicle = false; player.vehicle = null; } },
+    movement: {},
+  };
+  const bag = { world, vehicles, peds, player, ui };
+  const ctx = {
+    rng: new Rng(SEED).fork(), events, time,
+    camera: { position: new THREE.Vector3() },
+    scene: new THREE.Scene(),
+    peek: (i) => bag[i] ?? null, get: (i) => bag[i] ?? null, has: (i) => i in bag,
+  };
+  const wq = new WorldQuery(ctx).init();
+  // Every result sting the RUNNER plays, with the frame it played on, so a
+  // second one landing beside the card's is visible as a second one.
+  const sfx = [];
+  const rawUiSfx = wq.uiSfx.bind(wq);
+  wq.uiSfx = (id, gain) => { sfx.push({ id, frame: time.frame }); return rawUiSfx(id, gain); };
+  const economy = {
+    cash: 0, respect: 0, char: (who = 'aidan') => save.chars[who],
+    paid: [], respected: [],
+    addCash(n) { this.paid.push(n); }, addRespect(n) { this.respected.push(n); return []; },
+    unlockWeapon: () => false,
+  };
+  const heat = { wanted: 0, raise() {}, clear() {}, heat() {}, setPursuitEnabled() {} };
+  const pickups = {
+    spawn: () => null, despawn() {}, clearMission() {},
+    countMission: () => 0, nearestMission: () => null,
+  };
+  const hostiles = new HostilePool(ctx, wq).init();
+  const missions = new MissionRunner(ctx, { wq, economy, heat, hostiles, pickups, save });
+  missions.difficulty = difficulty;
+  bag.game = { missions, pickups };
+  const fails = [];
+  const wins = [];
+  events.on('mission:fail', (p) => fails.push({ ...p }));
+  events.on('mission:complete', (p) => wins.push({ ...p }));
+  return { save, ui, wq, events, world, vehicles, ctx, missions, time, player, fails, wins, sfx, economy };
+}
+
+/** Walk a chapter out of its intro. Returns the live mission record. */
+function begin(s, boy, idx, at) {
+  s.player.position.set(at.x, 0, at.z);
+  s.missions.start(boy, idx);
+  for (let i = 0; i < 8 && s.missions.M.phase === 'intro'; i++) s.missions.update(1);
+  if (s.missions.M.phase === 'travel') s.missions.forceBegin();
+  return s.missions.M;
+}
+
+/** Step the sim, cars and all, until the chapter ends or `steps` run out. */
+function drive(s, steps, onStep) {
+  let n = 0;
+  while (n < steps && s.missions.M && s.missions.M.phase !== 'over') {
+    s.time.raw += DT;
+    s.time.elapsed += DT;
+    s.time.frame++;
+    s.missions.update(DT);
+    for (const v of s.vehicles.live) stepCar(v, DT);
+    n++;
+    onStep?.(n);
+  }
+  return n;
+}
+
+/** Put the player into `v` the way the game's own seat state reads. */
+function board(s, v) {
+  s.player.inVehicle = true;
+  s.player.vehicle = v;
+}
+
+const chapterOf = (boyId, track) => {
+  const boy = BOYZ[boyId];
+  const idx = boy.story.findIndex((c) => c.track === track);
+  return { boy, idx, c: boy.story[idx] };
+};
+
+/* ========================================================================== */
+/* 1 — CHASE: the chapter cannot be lost before it can be played              */
+/* ========================================================================== */
+
+{
+  const { boy, idx } = chapterOf('dylan', 'chase');
+  const s = scene();
+  const at = s.wq.poi(boy.story[idx].at) ?? { x: 0, z: 0 };
+  const M = begin(s, boy, idx, at);
+  const target = M.target;
+
+  check('a chase chapter is live with a target on the road',
+    !!target && s.missions.running === true && M.track === 'chase',
+    `${M.def?.no} ${M.def?.name}, target at (${target?.position.x.toFixed(0)}, ${target?.position.z.toFixed(0)}), ` +
+    `${Math.hypot(target.position.x - at.x, target.position.z - at.z).toFixed(0)} m from the staging POI`);
+
+  // THE STAGING THE DEFECT NEEDS: put the target straight past `R.chaseLose`,
+  // which is where a fleeing muscle car is within ~15 s of a player on foot.
+  target.setPose({ x: at.x + R.chaseLose + 120, y: 0, z: at.z }, 0);
+  const startFrame = s.time.frame;
+
+  // ---- on foot, never boarding -----------------------------------------
+  drive(s, Math.ceil(15 / DT));
+  const alive15 = s.missions.M.phase !== 'over';
+  check('on foot 15 s in, 740 m adrift, the chapter is still alive',
+    alive15 && s.fails.length === 0,
+    alive15 ? `still running, ${Math.round(dist2(s.player.position, target.position))} m adrift`
+      : `FAILED: "${s.fails[0]?.reason}"`);
+
+  // ---- he gets in a car; now the 2.5 s grace, and only then the verdict --
+  const ride = s.missions.M.veh ?? s.vehicles.live.find((v) => v !== target);
+  board(s, ride);
+  const boardFrame = s.time.frame;
+  drive(s, Math.ceil(2.0 / DT));
+  const aliveGrace = s.missions.M.phase !== 'over';
+  check('and for 2.0 s after he takes the wheel it is STILL alive (the grace)',
+    aliveGrace && s.fails.length === 0,
+    aliveGrace ? `${((s.time.frame - boardFrame) * DT).toFixed(1)} s aboard, still running`
+      : `FAILED after ${((s.time.frame - boardFrame) * DT).toFixed(1)} s: "${s.fails[0]?.reason}"`);
+
+  // ---- past the grace, still 740 m adrift: it is a loss, and it says so --
+  drive(s, Math.ceil(6 / DT));
+  const f = s.fails[0];
+  check('past the grace and still adrift, the target IS scored as escaped',
+    !!f && /got away/i.test(f.reason ?? ''),
+    f ? `"${f.reason}" at ${((s.time.frame - boardFrame) * DT).toFixed(1)} s aboard` : 'never failed');
+  check('...and the whole thing took longer than the walk to the car',
+    (s.time.frame - startFrame) * DT > 15,
+    `${((s.time.frame - startFrame) * DT).toFixed(1)} s from the first frame of the chapter`);
+}
+
+/* ---- NEGATIVE CONTROL: the track as it behaved before -------------------- */
+{
+  const { boy, idx } = chapterOf('dylan', 'chase');
+  const s = scene();
+  const at = s.wq.poi(boy.story[idx].at) ?? { x: 0, z: 0 };
+  const M = begin(s, boy, idx, at);
+  M.target.setPose({ x: at.x + R.chaseLose + 120, y: 0, z: at.z }, 0);
+  // Exactly what the old code did: no latch, no grace — the distance test is
+  // live on the first update.
+  M.rolled = true;
+  M.graceT = 0;
+  drive(s, Math.ceil(1 / DT));
+  const f = s.fails[0];
+  check('NEG CONTROL: with the latch and grace disabled it fails on frame one',
+    !!f && /got away/i.test(f.reason ?? ''),
+    f ? `"${f.reason}" after ${(s.time.frame * DT).toFixed(2)} s` : 'did NOT fail — the staging is not adrift');
+}
+
+function dist2(a, b) {
+  return Math.hypot(a.x - b.x, a.z - b.z);
+}
+
+/* ========================================================================== */
+/* 2 — RECOVER: a wreck he never saw is not a wreck he caused                 */
+/* ========================================================================== */
+
+/** The marked cars the runner is holding that are still in play. */
+function markedAlive(M) {
+  return M.spawnedVehicles.filter((v) => v._marked && !v.destroyed && !v.despawned);
+}
+
+{
+  const { boy, idx } = chapterOf('aidan', 'recover');
+  const s = scene();
+  const at = s.wq.poi(boy.story[idx].at) ?? { x: 0, z: 0 };
+  const M = begin(s, boy, idx, at);
+
+  check('a recover chapter is live with its full set of marked cars',
+    s.missions.running === true && markedAlive(M).length === M.goal,
+    `${M.def?.no} ${M.def?.name}, ${markedAlive(M).length} marked of goal ${M.goal}`);
+
+  // The FARTHEST one, and park the player on the drop so it is unambiguous
+  // that he has never been anywhere near it.
+  const cars = markedAlive(M);
+  const victim = cars.reduce((m, v) =>
+    (dist2(v.position, M.dest) > dist2(m.position, M.dest) ? v : m));
+  s.player.position.set(M.dest.x, 0, M.dest.z);
+  drive(s, 4);
+  const away = dist2(s.player.position, victim.position);
+  s.vehicles.damage(victim, victim.maxHealth * 2);
+  drive(s, 6);
+
+  const stillLive = s.missions.M && s.missions.M.phase !== 'over';
+  check('a marked car wrecked 600 m away, unseen, does NOT fail the chapter',
+    stillLive && s.fails.length === 0,
+    stillLive ? `wrecked ${Math.round(away)} m away, chapter still running`
+      : `FAILED: "${s.fails[0]?.reason}"`);
+  check('...and it is REPLACED, so the goal is still reachable',
+    markedAlive(s.missions.M).length === M.goal,
+    `${markedAlive(s.missions.M).length} marked cars in play against goal ${M.goal}`);
+  check('...and the replacement is a car he has not seen either',
+    markedAlive(s.missions.M).every((v) => v.recoverSeen === false || dist2(s.player.position, v.position) <= 90),
+    markedAlive(s.missions.M).map((v) => `${Math.round(dist2(s.player.position, v.position))}m/${v.recoverSeen}`).join(' '));
+}
+
+/* ---- NEGATIVE CONTROL: a car he HAS seen ------------------------------- */
+{
+  const { boy, idx } = chapterOf('aidan', 'recover');
+  const s = scene();
+  const at = s.wq.poi(boy.story[idx].at) ?? { x: 0, z: 0 };
+  const M = begin(s, boy, idx, at);
+  const victim = markedAlive(M)[0];
+
+  // Walk him up to it — inside the witness radius — then all the way back to
+  // the drop. The wreck happens just as far off as it did above; the ONLY
+  // difference is that he has laid eyes on this one.
+  s.player.position.set(victim.position.x + 20, 0, victim.position.z);
+  drive(s, 4);
+  const sawIt = victim.recoverSeen === true;
+  s.player.position.set(M.dest.x, 0, M.dest.z);
+  drive(s, 4);
+  const away = dist2(s.player.position, victim.position);
+  s.vehicles.damage(victim, victim.maxHealth * 2);
+  drive(s, 6);
+
+  const f = s.fails[0];
+  check('NEG CONTROL: wrecking a car he HAS been up to fails the chapter',
+    sawIt && !!f && /marked car was wrecked/i.test(f.reason ?? ''),
+    `witnessed ${sawIt}, wrecked ${Math.round(away)} m away -> ${f ? `"${f.reason}"` : 'no fail'}`);
+}
+
+/* ========================================================================== */
+/* 3 — timedDeliver: the same seconds per metre for both chapters             */
+/* ========================================================================== */
+
+/**
+ * Run one authored `timedDeliver` chapter staged so the haul is roughly `want`
+ * metres, and return the EMITTED clock beside a distance measured here.
+ *
+ * The staging point is chosen by walking out from the destination until the
+ * crow-flight distance is close to `want` AND the point is dry — the chapter
+ * anchors on the player, so where he stands IS the haul length. That is what
+ * makes one authored `baseTimer` indefensible: the same chapter is a 300 m job
+ * or a 2 km job depending on where you accept it.
+ */
+function haulRun(boyId, want) {
+  const { boy, idx, c } = chapterOf(boyId, 'timedDeliver');
+  const dest = POI.get(c.dest);
+  const s = scene();
+  let at = null;
+  for (let a = 0; a < 64 && !at; a++) {
+    const ang = (a / 64) * Math.PI * 2;
+    const px = dest.x + Math.cos(ang) * want;
+    const pz = dest.z + Math.sin(ang) * want;
+    if (Math.abs(px) > 1500 || Math.abs(pz) > 1500) continue;
+    if (terrain.isWater(px, pz)) continue;
+    at = { x: px, z: pz };
+  }
+  if (!at) return null;
+  const M = begin(s, boy, idx, at);
+  const veh = M.veh;
+  if (!veh) return null;
+  // MEASURED HERE: the car the world actually holds, against the coordinate the
+  // POI TABLE authors. `tracks.js` used neither of these two objects.
+  const d = Math.hypot(veh.position.x - dest.x, veh.position.z - dest.z);
+  return {
+    id: `${boy.id} ${c.no} ${c.name}`,
+    dest: c.dest,
+    // The PRE-FIX authored seconds, kept HERE as history: data.js no longer
+    // carries a dead baseTimer on the timedDeliver chapters (the haul-derived
+    // clock overrides it), and the negative control needs the old numbers to
+    // keep proving they were unfair. Keyed by destination — the two chapters
+    // the defect was measured at.
+    authored: c.baseTimer ?? AUTHORED_TIMED[c.dest],
+    d,
+    timer: M.timer,
+    rate: M.timer / d,
+    hasTimer: M.hasTimer,
+  };
+}
+
+/** data.js's hand-authored timedDeliver seconds as shipped before the
+ * haul-derived clock (aidan CH4 shop_ammo, dylan CH6 ap_east). */
+const AUTHORED_TIMED = { shop_ammo: 88, ap_east: 96 };
+
+{
+  // The two hauls the defect was measured at: the short in-town run and the
+  // cross-city airfield run.
+  const shortRun = haulRun('aidan', 300);
+  const longRun = haulRun('dylan', 1959) ?? haulRun('dylan', 1500);
+
+  check('both authored timed deliveries stage and arm a clock',
+    !!shortRun && !!longRun && shortRun.hasTimer && longRun.hasTimer,
+    shortRun && longRun
+      ? `${shortRun.id} ${shortRun.d.toFixed(0)} m -> ${shortRun.timer.toFixed(0)} s · ` +
+        `${longRun.id} ${longRun.d.toFixed(0)} m -> ${longRun.timer.toFixed(0)} s`
+      : 'one of them did not stage');
+
+  if (shortRun && longRun) {
+    const spread = Math.abs(shortRun.rate - longRun.rate) / Math.max(shortRun.rate, longRun.rate);
+    check('the two chapters are clocked at the SAME seconds per metre',
+      spread <= RATE_TOL,
+      `${shortRun.rate.toFixed(4)} vs ${longRun.rate.toFixed(4)} s/m — ${(spread * 100).toFixed(1)}% apart ` +
+      `(tolerance ${(RATE_TOL * 100).toFixed(0)}%)`);
+    check('...and the rate is a real allowance, not a rounding of zero',
+      shortRun.rate > 0.05 && shortRun.rate < 0.5,
+      `${shortRun.rate.toFixed(4)} s/m ~ ${(1 / shortRun.rate).toFixed(1)} m/s of crow-flight progress ` +
+      `(the file states ${EXPECT_RATE})`);
+
+    // A THIRD point, so "the same rate" is not two points fitting any line.
+    const midRun = haulRun('aidan', 900);
+    check('a third haul on the same chapter lands on the same rate',
+      !!midRun && Math.abs(midRun.rate - shortRun.rate) / shortRun.rate <= RATE_TOL,
+      midRun ? `${midRun.d.toFixed(0)} m -> ${midRun.timer.toFixed(0)} s = ${midRun.rate.toFixed(4)} s/m`
+        : 'the mid haul did not stage');
+
+    /* ---- NEGATIVE CONTROL: the authored numbers, same test -------------- */
+    const mul = DIFFS.normal.timerMul;
+    const oldShort = (shortRun.authored * mul) / shortRun.d;
+    const oldLong = (longRun.authored * mul) / longRun.d;
+    const oldSpread = Math.abs(oldShort - oldLong) / Math.max(oldShort, oldLong);
+    check('NEG CONTROL: the authored baseTimers fail the same fairness test',
+      oldSpread > RATE_TOL,
+      `authored ${shortRun.authored} s / ${longRun.authored} s -> ` +
+      `${oldShort.toFixed(4)} vs ${oldLong.toFixed(4)} s/m — ${(oldSpread * 100).toFixed(0)}% apart`);
+    check('NEG CONTROL: ...and the long haul was the unwinnable one',
+      oldLong < oldShort / 2,
+      `${(1 / oldLong).toFixed(1)} m/s demanded on the long run against ` +
+      `${(1 / oldShort).toFixed(1)} m/s on the short one`);
+  }
+}
+
+/* ========================================================================== */
+/* 4 — ONE result card and ONE sting, per end, both directions               */
+/* ========================================================================== */
+
+/**
+ * The cards and the stings raised across ONE end.
+ *
+ * `ui.cards` counts what the player sees whichever side raised it, because the
+ * fake `ui` is on the bus. `sfx` counts what the RUNNER plays on top of the
+ * card's own — `fail` used to add a `damage` hit in the same frame as
+ * `mission_fail`.
+ */
+function endTally(s, sinceCards, sinceSfx, frame) {
+  return {
+    cards: s.ui.cards.length - sinceCards,
+    runnerSfx: s.sfx.filter((e, i) => i >= sinceSfx && e.frame >= frame).length,
+    stings: s.ui.stings.length - sinceCards,
+  };
+}
+
+{
+  // ---- a LOSS: the chase that got away ----------------------------------
+  const { boy, idx } = chapterOf('dylan', 'chase');
+  const s = scene();
+  const at = s.wq.poi(boy.story[idx].at) ?? { x: 0, z: 0 };
+  const M = begin(s, boy, idx, at);
+  M.target.setPose({ x: at.x + R.chaseLose + 400, y: 0, z: at.z }, 0);
+  M.rolled = true;
+  M.graceT = 0;
+  const c0 = s.ui.cards.length;
+  const x0 = s.sfx.length;
+  const f0 = s.time.frame;
+  drive(s, Math.ceil(2 / DT));
+  const lost = endTally(s, c0, x0, f0);
+
+  check('a LOST chapter raises exactly ONE result card',
+    lost.cards === 1 && s.ui.cards[c0]?.kind === 'failed',
+    `${lost.cards} card(s): ${JSON.stringify(s.ui.cards.slice(c0))}`);
+  check('...and exactly ONE sting under it',
+    lost.stings + lost.runnerSfx === 1,
+    `${lost.stings} from the card + ${lost.runnerSfx} from the runner ` +
+    `(${s.sfx.slice(x0).map((e) => e.id).join(',') || 'none'})`);
+  check('...and the fail event still went out for everyone else on the bus',
+    s.fails.length === 1,
+    `${s.fails.length} mission:fail — "${s.fails[0]?.reason}"`);
+}
+
+{
+  // ---- a WIN: a delivery driven into the drop ring ----------------------
+  const { boy, idx } = chapterOf('aidan', 'deliver');
+  const s = scene();
+  const at = s.wq.poi(boy.story[idx].at ?? boy.story[idx].dest) ?? { x: 0, z: 0 };
+  const M = begin(s, boy, idx, at);
+  const veh = M.veh;
+  board(s, veh);
+  // Put the car in the ring. The track's own arrival test is what wins it.
+  veh.setPose({ x: M.dest.x, y: 0, z: M.dest.z }, 0);
+  s.player.position.set(M.dest.x, 0, M.dest.z);
+  const c0 = s.ui.cards.length;
+  const x0 = s.sfx.length;
+  const f0 = s.time.frame;
+  drive(s, Math.ceil(20 / DT));
+  const won = endTally(s, c0, x0, f0);
+
+  check('a WON chapter raises exactly ONE result card',
+    won.cards === 1 && s.ui.cards[c0]?.kind === 'passed',
+    `${won.cards} card(s): ${JSON.stringify(s.ui.cards.slice(c0))}`);
+  check('...and the win event carries the payout the card prints',
+    s.wins.length === 1 && s.wins[0].cash > 0,
+    `${s.wins.length} mission:complete, cash ${s.wins[0]?.cash}, respect ${s.wins[0]?.respect}`);
+
+  /* ---- NEGATIVE CONTROL: the same end with `carded` stripped ----------
+   * Re-publish the END PAYLOAD the runner just emitted, minus the one field
+   * that stands the fallback down. That is precisely the shipped double, and
+   * it is the pre-fix behaviour rather than a synthetic extra call — so a
+   * green "exactly one card" above is a claim the counter can tell apart from
+   * a red one. */
+  const before = s.ui.cards.length;
+  const bare = { ...s.wins[0] };
+  delete bare.carded;
+  s.events.emit('mission:complete', bare);
+  check('NEG CONTROL: the same end without `carded` raises the second card',
+    s.ui.cards.length - before === 1 && s.ui.cards.length - c0 === 2,
+    `stripping carded takes the end from ${won.cards} card to ${s.ui.cards.length - c0}`);
+}
+
+/* ========================================================================== */
+/* 5 — the replay purse                                                       */
+/* ========================================================================== */
+
+/**
+ * A chapter the frontier has already passed pays a fraction, and SAYS so.
+ * Read off `economy.addCash` — the money that actually moved — and off the
+ * toast, not off `M.rate`.
+ */
+{
+  const { boy, idx, c } = chapterOf('aidan', 'deliver');
+
+  const firstTime = scene();
+  {
+    const at = firstTime.wq.poi(c.at ?? c.dest) ?? { x: 0, z: 0 };
+    const M = begin(firstTime, boy, idx, at);
+    board(firstTime, M.veh);
+    M.veh.setPose({ x: M.dest.x, y: 0, z: M.dest.z }, 0);
+    firstTime.player.position.set(M.dest.x, 0, M.dest.z);
+    drive(firstTime, Math.ceil(20 / DT));
+  }
+
+  const replay = scene();
+  // The frontier is already past this chapter — exactly the state
+  // `completeStoryChapter` leaves behind, and the state the pause menu replays
+  // an old chapter from.
+  replay.save.chars[boy.id].chapter = idx + 2;
+  {
+    const at = replay.wq.poi(c.at ?? c.dest) ?? { x: 0, z: 0 };
+    const M = begin(replay, boy, idx, at);
+    board(replay, M.veh);
+    M.veh.setPose({ x: M.dest.x, y: 0, z: M.dest.z }, 0);
+    replay.player.position.set(M.dest.x, 0, M.dest.z);
+    drive(replay, Math.ceil(20 / DT));
+  }
+
+  const paidFirst = firstTime.economy.paid.reduce((a, b) => a + b, 0);
+  const paidAgain = replay.economy.paid.reduce((a, b) => a + b, 0);
+  check('a first clear pays the authored purse',
+    paidFirst >= c.cash,
+    `${paidFirst} against an authored ${c.cash}`);
+  check('a REPLAY of a cleared chapter pays a fraction of it',
+    paidAgain > 0 && paidAgain < paidFirst * 0.5,
+    `${paidAgain} on the replay against ${paidFirst} first time — ` +
+    `${paidFirst ? ((paidAgain / paidFirst) * 100).toFixed(0) : '?'}%`);
+  check('...and the player is TOLD, rather than quietly short-changed',
+    replay.ui.toasts.some((t) => /replay/i.test(t.text ?? '')),
+    replay.ui.toasts.map((t) => `${t.text} ${t.value ?? ''}`).join(' | ') || 'no toast');
+  check('NEG CONTROL: the first clear is not toasted as a replay',
+    !firstTime.ui.toasts.some((t) => /replay/i.test(t.text ?? '')),
+    firstTime.ui.toasts.map((t) => t.text).join(' | ') || 'no toasts');
+}
+
+/* ========================================================================== */
+/* 6 — a LITE side job can be put down                                       */
+/* ========================================================================== */
+
+/**
+ * `abandonLite()` was the documented public abort and nothing called it.
+ * `game/index.js:_abortRequest` — the K path — returns on its first line when
+ * `missions.active` is false, and a lite job is not a `MissionRunner` mission.
+ * None of `explore`, `speed` or `copwar` has a clock, a leash or a wreck to end
+ * it, so an accepted one stayed on the HUD over free roam until the player took
+ * a chapter or died.
+ *
+ * Driven through the REAL key edge — a `ctx.input` stand-in with the two
+ * methods `src/core/input.js` publishes — and read off the EMITTED
+ * `mission:fail` and the toast, never off `jobs.lite.active`.
+ */
+{
+  const s = scene();
+  const keys = new Set();
+  const held = new Set();
+  s.ctx.input = {
+    enabled: true, frozen: false,
+    pressed: (c) => keys.has(c),
+    held: (c) => held.has(c),
+  };
+  const jobs = new JobBoard(s.ctx, {
+    wq: s.wq, economy: s.economy, missions: s.missions, save: s.save,
+  });
+  jobs.boy = BOYZ.aidan;
+  const tap = () => { keys.add('KeyK'); jobs.update(DT); keys.delete('KeyK'); };
+
+  const L = jobs.start('explore');
+  check('a LITE side job accepts and runs',
+    !!L && jobs.lite.active === true && jobs.lite.track === 'explore',
+    `${jobs.lite.name || 'none'} (${jobs.lite.track || '-'})`);
+
+  const toastsBefore = s.ui.toasts.length;
+  tap();
+  check('K once does NOT drop it — it asks first',
+    jobs.lite.active === true &&
+    s.ui.toasts.slice(toastsBefore).some((t) => /drop the job/i.test(t.text ?? '')),
+    `active ${jobs.lite.active}, said "${s.ui.toasts[s.ui.toasts.length - 1]?.text ?? 'nothing'}"`);
+
+  s.ctx.time.raw += 1.0;              // inside the confirmation window
+  const failsBefore = s.fails.length;
+  tap();
+  check('K again inside the window DROPS it',
+    jobs.lite.active === false && s.fails.length === failsBefore + 1,
+    `active ${jobs.lite.active}, mission:fail "${s.fails[s.fails.length - 1]?.reason ?? 'none'}"`);
+  check('...and the screen says so, exactly once',
+    s.ui.cards.filter((c) => c.kind === 'failed').length === 1,
+    `${s.ui.cards.length} card(s): ${JSON.stringify(s.ui.cards)}`);
+}
+
+/* ---- NEGATIVE CONTROL: the window expires ------------------------------- */
+{
+  const s = scene();
+  const keys = new Set();
+  s.ctx.input = { enabled: true, frozen: false, pressed: (c) => keys.has(c), held: () => false };
+  const jobs = new JobBoard(s.ctx, {
+    wq: s.wq, economy: s.economy, missions: s.missions, save: s.save,
+  });
+  jobs.boy = BOYZ.aidan;
+  const tap = () => { keys.add('KeyK'); jobs.update(DT); keys.delete('KeyK'); };
+  jobs.start('explore');
+  tap();
+  s.ctx.time.raw += 30;               // long past the window
+  tap();
+  check('NEG CONTROL: a second K long after the question does NOT drop it',
+    jobs.lite.active === true,
+    `active ${jobs.lite.active} after a 30 s gap between presses`);
+}
+
+/* ========================================================================== */
+
+console.log('\ngame flow — the failure edges of the fixed tracks, headless on the emitted city');
+console.log(`  seed ${SEED.toString(16)}, ${DT * 1000} ms step, ceiling ${MAX_STEPS} steps\n`);
+for (const r of rows) {
+  if (!r.ok || VERBOSE) {
+    console.log(`  ${r.ok ? 'ok  ' : 'FAIL'}  ${r.name.padEnd(64)} ${r.detail}`);
+  } else {
+    console.log(`  ok    ${r.name.padEnd(64)} ${r.detail}`);
+  }
+}
+console.log(`\nflow: ${pass}/${pass + fail}`);
+process.exit(fail === 0 ? 0 : 1);

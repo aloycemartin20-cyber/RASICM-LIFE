@@ -145,6 +145,13 @@ const REFRESH_TIME = 240;
 const OFFERS = 3;
 /** Jobless with the story done: re-surface the standing suggestion this often. */
 const STAND_PERIOD = 45;
+/**
+ * Seconds the K question stands before it has to be asked again. UNSCALED —
+ * see `_abortKey`. The same 4 s `game/index.js`'s `ABORT_CONFIRM` gives a
+ * chapter, because the player is answering the same question about the same
+ * key and two different windows would be worse than either.
+ */
+const ABORT_LITE = 4;
 /** `explore` completes inside this ring. */
 const EXPLORE_RADIUS = 46;
 /** `speed` wants the target held for this many seconds. */
@@ -202,6 +209,9 @@ export class JobBoard {
     this._liteMarkers = [this._liteMarker];
     this._liteObj = { eyebrow: 'SIDE JOB', text: '', count: '', progress: 0, timer: undefined };
     this._liteObjT = 0;
+    /** Unscaled raw time the K question was asked, and the job it was asked about. */
+    this._abortArmed = -1;
+    this._abortArmedId = '';
     this._startPayload = { id: '', chapter: 'SIDE JOB', name: '', zone: '', track: '', lines: null };
     this._endPayload = { id: '', name: '', cash: 0, respect: 0, reason: '' };
 
@@ -307,8 +317,59 @@ export class JobBoard {
 
   update(dt) {
     this._age += dt;
+    this._abortKey();
     this._liteUpdate(dt);
     this._feed(dt);
+  }
+
+  /**
+   * K ABANDONS A LITE JOB TOO.
+   *
+   * `abandonLite()` has been the documented public abort since the LITE tracks
+   * landed and NOTHING called it. `game/index.js:_abortRequest` — the K path —
+   * opens with `if (!this.missions.active) return false`, and a lite job is not
+   * a `MissionRunner` mission: it is `this.lite`. So CRUISE, OPEN IT UP and COP
+   * WAR could be started and then never put down. There is no fail condition on
+   * any of the three (no clock, no leash, no wreck), so the objective panel
+   * simply stayed up over free roam until the player took a chapter or died.
+   * Under rule 12 that is a feature that did not exist.
+   *
+   * It is read HERE rather than in `game/index.js` because `jobs` owns the lite
+   * lifecycle and `_abortRequest` is keyed on `missions.M.seq`, which a lite job
+   * has no equivalent of. The two cannot collide: a lite job is cancelled the
+   * moment a mission starts (`mission:start`, above) and `_abortRequest` returns
+   * on the first line when no mission is live, so on any given frame at most one
+   * of the two owns the K edge. `input.pressed` is a non-consuming edge query
+   * (`src/core/input.js:371`), so reading it twice is free.
+   *
+   * The contract is `_abortRequest`'s, deliberately: one press ARMS and toasts,
+   * a second inside `ABORT_LITE` commits, Shift+K commits outright — and the
+   * window is `ctx.time.raw`, UNSCALED, for the same reason it is there. A
+   * confirmation measured in simulated seconds is a different length behind the
+   * weapon wheel than it is on an open street, and raw time keeps running behind
+   * a menu so a window armed before a pause has expired by the time it lifts.
+   */
+  _abortKey() {
+    const L = this.lite;
+    if (!L.active || this.missions.active) { this._abortArmed = -1; return; }
+    const input = this.ctx.input;
+    if (!input?.enabled || input.frozen) return;
+    if (this.wq.ui?.isPaused?.()) return;
+    if (!input.pressed?.('KeyK')) return;
+    const raw = this.ctx.time.raw;
+    const force = !!(input.held?.('ShiftLeft') || input.held?.('ShiftRight'));
+    // Keyed to the job, not just to the clock: finishing one lite job and
+    // taking another inside the window must not answer for the new one.
+    const armed = this._abortArmedId === L.id && raw - this._abortArmed <= ABORT_LITE;
+    if (force || armed) {
+      this._abortArmed = -1;
+      this._abortArmedId = '';
+      this.abandonLite();
+      return;
+    }
+    this._abortArmed = raw;
+    this._abortArmedId = L.id;
+    this.wq.ui?.notify?.('Drop the job?', 'PRESS K AGAIN', 'bad');
   }
 
   /** The board, refreshed if it is stale. */

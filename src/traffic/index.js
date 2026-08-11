@@ -49,7 +49,31 @@ import { TUNE, clamp, clamp01 } from './tune.js';
 
 /** Control rate: every Nth fixed step. 120 Hz / 2 = 60 Hz. */
 const DECIMATE = 2;
-/** Fraction of the vehicle budget that is moving traffic; the rest is parked. */
+/**
+ * Fraction of `q.trafficBudget` this system spends on MOVING cars.
+ *
+ * HELD AT 0.72, AND THAT IS A MEASUREMENT, NOT AN OMISSION. The far ring
+ * (`TUNE.spawnFar`) landed with this raised to 1.0, so the wider envelope would
+ * be filled with new cars rather than by thinning the near ring. MEASURED with
+ * `tools/perfcheck.mjs --ab` against the same build with `?owNoFarRing=1`, tier
+ * high, governor pinned off, three-run medians:
+ *
+ *   share 1.0 + far ring   27 -> 38 live drivers, 5 -> 22 cars in frame
+ *                          day   p50 17.8 -> 24.2 ms   (+6.4, +36%)
+ *                          night p50 15.5 -> 20.2 ms   (+4.7)
+ *                          skyline    14.3 -> 18.0 ms  (+3.7)
+ *
+ * Eleven extra cars cost 0.58 ms of frame EACH, and the traffic controller is
+ * only 0.049 ms of that (the harness measures 48.7 us/car/tick): the rest is
+ * drawing and shadowing seventeen more vehicle models. That is four times the
+ * whole budget headroom the frame gate allows, so the density half was reverted
+ * and the far ring kept — spend DISTANCE, not density. The city reads alive
+ * from a vantage because its cars are spread over 380 m of road instead of 175,
+ * not because there are more of them.
+ *
+ * Raising this is a real option the day a vehicle LOD makes a distant car
+ * cheaper. It is not one before that, and the number above is what it costs.
+ */
 const MOVING_SHARE = 0.72;
 /** Seat a body in a traffic car once it is this close to the anchor... */
 const SEAT_NEAR = 78;
@@ -669,7 +693,10 @@ export class TrafficSystem {
         if (!p) { best = i; bestD = Infinity; break; }
         // The player's car and any live mission vehicle are never surplus.
         if (this.isPlayerVehicle(ctx, veh) || veh.isMission) continue;
-        const d = Math.hypot(p.x - this.anchor.x, p.z - this.anchor.z);
+        // FIELD distance, not anchor distance: from a vantage the far ring is
+        // centred down the view axis, and the cars this loop is looking at are
+        // the ones the shot is of. See `Director.fieldDist`.
+        const d = this.director.fieldDist(p.x, p.z);
         if (d <= bestD) continue;
         if (d < TUNE.despawnHard && this.director.visible(ctx, p.x, p.z)) continue;
         bestD = d;

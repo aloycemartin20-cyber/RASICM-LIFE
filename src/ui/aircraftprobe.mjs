@@ -52,6 +52,22 @@
  *     The climb gate is parametrized over the Skylark, the Slipstream and the
  *     two NEW airplanes (the Grizzly bush STOL and the Meridian twin), each
  *     spawned on a real runway — every plane flies on the same keys.
+ *   - THE INSTRUMENTS THE PILOT FLIES ON, read as EMITTED DOM. The cluster is
+ *     class-aware — a wing gets an altitude tape, a VSI, an airspeed tape with
+ *     its own airframe's stall band, an artificial horizon and the rotor spool;
+ *     a car gets speed, revs and gear. Every reading is compared to the emitted
+ *     body sampled in the SAME page evaluate, so nothing can drift between the
+ *     glass and its reference: the altimeter against `v.altitude` at two
+ *     heights, the VSI against `velocity.y` in both directions, the horizon's
+ *     COMPUTED rotation matrix against the bank off the body quaternion, the
+ *     spool bar against `rotorSpin`. Two controls that cannot pass by
+ *     agreement: the stall band is measured on TWO airframes and must scale
+ *     with their Vref ratio (Skylark 30, jet 85), and the bicycle — which has
+ *     no tank — must be drawn no fuel gauge at all while the car is.
+ *   - THE OFF-SCREEN OBJECTIVE MARKERS, for want of another wired browser gate
+ *     in `src/ui/`: two objectives on one bearing must not overprint on the
+ *     safe-area rim, measured on the drawn separation in CSS pixels, with the
+ *     de-collision disabled on the live widget as the negative control.
  *   - THE ROSTER. The cheat menu's own EMITTED spawn rows are read out of the
  *     live document and asserted to contain every flyable — heli, newsheli,
  *     plane, sportplane, bushplane, twinplane, jet — plus the tank, and each
@@ -74,6 +90,8 @@ const args = Object.fromEntries(
 );
 const VERBOSE = 'verbose' in args;
 const KEEP = 'keep' in args;
+/** `--shots` writes the two instrument frames to `shots/item8/` for eyeballing. */
+const SHOTS = 'shots' in args;
 const DEG = 180 / Math.PI;
 
 const { port, server } = await startServer({ explicitPort: args.port });
@@ -222,6 +240,121 @@ async function holdFor(keys, seconds, sampleEvery = 1.5) {
   await pump(6);
   return samples;
 }
+
+/**
+ * THE SEATED CLUSTER AS THE PLAYER SEES IT — emitted DOM, laid out, computed.
+ *
+ * Nothing here reads `ui.state.veh`, `FlightCluster`'s fields or the record
+ * `vehicles.getHudState()` returned. Every value is either the TEXT a person
+ * reads off the glass or the GEOMETRY the browser resolved: the horizon's
+ * rotation comes out of the computed transform matrix, the stall band's height
+ * and the spool's width out of `getBBox()`, the tach's fill out of the
+ * computed dash array. That is the point — an instrument wired to a constant,
+ * to the wrong field, or to nothing at all fails these differently, and none
+ * of them can pass by agreeing with the number the code already had.
+ */
+const readCluster = () =>
+  page.evaluate(() => {
+    const vis = (n) => {
+      if (!n) return false;
+      for (let e = n; e && e !== document.documentElement; e = e.parentElement) {
+        const s = getComputedStyle(e);
+        if (s.display === 'none' || s.visibility === 'hidden') return false;
+        if (parseFloat(s.opacity || '1') < 0.02) return false;
+      }
+      return true;
+    };
+    const q = (sel) => document.querySelector(sel);
+    const txt = (sel) => q(sel)?.textContent?.trim() ?? '';
+    const num = (sel) => {
+      const t = txt(sel);
+      const v = parseFloat(t.replace(/[^0-9+\-.]/g, ''));
+      return Number.isFinite(v) ? v : null;
+    };
+    const bbox = (sel) => { const n = q(sel); return n ? +n.getBBox().height.toFixed(2) : null; };
+    const bboxW = (sel) => { const n = q(sel); return n ? +n.getBBox().width.toFixed(2) : null; };
+    const hz = q('.ow-fl-horizon');
+    let rot = null;
+    if (hz) {
+      const m = new DOMMatrixReadOnly(getComputedStyle(hz).transform);
+      rot = +((Math.atan2(m.b, m.a) * 180) / Math.PI).toFixed(2);
+    }
+    const tf = q('.ow-vehm-tach-fill');
+    const dash = tf ? getComputedStyle(tf).strokeDasharray : '';
+    const pips = [...document.querySelectorAll('.ow-vehm-pip')];
+    const cluster = q('.ow-vehm');
+    const prompt = q('.ow-prompt');
+    // The EMITTED body, sampled in the SAME evaluate as the glass. Two round
+    // trips would let the aircraft move between the reading and its reference,
+    // which on a climbing wing is metres of slack in every comparison below.
+    const v = window.__PLANE__;
+    const emit = v ? {
+      kmh: Math.round(v.speed * 3.6),
+      speed: +v.speed.toFixed(2),
+      rpm: Math.round(v.drivetrain?.rpm ?? 0),
+      redline: v.spec?.engine?.redline ?? 0,
+      gear: v.drivetrain?.gearLabel ?? '',
+      alt: +(v.altitude ?? 0).toFixed(2),
+      vy: +v.velocity.y.toFixed(2),
+      rotor: +(v.rotorSpin ?? 0).toFixed(3),
+      vref: v.spec?.flight?.Vref ?? 0,
+      bank: (() => {
+        const qq = v.quaternion;
+        const ry = 2 * (qq.x * qq.y + qq.w * qq.z);
+        const uy = 1 - 2 * (qq.x * qq.x + qq.z * qq.z);
+        return +((Math.atan2(ry, uy) * 180) / Math.PI).toFixed(2);
+      })(),
+      grounded: v.grounded,
+    } : null;
+    return {
+      emit,
+      cluster: vis(cluster),
+      flight: vis(q('.ow-fl')),
+      ground: vis(q('.ow-vehm-ground')),
+      alt: num('.ow-fl-alt'),
+      ias: num('.ow-fl-ias'),
+      vsi: num('.ow-fl-vsi'),
+      warn: txt('.ow-fl-warn'),
+      rot,
+      stallH: bbox('.ow-fl-stall'),
+      spoolW: bboxW('.ow-fl-spool'),
+      speed: num('.ow-vehm-speed'),
+      gear: txt('.ow-vehm-gear-l'),
+      pips: pips.filter((p) => getComputedStyle(p).display !== 'none').length,
+      litPips: pips.filter((p) => getComputedStyle(p).backgroundColor === 'rgb(255, 201, 60)').length,
+      tach: parseFloat(String(dash).split(/[ ,]+/)[0]) || 0,
+      fuelRow: vis(q('.ow-vehm-row.fu')),
+      vehRow: vis(q('.ow-vehm-row.vh')),
+      // The DRAWN colour of the fuel row's label, so "pinned red when the tank
+      // is dry" is read off the glass rather than off a class name.
+      fuelHot: q('.ow-vehm-row.fu .k')
+        ? getComputedStyle(q('.ow-vehm-row.fu .k')).color === 'rgb(255, 59, 78)' : false,
+      water: txt('.ow-vehm-warn'),
+      promptVis: vis(prompt),
+      promptOp: prompt ? +parseFloat(getComputedStyle(prompt).opacity || '1').toFixed(3) : null,
+      promptText: txt('.ow-prompt-txt'),
+      promptDocked: !!(prompt && cluster && cluster.contains(prompt)),
+      source: window.__ENGINE__.ctx.peek('ui').action.source,
+    };
+  });
+
+/** Board any class at the current runway, the same way `boardAtRunway` does. */
+const boardClass = (type) => run(`
+  if (player.inVehicle) player.vehicles.abort(player.movement);
+  if (window.__PLANE__) { try { veh.despawn(window.__PLANE__); } catch(e){} window.__PLANE__ = null; }
+  const af = (world?.airfields ?? [])[0];
+  if (!af) return { err: 'no airfields' };
+  const px = af.x, pz = af.z;
+  for (const o of veh.vehicles.slice()) {
+    if (Math.hypot(o.position.x - px, o.position.z - pz) < 40) { try { veh.despawn(o); } catch(e){} }
+  }
+  const v = game.wq.spawnVehicle('${type}', px, pz, af.yaw);
+  if (!v) return { err: 'spawn failed for ${type}' };
+  window.__PLANE__ = v;
+  // The contextual action is published by whatever POI the spawn happens to be
+  // near; the seated chip is only reachable when nothing else is on offer.
+  ui.setAction(null);
+  return { boarded: game.debugBoard(v), kind: v.spec.kind, noFuel: !!v.spec.nogas };`);
 
 /** Set/clear the plane.js negative-control sign flips on the live plane. */
 const setFlip = (pitch, roll) => run(`
@@ -677,6 +810,320 @@ try {
     if (window.__PLANE__) { try { veh.despawn(window.__PLANE__); } catch(e){} }
     return true;`);
   await pump(20);
+
+  /* ================================================================= */
+  area = '6d THE FLIGHT INSTRUMENTS — emitted DOM against emitted flight';
+  /* ================================================================= */
+  // Until this landed the HUD drew THREE BARS — vehicle health, fuel and a
+  // nitro gauge that is not a bottle on an aircraft — while
+  // `vehicles.getHudState()` was already publishing `flying`, `altitude`,
+  // `climbRate` and `rotor` to nobody. Everything below reads the DOM the
+  // player reads and compares it to the EMITTED body: no assertion touches
+  // `ui.state`, and the two aircraft in the stall-band check make that one a
+  // RATIO of two drawn heights rather than a re-read of a constant.
+  const air0 = await boardClass('plane');
+  await pump(150);
+  const gnd = await readCluster();
+  rec('seated in an airplane the cluster shows the FLIGHT face, not the driving one',
+    gnd.cluster && gnd.flight && !gnd.ground,
+    `cluster ${gnd.cluster}, flight ${gnd.flight}, ground head ${gnd.ground} (${air0.kind})`);
+  rec('on the apron the altimeter reads the ground and nothing cries STALL',
+    gnd.alt !== null && Math.abs(gnd.alt - gnd.emit.alt) <= 2 && gnd.warn === '',
+    `ALT ${gnd.alt} vs emitted ${gnd.emit.alt}, warn "${gnd.warn}"`);
+  const stallSky = gnd.stallH;
+  const VREF = gnd.emit.vref;
+
+  // Climb out and read the tapes against the body at two different heights.
+  await page.keyboard.down('ShiftLeft');
+  let dom1 = null;
+  for (let i = 0; i < 46; i++) {
+    await pump(30);
+    const d = await readCluster();
+    if (d?.emit && d.emit.grounded === 0 && d.emit.alt > 12) { dom1 = d; break; }
+  }
+  await page.keyboard.down('KeyS');
+  await pump(240);
+  const dom2 = await readCluster();
+  if (SHOTS) await page.screenshot({ path: 'shots/item8/probe-cockpit.png' });
+  rec('the ALTITUDE tape reads the emitted altitude, at two different heights',
+    dom1 && dom2 && Math.abs(dom1.alt - dom1.emit.alt) <= 2.5 &&
+      Math.abs(dom2.alt - dom2.emit.alt) <= 2.5 && Math.abs(dom2.alt - dom1.alt) > 8,
+    `${dom1?.alt} vs ${dom1?.emit.alt} m, then ${dom2?.alt} vs ${dom2?.emit.alt} m`);
+  rec('the AIRSPEED tape reads the emitted speed',
+    dom2 && Math.abs(dom2.ias - dom2.emit.speed) <= 3,
+    `IAS ${dom2?.ias} vs emitted ${dom2?.emit.speed} m/s`);
+  rec('the VSI reads POSITIVE in a climb, and it is the emitted climb rate',
+    dom2 && dom2.emit.vy > 0.5 && dom2.vsi > 0.4 && Math.abs(dom2.vsi - dom2.emit.vy) <= 1.2,
+    `VSI ${dom2?.vsi} vs emitted ${dom2?.emit.vy} m/s at ${dom2?.emit.alt} m`);
+  rec('the rotor/prop spool bar tracks the emitted spool',
+    dom2 && dom2.emit.rotor > 0.5 && Math.abs(dom2.spoolW / 204 - dom2.emit.rotor) < 0.08,
+    `spool bar ${dom2?.spoolW}/204 (${((dom2?.spoolW ?? 0) / 204 * 100).toFixed(0)}%) vs rotorSpin ${dom2?.emit.rotor}`);
+
+  // BANK: roll and check the horizon counter-rotates with the emitted bank.
+  await page.keyboard.up('KeyS');
+  await page.keyboard.down('KeyD');
+  await pump(80);
+  const domR = await readCluster();
+  await page.keyboard.up('KeyD');
+  await pump(60);
+  rec('the artificial horizon rotates with the emitted BANK, same sign and size',
+    domR && Math.abs(domR.emit.bank) > 8 && Math.sign(domR.rot) === Math.sign(domR.emit.bank) &&
+      Math.abs(domR.rot - domR.emit.bank) < 4,
+    `horizon ${domR?.rot} deg vs emitted bank ${domR?.emit.bank} deg`);
+
+  /**
+   * ONE MANOEUVRE, TWO READINGS: climb back to height, then close the throttle
+   * and hold the stick back with the airspeed protection OFF (the same live
+   * switch area 3 uses). The wing runs out of speed at altitude — which is the
+   * STALL — and then falls, which is the DESCENT. Doing it in that order
+   * matters: pushing over first flies the aircraft into the ground and there is
+   * no air left to stall in, which is exactly how the first cut of this
+   * measured a VSI of -20 m/s against a body bouncing on its gear at 0.8 m.
+   */
+  await page.keyboard.up('KeyW');
+  await page.keyboard.down('KeyS');
+  let high = null;
+  for (let i = 0; i < 40; i++) {
+    await pump(30);
+    const d = await readCluster();
+    if (d?.emit && d.emit.alt > 90) { high = d; break; }
+  }
+  await setNoProtect(true);
+  await page.keyboard.down('Space');       // throttle to idle
+  await page.keyboard.up('ShiftLeft');
+  let stalled = null; let domD = null; let fastClean = true; let slowest = 999;
+  for (let i = 0; i < 30; i++) {
+    await pump(20);
+    const d = await readCluster();
+    if (!d?.emit) continue;
+    const fast = d.emit.speed;
+    // Well clear of the boundary on both sides: 6 m is unambiguously in the
+    // air (a parked Skylark's body sits ~1.5 m up on its own gear) and Vref
+    // itself is unambiguously slower than the 1.1x the panel warns at.
+    if (d.emit.alt > 6) slowest = Math.min(slowest, fast);
+    if (d.emit.alt > 6 && fast > VREF * 1.3 && d.warn !== '') fastClean = false;
+    if (d.emit.alt > 6 && fast < VREF && !stalled) stalled = d;
+    if (d.emit.alt > 20 && d.emit.vy < -2 && !domD) domD = d;
+    if (stalled && domD) break;
+  }
+  await page.keyboard.up('KeyS');
+  await page.keyboard.up('Space');
+  await setNoProtect(false);
+  rec('the aircraft got back to height for the stall / descent run',
+    !!high, high ? `${high.emit.alt} m on the tape at ${high.alt}` : 'never reached 90 m');
+  rec('the VSI reads NEGATIVE in a descent (the sign is real, not a constant)',
+    domD && domD.vsi < -0.4 && Math.abs(domD.vsi - domD.emit.vy) <= 2,
+    domD ? `VSI ${domD.vsi} vs emitted ${domD.emit.vy} m/s at ${domD.emit.alt} m`
+      : 'never sampled a descent above 20 m');
+  rec('below 1.1x Vref in the air the panel warns STALL',
+    !!stalled && stalled.warn === 'STALL',
+    stalled ? `airspeed ${stalled.emit.speed} m/s (Vref ${VREF}) at ${stalled.emit.alt} m ` +
+      `(tape ${stalled.alt}, ${stalled.emit.grounded} wheels down) -> "${stalled.warn}"`
+      : `never got below the stall reference (slowest ${slowest.toFixed(1)} vs Vref ${VREF})`);
+  rec('NEG CONTROL — it never warned STALL while the same wing was fast',
+    fastClean, fastClean ? 'clean above 1.3x Vref' : 'STALL drawn on a fast wing');
+
+  // THE STALL BAND IS THE AIRFRAME'S OWN NUMBER. Skylark Vref 30, jet Vref 85:
+  // the drawn band must scale with it. A band wired to a constant passes
+  // neither side of this.
+  await run(`
+    if (player.inVehicle) player.vehicles.abort(player.movement);
+    if (window.__PLANE__) { try { veh.despawn(window.__PLANE__); } catch(e){} }
+    return true;`);
+  await boardClass('jet');
+  await pump(120);
+  const jetDom = await readCluster();
+  // The bands are drawn from Vref DOWN plus a fixed 200-unit tail off the
+  // bottom of the scale, so the comparable quantity is the part above that
+  // tail — which is what makes this a ratio of two DRAWN heights.
+  const band = (h) => (h ?? 0) - 200;
+  const bandRatio = band(stallSky) > 0 ? band(jetDom.stallH) / band(stallSky) : 0;
+  const vrefRatio = VREF > 0 ? jetDom.emit.vref / VREF : 0;
+  rec("the stall band is the AIRFRAME's own Vref — jet band / plane band tracks their Vref ratio",
+    bandRatio > 1.5 && vrefRatio > 0 && Math.abs(bandRatio - vrefRatio) / vrefRatio < 0.15,
+    `band ${band(stallSky).toFixed(2)} -> ${band(jetDom.stallH).toFixed(2)} (x${bandRatio.toFixed(2)}) ` +
+    `vs Vref ${VREF} -> ${jetDom.emit.vref} (x${vrefRatio.toFixed(2)})`);
+
+  /* ================================================================= */
+  area = '6e THE DRIVING FACE — the same cluster, class-switched';
+  /* ================================================================= */
+  const car = await boardClass('muscle');
+  await pump(90);
+  const c0 = await readCluster();
+  rec('seated in a CAR the cluster switches to the driving face',
+    c0.cluster && c0.ground && !c0.flight,
+    `ground ${c0.ground}, flight ${c0.flight} (${car.kind})`);
+  // The WORDING is `game.freeroam`'s ("LEAVE THE IRONSIDE 440") and belongs to
+  // that directory; the PLACEMENT is the HUD's, and it is what is asserted
+  // here — nothing about getting out of a car may sit over the windscreen.
+  rec('the seated prompt is DOCKED inside the cluster, not over the windscreen',
+    c0.promptDocked && c0.promptVis && /EXIT|LEAVE|GET OUT/.test(c0.promptText.toUpperCase()),
+    `docked ${c0.promptDocked}, visible ${c0.promptVis}, "${c0.promptText}", action source ${c0.source}`);
+
+  await page.keyboard.down('KeyW');
+  await pump(200);
+  const c1 = await readCluster();
+  await page.keyboard.up('KeyW');
+  rec('the speed numeral reads the emitted road speed',
+    c1.speed !== null && Math.abs(c1.speed - c1.emit.kmh) <= 3 && c1.emit.kmh > 10,
+    `${c1.speed} km/h drawn vs ${c1.emit.kmh} emitted`);
+  rec("the gear letter reads the emitted gearbox, and the pip rack is the car's own",
+    c1.gear === c1.emit.gear && c1.pips > 0 &&
+      (/^[0-9]+$/.test(c1.emit.gear) ? c1.litPips === +c1.emit.gear : c1.litPips === 0),
+    `letter "${c1.gear}" vs "${c1.emit.gear}", ${c1.litPips}/${c1.pips} pips lit`);
+  // The tach's sweep constant is not re-read here: the assertion is the RATIO
+  // of two drawn fills against the ratio of the two rev counts that drew them.
+  const tachIdle = c0.tach;
+  const rpmIdle = c0.emit.rpm;
+  const drawnRatio = tachIdle > 0 ? c1.tach / tachIdle : 0;
+  const revRatio = rpmIdle > 0 ? c1.emit.rpm / rpmIdle : 0;
+  rec('the tach ring fills with the emitted revs (ratio of two drawn fills vs two rev counts)',
+    drawnRatio > 1.1 && revRatio > 1.1 && Math.abs(drawnRatio - revRatio) / revRatio < 0.12,
+    `dash ${tachIdle.toFixed(1)} -> ${c1.tach.toFixed(1)} (x${drawnRatio.toFixed(2)}) ` +
+    `vs rpm ${rpmIdle} -> ${c1.emit.rpm} (x${revRatio.toFixed(2)}, redline ${c1.emit.redline})`);
+  rec('the car has a fuel gauge',
+    c1.fuelRow && c1.vehRow, `fuel row ${c1.fuelRow}, hull row ${c1.vehRow}`);
+  // ...and the exit line, having been read once, gets out of the way: still
+  // there, no longer competing with the instruments. Sampled ~5 s after
+  // boarding, past the entry beat.
+  rec('the seated exit line FADES after the entry beat instead of vanishing',
+    c1.promptVis && c1.promptOp !== null && c1.promptOp < 0.75 && c1.promptOp > 0.05,
+    `opacity ${c0.promptOp} on boarding -> ${c1.promptOp} after the beat, still visible ${c1.promptVis}`);
+
+  /**
+   * THE DROWNED ENGINE AND THE DRY TANK — both off the car's OWN published
+   * fields, both read back as drawn text and drawn colour.
+   *
+   * `submerged` is deliberately not driven here: the water sim rewrites it
+   * every frame, MEASURED — a written 0.72 reads back 0 on the next frame — so
+   * forcing it would test nothing but the write. `drowned` is a latch and is
+   * the state that actually strands the player with a dead throttle and no
+   * explanation on screen, which is the defect the row exists for; it goes
+   * through the identical element and code path.
+   */
+  await run('window.__PLANE__.drowned = true; return true;');
+  await pump(10);
+  const cWet = await readCluster();
+  await run(`
+    const v = window.__PLANE__;
+    v.drowned = false; v.fuel = 0; v.fuelDry = true;
+    return true;`);
+  await pump(12);
+  const cDry = await readCluster();
+  rec('a drowned engine says so on the cluster instead of the throttle just dying',
+    /DROWNED/.test(cWet.water), `"${cWet.water}"`);
+  rec('NEG CONTROL — with the engine no longer drowned the warning is gone',
+    cDry.water === '', `"${cDry.water}"`);
+  rec('a DRY tank pins the fuel row red (and stops the low-fuel flash)',
+    cDry.fuelHot && cDry.fuelRow,
+    `fuel label red ${cDry.fuelHot}, row still drawn ${cDry.fuelRow}`);
+
+  // NO TANK, NO GAUGE — the `noFuel` gate, on the one class that has no tank.
+  const bike = await boardClass('bicycle');
+  await pump(90);
+  const cb = await readCluster();
+  rec('NEG CONTROL — the bicycle has no tank, so it is drawn NO fuel gauge',
+    bike.noFuel === true && !cb.fuelRow && cb.vehRow,
+    `spec.nogas ${bike.noFuel}, fuel row ${cb.fuelRow}, hull row ${cb.vehRow}`);
+
+  if (SHOTS) {
+    await boardClass('muscle');
+    await pump(60);
+    await page.screenshot({ path: 'shots/item8/probe-driving.png' });
+  }
+  await run(`
+    if (player.inVehicle) player.vehicles.abort(player.movement);
+    if (window.__PLANE__) { try { veh.despawn(window.__PLANE__); } catch(e){} }
+    return true;`);
+  await pump(20);
+
+  /* ================================================================= */
+  area = '6f OFF-SCREEN OBJECTIVE MARKERS — two targets, two chevrons';
+  /* ================================================================= */
+  // `project()` clamps an off-screen target to the safe-area rectangle along
+  // the ray from screen centre, so two objectives on a similar BEARING landed
+  // on the same rim point however far apart they were in the world. MEASURED
+  // on a live frame: RENDEZVOUS at 982 m and CRATE at 1295 m drew on top of
+  // each other and read as one smeared marker.
+  //
+  // Rule 12: the assertion is the DRAWN separation of the two marker nodes in
+  // laid-out CSS pixels, and the negative control is the same measurement with
+  // `markers.debugNoSpread` set on the LIVE widget — the overprinting build,
+  // no edit. This lives in this file rather than in a probe of its own because
+  // `ui` owns exactly one wired browser gate and an unwired probe is a file.
+  const placeMarkers = () => run(`
+    const cam = ctx.camera; cam.updateMatrixWorld();
+    const m = cam.matrixWorld.elements;
+    const fx = -m[8], fz = -m[10];
+    const l = Math.hypot(fx, fz) || 1;
+    // Straight behind the lens, so both are off screen and clamp to the rim.
+    const bx = -fx / l, bz = -fz / l;
+    const p = player.position;
+    const at = (d, a) => ({
+      x: p.x + (bx * Math.cos(a) - bz * Math.sin(a)) * d,
+      y: p.y + 1.4,
+      z: p.z + (bx * Math.sin(a) + bz * Math.cos(a)) * d,
+    });
+    // ONE BEARING, TWO DISTANCES — the shape of the reported defect. Both
+    // clamp to the same rim point, so without de-collision they are one blip.
+    ui.setObjectives([
+      { position: at(982, 0), label: 'A', name: 'RENDEZVOUS' },
+      { position: at(1295, 0), label: 'B', name: 'CRATE' },
+    ]);
+    return true;`);
+  const readMarkers = () => page.evaluate(() => {
+    const out = [];
+    for (const n of document.querySelectorAll('.ow-mk')) {
+      if (getComputedStyle(n).display === 'none') continue;
+      // The DRAWN extent of the whole marker — glyph, distance and name — not
+      // the node box, because the label is what actually overprints.
+      let l = Infinity; let r = -Infinity;
+      for (const c of [n, ...n.querySelectorAll('*')]) {
+        const q = c.getBoundingClientRect();
+        if (q.width < 0.5) continue;
+        l = Math.min(l, q.left);
+        r = Math.max(r, q.right);
+      }
+      const box = n.getBoundingClientRect();
+      out.push({
+        name: n.querySelector('.ow-mk-name')?.textContent ?? '',
+        dist: n.querySelector('.ow-mk-dist')?.textContent ?? '',
+        cx: +(box.x + box.width / 2).toFixed(1),
+        cy: +(box.y + box.height / 2).toFixed(1),
+        l: +l.toFixed(1),
+        r: +r.toFixed(1),
+        // The letter is hidden and the chevron shown only on a rim-clamped
+        // marker, so this is the drawn proof that both are off screen.
+        edge: getComputedStyle(n.querySelector('.ow-mk-letter')).opacity === '0',
+      });
+    }
+    return out;
+  });
+  const gap = (a) => (a.length < 2 ? -1 : Math.hypot(a[0].cx - a[1].cx, a[0].cy - a[1].cy));
+  /** Do the two DRAWN marker extents overlap? The thing a reader complains about. */
+  const overlap = (a) => a.length === 2 && a[0].l < a[1].r && a[1].l < a[0].r;
+
+  await run('ui.markers.debugNoSpread = true; return true;');
+  await placeMarkers();
+  await pump(8);
+  const mkBad = await readMarkers();
+  await run('ui.markers.debugNoSpread = false; return true;');
+  await placeMarkers();
+  await pump(8);
+  const mkGood = await readMarkers();
+  await run('ui.setObjectives([]); return true;');
+
+  rec('both objectives are drawn, both rim-clamped off screen',
+    mkGood.length === 2 && mkGood.every((m) => m.edge),
+    `${mkGood.length} marker(s): ${mkGood.map((m) => `${m.name} ${m.dist} @${m.cx},${m.cy}`).join(' | ')}`);
+  rec('two off-screen objectives on ONE bearing do NOT overprint',
+    mkGood.length === 2 && !overlap(mkGood),
+    `drawn extents [${mkGood.map((m) => `${m.name} ${m.l}..${m.r}`).join('] [')}], ` +
+    `centres ${gap(mkGood).toFixed(1)} px apart`);
+  rec('NEG CONTROL — with the spread disabled the same pair lands on one point',
+    mkBad.length === 2 && overlap(mkBad) && gap(mkBad) < 8,
+    `without de-collision: extents [${mkBad.map((m) => `${m.l}..${m.r}`).join('] [')}], ` +
+    `centres ${gap(mkBad).toFixed(1)} px apart`);
 
   /* ================================================================= */
   area = '7 THE ROSTER — the cheat menu enumerates every flyable + the tank';

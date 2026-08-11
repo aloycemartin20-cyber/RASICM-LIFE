@@ -52,6 +52,27 @@
  *   arenas      every `BOSSES[].arena` centre is dry and reachable. `boss.js`
  *               stages a brute with `findGroundSpot` around this point and
  *               teleports the player to another one 25-60 m away
+ *   services    every entry in `SHOPS` and `GAS_STATIONS` — see below
+ *
+ * SERVICES, AND WHY THEY ARE SWEPT AT ALL. The staging sweep above walks the
+ * POIs a CHAPTER NAMES, and no chapter names a fuel pump. So Rustbelt Respray
+ * shipped at (-336, 176), which is 10.9 m under the Monongahela — the one hard
+ * heat reset in the game, the thing every `escape` chapter is about reaching,
+ * on the riverbed — and this gate stayed green throughout, because the shop
+ * tables were simply not in it. A drive-in service is a staging point in every
+ * sense that matters: `freeroam._respray`, `_bodyShop` and `_gas` each need a
+ * CAR STOPPED within `R.service` of the authored coordinate, and `police` runs
+ * a respray ring off the same table.
+ *
+ * They are held to a STRICTER rule than a race gate, and the difference IS the
+ * defect. A checkpoint mid-span is correct — you drive over it at 40 m/s. A
+ * FORECOURT mid-span is not a forecourt. So `onDeck` is not an excuse here, it
+ * is a violation on its own: the old respray coordinate reads as road-adjacent
+ * to anything that only asks which carriageway is nearest, because the Fort
+ * Pitt deck passes 3.2 m away and twenty metres overhead. A service sweep that
+ * inherited the race gate's deck exemption would score the riverbed as a
+ * forecourt, which is exactly the bug it is here to catch — so the second
+ * negative control below is that coordinate, and it must fire THROUGH the deck.
  *
  * ...plus a NEGATIVE CONTROL that runs before any of them: the five race
  * coordinates this gate was written for are re-measured as they were authored,
@@ -70,7 +91,7 @@ import { dirname, resolve } from 'node:path';
 import { Terrain } from '../world/terrain.js';
 import { generateCity } from '../world/netgen.js';
 import { Rng } from '../core/rng.js';
-import { RACE_TRACKS, POI, BOSSES, BOYZ, R } from './data.js';
+import { RACE_TRACKS, POI, BOSSES, BOYZ, SHOPS, GAS_STATIONS, R } from './data.js';
 
 const args = Object.fromEntries(
   process.argv.slice(2).map((a) => {
@@ -101,6 +122,19 @@ const SEEDS = ALL_SEEDS.slice(0, Math.max(1, Math.min(ALL_SEEDS.length, Number(a
  */
 const STAGE_ROAD_MAX = 120;
 
+/**
+ * RATCHET (rule 13). How far a DRIVE-IN SERVICE may be from the nearest lane.
+ *
+ * The goal is `R.service` (11 m): the forecourt is the thing you pull onto, so
+ * a pump 50 m off the carriageway is a pump you reach by driving over a kerb
+ * and a verge. The bar is where the authored table actually is, MEASURED here
+ * over all six seeds — worst `shop_ammo2` (Row Hardware) 49.8 m, worst pump
+ * `gas_south` (Carson St Gas) 49.1 m, and every other entry inside 24 m.
+ * LOWER THIS WHEN A SERVICE GETS A CLOSER APPROACH; never raise it to make a
+ * moved coordinate pass.
+ */
+const SERVICE_ROAD_MAX = 50;
+
 /** The five gates this gate was written for, as they were authored. */
 const REVERTED = [
   { id: 'triangle cp1', x: -224, z: 208 },
@@ -109,6 +143,13 @@ const REVERTED = [
   { id: 'southrun cp3', x: 528, z: 720 },
   { id: 'southrun cp5', x: -16, z: 384 },
 ];
+
+/**
+ * Rustbelt Respray where DESIGN.md put it — (-84, 44) on the legacy 700 m map,
+ * which is (-336, 176) at K = 4. 10.9 m under the Monongahela, 60 m from the
+ * nearest bank, with the Fort Pitt deck 3.2 m away and twenty metres up.
+ */
+const REVERTED_SERVICE = { id: 'shop_spray AS AUTHORED', x: -336, z: 176 };
 
 /* ----------------------------------------------------------- the world --- */
 
@@ -209,14 +250,69 @@ function check(label, x, z, reach) {
   };
 }
 
+/**
+ * A SERVICE, which is a stricter question than a staging point.
+ *
+ * Three differences from `check`, and each of them is a defect this sweep
+ * exists for:
+ *
+ *   1. WET IS ALWAYS FATAL. `check` forgives water under a bridge deck because
+ *      a race gate mid-span is a race gate you drive through. A forecourt has
+ *      to be ground you can stop a car on, so there is no deck exemption — and
+ *      without this the authored respray passes, because a deck really does run
+ *      3.2 m from it.
+ *   2. A DECK IS ITSELF A FAIL. If the only carriageway within reach is a
+ *      bridge span, the "approach" is twenty metres of air.
+ *   3. The reach is `SERVICE_ROAD_MAX`, not the landmark ratchet: nothing
+ *      reserves a corridor away from a shop the way `reserveLandmarks` does.
+ */
+function checkService(label, x, z) {
+  const rows = worlds.map((w) => read(w, x, z, SERVICE_ROAD_MAX));
+  const worstRoad = rows.reduce((m, r) => (r.road > m.road ? r : m));
+  const fails = [];
+  if (worstRoad.road > SERVICE_ROAD_MAX) {
+    fails.push(`nearest lane ${worstRoad.road.toFixed(1)} m > ${SERVICE_ROAD_MAX} m (seed ${worstRoad.seed.toString(16)})`);
+  }
+  const wet = rows.find((r) => r.wet);
+  if (wet) fails.push(`in the water (h ${wet.h.toFixed(2)} m) — a forecourt cannot be a river`);
+  const deck = rows.find((r) => r.onDeck);
+  if (deck) fails.push(`its only carriageway is a BRIDGE DECK overhead, not an approach (seed ${deck.seed.toString(16)})`);
+  const off = rows.find((r) => r.road <= SERVICE_ROAD_MAX && !r.onMain);
+  if (off) fails.push(`its road is off the main drivable component (seed ${off.seed.toString(16)})`);
+  return {
+    label,
+    x,
+    z,
+    reach: SERVICE_ROAD_MAX,
+    h: +rows[0].h.toFixed(2),
+    wet: rows[0].wet,
+    onDeck: rows.every((r) => r.onDeck),
+    road: +worstRoad.road.toFixed(1),
+    corridor: worstRoad.corridor,
+    fails,
+  };
+}
+
 /* -------------------------------------------------------- the assertions -- */
 
-const report = { seeds: SEEDS.map((s) => s.toString(16)), control: [], race: [], staging: [], arenas: [] };
+const report = {
+  seeds: SEEDS.map((s) => s.toString(16)),
+  control: [], race: [], staging: [], arenas: [], services: [],
+};
 
 /* ---- NEGATIVE CONTROL: the authored defect must still read as one -------- */
 for (const p of REVERTED) {
   const c = check(`${p.id} AS AUTHORED`, p.x, p.z, R.checkpoint);
   report.control.push({ ...c, caught: c.fails.length > 0 });
+}
+{
+  const c = checkService(REVERTED_SERVICE.id, REVERTED_SERVICE.x, REVERTED_SERVICE.z);
+  report.control.push({ ...c, caught: c.fails.length > 0 });
+  // ...and the same point through the RACE gate's rule, which forgives a deck.
+  // Printed as evidence: if this one is not caught while the one above is, the
+  // deck exemption is exactly what the service sweep had to drop.
+  const lenient = check(`${REVERTED_SERVICE.id} (race rule)`, REVERTED_SERVICE.x, REVERTED_SERVICE.z, SERVICE_ROAD_MAX);
+  report.lenient = { ...lenient, caught: lenient.fails.length > 0 };
 }
 
 /* ---- 1. race gates ------------------------------------------------------ */
@@ -253,6 +349,14 @@ for (const b of Object.values(BOSSES)) {
   report.arenas.push(check(`${b.id} arena`, b.arena.x, b.arena.z, STAGE_ROAD_MAX));
 }
 
+/* ---- 4. every service the player drives or walks into -------------------- */
+// The whole of both tables, not just the drive-ins: `shop_ammo` and `shop_food`
+// are counters (`R.poi`, on foot), but a counter in a river is no more usable
+// than a pump in one, and the failure that put this sweep here was a table
+// nobody was checking rather than a kind of shop nobody was checking.
+for (const s of SHOPS) report.services.push(checkService(`${s.id} (${s.kind})`, s.x, s.z));
+for (const g of GAS_STATIONS) report.services.push(checkService(`${g.id} (fuel)`, g.x, g.z));
+
 /* -------------------------------------------------------------- output --- */
 
 if (args.json) {
@@ -272,8 +376,10 @@ const row = (c) =>
 console.log(`game ground-truth — authored coordinates against the emitted world`);
 console.log(`  seeds: ${report.seeds.join(' ')}   race reach ${R.checkpoint} m, staging reach ${STAGE_ROAD_MAX} m (RATCHET)`);
 console.log('');
-console.log('  NEGATIVE CONTROL — the five gates as they were authored must all read as violations');
+console.log('  NEGATIVE CONTROLS — every historical defect below must still read as a violation');
 for (const c of report.control) console.log(row(c) + (c.caught ? '' : '   <-- NOT CAUGHT'));
+console.log('    the same respray point under the RACE gate\'s deck-forgiving rule, for contrast:');
+console.log(row(report.lenient) + (report.lenient.caught ? '' : '   <-- passes, which is why services drop the deck exemption'));
 console.log('');
 console.log('  RACE GATES');
 for (const c of report.race) console.log(row(c));
@@ -283,9 +389,13 @@ for (const c of report.staging) console.log(row(c));
 console.log('');
 console.log('  BOSS ARENAS');
 for (const c of report.arenas) console.log(row(c));
+console.log('');
+console.log(`  SERVICES — SHOPS + GAS_STATIONS, reach ${SERVICE_ROAD_MAX} m (RATCHET), no bridge-deck exemption`);
+for (const c of report.services) console.log(row(c));
 
 const uncaught = report.control.filter((c) => !c.caught);
-const broken = [...report.race, ...report.staging, ...report.arenas].filter((c) => c.fails.length);
+const broken = [...report.race, ...report.staging, ...report.arenas, ...report.services]
+  .filter((c) => c.fails.length);
 
 console.log('');
 if (uncaught.length) {
@@ -299,5 +409,6 @@ if (broken.length) {
   process.exit(1);
 }
 console.log(`GROUND TRUTH GATE PASSED — ${report.race.length} race gates, ${report.staging.length} chapter ` +
-  `staging points and ${report.arenas.length} boss arenas are all on ground a car can reach, across ` +
-  `${SEEDS.length} seeds, and the five authored river gates all still read as violations.`);
+  `staging points, ${report.arenas.length} boss arenas and ${report.services.length} services are all on ` +
+  `ground a car can reach, across ${SEEDS.length} seeds, and all ${report.control.length} authored ` +
+  `river coordinates still read as violations.`);

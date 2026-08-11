@@ -118,6 +118,14 @@ const BLOCK_SKIN = 0.25;
  */
 const STATIC_BACKSTOP_FRAMES = 12;
 
+/**
+ * How far under the authored walkable surface a down-ray has to land before
+ * `groundHeight` overrides it. Below this the two authorities are simply
+ * disagreeing about camber on an 8 m grid; above it the surface is missing.
+ * The two measured populations are in `groundHeight`.
+ */
+const WALKABLE_FLOOR_MIN = 0.35;
+
 function makePublicHit() {
   return {
     hit: false,
@@ -220,6 +228,13 @@ export class PhysicsSystem {
      * nothing. Measured: 11.2% of the city answered a bullet ray without it.
      */
     this.ground = new GroundFallback();
+    /**
+     * `groundHeight` answers with the AUTHORED walkable surface when the ray
+     * came back under it — see the method. Set false for the raw-ray build.
+     */
+    this.debugWalkableFloor = true;
+    /** How many ground queries that correction actually moved. */
+    this.walkableFloorLifts = 0;
     this.bodies = new RigidBodyWorld(this.staticWorld, UNITS.gravity);
     this.characters = [];
     this.ragdolls = [];
@@ -341,7 +356,7 @@ export class PhysicsSystem {
     this.stats = {
       triangles: 0, nodes: 0, objects: 0, buildMs: 0,
       bodies: 0, awake: 0, ragdolls: 0, characters: 0, colliders: 0,
-      raycasts: 0, stepMs: 0, groundFallbackHits: 0,
+      raycasts: 0, stepMs: 0, groundFallbackHits: 0, walkableFloorLifts: 0,
       truncatedContacts: 0, truncatedTraversals: 0,
       worldHoles: 0, worldHolesAfterReady: 0, rejectedStatics: 0,
       /**
@@ -924,10 +939,88 @@ export class PhysicsSystem {
     );
   }
 
-  /** Floor height under (x, z). Returns -Infinity if there is no floor. */
+  /**
+   * Floor height under (x, z). Returns -Infinity if there is no floor.
+   *
+   * ────────────────────────────────────────────────────────────────────────
+   * IT IS NOT JUST "THE FIRST TRIANGLE DOWNWARDS", and it never could be.
+   *
+   * `world` streams its terrain collision as an 8 m grid sunk 6 cm under the
+   * TERRAIN — and the terrain is itself sunk 0.55 m under every road corridor,
+   * with the kerb 15 cm above that and the walkable surface interpolated
+   * across a carriageway 8 m of grid cannot resolve. `ARCHITECTURE.md` states
+   * the consequence plainly for `heightAt` ("NOT the ground — use
+   * `walkableHeightAt`") and says `groundHeight()` routes through it. THIS
+   * `groundHeight` never did: it took the ray and believed it.
+   *
+   * MEASURED at the `character` shot's mark on a raised riverfront pavement:
+   * the ray answered **2.2 m under the pavement**, the capsule was staged
+   * inside the ground, resolved upward and then squirted **4.7 m sideways over
+   * ~800 frames** while it worked its way out — which projected the subject's
+   * head to NDC x 2.85, nearly three screen half-widths outside the frame.
+   * `src/dev/shots.js` carries that measurement and the workaround built on
+   * top of it (compose the shot camera at the shutter, not at `apply`).
+   *
+   * `_resolveSpawn` in `src/player/index.js` had already found the same defect
+   * from the other end — "two metres of solid ground overhead, grounded true,
+   * the player buried to the chest before he had pressed a key" — and fixed it
+   * LOCALLY, by taking the higher of the ray and `walkableHeightAt` at the
+   * spawn. Every other caller (traffic spawns, police spawns, decals, puddles,
+   * car exits, wheel probes) still got the ray. One fact, one owner: the
+   * reconciliation belongs here, where the query is answered.
+   *
+   * THE RULE, and the two guards that make it safe:
+   *
+   *   lift the answer to the authored walkable surface only when the query
+   *   STARTED AT OR ABOVE that surface, and only when the ray came back more
+   *   than WALKABLE_FLOOR_MIN below it.
+   *
+   * `fromY >= wy` is what keeps a tunnel, a car park deck, a bridge soffit and
+   * a mission interior on the triangle they are standing on: a query from
+   * under a surface can never be lifted onto it. And a ray that hits something
+   * ABOVE the analytic surface — a bridge deck, a first floor, a container —
+   * already wins, because the correction only ever raises a low answer.
+   *
+   * THE THRESHOLD IS NOT A FUDGE, it is where two measured populations
+   * separate. `walkableHeightAt - the MASK.WORLD ray`, sampled on a 10 m grid
+   * 120 m either side of the player in the live city:
+   *
+   *   |                     | median | p90  | p99  | max  | > 0.35 m |
+   *   |---------------------|--------|------|------|------|----------|
+   *   | at boot, no sectors | 0.523  | 1.43 | 2.46 | 2.62 | 195/385  |
+   *   | settled (600 fr)    | 0.028  | 0.11 | 0.80 | 1.76 | 10/386   |
+   *   | settled (1800 fr)   | 0.029  | 0.11 | 0.80 | 1.74 | 10/386   |
+   *
+   * Where the real surface is present the two authorities agree to about a
+   * tenth of a metre — road camber and an 8 m grid — and a correction there
+   * would be noise, floating a decal or a puddle off the asphalt for no reason.
+   * Where the surface is MISSING the gap is half a metre to two and a half, and
+   * that is the population this exists for. 0.35 m sits between them: 3x above
+   * the settled p90, well under the boot median.
+   *
+   * The analytic value is `world.walkableHeightAt` reached through the ground
+   * proxy, and it is a no-op everywhere the proxy is not armed (every node
+   * bench, and any boot before `world` has initialised).
+   *
+   * WHAT IT COSTS, measured in the live build over 20 000 calls, twice each
+   * way: **1.25 us -> 2.30 us per call**, the extra being
+   * `walkableHeightAt`'s road-graph ring search. That is a 1.8x on a query
+   * that a running frame makes **0.1 times** (MEASURED over 300 frames of free
+   * roam by wrapping the method), i.e. 0.1 us a frame. Worth knowing before
+   * somebody puts it in a per-particle loop — `src/fx/` has two that are
+   * currently gated on rain.
+   *
+   * `debugWalkableFloor = false` is the negative control: it restores the raw
+   * ray, which is what `src/physics/plazaprobe.mjs` runs to prove its numbers.
+   */
   groundHeight(x, z, fromY = 200, mask = MASK.WORLD) {
     const h = this.raycast(x, fromY, z, 0, -1, 0, 1000, mask);
-    return h.hit ? h.point.y : -Infinity;
+    const gy = h.hit ? h.point.y : -Infinity;
+    if (this.debugWalkableFloor === false || (mask & LAYER.STATIC) === 0) return gy;
+    const wy = this.ground.heightAt(x, z);
+    if (!Number.isFinite(wy) || wy > fromY || !(wy - gy > WALKABLE_FLOOR_MIN)) return gy;
+    this.walkableFloorLifts++;
+    return wy;
   }
 
   /* ================================================================== */
@@ -1314,6 +1407,7 @@ export class PhysicsSystem {
     this.stats.characters = this.characters.length;
     this.stats.colliders = this.colliders.length;
     this.stats.groundFallbackHits = this.ground.hits;
+    this.stats.walkableFloorLifts = this.walkableFloorLifts;
     this.stats.truncatedContacts = this.staticWorld.truncations.contacts;
     this.stats.truncatedTraversals = this.staticWorld.truncations.traversal;
     this.stats.worldHoles = this.worldHoleCount;

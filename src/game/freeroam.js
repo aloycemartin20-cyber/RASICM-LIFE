@@ -126,6 +126,22 @@ const STOPPED = 1.5;
 /** Seconds between "still working on it" toasts inside a service ring. */
 const SERVICE_TOAST = 2.2;
 /**
+ * Which side of the car the driver's door is on, in `seatAnchor`'s own sign.
+ * `DRIVER_SIDE` is 1 in `src/vehicles/index.js` and `drivetest.mjs`'s layout
+ * section asserts that geometrically for the whole fleet; this is the one place
+ * `game` needs it and it is a scalar, so the vector API is not worth calling.
+ */
+const EXIT_SIDE = 1;
+/**
+ * Metres of clear air under the belly past which stepping out is a FALL.
+ *
+ * A parked car reads 0.0-0.1 m and suspension travel plus a kerb costs under
+ * half a metre, so 1.2 m cannot fire on anything the player is driving on the
+ * ground. It is a classifier for the prompt line, not a physics gate — `player`
+ * still owns whether the exit happens at all.
+ */
+const AIRBORNE_DROP = 1.2;
+/**
  * How close a brother has to be to the car to hop in with you.
  *
  * A 30 m ring is fine when the allies are ACTORS trailing 5 m behind you. Here
@@ -195,8 +211,8 @@ export class FreeRoam {
     this._lastActId = '';
     this._lastActLabel = '';
     this._actEvent = { id: 'none', short: '', label: '', sub: '', available: false };
-    /** `ui.setAction` shape: { label, verb, sub, available, key }. */
-    this._uiAction = { label: '', verb: '', sub: '', available: false, key: 'F' };
+    /** `ui.setAction` shape: { label, verb, sub, available, key, place }. */
+    this._uiAction = { label: '', verb: '', sub: '', available: false, key: 'F', place: null };
     this._serviceEvent = { kind: '', phase: '', place: '', progress: 0 };
     this._blockEvent = { id: '', reason: '' };
     this._serviceKind = null;
@@ -204,7 +220,19 @@ export class FreeRoam {
     /** Which brothers are riding along in the player's car. */
     this.crew = [];
 
-    this._prompt = { key: 'F', text: '', sub: '', progress: undefined };
+    /**
+     * The seated EXIT's landing data — see `_exitPlacement`.
+     *
+     * ONE preallocated record (rule 5), handed out BY REFERENCE on the prompt
+     * and the touch-button payloads and rewritten in place every frame. Holding
+     * the reference is correct and is how the change-guarded `setAction` path
+     * stays live; caching the NUMBERS off it is not. `active` is false on any
+     * frame the seated EXIT is not the resolved action.
+     */
+    this.exitPlace = {
+      active: false, x: 0, y: 0, z: 0, drop: 0, over: null, water: false, airborne: false,
+    };
+    this._prompt = { key: 'F', text: '', sub: '', progress: undefined, place: null };
     this._promptShown = false;
     this._atHome = false;
     this._sprayCd = 0;
@@ -673,6 +701,9 @@ export class FreeRoam {
     const a = this.act;
     a.id = 'none'; a.short = ''; a.label = ''; a.sub = '';
     a.key = 'F'; a.available = false; a.target = null;
+    // Stale placement is worse than none: a reader that sees `active` and a
+    // 210 m drop from the frame before he landed would warn about the kerb.
+    this.exitPlace.active = false;
     this.status.text = ''; this.status.sub = ''; this.status.progress = undefined;
     this._statusOn = false;
 
@@ -695,6 +726,7 @@ export class FreeRoam {
       // The button underneath a running service is still SWAP or EXIT, always.
       if (!this.missions.running && this._race(x, z, veh)) return;
       if (this._swapTarget(veh)) return;
+      this._exitPlacement(veh);
       this._setAction('exit', 'EXIT', `LEAVE THE ${nameOf(veh)}`, '', veh);
       return;
     }
@@ -715,6 +747,60 @@ export class FreeRoam {
     this._respray(x, z, null, dt);
     if (this._gas(x, z, null, dt)) return;
     this._race(x, z, null);
+  }
+
+  /**
+   * WHERE THE SEATED `EXIT` PUTS HIM DOWN, AND HOW FAR BELOW HIM THAT IS.
+   *
+   * The prompt reads `LEAVE THE SKYLARK` at 40 m/s and 210 m over the Allegheny
+   * exactly as it does at a kerb, because the line is written off the vehicle's
+   * NAME and nothing else. `player` owns the exit itself and will happily run
+   * it; the fleet now flies, so "leave the vehicle" is three different promises
+   * — step onto the pavement, step into the river, step out of an aeroplane —
+   * and one of them is fatal.
+   *
+   * `game` is the side that can answer it: `wq.surfaceY` folds the water plane
+   * over the terrain and `wq.surfaceAt` names the surface, and neither is
+   * reachable from `ui` (rule 2). So this file MEASURES and publishes; the
+   * wording, the colour and whether the line grows a second row are `ui`'s.
+   *
+   * NO ALLOCATION, and that is why it does not call `vehicles.seatAnchor`:
+   * that method builds three `THREE.Vector3`s per call and this runs on every
+   * frame the player is seated. The door side is scalar trig on the same facts
+   * the anchor uses — `DRIVER_SIDE` is left, `spec.half.x` is the body
+   * half-width — so the sampled point is the one he steps onto, not the middle
+   * of the car.
+   *
+   * Published on the prompt payload as `place` and mirrored onto the touch
+   * button's payload. Fields, all metres and all world space:
+   *
+   *   x, z      where he lands
+   *   y         the surface there — terrain, or the water plane over it
+   *   drop      metres from the vehicle's belly to that surface, floored at 0
+   *   over      the surface tag under the door ('water', 'asphalt', ...)
+   *   water     that tag is water, hoisted so the common case needs no compare
+   *   airborne  nothing is carrying the wheels — `drop` is a fall, not a step
+   */
+  _exitPlacement(veh) {
+    const p = this.exitPlace;
+    const q = veh.quaternion;
+    const yaw = Math.atan2(2 * (q.w * q.y + q.x * q.z), 1 - 2 * (q.y * q.y + q.x * q.x));
+    // Left of the nose, `enter`'s own offset: half the body plus a step.
+    const off = (veh.spec?.half?.x ?? 0.9) + 0.55;
+    const sx = Math.cos(yaw) * off * EXIT_SIDE;
+    const sz = -Math.sin(yaw) * off * EXIT_SIDE;
+    p.x = veh.position.x + sx;
+    p.z = veh.position.z + sz;
+    p.y = this.wq.surfaceY(p.x, p.z, veh.position.y + 30);
+    // From the BELLY, not the centre of mass: the belly is what he is standing
+    // on the inside of, so a tall van reads the same step as a low sports car.
+    const belly = veh.position.y - (veh.spec?.comY ?? 0.5);
+    p.drop = Math.max(0, belly - p.y);
+    p.over = this.wq.surfaceAt(p.x, p.z);
+    p.water = p.over === 'water' || this.wq.isWater(p.x, p.z);
+    p.airborne = p.drop > AIRBORNE_DROP;
+    p.active = true;
+    return p;
   }
 
   _setAction(id, short, label, sub, target) {
@@ -807,6 +893,8 @@ export class FreeRoam {
       pr.text = text;
       pr.sub = showStatus ? this.status.sub : a.sub;
       pr.progress = showStatus ? this.status.progress : undefined;
+      // Only the seated EXIT carries it, and only while it is the live action.
+      pr.place = (!showStatus && a.id === 'exit' && this.exitPlace.active) ? this.exitPlace : null;
       ui?.setPrompt?.(pr);
       this._promptShown = true;
     } else if (this._promptShown) {
@@ -832,6 +920,9 @@ export class FreeRoam {
       u.sub = a.sub;
       u.available = a.available;
       u.key = a.key;
+      // The LIVE record, not a copy: `setAction` is change-guarded on the label
+      // and the drop under an aeroplane changes every frame the label does not.
+      u.place = a.id === 'exit' ? this.exitPlace : null;
       ui?.setAction?.(a.available ? u : null);
     }
   }

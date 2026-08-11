@@ -87,6 +87,75 @@ import {
 
 const UP = new THREE.Vector3(0, 1, 0);
 
+/**
+ * THE FLIGHT CHASE — the framing classes `tuning.js` has no record for.
+ *
+ * `_resolveFrame`'s tag test read `/heli|chopper|rotor|aircraft/`, and not one
+ * of the five fixed-wings in `vehicles/specs.js` matches it: `plane`,
+ * `sportplane`, `bushplane`, `twinplane` and `jet` all fell through to `car`.
+ * So every aeroplane in the game flew on a camera solved for a hatchback — a
+ * 6.9 m boom pitched 9 degrees down at a machine that is 10 m long, climbs at
+ * 20 m/s and banks to 60, with a sphere cast probing for kerbs 300 m under it.
+ *
+ * `CHASE.classFrame` is the right home for `dist` / `height`, and these seven
+ * flight fields belong beside them — but `tuning.js` is another change's file,
+ * so they live here and are exported for the gate to revert. See the followup.
+ *
+ * The FLIGHT fields, and what each is for:
+ *   lagGain      multiplies the yaw settle. A car's 0.26 s reads as "loose"
+ *                behind a car and as "welded on" behind an aeroplane, because
+ *                a roll rate of 120 deg/s swings the travel vector far faster
+ *                than any steering rack does. MEASURED on the emitted camera:
+ *                0.5 s after a 69-degree step in travel the flight chase is
+ *                still 17.2 degrees behind, against the car chase's 7.0.
+ *   followGain   the same, for the pivot's positional lag — deliberately much
+ *                smaller, because this one is paid in METRES. The pivot's
+ *                steady-state lag is v * tau, so at 60 m/s each 0.075 s of
+ *                time constant is 4.5 m of extra boom; 1.5 already takes the
+ *                framing distance from 11 m at rest to 19 m at cruise.
+ *   pitchClimb   radians of camera pitch per unit of sine-of-climb-angle.
+ *                TUNED against the gate it serves rather than by feel: the
+ *                target is that a climb does not move the aircraft in frame,
+ *                and at 0.95 the emitted shift over climbs of +22, +10 and
+ *                -15 m/s is 0.68 / 0.16 / 0.05 degrees, against the car
+ *                framing's 6.51 / 2.92 / 4.25.
+ *   pitchLow     the boom's tilt on the deck. Steeper than the car law's -9,
+ *                because a low pass and an approach are the two things you fly
+ *                by looking at the ground.
+ *   pitchHigh    ...and at `altRef` and above, where the useful picture is the
+ *                horizon and the sky ahead of the nose.
+ *   altRef       metres of altitude over which the boom eases between them.
+ *   noCollideAlt metres AGL past which the boom stops sphere-casting at all.
+ *
+ * The car law that these replace is a function of GROUND SPEED — -9 degrees
+ * easing to -4.5 at `speedRef` (38 m/s). Every aeroplane in the game cruises
+ * past that, so on the car camera the tilt was pinned at -4.5 for the whole
+ * flight, from the runway to the ceiling. Altitude is the variable that
+ * actually changes what is worth looking at up there; airspeed is not.
+ */
+export const FLIGHT = {
+  lagGain: 1.9,
+  followGain: 1.5,
+  pitchClimb: 0.95,
+  pitchLow: -12 * DEG,
+  pitchHigh: 0,
+  altRef: 90,
+  noCollideAlt: 12,
+};
+
+/**
+ * Framing classes owned here rather than by `tuning.js`. `sizeGain: false` for
+ * the same reason the bus and the heli have it: a class with its own framing
+ * must not ALSO take the per-metre length gain, or a 12 m twin is paid for
+ * twice. 30/18 against the car's 18 is the widest of the four classes, which is
+ * what a 15 m wingspan needs to sit inside the frame.
+ */
+export const EXTRA_FRAMES = {
+  plane: {
+    dist: CHASE.distBase * (30 / 18), height: 1.5, sizeGain: false, flight: true,
+  },
+};
+
 export class CameraRig {
   constructor(ctx) {
     this.ctx = ctx;
@@ -325,18 +394,32 @@ export class CameraRig {
     if (v) {
       const spec = v.spec ?? v.def ?? null;
       const explicit = v.cameraClass ?? spec?.cameraClass;
-      if (explicit && CHASE.classFrame[explicit]) {
+      const tag = (`${spec?.kind ?? ''} ${spec?.class ?? ''} ${spec?.id ?? ''} ` +
+        `${spec?.type ?? ''} ${v.type ?? ''}`).toLowerCase();
+      /**
+       * ROTORCRAFT FIRST, then fixed-wing. The two tests overlap — a spec that
+       * says `heli` and a spec that says `plane` are both aircraft, and the
+       * `fly` flag says only that it leaves the ground — so the order is what
+       * decides, and putting the rotor test first is what keeps a `newsheli`
+       * out of the fixed-wing framing. An unqualified `aircraft` tag stays on
+       * the rotor class it has always resolved to.
+       */
+      const rotor = /heli|chopper|rotor|aircraft/.test(tag);
+      const wing = /plane|jet|glider|wing/.test(tag);
+      if (explicit && (CHASE.classFrame[explicit] || EXTRA_FRAMES[explicit])) {
         this.frameClass = explicit;
+      } else if (rotor) {
+        this.frameClass = 'heli';
+      } else if (wing) {
+        this.frameClass = 'plane';
       } else if (spec?.fly === true || spec?.air === true || v.fly === true) {
         this.frameClass = 'heli';
-      } else {
-        const tag = (`${spec?.kind ?? ''} ${spec?.class ?? ''} ${spec?.id ?? ''} ` +
-          `${spec?.type ?? ''} ${v.type ?? ''}`).toLowerCase();
-        if (/heli|chopper|rotor|aircraft/.test(tag)) this.frameClass = 'heli';
-        else if (/bus|coach|transit/.test(tag)) this.frameClass = 'bus';
+      } else if (/bus|coach|transit/.test(tag)) {
+        this.frameClass = 'bus';
       }
     }
-    this._frame = CHASE.classFrame[this.frameClass] ?? CHASE.classFrame.car;
+    this._frame = EXTRA_FRAMES[this.frameClass] ??
+      CHASE.classFrame[this.frameClass] ?? CHASE.classFrame.car;
     return this.frameClass;
   }
 
@@ -952,6 +1035,31 @@ export class CameraRig {
     const forwardDot = vx * this._vehFwd.x + vz * this._vehFwd.z;
     const facingYaw = Math.atan2(-this._vehFwd.x, -this._vehFwd.z);
 
+    /**
+     * Per-state framing. `F` is the framing class for whatever is being framed
+     * — see `CHASE.classFrame` and `EXTRA_FRAMES`. Resolved on `setVehicle`,
+     * read here.
+     *
+     * THE FLIGHT CHANNELS, both read off what `vehicles` already publishes so
+     * the camera adds no rays of its own:
+     *
+     *   `v.altitude`  metres AGL, written every step by `plane.js` / `heli.js`
+     *                 (`Math.max(0, position.y - gear - ground)`). Anything
+     *                 without it — a car, a stub in a bench — reads 0, which is
+     *                 exactly the grounded behaviour that came before.
+     *   `climb`       the sine of the flight path angle, from the velocity the
+     *                 solver has already copied. Horizontal speed alone cannot
+     *                 see a climb, which is why a car camera loses an aeroplane
+     *                 off the top of the frame the moment it rotates.
+     */
+    const F = this._frame;
+    const flight = F.flight === true;
+    const alt = flight && Number.isFinite(v.altitude) ? Math.max(0, v.altitude) : 0;
+    const altT = flight ? clamp01(alt / FLIGHT.altRef) : 0;
+    const climb = flight
+      ? clamp(this._vehVel.y / Math.max(6, this._vehVel.length()), -1, 1)
+      : 0;
+
     /* ---- travel yaw: the whole point of a chase camera ---- */
     let travelYaw = facingYaw;
     if (speed > CHASE.travelMinSpeed && forwardDot > 0) {
@@ -969,7 +1077,11 @@ export class CameraRig {
     // and use the same rate for the centripetal roll below.
     const swing = angleDelta(this.chasePrevTravel, travelYaw) / Math.max(1e-4, dt);
     this.chasePrevTravel = travelYaw;
-    const yawTau = lerp(CHASE.yawTau, CHASE.yawTauFast, clamp01(Math.abs(swing) / 2.6));
+    // ...and an aeroplane's travel vector swings far faster than a steering
+    // rack can move a car's, so the same time constant reads as a camera welded
+    // to the tailplane. `lagGain` is the whole "wider lag" of the flight chase.
+    const yawTau = lerp(CHASE.yawTau, CHASE.yawTauFast, clamp01(Math.abs(swing) / 2.6)) *
+      (flight ? FLIGHT.lagGain : 1);
     const k = 1 - Math.exp(-dt / yawTau);
     this.chaseYaw += angleDelta(this.chaseYaw, travelYaw) * k;
     if (this.chaseYaw > Math.PI) this.chaseYaw -= Math.PI * 2;
@@ -1023,12 +1135,8 @@ export class CameraRig {
     const size = v.length ?? v.size?.z ?? (half ? half.z * 2 : 4.5);
     const tall = v.height ?? v.size?.y ?? (half ? half.y * 2 : 1.4);
 
-    /**
-     * Per-state framing. `F` is the framing class for whatever is being framed
-     * — see `CHASE.classFrame`. A class with its own framing does not also take
-     * the per-metre length gain, or it would be paid for twice.
-     */
-    const F = this._frame;
+    // A class with its own framing does not also take the per-metre length
+    // gain, or it would be paid for twice. (`F` was resolved above.)
     const sizeTerm = F.sizeGain ? Math.max(0, size - 4.5) * CHASE.distSizeGain : 0;
 
     const nb = this.nearBlend;
@@ -1043,11 +1151,33 @@ export class CameraRig {
         Math.max(0, tall - 1.4) * 0.45) * this._viewHeight,
       0.35, dt
     );
-    this.chasePitch = approach(
-      this.chasePitch,
-      lerp(lerp(CHASE.pitchBase, CHASE.pitchFast, speedT), CHASE.pitchBonnet, nb),
-      CHASE.pitchTau, dt
-    );
+    /**
+     * PITCH, and the two terms an aeroplane adds to it.
+     *
+     * The car law tips the boom down (`pitchBase` -9 deg, easing to -4.5 flat
+     * out) because what a driver needs in frame is road. Both of its premises
+     * fail in the air:
+     *
+     *   1. THE SUBJECT CLIMBS. A Skylark rotates at 15 degrees and a Talon at
+     *      more, and it keeps climbing; a camera whose pitch is a function of
+     *      ground speed alone holds still while the aircraft walks up out of
+     *      the frame. `climb` is the sine of the flight-path angle, so the boom
+     *      follows the nose up and down and the machine stays where it was.
+     *   2. SPEED IS NOT THE VARIABLE. `speedT` saturates at 38 m/s, which every
+     *      aeroplane in the game passes before it leaves the runway, so the car
+     *      law is pinned at -4.5 degrees for the whole flight. ALTITUDE is what
+     *      changes what is worth looking at: the ground on a low pass and an
+     *      approach, the horizon at height. So the flight class replaces the
+     *      speed ramp outright rather than nudging it.
+     */
+    let pitchWant = lerp(lerp(CHASE.pitchBase, CHASE.pitchFast, speedT), CHASE.pitchBonnet, nb);
+    if (flight) {
+      pitchWant = lerp(
+        lerp(FLIGHT.pitchLow, FLIGHT.pitchHigh, altT) + climb * FLIGHT.pitchClimb,
+        CHASE.pitchBonnet, nb
+      );
+    }
+    this.chasePitch = approach(this.chasePitch, pitchWant, CHASE.pitchTau, dt);
 
     /* ---- roll into the corner (centripetal a = v * dPsi/dt) ---- */
     const latAcc = clamp(speed * swing, -14, 14);
@@ -1073,8 +1203,9 @@ export class CameraRig {
         .add(this._vehPos);
       this._tmp.lerp(this._bonnet, nb);
     }
+    const followTau = CHASE.followTau * (flight ? FLIGHT.followGain : 1);
     if (this.chasePivot.lengthSq() < 1e-8 || this.vehicleBlend < 0.02) this.chasePivot.copy(this._tmp);
-    else this.chasePivot.lerp(this._tmp, 1 - Math.exp(-dt / CHASE.followTau));
+    else this.chasePivot.lerp(this._tmp, 1 - Math.exp(-dt / followTau));
 
     /* ---- basis + collision ---- */
     const yaw = this.chaseYaw + this.manualYaw;
@@ -1092,8 +1223,28 @@ export class CameraRig {
     this._dir.multiplyScalar(1 / dirLen);
     const wantRadius = this.chaseDist * dirLen;
 
+    /**
+     * NO GROUND SNAP AT ALTITUDE. The boom cast is what stops the camera
+     * standing inside a wall, and behind a climbing aeroplane it is a menace:
+     * the climb term above pitches the boom UP, which points the cast BACKWARD
+     * AND DOWN — straight into the runway and the hillside the aircraft has
+     * just left. It reports a hit, the boom collapses to 0.6 m, and the camera
+     * snaps onto the tailplane with clear sky all round it.
+     *
+     * Above `noCollideAlt` the cast is skipped outright and `free` stays at the
+     * full radius — a skipped frame must publish "clear" rather than leave the
+     * ring holding a stale minimum, or one low pass would pin the boom in for
+     * the length of the collision window.
+     *
+     * THE TRADE, stated plainly: at 12 m AGL and above, a fixed-wing flown
+     * between downtown towers can push the camera through one. That is a
+     * deliberate choice of the rarer artefact — nobody threads the Steel
+     * Building at 40 knots, and everybody takes off. It is scoped to the
+     * fixed-wing class alone: a helicopter hovers next to buildings for a
+     * living and keeps its cast at every height.
+     */
     let free = wantRadius;
-    if (phys) {
+    if (phys && !(flight && alt > FLIGHT.noCollideAlt)) {
       const hit = phys.sphereCast(
         this.chasePivot, this._dir, CHASE.collideRadius, wantRadius, phys.MASK.WORLD
       );

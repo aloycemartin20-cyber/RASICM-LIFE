@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * CAMERA FEEL TEST — the four behaviours of the camera's feel package,
- * measured on the EMITTED CAMERA TRANSFORM and nothing else.
+ * CAMERA FEEL TEST — the six behaviours of the camera's feel package, measured
+ * on the EMITTED TRANSFORMS and nothing else.
  *
  *   node src/player/camtest.mjs
  *   node src/player/camtest.mjs --verbose
@@ -9,30 +9,40 @@
  *
  * WHY IT MEASURES WHAT IT MEASURES (hard rule 12)
  *
- * Every number below comes out of `cam.position` / `cam.quaternion` — the two
- * things the engine copies onto the real camera — compared either against the
- * car's own emitted pose or against an IDENTICAL rig that was not given the
- * event. Nothing asserts on `manualYaw`, `trauma`, `alignRate`, `frameClass` or
- * any other flag the production code set on itself, because a gate that reads
- * the code's own input compares a number to itself and always passes.
+ * Every camera number below comes out of `cam.position` / `cam.quaternion` —
+ * the two things the engine copies onto the real camera — compared either
+ * against the vehicle's own emitted pose or against an IDENTICAL rig that was
+ * not given the event. The attitude family reads the WORLD MATRICES OF THE REAL
+ * SKELETON, built by the shipping character mesh and driven by the real
+ * `Animator`. Nothing asserts on `manualYaw`, `trauma`, `alignRate`,
+ * `frameClass`, `_seatTilt` or any other flag the production code set on
+ * itself, because a gate that reads the code's own input compares a number to
+ * itself and always passes.
  *
  * Concretely, what would make each family fail:
  *
- *   align   — the align rate not varying with speed (the half-life gate is a
- *             ranking across four speeds, so a constant rate is red however
- *             fast it is), or the align running while the look control is live.
- *   framing — a class falling through to the car framing, or the class number
- *             being paid for twice by also taking the per-metre size gain. The
- *             target is a fixed ratio (22/18, 24/18) written into this file, so
- *             it cannot be satisfied by agreeing with whatever `tuning.js`
- *             currently says.
- *   recoil  — a kick channel that moves `viewKick` without moving the emitted
- *             quaternion. This is exactly the state the chase solver was in.
- *   shake   — no listener, the wrong severity, or a decay that never lands.
+ *   align    — the align rate not varying with speed (the half-life gate is a
+ *              ranking across four speeds, so a constant rate is red however
+ *              fast it is), or the align running while the look control is live.
+ *   framing  — a class falling through to the car framing, or the class number
+ *              being paid for twice by also taking the per-metre size gain. The
+ *              target is a fixed ratio (22/18, 24/18) written into this file, so
+ *              it cannot be satisfied by agreeing with whatever `tuning.js`
+ *              currently says.
+ *   flight   — a fixed-wing framed like a hatchback (which every one of them
+ *              was), a boom that stares at the ground from 400 m, an aircraft
+ *              that walks out of frame in a climb, a boom cast that snaps onto
+ *              the tailplane at altitude, or a yaw filter no looser than a car's.
+ *   attitude — a seated body that does not wear the car's roll and pitch, one
+ *              that wears the chatter as well as the bank, one whose facing the
+ *              tilt has rotated, or a tilt that leaks onto a man on foot.
+ *   recoil   — a kick channel that moves `viewKick` without moving the emitted
+ *              quaternion. This is exactly the state the chase solver was in.
+ *   shake    — no listener, the wrong severity, or a decay that never lands.
  *
- * And every family has a NEGATIVE CONTROL that reverts the behaviour through
- * `tuning.js` and asserts the named gates go red. `--controls` (on by default)
- * runs all five. A gate that has never failed is not evidence of anything.
+ * And every family has a NEGATIVE CONTROL that reverts the behaviour and
+ * asserts the named gates go red. `--controls` (on by default) runs all seven.
+ * A gate that has never failed is not evidence of anything.
  */
 
 import * as THREE from 'three';
@@ -43,8 +53,11 @@ import { Vehicle } from '../vehicles/dynamics.js';
 import { VehicleSystem } from '../vehicles/index.js';
 import { Movement } from './movement.js';
 import { VehicleHandler } from './vehicle.js';
-import { CameraRig } from './camera.js';
+import { CameraRig, EXTRA_FRAMES, FLIGHT } from './camera.js';
 import { CAMERA, CHASE } from './tuning.js';
+import { Animator } from './anim/animator.js';
+import { buildCharacter } from './character/mesh.js';
+import { BROTHERS } from './brothers.js';
 
 const args = Object.fromEntries(
   process.argv.slice(2).map((a) => {
@@ -224,7 +237,7 @@ function seatThePlayer(rig) {
  * and once they DO exist the same test runs against the real spec instead
  * (see `framingSubject`).
  */
-function makeCamRig() {
+function makeCamRig(phys = fakePhysics) {
   const time = { dt: FDT, elapsed: 0, alpha: 1, frame: 0 };
   const listeners = new Map();
   const events = {
@@ -235,7 +248,7 @@ function makeCamRig() {
       return () => {};
     },
   };
-  const registry = { physics: fakePhysics };
+  const registry = { physics: phys };
   const ctx = {
     time, events, input: makeInput(), config: { fov: 65 },
     peek: (k) => registry[k] ?? null,
@@ -555,7 +568,7 @@ function realFraming(id) {
 }
 
 function testFramingReal() {
-  const ids = ['bike', 'sports', 'sedan', 'police', 'van', 'truck', 'bus', 'heli']
+  const ids = ['bike', 'sports', 'sedan', 'police', 'van', 'truck', 'bus', 'heli', 'plane', 'jet']
     .filter((id) => VEHICLE_SPECS[id]);
   const got = ids.map(realFraming);
   const by = Object.fromEntries(got.map((g) => [g.id, g]));
@@ -581,6 +594,453 @@ function testFramingReal() {
       ? `truck (7.2 m body) ${f2(by.truck.dist)} m vs sports (4.6 m) ${f2(by.sports.dist)} m` : 'missing a spec');
 
   return got;
+}
+
+/* ====================================================================== */
+/* 2b. THE FLIGHT CHASE — fixed-wing framing, lag, climb and the boom cast */
+/* ====================================================================== */
+
+/**
+ * A duck-typed aircraft with the same neutral dimensions the framing subjects
+ * use, so a comparison between classes is a statement about the CLASS and not
+ * about a wingspan. `alt` and a climbing velocity are what `plane.js` publishes
+ * (`v.altitude`, `v.velocity`) and are the only two channels the flight camera
+ * reads beyond the pose.
+ *
+ * `altitude` is HELD while the position climbs, deliberately: the altitude term
+ * and the climb term are separate laws and a run that moved both would not say
+ * which one produced the number. A real Skylark re-publishes AGL every step.
+ */
+function flyer(kind, { alt = 0, speed = 60, climb = 0, yaw = 0 } = {}) {
+  const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
+  const fwd = new THREE.Vector3(0, 0, 1).applyQuaternion(q);
+  return {
+    position: new THREE.Vector3(0, 40 + alt, 0),
+    quaternion: q,
+    velocity: new THREE.Vector3(fwd.x * speed, climb, fwd.z * speed),
+    altitude: alt,
+    length: 4.5,
+    height: 1.4,
+    spec: { kind, id: kind, half: { x: 0.95, y: 0.7, z: 2.25 } },
+  };
+}
+
+/**
+ * Step an already-built rig for `secs`, re-scripting the subject each frame.
+ *
+ * THE SUBJECT MOVES. It has to: a chase camera's pivot is a filtered follow, so
+ * an aircraft nailed to one point produces a converged camera and no lag of any
+ * kind — which reads as every framing being perfect at everything. A climb is a
+ * POSITION going up, not a velocity field.
+ */
+function flySteps(rig, subject, secs, steer = null, t0 = 0) {
+  const n = Math.round(secs * 60);
+  for (let i = 0; i < n; i++) {
+    if (steer) steer(t0 + i / 60, subject);
+    subject.position.addScaledVector(subject.velocity, FDT);
+    rig.time.frame++;
+    rig.time.elapsed += FDT;
+    rig.cam.update(FDT, rig.m, rig.health);
+  }
+  return t0 + n / 60;
+}
+
+/** Fly a subject for `secs` and return the emitted camera geometry. */
+function flightRun(subject, { secs = 6, phys = fakePhysics, steer = null } = {}) {
+  const rig = makeCamRig(phys);
+  rig.cam.setVehicle(subject);
+  flySteps(rig, subject, secs, steer);
+  return {
+    cls: rig.cam.frameClass,
+    dist: rig.cam.position.distanceTo(subject.position),
+    /** Where the subject sits relative to the view axis, in degrees. */
+    offAxis: offAxisDeg(rig.cam, subject.position),
+    /** How far the camera is looking below level, in degrees. */
+    lookDown: -Math.asin(clampN(rig.cam.forward.y, -1, 1)) * RAD,
+    rig,
+  };
+}
+
+const clampN = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+const _off = new THREE.Vector3();
+
+/** Angle between the camera's forward and the direction to a point. */
+function offAxisDeg(cam, at) {
+  _off.copy(at).sub(cam.position);
+  const l = _off.length();
+  if (l < 1e-5) return 0;
+  _off.multiplyScalar(1 / l);
+  return Math.acos(clampN(_off.dot(cam.forward), -1, 1)) * RAD;
+}
+
+/** A physics stub that reports a blocker at `d` metres down every boom. */
+function blockingPhysics(d) {
+  const hit = { hit: true, distance: d, point: new THREE.Vector3(), normal: new THREE.Vector3(0, 1, 0) };
+  return { ...fakePhysics, sphereCast: () => hit };
+}
+
+function testFlight() {
+  /* ---- 1. framing: the fixed-wing has its own, and the heli keeps his ---- */
+  // At rest, like every other framing subject — the speed gain is a separate
+  // term and mixing it in would make this a statement about airspeed.
+  const car = framingSubject('car').vehicle;
+  const dCar = framingDistance(car);
+  const dHeli = framingDistance(framingSubject('heli').vehicle);
+  const plane = flightRun(flyer('plane', { speed: 0 }), { secs: 6 });
+  const rPlane = plane.dist / dCar.dist;
+
+  rec('flight.frame', 'flight', 'a fixed-wing gets the flight framing, not the car one',
+    Math.abs(rPlane / (30 / 18) - 1) < 0.08,
+    `plane/car = ${f3(rPlane)} (expected 30/18 = ${f3(30 / 18)}, tol 8%) — ` +
+    `plane ${f2(plane.dist)} m vs car ${f2(dCar.dist)} m`);
+
+  rec('flight.order', 'flight', 'car < heli < plane, and the heli is untouched',
+    dCar.dist < dHeli.dist && dHeli.dist < plane.dist &&
+    Math.abs((dHeli.dist / dCar.dist) / (24 / 18) - 1) < 0.08,
+    `${f2(dCar.dist)} / ${f2(dHeli.dist)} / ${f2(plane.dist)} m ` +
+    `(heli/car ${f3(dHeli.dist / dCar.dist)}, still 24/18)`);
+
+  /**
+   * ...and every fixed-wing `vehicles` ships resolves to it, measured on the
+   * emitted distance rather than on `frameClass`: each aeroplane must frame
+   * WIDER than the shipping helicopter, which no car-class vehicle in the game
+   * does. This is the check that the old `/heli|chopper|rotor|aircraft/` tag
+   * test fails — every one of them fell through to `car`.
+   */
+  const wings = ['plane', 'sportplane', 'bushplane', 'twinplane', 'jet'].filter((id) => VEHICLE_SPECS[id]);
+  const shipHeli = realFraming('heli').dist;
+  const shipWings = wings.map((id) => ({ id, d: realFraming(id).dist }));
+  rec('flight.shipping', 'flight', 'every shipping fixed-wing frames wider than the helicopter',
+    shipWings.length >= 4 && shipWings.every((w) => w.d > shipHeli),
+    shipWings.map((w) => `${w.id} ${f2(w.d)}`).join('  ') + `  vs heli ${f2(shipHeli)} m`);
+
+  /* ---- 2. altitude-aware pitch ---- */
+  const low = flightRun(flyer('plane', { alt: 0 }));
+  const high = flightRun(flyer('plane', { alt: 400 }));
+  rec('flight.altitude', 'flight', 'the boom stops staring at the ground once it is 400 m away',
+    low.lookDown - high.lookDown > 5,
+    `looking down ${f2(low.lookDown)} deg on the runway, ${f2(high.lookDown)} deg at 400 m`);
+
+  /* ---- 3. the climb stays where level flight put it in frame ---- */
+  /**
+   * The measurement is a SHIFT: how far the subject moves in the frame between
+   * level flight and a 22 m/s climb, for each framing. An absolute off-axis
+   * angle would be measuring the boom's height-over-distance ratio (13-odd
+   * degrees for every chase camera in the game, on foot included) rather than
+   * anything to do with climbing.
+   */
+  const level = flightRun(flyer('plane', { alt: 300, climb: 0 }));
+  const carLevel = flightRun(flyer('sedan', { alt: 300, climb: 0 }));
+  // THREE rates, one of them a dive. `pitchClimb` was tuned against the 22 m/s
+  // case; a single rate would not tell anyone whether it generalises or was
+  // simply fitted to the one number in the gate.
+  const RATES = [22, 10, -15];
+  const shifts = RATES.map((c) => ({
+    c,
+    flight: Math.abs(flightRun(flyer('plane', { alt: 300, climb: c })).offAxis - level.offAxis),
+    car: Math.abs(flightRun(flyer('sedan', { alt: 300, climb: c })).offAxis - carLevel.offAxis),
+  }));
+  const worstFlight = Math.max(...shifts.map((s) => s.flight));
+  const worstRatio = Math.min(...shifts.map((s) => s.car / Math.max(1e-4, s.flight)));
+  rec('flight.climb', 'flight', 'a climb or a dive barely moves the aeroplane in frame',
+    worstFlight < 1.2,
+    shifts.map((s) => `${s.c > 0 ? '+' : ''}${s.c} m/s: ${f2(s.flight)} deg`).join('  ') +
+    `  (level framing ${f2(level.offAxis)} deg off axis)`);
+  rec('flight.climbgain', 'flight', '...where the car framing lets it drift',
+    worstRatio > 2.5,
+    shifts.map((s) => `${s.c > 0 ? '+' : ''}${s.c}: car ${f2(s.car)} vs flight ` +
+      `${f2(s.flight)} deg`).join('  ') + `  (worst ratio ${f3(worstRatio)}x)`);
+
+  /* ---- 4. no ground snap at altitude ---- */
+  const NEAR = 1.4;
+  const blocked = blockingPhysics(NEAR);
+  const grounded = flightRun(flyer('plane', { alt: 0 }), { phys: blocked });
+  const aloft = flightRun(flyer('plane', { alt: 300 }), { phys: blocked });
+  const clear = flightRun(flyer('plane', { alt: 300 }));
+  rec('flight.nosnap', 'flight', 'the boom ignores a blocker reported at altitude',
+    Math.abs(aloft.dist - clear.dist) < 0.05,
+    `${f2(aloft.dist)} m with a blocker at ${f2(NEAR)} m, ${f2(clear.dist)} m with open sky`);
+  rec('flight.snapsonground', 'flight', '...and still obeys one on the runway',
+    grounded.dist < clear.dist - 2,
+    `${f2(grounded.dist)} m on the ground vs ${f2(clear.dist)} m aloft`);
+
+  /* ---- 5. wider lag ---- */
+  /**
+   * A step in travel direction, held, AFTER the camera has settled behind the
+   * subject. Settling first is not optional: from a cold start the yaw filter
+   * is still travelling half a turn, and a looser filter is FURTHER from home
+   * when the step lands — which reads as the flight camera being tighter and is
+   * a measurement of the initial transient, not of the lag.
+   *
+   * The emitted camera-to-nose angle 0.5 s after the step is how far behind the
+   * camera still is. Bigger is looser, and looser is the point.
+   */
+  const turn = (t, s) => {
+    const yaw = t < 4 ? 0 : 1.2;
+    s.quaternion.setFromAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
+    const f = new THREE.Vector3(0, 0, 1).applyQuaternion(s.quaternion);
+    s.velocity.set(f.x * 60, 0, f.z * 60);
+  };
+  const lagOf = (kind) => {
+    const s = flyer(kind, { alt: 300 });
+    const rig = makeCamRig();
+    rig.cam.setVehicle(s);
+    const settled = flySteps(rig, s, 4.0, turn);
+    const before = alignErrDeg(rig.cam, s);
+    flySteps(rig, s, 0.5, turn, settled);
+    return { before, after: alignErrDeg(rig.cam, s) };
+  };
+  const lagPlane = lagOf('plane');
+  const lagCar = lagOf('sedan');
+  rec('flight.lag', 'flight', 'the flight chase lags a hard turn more than the car chase',
+    lagPlane.before < 1 && lagCar.before < 1 && lagPlane.after > lagCar.after * 1.25,
+    `0.5 s after a 69 deg step: ${f2(lagPlane.after)} deg still to catch up vs ` +
+    `${f2(lagCar.after)} deg for the car (ratio ` +
+    `${f3(lagPlane.after / Math.max(1e-4, lagCar.after))}; both settled to ` +
+    `${f2(lagPlane.before)} / ${f2(lagCar.before)} deg first)`);
+
+  return { rPlane, plane, low, high, shifts, aloft, clear, lagPlane, lagCar };
+}
+
+/* ====================================================================== */
+/* 2c. THE SEATED BODY WEARS THE CAR'S ATTITUDE                           */
+/* ====================================================================== */
+
+/**
+ * `setSeatTransform` carries a position and a YAW SCALAR, and the animator
+ * writes the root from that yaw alone — so the driver stood bolt upright in
+ * world space whatever the car was doing, through the roof on any slope and
+ * out of the side of a banked bike. `drivetest`'s facing check already carried
+ * the gap in prose and gave bikes a 12-degree tolerance to hide it.
+ *
+ * MEASURED ON THE REAL EMITTED SKELETON (hard rule 12): this section builds the
+ * shipping character mesh (`character/mesh.js`) and drives the real `Animator`,
+ * then reads the WORLD matrices of the hips and head bones that three.js will
+ * skin the frame from. Nothing asserts on `_seatTilt`, `seatYaw` or any other
+ * value the production code set on itself.
+ *
+ * Every number is DIFFERENTIAL — the same run with the car level minus the same
+ * run with the car banked — so it cannot be produced by the seated pose, the
+ * bind skeleton or the harness, only by the attitude.
+ *
+ * The car's transform is SCRIPTED here rather than driven, because the point is
+ * a controlled attitude: a flat test track cannot bank a car 14 degrees, and a
+ * hill built to do it would make the input a property of the hill.
+ */
+
+/** Set false by `--control=tilt`; see CONTROLS. */
+let TILT_ON = true;
+
+const _bodyUp = new THREE.Vector3();
+const _bodyFwd = new THREE.Vector3();
+const _hips = new THREE.Vector3();
+const _head = new THREE.Vector3();
+const _carUp = new THREE.Vector3();
+const _local = new THREE.Vector3();
+const _qi = new THREE.Quaternion();
+
+function makeBodyRig() {
+  const spec = Object.values(BROTHERS)[0];
+  const built = buildCharacter(spec.build, null);
+  const rig = {
+    root: built.root, bones: built.bones, boneList: built.boneList,
+    skeleton: built.skeleton, bindPositions: built.bindPositions, scale: 1, side: 1,
+  };
+  return { rig, built };
+}
+
+/** The pose request `PlayerSystem._buildPose` fills, for a seated driver. */
+function seatedPose() {
+  return {
+    x: 0, y: 0, z: 0, faceYaw: 0, aimYaw: 0, aimPitch: 0,
+    speed: 0, grounded: true, crouch: false, aim: 0, swim: false, driving: true,
+    stumble: 0, turning: 0, strafe: 0, forwardSign: 1, verticalVel: 0,
+    landImpulse: 0, steer: 0, lateral: 0, surface: 'concrete', groundDist: 0,
+    swing: 0, swingSide: 1, swingWeight: 0, submerged: 0, dead: 0, guard: 0,
+    topSpeed: 6.4, sprinting: false,
+  };
+}
+
+/**
+ * Seat a driver, script the car's attitude, and sample the EMITTED skeleton.
+ *
+ * `attitude(t)` returns { roll, pitch } in radians. Returns per-frame samples of
+ * the world-space hips->head axis, the head's position expressed in the CAR's
+ * own frame, and the body's ground-plane facing.
+ */
+function tiltRun(attitude, { secs = 2.5, type = 'sedan', drive = true } = {}) {
+  const rig = makeRig(type);
+  if (drive && !seatThePlayer(rig)) return null;
+  const { rig: body } = makeBodyRig();
+  const ctx = {
+    time: rig.time, peek: () => null,
+    events: { emit() {}, on() { return () => {}; } },
+  };
+  const anim = new Animator(ctx, body);
+  const pose = seatedPose();
+  rig.handler.debugSeatTilt = TILT_ON;
+
+  const v = rig.v;
+  const yaw = 0.6;                       // an arbitrary heading, held
+  const q = new THREE.Quaternion();
+  const e = new THREE.Euler(0, 0, 0, 'YXZ');
+  const samples = [];
+  const n = Math.round(secs * 60);
+  for (let i = 0; i < n; i++) {
+    const t = i / 60;
+    const a = attitude(t);
+    e.set(a.pitch, yaw, a.roll);
+    q.setFromEuler(e);
+    v.quaternion.copy(q);
+    if (v.prevQuaternion) v.prevQuaternion.copy(q);
+    if (v.prevPosition) v.prevPosition.copy(v.position);
+
+    rig.time.frame++;
+    rig.time.elapsed += FDT;
+    rig.handler.update(FDT, rig.m);
+
+    pose.x = rig.m.position.x; pose.y = rig.m.position.y; pose.z = rig.m.position.z;
+    pose.faceYaw = rig.m.faceYaw;
+    pose.aimYaw = rig.m.faceYaw;
+    pose.driving = rig.handler.seated;
+    anim.update(FDT, pose);
+    rig.handler.applySeatAttitude(body.root);
+
+    // ---- read the EMITTED skeleton ----
+    body.bones.hips.updateWorldMatrix(true, false);
+    body.bones.head.updateWorldMatrix(true, false);
+    _hips.setFromMatrixPosition(body.bones.hips.matrixWorld);
+    _head.setFromMatrixPosition(body.bones.head.matrixWorld);
+    _bodyUp.copy(_head).sub(_hips).normalize();
+    _bodyFwd.set(0, 0, -1).applyQuaternion(body.root.quaternion);
+    _carUp.set(0, 1, 0).applyQuaternion(q);
+    // The head in the CAR's frame — is he still in the cabin?
+    _local.copy(_head).sub(v.position).applyQuaternion(_qi.copy(q).invert());
+    samples.push({
+      t,
+      up: _bodyUp.clone(),
+      carUp: _carUp.clone(),
+      headLocal: _local.clone(),
+      fwdYaw: Math.atan2(-_bodyFwd.x, -_bodyFwd.z),
+      carYaw: yaw,
+    });
+  }
+  return { samples, rig };
+}
+
+/** Angle between the emitted body axis and the car's up, in degrees. */
+const upErrDeg = (s) => Math.acos(clampN(s.up.dot(s.carUp), -1, 1)) * RAD;
+const _rollTmp = new THREE.Vector3();
+const _rollQ = new THREE.Quaternion();
+const _yAxis = new THREE.Vector3(0, 1, 0);
+/**
+ * Signed roll of the emitted body axis, IN THE CAR'S YAW FRAME. Measuring it
+ * against world X instead reads a fraction of the roll set by the heading —
+ * 12.41 degrees for a 14-degree bank at a yaw of 0.6 rad — and looks exactly
+ * like a filter that is losing the bank.
+ */
+const rollOf = (s) => {
+  _rollTmp.copy(s.up).applyQuaternion(_rollQ.setFromAxisAngle(_yAxis, -s.carYaw));
+  return Math.atan2(_rollTmp.x, _rollTmp.y) * RAD;
+};
+
+function testTilt() {
+  const LEVEL = () => ({ roll: 0, pitch: 0 });
+  const BANK = 14 * DEG;
+  const NOSE = 12 * DEG;
+
+  const level = tiltRun(LEVEL);
+  const bank = tiltRun(() => ({ roll: BANK, pitch: 0 }));
+  const nose = tiltRun(() => ({ roll: 0, pitch: NOSE }));
+  if (!level || !bank || !nose) {
+    rec('tilt.seated', 'attitude', 'the driver could be seated at all', false, 'seating failed');
+    return null;
+  }
+  const last = (r) => r.samples[r.samples.length - 1];
+
+  /**
+   * 1. THE BODY IS SQUARE TO THE CAR. Differential: the emitted hips->head axis
+   *    tilts by the same angle the car did. `level` carries the seated pose's
+   *    own forward lean, and subtracting it is what makes this a statement
+   *    about the attitude rather than about the pose.
+   */
+  const errLevel = upErrDeg(last(level));
+  const errBank = upErrDeg(last(bank));
+  const errNose = upErrDeg(last(nose));
+  rec('tilt.bank', 'attitude', 'the body banks with the car',
+    Math.abs(errBank - errLevel) < 1.5,
+    `body-to-car-up ${f2(errBank)} deg at ${f2(BANK * RAD)} deg of bank, ` +
+    `${f2(errLevel)} deg level (the seated pose's own lean)`);
+  rec('tilt.pitch', 'attitude', 'the body pitches with the car',
+    Math.abs(errNose - errLevel) < 1.5,
+    `body-to-car-up ${f2(errNose)} deg at ${f2(NOSE * RAD)} deg nose-up, ` +
+    `${f2(errLevel)} deg level`);
+
+  /**
+   * 2. AND THEREFORE HE IS STILL IN THE CABIN. The head expressed in the car's
+   *    own frame is what "through the sheet metal" means: a body that does not
+   *    bank walks its head sideways out of the roof by the bank angle times the
+   *    seat height.
+   */
+  const dHead = last(bank).headLocal.distanceTo(last(level).headLocal);
+  rec('tilt.cabin', 'attitude', 'the head stays where the seat is, in the car\'s frame',
+    dHead < 0.03,
+    `head moves ${f3(dHead)} m in the car's frame between level and ` +
+    `${f2(BANK * RAD)} deg of bank`);
+
+  /**
+   * 3. COBBLES DO NOT SHAKE THE HEAD. An 8 Hz, 2-degree chatter on top of a
+   *    14-degree bank — a chassis quaternion over tram rails. The filter has to
+   *    hold the bank and lose the chatter.
+   */
+  const CH_HZ = 8, CH_AMP = 2 * DEG;
+  const cobble = tiltRun((t) => ({ roll: BANK + Math.sin(t * CH_HZ * Math.PI * 2) * CH_AMP, pitch: 0 }));
+  const tail = cobble.samples.filter((s) => s.t > 1.2);
+  const rolls = tail.map(rollOf);
+  const bodyPP = Math.max(...rolls) - Math.min(...rolls);
+  const carPP = 2 * CH_AMP * RAD;
+  const mean = rolls.reduce((a, b) => a + b, 0) / rolls.length;
+  rec('tilt.cobbles', 'attitude', 'chassis chatter is filtered out of the head',
+    bodyPP < carPP * 0.45,
+    `${f2(bodyPP)} deg peak-to-peak in the body against ${f2(carPP)} deg in the ` +
+    `chassis (${(100 * bodyPP / carPP).toFixed(0)}% through, want < 45%)`);
+  rec('tilt.holds', 'attitude', '...without losing the bank underneath it',
+    Math.abs(Math.abs(mean) - BANK * RAD) < 1.0,
+    `mean body roll ${f2(Math.abs(mean))} deg against a ${f2(BANK * RAD)} deg bank`);
+
+  /**
+   * 4. THE YAW IS UNTOUCHED. The tilt is applied in body space precisely so it
+   *    cannot rotate the facing — which is what `drivetest`'s "body faces the
+   *    way the car faces" gates rest on.
+   */
+  let worstYaw = 0;
+  for (const s of cobble.samples) {
+    let d = s.fwdYaw - (s.carYaw + Math.PI);
+    while (d > Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    worstYaw = Math.max(worstYaw, Math.abs(d) * RAD);
+  }
+  rec('tilt.yaw', 'attitude', 'banking never rotates the body\'s facing',
+    worstYaw < 0.5,
+    `worst ${f3(worstYaw)} deg from the car's heading over ${cobble.samples.length} frames`);
+
+  /**
+   * 5. IT NEVER LEAKS ONTO A MAN ON FOOT. Same scripted 14-degree bank, nobody
+   *    in the car — and compared against the SAME run beside a level car, not
+   *    against the seated baseline: a standing body has its own lean and
+   *    subtracting the wrong one would report it as leakage.
+   */
+  const upWorld = new THREE.Vector3(0, 1, 0);
+  const footBank = tiltRun(() => ({ roll: BANK, pitch: 0 }), { drive: false });
+  const footLevel = tiltRun(LEVEL, { drive: false });
+  const footErr = Math.acos(clampN(last(footBank).up.dot(upWorld), -1, 1)) * RAD;
+  const footRef = Math.acos(clampN(last(footLevel).up.dot(upWorld), -1, 1)) * RAD;
+  rec('tilt.onfoot', 'attitude', 'a man who is not in the car stays upright',
+    Math.abs(footErr - footRef) < 0.05,
+    `${f3(footErr)} deg off world up beside a car banked ${f2(BANK * RAD)} deg, ` +
+    `${f3(footRef)} deg beside a level one (the standing pose's own lean)`);
+
+  return { errLevel, errBank, errNose, dHead, bodyPP, carPP, worstYaw };
 }
 
 /* ====================================================================== */
@@ -896,6 +1356,30 @@ const CONTROLS = {
       return () => { F.bus = s.bus; F.heli = s.heli; };
     },
   },
+  flight: {
+    what: 'every fixed-wing on the car chase camera again (the old tag test)',
+    expect: [
+      'flight.frame', 'flight.order', 'flight.shipping',
+      'flight.altitude', 'flight.climbgain', 'flight.nosnap', 'flight.lag',
+    ],
+    run: testFlight,
+    apply() {
+      const s = { ...EXTRA_FRAMES.plane };
+      // Exactly what `_resolveFrame` did before: no `plane` class at all, so
+      // the lookup falls through to the car framing and `flight` is never set.
+      delete EXTRA_FRAMES.plane;
+      return () => { EXTRA_FRAMES.plane = s; };
+    },
+  },
+  tilt: {
+    what: 'the seated body upright in world space whatever the car is doing',
+    expect: ['tilt.bank', 'tilt.pitch', 'tilt.cabin', 'tilt.holds'],
+    run: testTilt,
+    apply() {
+      TILT_ON = false;
+      return () => { TILT_ON = true; };
+    },
+  },
   kick: {
     what: 'the old partial chase composition (kickPitch only, no rotational shake)',
     expect: ['kick.yawroll', 'kick.punch', 'shake.ram', 'shake.building', 'shake.vehicle'],
@@ -966,6 +1450,8 @@ function main() {
   const align = testAlign();
   testFraming();
   const real = testFramingReal();
+  testFlight();
+  testTilt();
   testRecoil();
   testShake();
 

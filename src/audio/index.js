@@ -18,6 +18,10 @@
  *   audio.bark(kind, position, opts)   voice: 'spot' | 'reload' | 'grenade' |
  *                                      'flank' | 'suppress' | 'advance' |
  *                                      'hurt' | 'death' | 'copy'
+ *   audio.dialogue(id, line, dur)      speak an authored story line in the
+ *                                      speaker's own voice, duck the bed under
+ *                                      it, and raise dialogue:start/:end. One
+ *                                      at a time; barks yield to it.
  *   audio.ui(kind)                     'hitmarker'|'headshot'|'kill'|'damage'
  *   audio.radioNext()                  cycle station -> ... -> OFF -> station 1
  *   audio.setRadioStation(id|null)     'grease'|'gold'|'redline'|'slack'|
@@ -52,6 +56,18 @@
  * runs, police:busted and player:wasted get their four-note stings,
  * mission:start gets its arpeggio, and player:state.nitroOn drives the nitro
  * ignition + sustain layer.
+ *
+ * STORY DIALOGUE is the one thing here that is POLLED rather than driven by an
+ * event, and the reason is worth writing down. Twenty-four chapters of authored
+ * dialogue are performed by `ui`'s cutscene player and its subtitle bar, and
+ * neither raises an event when a line goes up — there is no `dialogue:*` in
+ * ARCHITECTURE.md's table because until now nothing needed one. So `_pollDialogue`
+ * reads the live line off `ui` at runtime (`ctx.peek('ui')`, never an import —
+ * rule 2, and the same shape as `_pollSky`), voices it, and RAISES the missing
+ * events itself: `dialogue:start { id, text, dur, source }` and
+ * `dialogue:end { id, reason }`. If `ui`/`game` ever emit those at the source,
+ * this poller should be deleted in the same change — the emit is the contract,
+ * the poll is the scaffolding under it.
  */
 
 import {
@@ -71,7 +87,7 @@ import {
   heartbeat, cloth,
 } from './foley.js';
 import { jingle, hasJingle } from './jingles.js';
-import { bark as voxBark, barkFor } from './vox.js';
+import { bark as voxBark, barkFor, DialogueVoice } from './vox.js';
 import { classifySpace } from './ir.js';
 
 const PROBE_RAYS = 9;
@@ -147,6 +163,27 @@ export class AudioSystem {
      */
     this._pendingStation = undefined;
 
+    /* ---- story dialogue -------------------------------------------- */
+    /** Built with the graph; null until then. See `_pollDialogue`. */
+    this.vox = null;
+    /**
+     * Which line is already spoken. IDENTITY, not content: the cutscene's own
+     * `lines` array reference plus its index, and for the subtitle bar the
+     * direction of its `t`. Held across a pause on purpose — clearing it is how
+     * a resumed scene speaks the same line twice.
+     */
+    this._cutLines = null;
+    this._cutIdx = -1;
+    this._barkT = -1;
+    this._dlgHeld = false;
+    this._onDlgStart = (r) => {
+      this.stats.dialogue++;
+      this.ctx.events.emit('dialogue:start', r);
+    };
+    this._onDlgEnd = (r) => this.ctx.events.emit('dialogue:end', r);
+    /** `actx.currentTime` at the last frame — the mixer's clock. See update(). */
+    this._audioT = -1;
+
     /* ---- gameplay jingles ------------------------------------------ */
     this._service = { active: false, kind: 'repair', timer: 0, until: 0 };
     this._nitro = { on: false, evOn: false, pollOn: false };
@@ -188,6 +225,7 @@ export class AudioSystem {
     this.stats = {
       voices: 0, dropped: 0, stolen: 0, rays: 0, deafness: 0,
       space: 'open', started: false, contextState: 'none', events: 0, errors: 0, ms: 0,
+      dialogue: 0, barksYielded: 0,
     };
 
     this._offs = [];
@@ -319,6 +357,11 @@ export class AudioSystem {
       if (this._pendingStation !== undefined) this.radio.tune(this._pendingStation);
       this.police = new PoliceAudio(actx, this.bank, this.mixer, this.field, this.rng.fork());
       this.police.setWanted(this._wanted, 0);
+      // Its own fork: `speak` reseeds it per line so a replayed chapter sounds
+      // the same, and nothing else may be sharing that stream.
+      this.vox = new DialogueVoice(actx, this.bank, this.mixer, this.rng.fork());
+      this.vox.onStart = this._onDlgStart;
+      this.vox.onEnd = this._onDlgEnd;
       this.mixer.setSpace(this._space, 0.001);
 
       if (actx.state === 'suspended') await actx.resume();
@@ -345,7 +388,12 @@ export class AudioSystem {
     }
     this._nitro.on = false;
     this._service.active = false;
+    this._cutLines = null;
+    this._cutIdx = -1;
+    this._barkT = -1;
+    this._audioT = -1;
     try {
+      this.vox?.dispose();
       this.police?.dispose();
       this.radio?.dispose();
       this.vehicles?.dispose();
@@ -355,7 +403,7 @@ export class AudioSystem {
       this.bank?.dispose();
       if (this.actx && this.actx.state !== 'closed') this.actx.close();
     } catch { /* nothing useful to do */ }
-    this.police = this.radio = this.vehicles = null;
+    this.police = this.radio = this.vehicles = this.vox = null;
     this.ambience = this.field = this.mixer = this.bank = null;
     this.actx = null;
     this.running = false;
@@ -402,7 +450,26 @@ export class AudioSystem {
       }
 
       /* ---- subsystems -------------------------------------------- */
-      this.mixer.update(dt);
+      /*
+       * THE MIXER RUNS ON THE AUDIO CLOCK, NOT THE FRAME CLOCK, and it is the
+       * only thing here that does. Everything `Mixer.update` drives — duck
+       * recovery, the hearing-damage tail — is automation it has ALREADY
+       * scheduled on `actx.currentTime`, which does not stop when `time.scale`
+       * does. Fed the scaled dt it froze all three whenever the world stopped:
+       * a cutscene holds `time.scale` at 0 for as long as the scene runs, so a
+       * gunshot duck taken one frame before the cut stayed down for the whole
+       * chapter intro, and a story line's own -9 dB duck (below) would have had
+       * no clock at all to release on. `dt` is still what every other subsystem
+       * here gets — they model the WORLD, and the world really is stopped.
+       */
+      const audioNow = actx.currentTime;
+      const aDt = this._audioT < 0 ? dt : clamp(audioNow - this._audioT, 0, 0.25);
+      this._audioT = audioNow;
+      this.mixer.update(aDt);
+      /* Story dialogue: after the mixer, because its side-chain re-assert has to
+         land after that frame's decay. See DialogueVoice's header. */
+      this._pollDialogue();
+      this.vox.update(audioNow);
       this.field.update(dt);
       this.deafness = this.mixer.deafness;
       if (!this._ambienceApi) {
@@ -419,7 +486,7 @@ export class AudioSystem {
       this._pollSky(dt);
 
       /* ---- head-locked voice teardown ---------------------------- */
-      const now = actx.currentTime;
+      const now = audioNow;
       for (let i = 0; i < this._dry.length; i++) {
         const d = this._dry[i];
         if (!d.node || now < d.end) continue;
@@ -835,6 +902,13 @@ export class AudioSystem {
     if (!this.running) return false;
     const now = this.actx.currentTime;
     if (now - this._lastBarkTime < 0.42 && !opts.force) return false; // no mush
+    // A story line outranks ambient chatter, and the synth budget is ONE voice:
+    // a boss taunt buried under his own men shouting CONTACT is the line the
+    // player was meant to hear and did not.
+    if (this.vox?.sounding(now) && !opts.force) {
+      this.stats.barksYielded++;
+      return false;
+    }
     this._lastBarkTime = now;
     const seed = (opts.voice ?? 0) | 0;
     const o = {
@@ -847,6 +921,100 @@ export class AudioSystem {
     };
     if (position) return this._playAt('bark', position.x, position.y, position.z, o, 'voice', 0.85);
     return this._playDry('bark', o, 'voice', 0.25);
+  }
+
+  /**
+   * Speak one authored story line — a chapter intro or outro beat, a brother's
+   * advice, a boss taunt — in that speaker's own voice, with the radio and the
+   * city bed ducked under it.
+   *
+   * @param {string} id speaker id: 'carson' | 'aidan' | 'dylan' | 'gabby' |
+   *   'boss' | 'cop' | 'radio', or anything else (hashed to a stable voice).
+   * @param {string} line the authored text. Its syllable count and stress
+   *   pattern are what is performed — see `voiceLine` in vox.js for why it is
+   *   deliberately not a pronunciation.
+   * @param {number} dur seconds the line is on screen. 0 means "pace it
+   *   naturally"; a real number makes the read fit inside it, by elision first
+   *   and truncation last.
+   */
+  dialogue(id, line, dur = 0, opts = {}) {
+    if (!this.running || !this.vox) return false;
+    try {
+      return this.vox.speak(id, line, dur, opts);
+    } catch (err) {
+      this._error(err);
+      return false;
+    }
+  }
+
+  /** Take the live line down. `reason` rides on `dialogue:end`. */
+  stopDialogue(reason = 'stopped') {
+    return this.vox?.stop(reason) ?? false;
+  }
+
+  /**
+   * WHOSE LINE IS ON SCREEN RIGHT NOW? Polled, because nothing emits it — see
+   * this file's header.
+   *
+   * Two performers, and they are not interchangeable. `ui.subs.cut` is the
+   * chapter cutscene: the world is stopped, the letterbox is down, and the
+   * lines are `{who, text}` records it holds for the whole scene. `ui.subs` is
+   * the in-mission caption bar: ONE line over live gameplay, its text kept only
+   * in the DOM, its identity recoverable from `t` resetting to zero. The cut
+   * wins whenever both are up, which is also `Subtitles.update`'s own rule.
+   */
+  _pollDialogue() {
+    const ui = this.ctx.peek?.('ui');
+    const subs = ui?.subs;
+    if (!subs) return;
+    const cut = subs.cut;
+    const cutUp = cut?.active === true;
+
+    /*
+     * A CUTSCENE IS NOT A PAUSE, even though `ui`'s arbiter freezes the clock
+     * for one (`_wants.cut`). Gating on `isPaused()` alone would silence every
+     * line in the game — the only ones it must silence are the lines a player
+     * walked away from into the pause menu, the map or the phone.
+     */
+    const held = !cutUp && ui.isPaused?.() === true;
+    if (held) {
+      // Identity is deliberately NOT reset: on resume the poller sees the same
+      // line it already spoke and stays quiet, which is what "no doubling"
+      // means. The bed comes back up on the mixer's own release.
+      if (!this._dlgHeld) { this.vox.stop('paused'); this._dlgHeld = true; }
+      return;
+    }
+    this._dlgHeld = false;
+
+    if (cutUp) {
+      this._barkT = -1;
+      const lines = cut.lines;
+      const idx = cut.idx | 0;
+      if (lines === this._cutLines && idx === this._cutIdx) return;
+      this._cutLines = lines;
+      this._cutIdx = idx;
+      const l = Array.isArray(lines) ? lines[idx] : null;
+      if (l && l.text) this.dialogue(l.who, l.text, 0, { source: 'cutscene' });
+      else this.vox.stop('empty');
+      return;
+    }
+    if (this._cutLines) {
+      this._cutLines = null;
+      this._cutIdx = -1;
+      this.vox.stop('scene-end');
+    }
+
+    if (!subs.active) { this._barkT = -1; return; }
+    // `t` counts up within a line and is reset to 0 by `_next()`, so a fall is
+    // the only edge there is. `life` is the bar's OWN display duration — read,
+    // not re-derived, so a change to its formula moves the read with it.
+    const t = subs.t ?? 0;
+    if (this._barkT < 0 || t < this._barkT) {
+      const text = subs.line?.textContent ?? '';
+      const who = subs.who?.textContent ?? '';
+      if (text) this.dialogue(who, text, subs.life ?? 0, { source: 'subtitle' });
+    }
+    this._barkT = t;
   }
 
   setMasterVolume(v) { this.mixer?.setMasterVolume(v); }
@@ -1464,6 +1632,10 @@ export class AudioSystem {
     ev.emit('game:service', { kind: 'refuel', phase: 'done', progress: 1 });
     ev.emit('ui:station', { id: 'gold' });
     this.radio.tune('grease');
+    // A story line last, so the storm also exercises the read, the side-chain
+    // and the dialogue:start/:end pair through the real event bus.
+    this.dialogue('carson', 'Every time it rains in this town I think of the bridge.', 0,
+      { source: 'debugStorm' });
     return {
       ok: true, voices: this.field.stats.active, tracked: this.field.stats.tracked,
       errors: this.stats.errors,
@@ -1514,6 +1686,13 @@ export class AudioSystem {
       vehicles: this.vehicles ? { ...this.vehicles.stats } : null,
       radio: this.radio ? { ...this.radio.stats } : null,
       police: this.police ? { ...this.police.stats } : null,
+      dialogue: {
+        lines: this.stats.dialogue,
+        speaking: this.vox?.sounding() ?? false,
+        speaker: this.vox?.id ?? '',
+        barksYielded: this.stats.barksYielded,
+        musicDuck: +(this.mixer?.buses?.music?.duckAmount ?? 0).toFixed(3),
+      },
       city: this.ambience?.report ?? null,
       updateMs: +this.stats.ms.toFixed(3),
       events: this.stats.events,

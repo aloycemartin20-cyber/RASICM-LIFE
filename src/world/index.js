@@ -63,6 +63,19 @@ const DET_JOBS_OVERRIDE = Number(_qs?.get('owBuildJobs')) || 0;
  * failed is not evidence of anything (ARCHITECTURE rule 12).
  */
 const STALE_TILE_LOADS = _qs?.get('owStaleTileLoads') === '1';
+/**
+ * NEGATIVE CONTROL for the amortised sector attach and the banded terrain-patch
+ * rebuild: `?owNoAmortise=1` puts both back the way they were — a finished
+ * sector's whole Group joins the scene in the build job that finished it, and
+ * the 81x81 collision patch is refilled in one.
+ *
+ * This exists because the fix is only visible as an ABSENCE (a hitch that did
+ * not happen), and an absence is exactly what a harness cannot distinguish from
+ * a harness that measured nothing. `tools/perfcheck.mjs --drive` runs both arms
+ * off ONE build, which is the only way to A/B a frame time honestly on a
+ * machine that is also doing something else.
+ */
+const NO_AMORTISE = _qs?.get('owNoAmortise') === '1';
 
 /**
  * Run `fn` with a render target bound, so every program compiled inside it gets
@@ -170,6 +183,22 @@ const COL_DROP = 72;
  */
 const TCOL_HALF = 320;
 const TCOL_STEP = 8;
+/**
+ * Meshes finished road sectors may join the scene with PER FRAME.
+ *
+ * A COUNT, not a millisecond budget, and drained from `update()` rather than
+ * from the job queue — see the long note in `_streamSectors` for why the queue
+ * cannot bound this. RATCHET: this is where the measurement below was taken,
+ * not a derived optimum. Lower it if a frame is ever caught carrying more
+ * geometry uploads than this; raise it only with a fresh `--drive` reading.
+ */
+const SECTOR_ATTACH_PER_FRAME = 6;
+/**
+ * Rows of the terrain collision patch rebuilt per build job on the AMORTISED
+ * path. `_updateTerrainCollider` explains why the teleport path is never
+ * amortised and this one always is.
+ */
+const TCOL_ROWS_PER_JOB = 12;
 
 /**
  * THE SAFETY NET — a coarse ground sheet over the WHOLE city, resident from
@@ -361,6 +390,11 @@ export class WorldSystem {
     this._physDirty = false;
     this._physFrame = -999;
     this._sectorJobs = 0;
+    /**
+     * Sector records whose meshes are built but not yet in the scene, oldest
+     * first. Drained by `_pumpAttach` at a fixed number of meshes per frame.
+     */
+    this._attachQ = [];
     this._stats = { sectors: 0, tiles: 0, tris: 0, buildMs: 0 };
     this._now = typeof performance !== 'undefined' ? () => performance.now() : () => Date.now();
     this._camPos = new THREE.Vector3();
@@ -537,6 +571,10 @@ export class WorldSystem {
     // DET_JOBS_PER_FRAME. Play keeps its wall-clock budget untouched, because a
     // frame that overruns is a stutter.
     this.queue.run(q.tileBuildBudgetMs ?? 5, this._now, this._jobBudget(ctx));
+    // AFTER the queue, and outside its budget on purpose: this is a per-frame
+    // COUNT of geometry uploads, and its cost lands in the renderer rather than
+    // here. See `_streamSectors`.
+    this._pumpAttach();
     this._stats.buildMs = this._now() - t0;
 
     if (this._physDirty && ctx.time.frame - this._physFrame > 12) {
@@ -546,7 +584,10 @@ export class WorldSystem {
     }
 
     // Idle bookkeeping for `streamingIdle()` / the capture harness.
-    if (this.queue.pending === 0 && this._sectorJobs === 0 && this._colJobs === 0 && this.terrainMesh.ready) {
+    if (
+      this.queue.pending === 0 && this._sectorJobs === 0 && this._colJobs === 0 &&
+      this._attachQ.length === 0 && this.terrainMesh.ready
+    ) {
       this._idleFrames++;
       if (!this._ready) {
         this._ready = true;
@@ -592,6 +633,7 @@ export class WorldSystem {
       this.queue.pending === 0 &&
       this._sectorJobs === 0 &&
       this._colJobs === 0 &&
+      this._attachQ.length === 0 &&
       this.terrainMesh.ready &&
       this._idleFrames >= 3
     );
@@ -655,12 +697,45 @@ export class WorldSystem {
         this._dropSector(rec);
       }
       for (const [sx, sz, d2] of d.add) {
-        const rec = { sx, sz, group: null, job: null };
+        const rec = { sx, sz, group: null, job: null, pend: null, pendI: 0 };
         this._sectors.live.set(this._sectors.key(sx, sz), rec);
         if (!this.roadMesh.hasWork(sx, sz)) continue;
         this._sectorJobs++;
         rec.job = this.roadMesh.begin(sx, sz);
         const pri = d2 < SECTOR * SECTOR ? 0 : d2 < SECTOR * SECTOR * 6 ? 2 : 4;
+        /**
+         * THE ATTACH IS THE EXPENSIVE HALF, and it is not in the build job.
+         *
+         * `SectorBuild.finish()` returns a Group carrying ONE MESH PER MATERIAL
+         * KEY — asphalt, kerb, walk, verge, riser, drain, cover, rail steel and
+         * every `line_*` / `mark_*` class the sector used. Adding that Group to
+         * the scene in one go hands the renderer all of them at once, and three
+         * uploads them all on the next frame it draws them: MEASURED on a
+         * scripted 45 m/s drive, every frame over 25 ms carried a geoDelta of
+         * 22-55, which is one or two sector attaches and nothing else.
+         *
+         * `q.tileBuildBudgetMs` cannot help with that, and CHUNKING IT INSIDE
+         * THE JOB QUEUE DOES NOT EITHER — that was tried first and MEASURED not
+         * to work: worst geoDelta on a hitch went 44 -> 58, the wrong way.
+         * Adding four meshes to a Group costs microseconds, so a 5 ms build
+         * budget happily runs fourteen of those chunks back to back and hands
+         * the renderer the same fifty-odd geometries on the same frame. The
+         * queue's budget is denominated in the wrong thing for this work: the
+         * cost is not the CPU spent attaching, it is the GPU upload that lands
+         * later, where no budget is looking.
+         *
+         * So the attach is drained from `update()` under a per-FRAME ceiling on
+         * MESHES (`SECTOR_ATTACH_PER_FRAME`) instead — a count, not a clock,
+         * which is also what rule 8's deterministic exception wants, so capture
+         * mode needs no separate path.
+         *
+         * The visible consequence of a partial attach is a sector that has its
+         * carriageway before it has its lane paint, for the handful of frames
+         * the meshes take. That is strictly better than the same sector
+         * arriving whole on a 60 ms frame, and `streamingIdle()` still refuses
+         * to report idle while any mesh is outstanding, so no capture can
+         * photograph one.
+         */
         const pump = () => {
           // `_dropSector` nulls the job and does the decrement itself, so a
           // stale pump left in the queue must do nothing at all.
@@ -677,11 +752,22 @@ export class WorldSystem {
           const out = rec.job.finish();
           rec.job = null;
           rec.group = out.group;
-          this.root.add(out.group);
           this._stats.tris += out.tris;
-          const far = this._far.get(`${sx},${sz}`);
-          if (far) far.visible = false;
-          this._sectorJobs--;
+          // Hold every mesh OUT of the scene; `_pumpAttach` lets them in. The
+          // Group itself goes in now so nothing else has to know it is still
+          // filling.
+          if (NO_AMORTISE) {
+            this.root.add(out.group);
+            const far0 = this._far.get(`${sx},${sz}`);
+            if (far0) far0.visible = false;
+            this._sectorJobs--;
+            return;
+          }
+          rec.pend = out.group.children.slice();
+          rec.pendI = 0;
+          out.group.clear();
+          this.root.add(out.group);
+          this._attachQ.push(rec);
         };
         this.queue.push(pump, pri);
       }
@@ -781,9 +867,59 @@ export class WorldSystem {
     rec.colMesh = null;
   }
 
+  /**
+   * Let finished sectors into the scene, at most `SECTOR_ATTACH_PER_FRAME`
+   * meshes per frame across all of them.
+   *
+   * Oldest first, so the sector that has been half-drawn the longest finishes
+   * before a newer one starts — a road with no lane paint for four frames is
+   * fine, six of them at once is not.
+   */
+  _pumpAttach() {
+    let left = SECTOR_ATTACH_PER_FRAME;
+    while (left > 0 && this._attachQ.length) {
+      const rec = this._attachQ[0];
+      if (!rec.pend) { this._attachQ.shift(); continue; }
+      const end = Math.min(rec.pend.length, rec.pendI + left);
+      for (; rec.pendI < end; rec.pendI++) {
+        rec.group.add(rec.pend[rec.pendI]);
+        left--;
+      }
+      if (rec.pendI < rec.pend.length) return;
+      rec.pend = null;
+      rec.pendI = 0;
+      this._attachQ.shift();
+      const far = this._far.get(`${rec.sx},${rec.sz}`);
+      if (far) far.visible = false;
+      this._sectorJobs--;
+    }
+  }
+
+  /**
+   * Free the meshes a partly-attached sector never got into the scene.
+   *
+   * Rule 6 with a twist: these are geometries `world` created that no parent
+   * ever adopted, so nothing else can free them. `_dropSector`'s child sweep
+   * only reaches what is already in the Group.
+   */
+  _discardPending(rec) {
+    if (!rec.pend) return;
+    for (let i = rec.pendI; i < rec.pend.length; i++) rec.pend[i].geometry?.dispose();
+    rec.pend = null;
+    rec.pendI = 0;
+  }
+
   _dropSector(rec) {
     if (rec.job) {
       rec.job = null;
+      this._sectorJobs = Math.max(0, this._sectorJobs - 1);
+    } else if (rec.pend) {
+      // Built, part-attached, and dropped mid-attach. Take it out of the attach
+      // queue and do the decrement here — exactly once, same contract as the
+      // job above.
+      const i = this._attachQ.indexOf(rec);
+      if (i >= 0) this._attachQ.splice(i, 1);
+      this._discardPending(rec);
       this._sectorJobs = Math.max(0, this._sectorJobs - 1);
     }
     if (rec.group) {
@@ -835,9 +971,28 @@ export class WorldSystem {
         idx[k++] = a + 1;
       }
     }
+    /**
+     * THE PATCH IS FILLED INTO SCRATCH, NEVER IN PLACE.
+     *
+     * The amortised rebuild writes a band of rows per build job, so for the
+     * handful of frames that takes, the sheet would otherwise be half at the
+     * old centre and half at the new — a torn collision surface under whatever
+     * is driving on it. Filling scratch and copying once at `publish` makes the
+     * amortisation invisible to physics: the collision world holds the PREVIOUS
+     * complete patch right up to the frame it is handed the next complete one.
+     *
+     * SAID HONESTLY: this was written to explain a collision-rate regression it
+     * turned out not to cause. The traffic harness runs under `?capture=1`,
+     * where the build queue is JOB-denominated, and it scored 49 impacts either
+     * way, to the impact. The tear is real on the WALL-CLOCK path the player is
+     * on and this closes it; it is not evidence, because nothing has measured
+     * it. If you need that evidence, the shape of it is a harness that drives
+     * over a 48 m snap boundary without capture mode's job budget.
+     */
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
     g.setIndex(new THREE.BufferAttribute(idx, 1));
+    this._tcScratch = new Float32Array(pos.length);
     this._tcMesh = new THREE.Mesh(g, INVISIBLE);
     this._tcMesh.name = 'terrain_col';
     this._tcMesh.visible = false;
@@ -847,6 +1002,8 @@ export class WorldSystem {
     this._tcHandle = -1;
     this._tcx = NaN;
     this._tcz = NaN;
+    /** Rebuild generation — see the amortised path in `_updateTerrainCollider`. */
+    this._tcSeq = 0;
   }
 
   /**
@@ -1061,12 +1218,18 @@ export class WorldSystem {
       Math.abs(cz - this._tcz) > TCOL_HALF * 0.5;
     this._tcx = cx;
     this._tcz = cz;
-    const build = () => {
+    /**
+     * Fill rows [j0, j1) of the patch. 81 x 81 vertices is 6561 `heightAt` calls
+     * plus two airfield-deck lookups each, and it lands in ONE build job — which
+     * the queue cannot preempt, so the whole thing is charged to whatever frame
+     * it starts on however small `tileBuildBudgetMs` is. On the amortised path
+     * it now goes a band at a time.
+     */
+    const rows = (j0, j1) => {
       const n = this._tcN;
-      const pos = this._tcMesh.geometry.getAttribute('position');
-      const arr = pos.array;
+      const arr = this._tcScratch;
       const t = this.terrain;
-      for (let j = 0; j < n; j++) {
+      for (let j = j0; j < j1; j++) {
         const zz = cz - TCOL_HALF + j * TCOL_STEP;
         for (let i = 0; i < n; i++) {
           const xx = cx - TCOL_HALF + i * TCOL_STEP;
@@ -1088,6 +1251,11 @@ export class WorldSystem {
           arr[k + 2] = zz;
         }
       }
+    };
+    /** Hand the filled patch to the collision world. Cheap; never split. */
+    const publish = () => {
+      const pos = this._tcMesh.geometry.getAttribute('position');
+      pos.array.set(this._tcScratch);
       pos.needsUpdate = true;
       this._tcMesh.geometry.computeBoundingSphere();
       if (this.physics) {
@@ -1097,15 +1265,49 @@ export class WorldSystem {
       }
     };
     if (jumped) {
-      build();
+      rows(0, this._tcN);
+      publish();
       // And publish it THIS frame, not in twelve: `_physDirty` is normally
       // rate-limited, which is fine for a road tile and not fine for the floor.
       this._physDirty = false;
       this._physFrame = this.ctx.time.frame;
       this.physics?.rebuildStatic?.();
-    } else {
-      this.queue.push(build, 1);
+      this._tcSeq++;
+      return;
     }
+    /**
+     * AMORTISED, in bands, and the sequence number is what makes that safe.
+     *
+     * The patch is written IN PLACE, so while the bands are running the sheet
+     * is part new centre and part old — but it is never handed to `physics`
+     * until `publish` runs, and until then the collision world still holds the
+     * PREVIOUS complete patch. The one thing that must not happen is two
+     * overlapping rebuilds interleaving their rows (a 48 m snap crossed twice
+     * inside one drain of the queue), which would publish a sheet stitched from
+     * two centres. `_tcSeq` is stamped at schedule time and re-checked in every
+     * band, so a superseded rebuild abandons itself and the newest one wins
+     * whole.
+     */
+    const seq = ++this._tcSeq;
+    if (NO_AMORTISE) {
+      this.queue.push(() => {
+        if (this._tcSeq !== seq) return;
+        rows(0, this._tcN);
+        publish();
+      }, 1);
+      return;
+    }
+    for (let j0 = 0; j0 < this._tcN; j0 += TCOL_ROWS_PER_JOB) {
+      const j1 = Math.min(this._tcN, j0 + TCOL_ROWS_PER_JOB);
+      this.queue.push(() => {
+        if (this._tcSeq !== seq) return;
+        rows(j0, j1);
+      }, 1);
+    }
+    this.queue.push(() => {
+      if (this._tcSeq !== seq) return;
+      publish();
+    }, 1);
   }
 
   /* ==================================================================== */

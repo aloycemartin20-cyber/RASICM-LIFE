@@ -11,8 +11,33 @@ const _proj = { x: 0, y: 0, dist: 0, behind: false, offscreen: false, angle: 0 }
 function project(pos, camera, w, h, margin) {
   _v.copy(pos);
   const dist = _v.distanceTo(camera.position);
+  /**
+   * BEHIND IS A DOT PRODUCT, NOT AN NDC TEST — because this renderer's depth
+   * is REVERSED.
+   *
+   * This read `_v.z > 1` after `project()`, which is the correct test for a
+   * conventional projection (near -> -1, far -> +1) and is NEVER TRUE here:
+   * `render` runs a reversed-Z pipeline (near -> 1, far -> 0), so a point
+   * behind the lens comes back at z ~= 0. MEASURED on a live frame with an
+   * objective 978 m directly astern: `ndc.z = -0.0001`, `behind = false`.
+   *
+   * Everything downstream of the flag was therefore dead for every
+   * behind-the-player target: the mirror below never ran, so the marker drew
+   * at the projection's ANTIPODE — the wrong side of the screen — the chevron
+   * never replaced the diamond, and a target you had turned your back on was
+   * drawn as an on-screen diamond a few dozen pixels from the crosshair with a
+   * distance of nearly a kilometre on it.
+   *
+   * The camera's own forward axis answers the question in any depth
+   * convention: `matrixWorld` columns are [right, up, BACKWARD], so forward is
+   * the negated third column and the sign of the dot is the whole test.
+   */
+  const e = camera.matrixWorld.elements;
+  const behind =
+    (pos.x - camera.position.x) * -e[8] +
+    (pos.y - camera.position.y) * -e[9] +
+    (pos.z - camera.position.z) * -e[10] <= 0;
   _v.project(camera);
-  const behind = _v.z > 1;
   let x = (_v.x * 0.5 + 0.5) * w;
   let y = (-_v.y * 0.5 + 0.5) * h;
   if (behind) {
@@ -26,12 +51,32 @@ function project(pos, camera, w, h, margin) {
   let dy = y - cy;
   const mx = w * 0.5 - margin;
   const my = h * 0.5 - margin;
+  /**
+   * A BEHIND-CAMERA TARGET IS PUSHED OUT TO THE RIM, NOT LEFT NEAR THE MIDDLE.
+   *
+   * The mirror above maps a point directly behind the lens to somewhere near
+   * screen CENTRE, and the old test only ever clamped points that were already
+   * outside the safe area — so an objective straight behind the player drew its
+   * chevron a few dozen pixels from the crosshair, pointing at nothing the eye
+   * could follow, while the whole grammar of the widget says "on the edge, in
+   * the direction you must turn". The same `Math.min` ratio SCALES UP as
+   * happily as it clamps down, so one condition covers both.
+   */
+  const ax = Math.abs(dx);
+  const ay = Math.abs(dy);
   let off = behind;
-  if (Math.abs(dx) > mx || Math.abs(dy) > my) {
+  if (behind || ax > mx || ay > my) {
     off = true;
-    const s = Math.min(mx / (Math.abs(dx) || 1e-4), my / (Math.abs(dy) || 1e-4));
-    dx *= s;
-    dy *= s;
+    if (ax < 1e-3 && ay < 1e-3) {
+      // Dead astern, with no bearing left in the projection: six o'clock is
+      // the honest answer and the chevron points down at it.
+      dx = 0;
+      dy = my;
+    } else {
+      const s = Math.min(mx / (ax || 1e-4), my / (ay || 1e-4));
+      dx *= s;
+      dy *= s;
+    }
   }
   _proj.x = cx + dx;
   _proj.y = cy + dy;
@@ -61,6 +106,108 @@ const GLYPH = 22;
  */
 const FADE_FLOOR = 0.55;
 const CHEVRON_FLOOR = 0.8;
+
+/**
+ * ---------------------------------------------------------------------------
+ * RIM DE-COLLISION — two off-screen objectives are not one objective
+ * ---------------------------------------------------------------------------
+ * `project()` clamps an off-screen target to the safe-area rectangle along the
+ * ray from screen centre, so any two targets on a similar BEARING land on the
+ * same rim point however far apart they are in the world. MEASURED on a live
+ * frame with two live objectives behind the player — RENDEZVOUS at 982 m and
+ * CRATE at 1295 m — both chevrons, both distance readouts and both names drew
+ * on top of each other, and the pair read as one marker with a smeared label.
+ *
+ * The fix is a one-dimensional problem, so it is solved in one dimension: a
+ * clamped point lies ON the rim rectangle, so it has a single perimeter
+ * coordinate, and separating labels along that coordinate is the classic
+ * spread. Sliding along the rim keeps every chevron on the boundary and moves
+ * it the SHORTEST distance that makes it readable, which is what preserves the
+ * bearing — pushing them radially inward instead would put an "off-screen"
+ * marker in the middle of the picture.
+ *
+ * On-screen markers are left alone: they are at their true projected position
+ * and moving one would be a lie about where the thing is.
+ */
+/**
+ * Minimum gap between two rim markers, CSS px before `k`.
+ *
+ * SIZED FOR THE LABEL, NOT FOR THE GLYPH. The first cut used 58 — a little
+ * over the 44 px glyph box — and MEASURED on the emitted layout that still
+ * overprinted: at k = 0.667 the pair came out 38.7 px apart while
+ * "RENDEZVOUS" alone draws 53 px wide, so the two names still touched by
+ * 2.6 px with the chevrons cleanly separated. The name is the widest part of a
+ * marker and the part that is unreadable when it collides, so the spacing is
+ * set from it: ~96 px clears a ten-character objective name beside a short one
+ * at every scale, and the rim has 5 400 px of perimeter at 1080p to spend.
+ */
+const RIM_SEP = 96;
+/** Preallocated spread workspace — rule 5, never grown per frame. */
+const _rimS = new Float64Array(8);
+const _rimI = new Int32Array(8);
+
+/**
+ * Perimeter coordinate of a point already clamped to the rim rectangle
+ * (half-extents `mx`, `my`, centred on the origin). Runs clockwise from the
+ * middle of the right edge; the total perimeter is `4 * (mx + my)`.
+ */
+export function rimParam(dx, dy, mx, my) {
+  // The clamp in `project()` scales by the SMALLER of mx/|dx| and my/|dy|, so
+  // exactly one axis is pinned. Whichever is proportionally further out is the
+  // edge the point is on; the corner case resolves either way and agrees.
+  if (Math.abs(dx) * my >= Math.abs(dy) * mx) {
+    return dx >= 0 ? dy + my                       // right edge, top -> bottom
+      : 2 * my + 2 * mx + (my - dy);               // left edge, bottom -> top
+  }
+  return dy >= 0 ? 2 * my + (mx - dx)              // bottom edge, right -> left
+    : 4 * my + 2 * mx + (dx + mx);                 // top edge, left -> right
+}
+
+/** Inverse of `rimParam` — writes into `out` (`{x, y}`), never allocates. */
+export function rimPoint(s, mx, my, out) {
+  const P = 4 * (mx + my);
+  let t = s % P;
+  if (t < 0) t += P;
+  if (t < 2 * my) { out.x = mx; out.y = t - my; return out; }
+  t -= 2 * my;
+  if (t < 2 * mx) { out.x = mx - t; out.y = my; return out; }
+  t -= 2 * mx;
+  if (t < 2 * my) { out.x = -mx; out.y = my - t; return out; }
+  t -= 2 * my;
+  out.x = t - mx;
+  out.y = -my;
+  return out;
+}
+
+/**
+ * Push `n` perimeter coordinates apart until no neighbour is within `sep`,
+ * in place, on a CIRCLE of circumference `P`. Order-preserving and symmetric:
+ * a colliding pair splits the correction between them, so neither marker gets
+ * to keep the disputed spot and both stay near their true bearing.
+ *
+ * Two relaxation sweeps rather than an exact solve — with the six markers the
+ * pool can hold and a rim of a few thousand pixels, two sweeps converge, and a
+ * cluster too dense to separate degrades to evenly spaced rather than to a
+ * pile. Returns the number of coordinates it moved.
+ */
+export function spreadRim(s, n, sep, P) {
+  if (n < 2) return 0;
+  let moved = 0;
+  for (let pass = 0; pass < 2; pass++) {
+    for (let i = 0; i < n; i++) {
+      const j = (i + 1) % n;
+      let gap = s[j] - s[i];
+      // The last-to-first gap wraps the circle.
+      if (j === 0) gap += P;
+      if (gap >= sep) continue;
+      const push = (sep - gap) * 0.5;
+      s[i] -= push;
+      s[j] += push;
+      moved++;
+    }
+  }
+  return moved;
+}
 
 function diamond(parent) {
   const s = svg('svg', { viewBox: '0 0 16 16' }, parent);
@@ -152,6 +299,50 @@ export class WorldMarkers {
       },
       this.objRoot
     );
+
+    // Per-frame projection scratch for the objective pass, sized to the pool.
+    // Rule 5: `updateObjectives` allocates nothing.
+    const cap = this.objPool.items.length;
+    this._px = new Float64Array(cap);
+    this._py = new Float64Array(cap);
+    this._pd = new Float64Array(cap);
+    this._pa = new Float64Array(cap);
+    this._pe = new Uint8Array(cap);
+    this._rimOut = { x: 0, y: 0 };
+    /** Negative control for `src/ui/rimprobe.mjs` — the overprinting build. */
+    this.debugNoSpread = false;
+  }
+
+  /**
+   * Slide every rim-clamped marker along the safe-area rectangle until no two
+   * are within `RIM_SEP`. See the note above `rimParam`. The chevrons keep the
+   * angle they were projected at, so each still points at its own target.
+   */
+  _spreadEdges(n, cx, cy, mx, my, k) {
+    if (this.debugNoSpread) return 0;
+    let m = 0;
+    for (let i = 0; i < n && m < _rimS.length; i++) {
+      if (!this._pe[i]) continue;
+      const s = rimParam(this._px[i] - cx, this._py[i] - cy, mx, my);
+      // Insertion sort as we collect — n is at most the pool size.
+      let j = m++;
+      while (j > 0 && _rimS[j - 1] > s) {
+        _rimS[j] = _rimS[j - 1];
+        _rimI[j] = _rimI[j - 1];
+        j--;
+      }
+      _rimS[j] = s;
+      _rimI[j] = i;
+    }
+    if (m < 2) return 0;
+    const moved = spreadRim(_rimS, m, RIM_SEP * k, 4 * (mx + my));
+    if (!moved) return 0;
+    for (let q = 0; q < m; q++) {
+      const p = rimPoint(_rimS[q], mx, my, this._rimOut);
+      this._px[_rimI[q]] = cx + p.x;
+      this._py[_rimI[q]] = cy + p.y;
+    }
+    return moved;
   }
 
   /** @param {Array} list [{ position:Vector3, label:'A', name:'CAPTURE', color }] */
@@ -159,30 +350,45 @@ export class WorldMarkers {
     const items = this.objPool.items;
     let n = 0;
     const margin = 74 * k;
+    // PROJECT FIRST, DRAW SECOND. The rim spread is a decision about the whole
+    // SET of markers, so no position can be written until every one is known.
     if (list) {
       for (let i = 0; i < list.length && n < items.length; i++) {
         const o = list[i];
         if (!o?.position) continue;
         const p = project(o.position, camera, w, h, margin);
-        const it = items[n++];
+        const it = items[n];
         if (!it.alive) {
           it.alive = true;
           setStyle(it.node, 'display', '');
         }
-        const node = it.node;
+        this._px[n] = p.x;
+        this._py[n] = p.y;
+        this._pd[n] = p.dist;
+        this._pa[n] = p.angle;
+        this._pe[n] = p.offscreen ? 1 : 0;
+        setText(it.node._letter, o.label ?? '');
+        setText(it.node._dist, metres(p.dist));
+        setText(it.node._name, o.name ?? '');
+        n++;
+      }
+      this._spreadEdges(n, w * 0.5, h * 0.5, w * 0.5 - margin, h * 0.5 - margin, k);
+      for (let i = 0; i < n; i++) {
+        const node = items[i].node;
         const gh = GLYPH * k * 0.5;
-        setStyle(node, 'transform', `translate(${(p.x - GLYPH * k).toFixed(1)}px,${(p.y - gh).toFixed(1)}px)`);
+        setStyle(node, 'transform',
+          `translate(${(this._px[i] - GLYPH * k).toFixed(1)}px,${(this._py[i] - gh).toFixed(1)}px)`);
         setStyle(node, 'width', `${(GLYPH * 2 * k).toFixed(1)}px`);
-        setText(node._letter, o.label ?? '');
-        setText(node._dist, metres(p.dist));
-        setText(node._name, o.name ?? '');
-        const edge = p.offscreen;
+        const edge = this._pe[i] === 1;
         setStyle(node._dia, 'display', edge ? 'none' : '');
         setStyle(node._chev, 'display', edge ? '' : 'none');
         setStyle(node._letter, 'opacity', edge ? '0' : '1');
-        if (edge) setStyle(node._chev, 'transform', `rotate(${p.angle.toFixed(1)}deg)`);
+        // The chevron keeps the angle it was PROJECTED at, not the one the
+        // slid position implies: it points at its own target, which is the
+        // only reason a chevron is on screen at all.
+        if (edge) setStyle(node._chev, 'transform', `rotate(${this._pa[i].toFixed(1)}deg)`);
         // Distant markers dim, but never out — see the floors above.
-        const curve = clamp01(1.15 - p.dist / 260);
+        const curve = clamp01(1.15 - this._pd[i] / 260);
         const fade = Math.max(edge ? CHEVRON_FLOOR : FADE_FLOOR, curve);
         setStyle(node, 'opacity', fade.toFixed(3));
       }

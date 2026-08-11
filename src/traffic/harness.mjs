@@ -22,6 +22,9 @@
  *   node src/traffic/harness.mjs --render=1             (draw frames too)
  *   node src/traffic/harness.mjs --json=/tmp/tr.json
  *   node src/traffic/harness.mjs --isolate              (silence police)
+ *   node src/traffic/harness.mjs --query=owNoFarRing=1  (any URL hatch, e.g. the
+ *       far ring's negative control — so a behaviour change can be bisected
+ *       against the SAME build rather than against a rebuild)
  *   node src/traffic/harness.mjs --control              (NEGATIVE CONTROL:
  *       run the live build with the derby fixes' debug hatches flipped —
  *       trap refusal, recovery cap, lane adoption and the queue-head wedge
@@ -120,7 +123,10 @@ page.on('console', (m) => {
 let failure = null;
 let report = null;
 try {
-  await page.goto(`http://127.0.0.1:${PORT}/?capture=1&lockstep=1&prewarm=0&q=${QUALITY}`, {
+  await page.goto(
+    `http://127.0.0.1:${PORT}/?capture=1&lockstep=1&prewarm=0&q=${QUALITY}` +
+      (args.query ? `&${args.query}` : ''),
+    {
     waitUntil: 'domcontentloaded',
     timeout: 120000,
   });

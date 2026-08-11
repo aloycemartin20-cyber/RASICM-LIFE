@@ -192,6 +192,32 @@ const BOSS_FILL_RATE = 9;
 const BOSS_CHIP_RATE = 2.1;
 
 /**
+ * How long a `mission:boss` record stays believable, in SIMULATED seconds.
+ *
+ * THE BAR'S LIVENESS IS READ OFF ITS OWN STREAM, NOT OFF `hud.objective`.
+ * It used to be `this._bossOn && hud?.objective` — the fight's `active` flag
+ * ANDed with a field belonging to a different producer — and that inference is
+ * a defect with a paper trail: `src/game/index.js` carries a whole paragraph
+ * warning the next author not to make `objective` fall back to the next
+ * chapter, *because it would leave a dead rival's health bar over an empty
+ * street*. A backstop that turns a one-line change three files away into a
+ * visible HUD bug is a coupling, not a backstop.
+ *
+ * `src/game/boss.js` publishes once per fight tick (`publish(g, B, phase,
+ * hpFrac, true)`), so the stream itself says whether a fight is live: a record
+ * carrying `active: true`, arriving recently. Every hole the `objective` test
+ * covered — a chapter that completes, fails, or is replaced without ever
+ * saying `active: false` — is covered by the record simply stopping.
+ *
+ * SIMULATED time, never raw: the publisher runs on the game clock, so a
+ * MISSION FAILED card or a pause menu (scale 0) must not age the record out
+ * from under a fight that is still there. 0.35 s is ~21 frames — comfortably
+ * past any single-frame hitch and well inside the 0.5 s `wardprobe` allows
+ * itself between aborting the chapter and demanding the bar be gone.
+ */
+const BOSS_STALE = 0.35;
+
+/**
  * Name, weak point, phase ticks and a smoothly depleting meter.
  *
  * Driven from `mission:boss` (`src/game/boss.js`) — the fight publishes its own
@@ -424,6 +450,8 @@ export class HudSystem {
      */
     this._boss = { name: '', weak: '', colour: '', phase: 0, phases: 1, health: 1 };
     this._bossOn = false;
+    /** `time.elapsed` of the last live record. See `BOSS_STALE`. */
+    this._bossAt = -1e9;
     this._onBoss = (p) => {
       if (!p || p.active !== true || !Number.isFinite(p.health)) {
         this._bossOn = false;
@@ -433,13 +461,15 @@ export class HudSystem {
       b.name = p.name; b.weak = p.weak; b.colour = p.colour;
       b.phase = p.phase; b.phases = p.phases; b.health = p.health;
       this._bossOn = true;
+      this._bossAt = this.ctx.time.elapsed;
     };
     /**
-     * Three canonical lifecycle events as well, and each one closes a hole the
-     * others do not: a chapter that FAILS or COMPLETES stops emitting without
-     * ever saying `active:false`, and a chapter that is replaced (abort, then
-     * the next `startMission` in the same breath) says nothing at all. The
-     * `objective` backstop in `lateUpdate` catches even that.
+     * Three canonical lifecycle events as well, and each one drops the bar in
+     * the SAME FRAME rather than waiting out `BOSS_STALE`: a chapter that FAILS
+     * or COMPLETES stops emitting without ever saying `active:false`. A chapter
+     * that is replaced (abort, then the next `startMission` in the same breath)
+     * says nothing at all, and the staleness test in `lateUpdate` is what
+     * catches that one.
      */
     this._off = [
       ctx.events.on('mission:boss', this._onBoss),
@@ -469,9 +499,10 @@ export class HudSystem {
     else this.bar.hide();
     this.bar.update(rawDt);
 
-    // `objective` is null the moment the runner has no live chapter, so this is
-    // the one condition that cannot be missed by an event that never fired.
-    if (this._bossOn && hud?.objective) this.boss.set(this._boss);
+    // The fight's OWN flag, plus the freshness of the record carrying it —
+    // nothing else. See `BOSS_STALE` for why this is not `hud.objective`.
+    const live = this._bossOn && ctx.time.elapsed - this._bossAt < BOSS_STALE;
+    if (live) this.boss.set(this._boss);
     else this.boss.hide();
     this.boss.update(rawDt);
   }

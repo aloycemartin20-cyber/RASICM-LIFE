@@ -23,6 +23,41 @@
 
 import { TUNE, KIND_RANK, hashF, wrapPi } from './tune.js';
 
+/*
+ * WHERE THE STOPPED CARS ACTUALLY ARE — measured, because three other answers
+ * were being guessed at.
+ *
+ * "About a third of live drivers are sitting at zero speed" was read as a bug in
+ * the wedge resolver, or in spawn placement, or as scheduler starvation. It is
+ * none of the three. MEASURED, `node src/traffic/harness.mjs --minutes=3
+ * --isolate`, downtown at 17:12, 180 simulated seconds, 27 drivers:
+ *
+ *   car-frames below 1 m/s                        45.3 %
+ *   ...of those, stopped BY REASON:
+ *       light                                     76.4 %   (100 406 samples)
+ *       following a leader inside 6 m              9.6 %
+ *       no light, no leader, no errand             8.8 %
+ *       world geometry across the carriageway      4.2 %
+ *       gridlock / give-way / panic / recovery     1.0 %
+ *   the harness's own "stopped without a reason"   4.15 %
+ *
+ * So three quarters of the stopped time is a car waiting at a red light, which
+ * is what a car in a signalised grid does. The phase table below is why there
+ * is so much of it: the minor phase's red is `gA + AMBER + PED` = 24.6 s of a
+ * 45.2 s cycle, so an approach on that phase is legally stopped 54% of the time
+ * before any queue forms. That is a DESIGN NUMBER, not a defect, and shortening
+ * it is a throughput trade that has to be made against `signalAt`'s own measured
+ * history — a residential grid fully signalised measured 39% of car-frames
+ * stopped at 9 km/h, "technically correct, visually dead".
+ *
+ * The genuinely illegitimate fraction — stopped with no light, no leader and no
+ * errand — is 4.15%, and it is the only number here worth chasing. The lever
+ * that moved what a PLAYER sees was not this file at all: spreading the same
+ * cars over a 380 m envelope instead of a 175 m one (`TUNE.spawnFar`) doubled
+ * the moving cars in frame at street level, because the added road is open
+ * arterial rather than more of the same signalised grid.
+ */
+
 /** Phase table, seconds. Index order: A green, A amber, ped, B green, B amber, ped. */
 const AMBER = 3.0;
 const PED = 2.6;

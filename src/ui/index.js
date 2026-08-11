@@ -32,6 +32,16 @@ const MAX_BLIPS = 64;
 const RADAR_FLASH = 1.8;
 
 /**
+ * The docked EXIT chip: what it fades to once the entry beat has passed, and
+ * the altitude above which it is not offered at all. Four metres is a step off
+ * a kerb from a hovering helicopter and a fall from anything else.
+ */
+const EXIT_DIM = 0.4;
+const EXIT_ALT = 4;
+/** A seated prompt that is only "here is how you get out". See `setPrompt`. */
+const EXIT_LINE = /^\s*(EXIT|LEAVE|GET OUT|STEP OUT)\b/i;
+
+/**
  * ===========================================================================
  * THE PAUSE ARBITER — the ONE owner of `ctx.time.scale`
  * ===========================================================================
@@ -417,7 +427,16 @@ const bootFlow = installBoot();
  *   game.getHudState()   -> { money, respect, objective, chapter }
  *   game.getStoryOverview() -> the chapter list (optional; a fallback is
  *                             assembled from duck-typed game internals)
- *   vehicles.getHudState()-> { health, fuel, fuelDry, speedKmh, ... } | null
+ *   vehicles.getHudState()-> { health, fuel, fuelDry, noFuel, speedKmh, rpm,
+ *                             redline, gear, flying, altitude, climbRate,
+ *                             rotor, submerged, drowned, ... } | null
+ *                             — the whole seated cluster, ground and air
+ *   player.vehicle        -> the live machine, for the three facts its HUD
+ *                             state does not carry: `spec.flight.Vref` (the
+ *                             stall band), `spec.gearbox.gears` (the pip rack)
+ *                             and the body quaternion (the horizon). Read at
+ *                             runtime in `_readVehicleBody`, never imported;
+ *                             every one is optional and absence draws nothing.
  *   peds.getHudActors()  -> [{ position|pos|x/z, kind|friendly, heading }]
  *   audio.station        -> current radio station id
  *
@@ -577,8 +596,21 @@ export class UiSystem {
       reloading: false, reloadProgress: 0,
       // world
       x: 0, z: 0, heading: 0, speed: 0, inVehicle: false, street: '',
-      // the vehicle meter cluster — a field of -1 means "no producer, hide it"
-      veh: { on: false, health: -1, fuel: -1, nitro: -1, nitroOn: false, dry: false },
+      /**
+       * The seated cluster — a field of -1 means "no producer, hide it".
+       *
+       * Everything below `dry` is what `vehicles.getHudState()` has been
+       * publishing since the airframes landed and nothing was drawing:
+       * `flying`, `altitude`, `climbRate`, `rotor`, `submerged`, `drowned`,
+       * `noFuel`, `rpm`, `redline`, `gear`. `vref` and `gearCount` are read off
+       * the live vehicle's own spec — see `_pullState`.
+       */
+      veh: {
+        on: false, health: -1, fuel: -1, nitro: -1, nitroOn: false, dry: false,
+        noFuel: false, kind: '', speedKmh: 0, speed: 0, rpm01: 0, gear: '—',
+        gearCount: 0, flying: false, altitude: 0, climb: 0, rotor: 0, vref: 0,
+        pitch: 0, bank: 0, submerged: 0, drowned: false,
+      },
       // economy / heat
       money: 0, respect: 0, wanted: 0, wantedCooldown: 1, hunting: true,
       // character / radio
@@ -681,7 +713,12 @@ export class UiSystem {
     this._apiAction = null;
     this._exitPromptT = 0;
     this._exitPromptShown = false;
-    this._exitPrompt = { key: 'F', text: 'EXIT', sub: '' };
+    this._exitPrompt = { key: 'F', text: 'EXIT', sub: '', placement: 'dock', host: null, dim: 1 };
+    /** One reused record for `setPrompt` — see the note there. */
+    this._promptRec = {
+      key: 'F', text: '', sub: '', progress: undefined,
+      placement: 'centre', host: null, dim: 1,
+    };
     this._lastPromptText = '';
     this._promptVerb = 'USE';
     this._promptIcon = 'hand';
@@ -871,16 +908,23 @@ export class UiSystem {
       if (name) this.titleCard(ch, name, e?.zone ?? '');
       if (e?.lines) this.playScene(e.lines);
     });
+    // `carded: true` on the payload means the emitter drew its own card (the
+    // mission runner does, with the split payout rows and the true WASTED /
+    // BUSTED kind). This listener is the fallback for emitters with none —
+    // `jobs._endLite` — and standing down on `carded` is what keeps every
+    // mission end to ONE card and ONE sting. See `MissionRunner._finish`.
     on('mission:complete', (e) => {
+      this.clearObjective();
+      if (e?.carded) return;
       this.card('passed', e?.name ?? '', [
         { value: '$' + (e?.cash ?? 0).toLocaleString('en-US'), label: 'CASH' },
         { value: '+' + (e?.respect ?? 0), label: 'RESPECT' },
       ]);
-      this.clearObjective();
     });
     on('mission:fail', (e) => {
-      this.card('failed', e?.reason ?? '', []);
       this.clearObjective();
+      if (e?.carded) return;
+      this.card('failed', e?.reason ?? '', []);
     });
 
     /**
@@ -1016,6 +1060,47 @@ export class UiSystem {
     const pos = p?.position ?? p?.getPosition?.();
     if (pos && pos.isVector3) return this._pos.copy(pos);
     return this._pos.copy(this.ctx.camera.position);
+  }
+
+  /**
+   * The three facts the instrument panel needs that `vehicles.getHudState()`
+   * does not publish: the airframe's stall reference, how many forward gears
+   * the box has, and the body's ATTITUDE.
+   *
+   * Read off the live vehicle at runtime through `ctx.peek('player')` — never
+   * an import (rule 2), and exactly the shape `_updateAction` already uses to
+   * watch `player.vehicles.stats.exitBlocked`. Every field is optional and
+   * every failure is "draw no instrument", never a wrong one: `vref` 0 hides
+   * the stall band, `gearCount` 0 hides the pip rack, and a missing quaternion
+   * leaves the horizon level rather than inventing an attitude.
+   *
+   * Attitude is computed from the body quaternion the same way
+   * `src/ui/aircraftprobe.mjs` reads it — local +Z is the nose, +X the right
+   * wing — so the panel and the gate cannot disagree about which way is up.
+   * `vehicles` publishing `vref` / `gearCount` / `pitch` / `bank` on its HUD
+   * state would let all of this go; that is a followup in its directory.
+   */
+  _readVehicleBody(veh) {
+    const p = this.ctx.peek('player');
+    const v = p?.vehicle ?? p?.currentVehicle ?? null;
+    const spec = v?.spec ?? null;
+    veh.kind = spec?.kind ?? '';
+    veh.vref = spec?.flight?.Vref > 0 ? spec.flight.Vref : 0;
+    // `gearbox.gears` is [reverse, neutral, ...forward] — see `drivetrain.js`.
+    const gb = spec?.gearbox?.gears;
+    veh.gearCount = Array.isArray(gb) ? Math.max(0, gb.length - 2) : 0;
+    const q = veh.flying ? v?.quaternion : null;
+    if (!q) {
+      veh.pitch = 0;
+      veh.bank = 0;
+      return;
+    }
+    const { x, y, z, w } = q;
+    const fy = 2 * (y * z - w * x);
+    const ry = 2 * (x * y + w * z);
+    const uy = 1 - 2 * (x * x + z * z);
+    veh.pitch = (Math.asin(clamp(fy, -1, 1)) * 180) / Math.PI;
+    veh.bank = (Math.atan2(ry, uy) * 180) / Math.PI;
   }
 
   /** Fire-and-forget audio; the audio subsystem may not exist yet. */
@@ -1261,10 +1346,27 @@ export class UiSystem {
       a.sub = '';
       a.key = 'F';
       a.source = 'vehicle';
-      // On desktop, say EXIT for a beat after getting in and then get out of
-      // the way — a permanent "F · EXIT" panel over the windscreen is noise —
-      // but never over the top of a real prompt `game` is publishing.
-      if (this._exitPromptT > 0 && !this._promptActive) {
+      /**
+       * THE SEATED CHIP IS DOCKED, NOT CENTRED, AND IT FADES RATHER THAN
+       * VANISHING.
+       *
+       * It used to be the centre-screen prompt for 3.2 s and then nothing: a
+       * panel over the windscreen at the moment the player is learning the
+       * car, and no reminder at all ever again — which is the state the button
+       * exists to fix. Docked into the vehicle cluster it costs no attention,
+       * so it can stay: full for the first `_exitPromptT` seconds, then
+       * `EXIT_DIM` for as long as you are seated.
+       *
+       * SUPPRESSED IN THE AIR. `F` in a flying aircraft is a fall, and an
+       * always-on chip offering it a thousand feet up is an invitation the HUD
+       * should not be extending. Above `EXIT_ALT` metres the chip goes away
+       * entirely and comes back on the ground. Never over a real prompt
+       * `game` is publishing, in any placement.
+       */
+      const airborne = this.state.veh.flying && this.state.veh.altitude > EXIT_ALT;
+      if (!this._promptActive && !airborne) {
+        this._exitPrompt.dim = this._exitPromptT > 0 ? 1 : EXIT_DIM;
+        this._exitPrompt.host = this.vehm.promptSlot;
         this.prompt.set(this._exitPrompt);
         this._exitPromptShown = true;
       } else if (this._exitPromptShown && !this._promptActive) {
@@ -1577,20 +1679,57 @@ export class UiSystem {
    * text actually changes.
    */
   setPrompt(p) {
-    this.prompt.set(p);
-    this._promptActive = true;
+    /**
+     * A PROMPT PUBLISHED WHILE SEATED IS ABOUT THE MACHINE, SO IT DOCKS.
+     *
+     * `game.freeroam` publishes a prompt for the whole time you are in a car
+     * — MEASURED in `aircraftprobe`: "LEAVE THE IRONSIDE 440", centre screen,
+     * permanently, over the windscreen at 100 km/h. That is the same complaint
+     * the synthesized EXIT chip was written to avoid, arriving from the other
+     * side. Placement is the HUD's decision either way, so it is made here: in
+     * a vehicle the chip belongs beside the vehicle instruments.
+     *
+     * The caller's record is COPIED rather than annotated — `freeroam` re-uses
+     * one object for its prompt (rule 5) and writing placement fields into it
+     * would be writing into another subsystem's state.
+     */
     const text = p?.text ?? '';
     if (text !== this._lastPromptText) {
       this._onPromptChanged(this._lastPromptText, text);
       this._lastPromptText = text;
       // Derived ONCE per change, not once per frame: `game` re-asserts the
       // prompt every frame and `toUpperCase`/`split` both allocate, which is a
-      // steady 60 Hz of garbage for a string that almost never changes.
+      // steady 60 Hz of garbage for a string that almost never changes. The
+      // exit test joins them for the same reason.
       const v = verbFor(text, this.state.inVehicle);
       this._promptVerb = v.verb;
       this._promptIcon = v.icon;
       this._promptLabel = String(text).toUpperCase();
+      this._promptIsExit = EXIT_LINE.test(text);
     }
+
+    const r = this._promptRec;
+    r.key = p?.key;
+    r.text = p?.text;
+    r.sub = p?.sub;
+    r.progress = p?.progress;
+    r.placement = this.state.inVehicle ? 'dock' : 'centre';
+    r.host = this.vehm.promptSlot;
+    /**
+     * A LINE THAT ONLY SAYS "THIS IS HOW YOU GET OUT" FADES AFTER THE ENTRY
+     * BEAT; ANYTHING ELSE STAYS FULL.
+     *
+     * `freeroam`'s seated line is the exit ("LEAVE THE IRONSIDE 440") and the
+     * player needs it once, so it drops to a reminder after `_exitPromptT`.
+     * "FILLING · 62%", "SWAP", a race start and the body shop are all live
+     * information about something in progress and must not dim. Matched on the
+     * line's own opening verb, which is the same handle `verbFor` uses to fill
+     * the touch button — one convention, not two.
+     */
+    r.dim = r.placement === 'dock' && this._exitPromptT <= 0 && this._promptIsExit
+      ? EXIT_DIM : 1;
+    this.prompt.set(r);
+    this._promptActive = true;
   }
 
   clearPrompt() {
@@ -2057,15 +2196,37 @@ export class UiSystem {
     // publishes nitroFraction on its HUD state). Any absent producer
     // hides its row; it never invents a value.
     const veh = s.veh;
-    veh.on = !!s.inVehicle && !this._debug;
-    veh.health = typeof vs?.health === 'number' && Number.isFinite(vs.health)
-      ? clamp01(vs.health) : -1;
-    veh.fuel = typeof vs?.fuel === 'number' && Number.isFinite(vs.fuel)
-      ? clamp01(vs.fuel) : -1;
-    veh.dry = !!vs?.fuelDry;
-    const nitro = ps?.nitroFraction ?? (typeof ps?.nitro === 'number' ? ps.nitro / 100 : undefined);
-    veh.nitro = typeof nitro === 'number' && Number.isFinite(nitro) ? clamp01(nitro) : -1;
-    veh.nitroOn = !!ps?.nitroOn;
+    // A debug scene may AUTHOR the cluster — see `debugState`. That is the only
+    // way a review capture ever photographs it, because no producer is running.
+    if (this._debug?.veh) {
+      veh.on = true;
+    } else {
+      veh.on = !!s.inVehicle && !this._debug;
+      veh.health = typeof vs?.health === 'number' && Number.isFinite(vs.health)
+        ? clamp01(vs.health) : -1;
+      veh.fuel = typeof vs?.fuel === 'number' && Number.isFinite(vs.fuel)
+        ? clamp01(vs.fuel) : -1;
+      veh.dry = !!vs?.fuelDry;
+      veh.noFuel = !!vs?.noFuel;
+      const nitro = ps?.nitroFraction ?? (typeof ps?.nitro === 'number' ? ps.nitro / 100 : undefined);
+      veh.nitro = typeof nitro === 'number' && Number.isFinite(nitro) ? clamp01(nitro) : -1;
+      veh.nitroOn = !!ps?.nitroOn;
+
+      // ---- the driving face ---------------------------------------------
+      veh.speedKmh = Number.isFinite(vs?.speedKmh) ? vs.speedKmh : Math.round(s.speed * 3.6);
+      veh.rpm01 = Number.isFinite(vs?.rpm) && vs.redline > 0 ? vs.rpm / vs.redline : 0;
+      veh.gear = typeof vs?.gear === 'string' ? vs.gear : '—';
+
+      // ---- the flying face ----------------------------------------------
+      veh.flying = !!vs?.flying;
+      veh.altitude = Number.isFinite(vs?.altitude) ? vs.altitude : 0;
+      veh.climb = Number.isFinite(vs?.climbRate) ? vs.climbRate : 0;
+      veh.rotor = Number.isFinite(vs?.rotor) ? clamp01(vs.rotor) : 0;
+      veh.speed = Number.isFinite(vs?.speedKmh) ? vs.speedKmh / 3.6 : s.speed;
+      veh.submerged = Number.isFinite(vs?.submerged) ? vs.submerged : 0;
+      veh.drowned = !!vs?.drowned;
+      this._readVehicleBody(veh);
+    }
 
     // ---- police -----------------------------------------------------------
     const pol = this._sub('police');
@@ -2520,11 +2681,27 @@ export class UiSystem {
     s.speed = 24;
     s.weather = 'WET';
     s.hour = 17.4;
+    /**
+     * THE DEBUG SCENES AUTHOR THE CLUSTER, and until now none of them did.
+     * Every state below shares the fiction "Aidan, mid-chapter, IN A CAR", and
+     * `_pullState` hides the cluster whenever `_debug` is set because there is
+     * no `vehicles.getHudState()` behind it — so the one review shot of this
+     * HUD (`hud` in `src/dev/shots.js`, which applies `debugState('combat')`)
+     * photographed a driving HUD with no vehicle instruments in it at all.
+     * A debug scene is an authored fiction; this is the rest of the fiction.
+     */
+    Object.assign(s.veh, {
+      on: true, health: 0.62, fuel: 0.31, noFuel: false, dry: false,
+      nitro: 0.48, nitroOn: false, kind: 'muscle', speedKmh: 86, speed: 23.9,
+      rpm01: 0.61, gear: '3', gearCount: 6, flying: false, altitude: 0,
+      climb: 0, rotor: 0, vref: 0, pitch: 0, bank: 0, submerged: 0, drowned: false,
+    });
     this._selectWeapon('nailgun');
     s.ammo = 18;
     s.reserve = 64;
 
-    const scene = { kind: name, blips: [], t: 0 };
+    // `veh` marks the scene as one that authors the cluster — see `_pullState`.
+    const scene = { kind: name, blips: [], t: 0, veh: s.veh };
 
     if (name === 'combat') {
       s.health = 84;

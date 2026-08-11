@@ -60,6 +60,12 @@ const HZ = 5;
 const KEEP = !!args.keep;
 /** Star level to stage the theft at. evadeNeed[3] = 20 s, [2] = 15 s. */
 const LEVEL = 2;
+/**
+ * Star level the ESCAPE is measured from — see the note on `jump`. Three,
+ * because that is the staging every number in `police.releaseVehicle`'s
+ * write-up was taken at, and `evadeNeed[3]` is 20 s against a 32 s window.
+ */
+const ESCAPE_LEVEL = 3;
 
 const { port, server } = await startServer({ explicitPort: args.port });
 const browser = await chromium.launch({
@@ -249,6 +255,54 @@ try {
   /* ================================================================== */
   /* THE GETAWAY — drive it, then break contact                         */
   /* ================================================================== */
+  /**
+   * ON THE LANE FIRST, AND THAT IS THE POINT OF THE NEXT CHECK.
+   *
+   * This check read "1.2 m under throttle in ~3.3 s" for two deterministic runs
+   * and was filed in ARCHITECTURE.md as a real defect in emitted behaviour. It
+   * is not. It was THIS FILE'S OWN STAGING measuring an obstacle.
+   *
+   * The theft is deliberately staged in a field — see `far()` above: grass,
+   * more than 45 m off the road graph, 60 m from any POI — because a cruiser
+   * pinned on a pavement mows down pedestrians and walks the wanted meter to
+   * five before the theft happens. That fix was right and it stays. But the
+   * getaway then began in a field, driving DEAD STRAIGHT (`{x: 0, y: 1}`, no
+   * steering, ever) at whatever scenery happened to be two metres off the nose,
+   * while the 12 m bar was calibrated for a car on a road.
+   *
+   * MEASURED on the shipped build, one boot, a police cruiser under full
+   * throttle for 200 frames at the pinned 1/60 step:
+   *
+   *   from a LANE   28.6 / 27.25 / 16.66 m   — 3 of 3 clear 12 m
+   *   from GRASS     1.8 / 10.99 / 17.03 / 15.96 / 13.69 / 8.17 m
+   *                                          — 3 of 6 do not
+   *
+   * ...and this file's own staging spot is deterministic: (-343.6, -456.6),
+   * which is the WORST of the six. It makes 1.8 m in 200 frames and 2.38 m in
+   * 600, sitting at 784 rpm — IDLE — with throttle at 1, four wheels grounded
+   * and zero slip: a chassis wedged against static scenery. Add a 0.35 steer,
+   * which is what a player pulling away actually does, and the SAME spot makes
+   * 50 m. Nothing about that is police, a stolen car, or a `Unit` binding.
+   *
+   * So the car is put on the nearest lane, facing along it, before the throttle
+   * goes down — through `wq.unwedgeVehicle`, which is the SHIPPED recovery and
+   * the same `setPose` door `pin()` above already uses. What is then measured
+   * is the drivetrain under the player's control, which is what the check is
+   * named after and the only thing the theft could have broken.
+   */
+  const onLane = await run(`
+    const v = window.__STOLEN__;
+    const moved = game.wq.unwedgeVehicle(v, 0.6);
+    return { moved, road: (() => {
+      const w = ctx.peek('world');
+      const h = w && w.roads && w.roads.nearestEdge ? w.roads.nearestEdge(v.position.x, v.position.z, 300) : null;
+      return h && h.edge ? +h.dist.toFixed(1) : -1;
+    })() };`);
+  await pump(40);
+  check('the getaway starts from a lane, not from the middle of a field',
+    onLane.road >= 0 && onLane.road < 8,
+    `${onLane.moved ? 'put back on' : 'already on'} a lane, ${onLane.road} m from the centreline`);
+
   const drove = await run(`
     const v = window.__STOLEN__;
     window.__FROM__ = { x: v.position.x, z: v.position.z };
@@ -260,21 +314,57 @@ try {
     const v = window.__STOLEN__, f = window.__FROM__;
     player.movement.scriptedInput = null;
     return { m: +Math.hypot(v.position.x - f.x, v.position.z - f.z).toFixed(1),
-             mine: player.vehicle === v };`);
+             mine: player.vehicle === v,
+             fwd: +(v.forwardSpeed || 0).toFixed(1),
+             rpm: Math.round(v.rpm || 0) };`);
   check('the player really drives the stolen cruiser', driven.mine && driven.m > 12,
-    `${driven.m} m under throttle in ~3.3 s`);
+    `${driven.m} m under throttle in ~3.3 s (${driven.fwd} m/s, ${driven.rpm} rpm)`);
+
+  /**
+   * NEGATIVE CONTROL. The same car, the same 200 frames, no throttle. Without
+   * this, "it moved 28 m" is not evidence that the throttle did it — a car
+   * rolling down one of Steel City's inclines would score the same, and this
+   * city has a 120 m hill in it.
+   */
+  const coasted = await run(`
+    const v = window.__STOLEN__;
+    game.wq.unwedgeVehicle(v, 0.6);
+    window.__FROM2__ = { x: v.position.x, z: v.position.z };
+    player.movement.scriptedInput = { x: 0, y: 0 };
+    return true;`);
+  void coasted;
+  await pump(200);
+  const idle = await run(`
+    const v = window.__STOLEN__, f = window.__FROM2__;
+    player.movement.scriptedInput = null;
+    return +Math.hypot(v.position.x - f.x, v.position.z - f.z).toFixed(1);`);
+  check('NEG CONTROL: with no throttle the same car goes nowhere',
+    idle < 4,
+    `${idle} m coasting over the same 200 frames, against ${driven.m} m under throttle`);
 
   /**
    * Break contact. Every other cruiser is retired first so the ONLY thing that
    * could still have eyes on the player is the unit bound to the car he is
    * sitting in — which is the defect under test. Then jump ~1 km, exactly as
    * `harness.mjs`'s evasion phase does.
+   *
+   * THE METER IS NORMALISED HERE, for the same reason it is normalised at the
+   * door above: what follows must be read against a known staging rather than
+   * against whatever the phase before it happened to leave behind. Driving a
+   * stolen cruiser 28 m down a public lane is itself worth stars — the run that
+   * exposed this arrived at the jump on FIVE — and `TUNE.sightRange` and the
+   * evade requirement both key off the level, so an escape scored from five is
+   * not the escape the section is written for. `ESCAPE_LEVEL` is three, which
+   * is the staging every measurement in `releaseVehicle`'s note was taken at:
+   * "three stars in and three stars out", `evadeNeed[3] = 20 s` against this
+   * file's 32 s window.
    */
   const jump = await run(`
     const v = window.__STOLEN__;
     for (const u of police.units.slice()) if (u.vehicle !== v) police.retireUnit(u, 'far');
     police.officers.clear();
     police.heli.stand(ctx);
+    police.setWanted(${ESCAPE_LEVEL});
     let s = null;
     for (const r of [[900, 1400], [600, 1800], [400, 2400]]) {
       s = police.roads.sampleSpawn(police.rng, v.position, r[0], r[1], (e) => !e.rail);

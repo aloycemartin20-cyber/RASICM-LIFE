@@ -364,10 +364,20 @@ export class PlayerSystem {
    * soffit or a road corridor's underside can easily be below the pavement the
    * player is supposed to be standing on.
    *
-   * So: take the HIGHER of the two, which is the surface you stand on rather
-   * than the one you would fall to, and refuse a site where they disagree so
-   * badly that neither can be trusted. Trying the next spawn is free; shipping a
-   * player under the map is not.
+   * THAT RECONCILIATION HAS MOVED. It used to be done here, with a local
+   * `Math.max(wy, gy)`, and every other caller in the game — traffic spawns,
+   * police spawns, car exits, decals, the shot harness — went on believing the
+   * raw ray. `physics.groundHeight` now performs it for everybody (see the
+   * method: it lifts a low ray to the authored surface, and only when the
+   * query started above that surface), so what is left here is the part that
+   * is genuinely this file's business: pick a site, and refuse one nobody can
+   * describe.
+   *
+   * `disagree` therefore no longer measures "the ray is under the pavement" —
+   * that case is now corrected before it is returned. What survives it is a ray
+   * that came back well ABOVE the authored surface: a spawn record under a
+   * bridge deck, inside a building, on top of a container. Skipping those is
+   * still worth doing, and trying the next spawn is still free.
    */
   _resolveSpawn() {
     const world = this.ctx.peek('world');
@@ -382,15 +392,17 @@ export class PlayerSystem {
       const x = sp.position.x, z = sp.position.z;
       const wy = world?.walkableHeightAt?.(x, z);
       // Start the ray well clear of anything the spawn record may be embedded
-      // in, and above the authored surface as well as the recorded one.
+      // in, and above the authored surface as well as the recorded one — a
+      // query that starts UNDER a deck is never lifted onto it, by design.
       const from = Math.max(sp.position.y, Number.isFinite(wy) ? wy : -Infinity) + 8;
       const gy = this.physics.groundHeight(x, z, from);
-
-      const hasW = Number.isFinite(wy);
-      const hasG = Number.isFinite(gy);
-      if (!hasW && !hasG) continue;
-      const y = hasW && hasG ? Math.max(wy, gy) : (hasW ? wy : gy);
-      const disagree = hasW && hasG ? Math.abs(wy - gy) : 0;
+      // A ray that finds nothing at all should be impossible inside the city —
+      // `physics` solves an unhit ray against the same analytic surface — but a
+      // bench with no `world` bound has no floor anywhere, and falling back to
+      // whichever authority answered is what this loop did before.
+      const y = Number.isFinite(gy) ? gy : wy;
+      if (!Number.isFinite(y)) continue;
+      const disagree = Number.isFinite(wy) ? Math.abs(wy - y) : 0;
 
       const cand = { x, y, z, yaw: sp.yaw ?? 0, disagree, i };
       if (!best || cand.disagree < best.disagree) best = cand;
@@ -404,7 +416,7 @@ export class PlayerSystem {
         console.warn(
           `[player] every spawn candidate is ambiguous — using #${best.i}, where the authored ` +
           `walkable surface and the collision ray differ by ${best.disagree.toFixed(2)} m. ` +
-          `Standing on the higher of the two.`
+          `The ray found something well above the pavement here.`
         );
       }
     }
@@ -519,6 +531,16 @@ export class PlayerSystem {
     // function.
     this._buildPose(dt);
     this.animator.update(dt, this._pose);
+    /**
+     * THE SEATED BODY WEARS THE CAR'S ROLL AND PITCH, and it can only be put on
+     * here — after the animator, because the animator OPENS by writing the root
+     * from `pose.faceYaw` alone (a yaw scalar is the whole attitude channel the
+     * pose request has) and would overwrite anything applied earlier. What it
+     * leaves behind is a body-local pose solved against `root.localToWorld`, so
+     * rotating the root now carries the legs, the wheel grip and the head with
+     * it. See `VehicleHandler.applySeatAttitude`.
+     */
+    this.vehicles.applySeatAttitude(this.character?.root ?? null);
     this._drainFootstep();
     this._updateVisibility(dt);
 
@@ -1276,7 +1298,22 @@ export class PlayerSystem {
       z = cam.position.z + this._tmp.z;
       y = cam.position.y;
     }
-    const gy = this.physics.groundHeight(x, z, y + 8);
+    /**
+     * STAGE HIM ON THE PAVEMENT, ON THE FRAME HE IS STAGED.
+     *
+     * This mark is where `groundHeight`'s raised-plaza defect was measured:
+     * the ray answered 2.2 m under the riverfront pavement, so the capsule was
+     * placed inside the ground, spent ~800 frames resolving upward and slid
+     * 4.7 m sideways doing it — which is a subject that is somewhere different
+     * in every capture, i.e. exactly what a review frame must not be. The query
+     * is fixed in `physics.groundHeight`; the only thing left to do here is
+     * start the ray above the authored surface as well as above the requested
+     * y, because a query that begins UNDER a deck is deliberately never lifted
+     * onto it. Nothing about the staging is time- or settle-dependent now.
+     */
+    const wy = this.ctx.peek('world')?.walkableHeightAt?.(x, z);
+    const from = Math.max(y, Number.isFinite(wy) ? wy : -Infinity) + 8;
+    const gy = this.physics.groundHeight(x, z, from);
     const feetY = Number.isFinite(gy) ? gy + 0.03 : y;
     let yaw = req.yaw;
     if (yaw === undefined) {

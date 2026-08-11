@@ -49,13 +49,22 @@ const _fwd = new THREE.Vector3();
  * vector is how that rule fails, and it fails silently.
  */
 const _cam = new THREE.Vector3();
+/** Centre of the FAR ring — anchor, pushed down the view axis when high up. */
+const _centre = new THREE.Vector3();
 
 /**
  * Metres of drivable lane per moving car — the density knob behind
- * `laneCapacity()`. `spawnMax` is pinned at 175 m by the collision world, so no
- * amount of `trafficBudget` can put more than (lane length in that disc)/this
- * many moving cars on screen: this, not the budget, is the wall the near-camera
- * car count hits in a dense grid at the top tiers.
+ * `laneCapacity()`. No amount of `trafficBudget` can put more than (lane length
+ * in the populated disc)/this many moving cars on screen: this, not the budget,
+ * is the wall the near-camera car count hits in a dense grid at the top tiers.
+ *
+ * THE DISC IT IS MEASURED OVER IS NOW `spawnFar`, NOT `spawnMax` — see
+ * `laneCapacity`. Metres of lane per car is the invariant this constant names,
+ * so it has to be counted over the road traffic is actually spread across. That
+ * change does not loosen the paragraph below: downtown at `high` was already
+ * budget-bound, not capacity-bound (the harness measures the target reached at
+ * 27 of a 27.4 budget term), so nothing about the Golden Triangle's saturation
+ * moved with it.
  *
  * KEPT AT 95 ON PURPOSE, and that is the measured result of trying to lower it.
  * When the tier budgets were raised for street density, dropping this to pack
@@ -78,6 +87,24 @@ const _cam = new THREE.Vector3();
  * with a fresh harness run showing "nobody stopped forever" still green.
  */
 const LANE_M_PER_CAR = 95;
+
+/**
+ * NEGATIVE CONTROL for the far ring and the budget it is paid for with:
+ * `?owNoFarRing=1` puts the envelope back to the single [spawnMin, spawnMax]
+ * disc AND the old 0.72 moving share, so ONE build can be measured with the
+ * change on and off.
+ *
+ * That is not a convenience. `tools/perfcheck.mjs` A/Bs two directories, and on
+ * a machine that is doing anything else the between-directory noise swamped the
+ * signal: two runs of the SAME unchanged baseline tree, an hour apart, measured
+ * day p50 31.0 ms and 18.3 ms. A hatch that flips the change inside one page
+ * load is the only arm pairing on this machine that is not measuring the load
+ * average.
+ */
+const _tq = typeof location !== 'undefined' ? new URLSearchParams(location.search) : null;
+const NO_FAR_RING = _tq?.get('owNoFarRing') === '1';
+/** The share this system spent before the far ring — see index.js MOVING_SHARE. */
+const OLD_MOVING_SHARE = 0.72;
 
 export class Director {
   constructor(sys) {
@@ -138,12 +165,22 @@ export class Director {
     const a = this.sys.anchor;
     const vol = this.volumeAt(a.x, a.z);
     const capacity = this.laneCapacity();
-    const moving = Math.round(Math.min(this.budget * this.sys.movingShare, capacity) * vol);
+    const share = NO_FAR_RING ? OLD_MOVING_SHARE : this.sys.movingShare;
+    const moving = Math.round(Math.min(this.budget * share, capacity) * vol);
     this.target = clamp(moving, this.budget > 20 ? 4 : 2, this.budget);
     return this.target;
   }
 
-  /** How many moving cars the road network around the anchor can hold. */
+  /**
+   * How many moving cars the road network around the anchor can hold.
+   *
+   * MEASURED OVER THE RADIUS TRAFFIC ACTUALLY POPULATES, which is `spawnFar`,
+   * not `spawnMax`. When the far ring landed, leaving this at the near radius
+   * would have kept `LANE_M_PER_CAR` metres of lane per car in the inner disc
+   * while the outer annulus — 4.7x the area — got its cars for free, which is
+   * not a capacity model, it is an off-by-one. Metres of lane per car is the
+   * invariant; the disc it is measured over has to be the disc it is spent on.
+   */
   laneCapacity() {
     const roads = this.sys.world?.roads;
     if (!roads) return 8;
@@ -151,7 +188,7 @@ export class Director {
     if (this._capTimer > 0) return this._capacity;
     this._capTimer = 90; // frames
     const a = this.sys.anchor;
-    const R = TUNE.spawnMax;
+    const R = this.outerRadius();
     this._edges.length = 0;
     roads.edgesInRect(a.x - R, a.z - R, a.x + R, a.z + R, this._edges);
     let m = 0;
@@ -202,6 +239,75 @@ export class Director {
   /* ----------------------------------------------------------- spawning -- */
 
   /**
+   * Metres the anchor stands above the ground under it.
+   *
+   * `walkableHeightAt` is the published analytic surface and is answerable
+   * city-wide (the world contract), so this costs nothing and cannot be
+   * defeated by standing somewhere the collision window has not reached — which
+   * is exactly where an aircraft is.
+   */
+  anchorAltitude() {
+    const a = this.sys.anchor;
+    const g = this.sys.world?.walkableHeightAt?.(a.x, a.z);
+    return Number.isFinite(g) ? Math.max(0, a.y - g) : 0;
+  }
+
+  /** 0 at eye level, 1 at `TUNE.airAlt` and above. Drives the share and the lead. */
+  airT() {
+    return clamp01((this.anchorAltitude() - 12) / Math.max(1, TUNE.airAlt - 12));
+  }
+
+  /** Share of spawn attempts aimed at the far ring, from eye level to the air. */
+  farShare() {
+    if (NO_FAR_RING) return 0;
+    const t = this.airT();
+    return TUNE.farShare + (TUNE.farShareAir - TUNE.farShare) * t;
+  }
+
+  /**
+   * Where the far ring is centred, written into `_centre`.
+   *
+   * The anchor at eye level; the anchor pushed `TUNE.farLead` down the camera's
+   * GROUND bearing from a vantage. Uses `_cam`/`_fwd` and never `_v` — `_v`
+   * holds the live candidate lane point and aliasing the two is the bug the
+   * note at the top of this file exists for.
+   */
+  farCentre(ctx) {
+    const a = this.sys.anchor;
+    _centre.set(a.x, a.y, a.z);
+    if (NO_FAR_RING) return _centre;
+    const lead = TUNE.farLead * this.airT();
+    if (lead < 1) return _centre;
+    ctx.camera.getWorldDirection(_fwd);
+    const l = Math.hypot(_fwd.x, _fwd.z);
+    if (l < 1e-3) return _centre;
+    _centre.x += (_fwd.x / l) * lead;
+    _centre.z += (_fwd.z / l) * lead;
+    return _centre;
+  }
+
+  /**
+   * Distance from the populated FIELD — the nearer of the anchor and the far
+   * ring's centre.
+   *
+   * Every "is this car too far away" test uses this rather than the raw anchor
+   * distance, or the lead above would make the cars it just placed the first
+   * ones `recycleFarthest` and `shouldDespawn` threw away.
+   */
+  fieldDist(x, z) {
+    const a = this.sys.anchor;
+    const d0 = Math.hypot(x - a.x, z - a.z);
+    if (NO_FAR_RING || this._leadX === undefined) return d0;
+    const d1 = Math.hypot(x - this._leadX, z - this._leadZ);
+    return d1 < d0 ? d1 : d0;
+  }
+
+  /** Outer radius traffic is populated to right now. The control sees the old one. */
+  outerRadius() {
+    return NO_FAR_RING ? TUNE.spawnMax : TUNE.spawnFar;
+  }
+
+  /**
    * One attempt at a spawn. `force` skips the visibility rule (capture fills,
    * and the first population after a teleport).
    */
@@ -217,8 +323,24 @@ export class Director {
      */
     if (sys.vehicles.vehicles.length > this.budget * 2 + 12) return null;
     const a = sys.anchor;
-    const minD = force ? 34 : TUNE.spawnMin;
-    const s = roads.sampleSpawn(sys.rng, a, minD, TUNE.spawnMax, this._filter);
+    /**
+     * NEAR RING or FAR RING, decided per attempt. `sampleSpawn` picks uniformly
+     * among the edges whose midpoint falls in [minD, maxD], so handing it two
+     * different annuli is what makes the radial distribution non-uniform —
+     * dense where the player is standing, thin but present out to `spawnFar`.
+     */
+    /**
+     * The share is ZERO at eye level, and the rng draw is SKIPPED when it is —
+     * not merely compared against zero. Consuming a float shifts every later
+     * draw in the stream, so a "disabled" feature that still rolls the dice
+     * changes the city anyway and cannot be A/B'd against its own control.
+     */
+    const share = this.farShare();
+    const far = share > 0 && sys.rng.float() < share;
+    const minD = far ? (this.airT() > 0.5 ? 60 : TUNE.spawnMax) : force ? 34 : TUNE.spawnMin;
+    const maxD = far ? this.outerRadius() : TUNE.spawnMax;
+    const from = far ? this.farCentre(ctx) : a;
+    const s = roads.sampleSpawn(sys.rng, from, minD, maxD, this._filter);
     if (!s?.edge) return null;
 
     const L = sys.lanes;
@@ -247,7 +369,7 @@ export class Director {
      * lens — which is how a flatbed ended up parked across a hero shot. Test
      * the actual point.
      */
-    if (Math.hypot(_v.x - a.x, _v.z - a.z) < minD) return null;
+    if (Math.hypot(_v.x - from.x, _v.z - from.z) < minD) return null;
     /**
      * ...and never near the PLAYER, whatever the anchor happens to be. See
      * `TUNE.spawnPlayerMin`. `force` does not relax this and nothing else may
@@ -359,8 +481,7 @@ export class Director {
   shouldDespawn(ctx, driver) {
     const p = driver.vehicle?.position;
     if (!p) return true;
-    const a = this.sys.anchor;
-    const d = Math.hypot(p.x - a.x, p.z - a.z);
+    const d = this.fieldDist(p.x, p.z);
     if (d > TUNE.despawnHard) return true;
     if (d < TUNE.despawnR) return false;
     return !this._visible(ctx, p.x, p.z);
@@ -369,6 +490,12 @@ export class Director {
   /* --------------------------------------------------------------- step -- */
 
   step(dt, ctx) {
+    // Publish the far ring's centre once a frame, so `fieldDist` — which is
+    // called from the recycle loop for every driver — costs two subtractions
+    // rather than a camera query each time.
+    const c = this.farCentre(ctx);
+    this._leadX = c.x;
+    this._leadZ = c.z;
     const want = this.desired(ctx);
     const live = this.sys.liveCount;
 

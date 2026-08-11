@@ -1,5 +1,5 @@
 /**
- * AUDIO / VOICE — formant synthesis for enemy barks
+ * AUDIO / VOICE — formant synthesis for enemy barks AND story dialogue
  *
  * No speech samples, so barks are built the way a vocal tract works:
  *
@@ -14,9 +14,16 @@
  * most important ingredient: without it the result is a Speak&Spell, with it a
  * player reads it as a human shouting a word they cannot quite make out — which
  * is exactly the goal for enemy chatter at 30 m.
+ *
+ * The bottom half of this file is `DialogueVoice`: the same tract, driven from
+ * an AUTHORED LINE OF TEXT rather than a canned bark script, at a much quieter
+ * and warmer register — see the header above `voiceLine`, which explains why it
+ * deliberately does NOT try to pronounce the words.
  */
 
-import { ad, adsr, biquad, clamp, gain, hit, saturationCurve, series, shaper, sweep } from './dsp.js';
+import {
+  ad, adsr, biquad, clamp, gain, hit, saturationCurve, series, shaper, sweep, to,
+} from './dsp.js';
 
 /** F1, F2, F3 (Hz) and their bandwidths, adult male, shouted register. */
 const VOWELS = {
@@ -417,5 +424,691 @@ export function barkFor(kind, rng) {
     case 'death': return 'death';
     case 'copy': return 'copy';
     default: return 'contact';
+  }
+}
+
+/* ===================================================================== */
+/* STORY DIALOGUE                                                        */
+/* ===================================================================== */
+
+/**
+ * THE DECISION THIS SECTION IS BUILT AROUND, because it is the difference
+ * between a game that sounds better and one that sounds worse.
+ *
+ * Twenty-four chapters of authored dialogue play as typed text. There are two
+ * ways to put a voice under it with a formant synth and no speech samples:
+ *
+ *   1. TRY TO PRONOUNCE THE LINE. Articulate every consonant, hold every vowel,
+ *      and sit the result up in the mix where a voice-over belongs. This is the
+ *      uncanny-valley option: it PROMISES words and delivers a phoneme salad,
+ *      and the brain — which is already reading the real words off the screen —
+ *      spends the whole scene noticing the mismatch. Speak&Spell reciting
+ *      Chekhov. A player would rather have silence.
+ *   2. VOCALISE IT. The same tract, the same per-speaker larynx, the syllable
+ *      COUNT and STRESS PATTERN of the real line, but soft consonants, a warm
+ *      source and a level that sits under the writing rather than over it. This
+ *      is the register every open-world game uses for radio chatter and crowd
+ *      talk, and the one the Sims/Animal Crossing lineage made a genre of: the
+ *      listener hears "a person is speaking, and that is Carson", never "that
+ *      word was wrong".
+ *
+ * This is (2), and every parameter below is chosen to keep it there:
+ *   - ARTICULATION is a scalar, not a switch, and it is low. Consonant bursts
+ *     are mixed at a third of the bark's level, which is what stops the ear
+ *     trying to parse syllables into words.
+ *   - The source tilt is the WARMEST bucket and the presence peak is a fifth of
+ *     the shout's, so it reads as talk in a room, not a PA announcement.
+ *   - It is paced at a human speaking rate (~4.5 syllables/s) and DROPS weak
+ *     syllables rather than gabbling when the line is long. A read that gabbles
+ *     to keep up with the typewriter is the tell that gives the whole trick
+ *     away.
+ *   - Level sits above the ducked bed and below the typing.
+ *
+ * What it still buys, which silence does not: the scene has a voice, the three
+ * brothers are audibly three different people, the boss is audibly bigger than
+ * they are, and `cop` / `radio` come through a speaker. Those are the four
+ * things the writing needed and did not have.
+ */
+
+/** Vowel + r: the r-coloured nucleus you actually hear ("her", "far"). */
+const R_COLOUR = { ar: 'ah', er: 'ehr', ir: 'ehr', or: 'ohh', ur: 'ehr' };
+/** Two-letter vowel groups worth distinguishing. */
+const V2 = {
+  ee: 'i', ea: 'i', ie: 'i', ei: 'e', ey: 'e', ay: 'e', ai: 'e',
+  oo: 'u', ou: 'ohh', ow: 'ohh', oa: 'ohh', oi: 'o', oy: 'o',
+  au: 'ah', aw: 'ah', ue: 'u', ui: 'u', eu: 'u', ya: 'a',
+};
+const V1 = { a: 'a', e: 'e', i: 'i', o: 'o', u: 'u', y: 'i' };
+/** Consonant letter -> the onset class `bark`'s syllable player understands. */
+const ONSET = {
+  b: 'p', p: 'p', t: 'p', d: 'p', k: 'p', g: 'p', c: 'p', q: 'p', j: 'p', x: 'p',
+  f: 'f', s: 'f', h: 'f', v: 'f', z: 'f',
+  m: 'n', n: 'n', l: 'n', r: 'n', w: 'n', y: 'n',
+};
+/** Function words: never stressed, and the first to be dropped from a long line. */
+const WEAK = new Set([
+  'a', 'an', 'the', 'of', 'to', 'in', 'on', 'at', 'and', 'or', 'is', 'it', 'its',
+  'was', 'are', 'be', 'for', 'with', 'that', 'this', 'you', 'your', 'we', 'he',
+  'she', 'they', 'i', 'me', 'my', 'him', 'her', 'them', 'as', 'so', 'if', 'do',
+  'did', 'from', 'by', 'has', 'have', 'had', 'am', 'been', 'were', 'our', 'us',
+]);
+
+const isVowelLetter = (c) => c === 'a' || c === 'e' || c === 'i' || c === 'o' || c === 'u' || c === 'y';
+/** Hoisted: a literal inside the scan loop builds a RegExp per character. */
+const WORD_CH = /[a-z']/;
+
+/**
+ * An authored line -> the syllable spine a vocal tract can play.
+ *
+ * Deliberately NOT a pronunciation dictionary: it recovers the NUMBER of
+ * syllables, their vowel colour, their onset class and which of them carry
+ * stress, which is everything the register above needs and nothing it does not.
+ * Two different lines therefore sound different (same speaker, different shape),
+ * which is the property a generic murmur loop cannot have.
+ *
+ * Writes into `out` and returns it — one array per DialogueVoice, reused per
+ * line, so a scene of twenty lines allocates one array and not twenty.
+ */
+export function syllabify(text, out = []) {
+  out.length = 0;
+  const s = String(text ?? '').toLowerCase();
+  let i = 0;
+  while (i < s.length) {
+    const ch = s[i];
+    /* punctuation: a breath, and the terminal intonation for the last one */
+    if (ch === ',' || ch === ';' || ch === ':' || ch === '-' || ch === '—') {
+      if (out.length) out[out.length - 1].gap = Math.max(out[out.length - 1].gap, 0.17);
+      i++;
+      continue;
+    }
+    if (ch === '.' || ch === '!' || ch === '?' || ch === '…') {
+      if (out.length) {
+        const last = out[out.length - 1];
+        last.gap = Math.max(last.gap, 0.3);
+        last.rise = ch === '?';
+      }
+      i++;
+      continue;
+    }
+    if (!WORD_CH.test(ch)) { i++; continue; }
+
+    /* one word */
+    let j = i;
+    while (j < s.length && WORD_CH.test(s[j])) j++;
+    const w = s.slice(i, j).replace(/'/g, '');
+    i = j;
+    const first = out.length;
+    let onset = '';
+    let k = 0;
+    while (k < w.length) {
+      const c = w[k];
+      if (!isVowelLetter(c)) {
+        // The LAST consonant before the nucleus is the one you hear on it.
+        const cls = ONSET[c];
+        if (cls) onset = cls;
+        k++;
+        continue;
+      }
+      let e = k + 1;
+      if (e < w.length && isVowelLetter(w[e])) e++;
+      let key = null;
+      if (e - k === 1 && w[e] === 'r' && (e + 1 >= w.length || !isVowelLetter(w[e + 1]))) {
+        key = R_COLOUR[c + 'r'];
+        if (key) e++;
+      }
+      if (!key && e - k === 2) key = V2[w.slice(k, e)];
+      if (!key) { key = V1[c]; e = k + 1; }
+      // Silent terminal 'e' ("stone", "made") is not a syllable — unless it is
+      // the word's only vowel ("the", "we"), where it is the whole word.
+      const silentE = e === w.length && e - k === 1 && c === 'e' && out.length > first;
+      if (!silentE) {
+        out.push({ v: key, on: onset, stress: 0, gap: 0, rise: false, keep: true });
+        onset = '';
+      }
+      k = e;
+    }
+    if (out.length === first) continue;         // a word with no vowel at all
+    // English stress is overwhelmingly word-initial, and a function word carries
+    // none: that pattern alone is most of what makes a read scan as a sentence.
+    if (!WEAK.has(w)) out[first].stress = 1;
+    out[out.length - 1].gap = Math.max(out[out.length - 1].gap, 0.055);
+  }
+  return out;
+}
+
+/**
+ * Per-speaker larynx. The named cast is AUTHORED — the three brothers have to be
+ * three audibly different men in the order the game presents them (Carson
+ * eldest and lowest, Dylan youngest and highest), the boss has to be bigger than
+ * any of them, and `cop` / `radio` arrive through a speaker. Anyone else is
+ * hashed from their id, so an unknown speaker is still stable across a replay
+ * and still not a clone of the last one.
+ *
+ * `rate` is syllables per second, which is the other half of a character: Carson
+ * is slow, Dylan talks fast, the boss takes his time.
+ */
+export const VOICES = {
+  carson: { f0: 92, tract: 1.06, drive: 0.86, breath: 0.22, rate: 4.0 },
+  aidan: { f0: 116, tract: 0.99, drive: 1.02, breath: 0.17, rate: 4.9 },
+  dylan: { f0: 132, tract: 0.94, drive: 0.94, breath: 0.20, rate: 5.3 },
+  gabby: { f0: 186, tract: 0.86, drive: 0.88, breath: 0.26, rate: 4.7 },
+  boss: { f0: 84, tract: 1.10, drive: 1.14, breath: 0.14, rate: 3.6 },
+  cop: { f0: 124, tract: 1.00, drive: 1.00, breath: 0.16, rate: 5.0, radio: true },
+  radio: { f0: 128, tract: 0.97, drive: 0.92, breath: 0.18, rate: 5.4, radio: true },
+};
+
+/** FNV-1a over the id — a stable voice for a speaker nobody authored. */
+function hashId(id) {
+  let h = 0x811c9dc5;
+  const s = String(id ?? '');
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h;
+}
+
+/** The voice for a speaker id. Never null; deterministic for any string. */
+export function voiceFor(id) {
+  const key = String(id ?? '').trim().toLowerCase();
+  const named = VOICES[key];
+  if (named) return named;
+  const h = hashId(key);
+  return {
+    f0: 96 + (h % 56),                       // 96..151 Hz
+    tract: 0.92 + ((h >>> 8) % 17) / 100,    // 0.92..1.08
+    drive: 0.88 + ((h >>> 16) % 25) / 100,   // 0.88..1.12
+    breath: 0.15 + ((h >>> 20) % 12) / 100,
+    rate: 4.2 + ((h >>> 24) % 13) / 10,      // 4.2..5.4 syllables/s
+  };
+}
+
+/** Never gabble: past this the read stops sounding like a person talking. */
+const MAX_SYL_RATE = 6.2;
+/** Consonant bursts, relative to a bark's. See the register note above. */
+const ARTICULATION = 0.34;
+/**
+ * Output trim, MEASURED on the rendered mix rather than chosen (duckprobe arms
+ * 2 and 2b). A dialogue line has to sit ABOVE the bed it is ducking, or the
+ * duck was pointless: at 0.30 the read came out at -40.2 dBFS against a ducked
+ * radio at -25.4 — 15 dB UNDER the thing it had just pushed down.
+ *
+ * THE CEILING IS NOT THE LIMITER, IT IS THE VOICE BUS COMPRESSOR, and that is
+ * the whole reason this number is 7 and not 16. Measured across a sweep:
+ *
+ *     trim   read dBFS   modulation depth   voiced
+ *      5.6     -24.0          14.9 dB         81%
+ *      7.0     -23.1          14.4 dB         84%
+ *     16.0     -19.5          12.4 dB         91%   <- squashed back into a drone
+ *
+ * `voice` compresses at -18 dBFS, ratio 3, release 0.22 s, and there is no
+ * makeup gain — so past about 8 the extra trim buys 1 dB of level and spends 2
+ * dB of the speech dynamics that make it sound like a person at all. The right
+ * lever for "louder than the bed" is therefore the DUCK, not the voice: see
+ * DIALOGUE_DUCK. At 7.0 the read is -23.1 dBFS peak 0.32, 8.2 dB over the
+ * ducked bed, and still modulating 14.4 dB.
+ */
+const LINE_TRIM = 7.0;
+
+/**
+ * Synthesize a spoken read of `o.text` in `o.voice`'s larynx.
+ *
+ * @param {object} o { when, text, voice, dur, level, id }
+ * @returns {?{node, end, send, sources}} null if the line has no syllables.
+ *   `sources` is every started node, so the caller can cut the read short — a
+ *   skipped line has to stop MID-WORD, which is the one thing a fire-and-forget
+ *   one-shot cannot do.
+ */
+export function voiceLine(actx, bank, rng, o = {}) {
+  const t0 = Math.max(o.when ?? actx.currentTime, 0);
+  const V = o.voice ?? voiceFor(o.id);
+  const syl = o.syllables ?? syllabify(o.text);
+  if (!syl.length) return null;
+
+  /* ---- pacing ------------------------------------------------------- */
+  /*
+   * `rate` is SYLLABLES PER SECOND AS HEARD — nuclei divided by the wall clock
+   * of the whole read, gaps and all. That is the number a listener perceives as
+   * "he talks fast", and it is the one the probe recovers from the emitted
+   * envelope, so the two cannot drift apart. It is NOT a per-syllable duration:
+   * treating it as one made Carson's 4.0 come out at 3.0 as heard, because the
+   * word gaps and the stress weighting are half a second of the line.
+   */
+  const rate = clamp(o.rate ?? V.rate ?? 4.6, 3.0, 6.5);
+  let n = syl.length;
+  for (let i = 0; i < n; i++) syl[i].keep = true;
+  const budget = Number.isFinite(o.dur) && o.dur > 0.5 ? o.dur : Infinity;
+  let kept = 0;
+  const count = () => {
+    kept = 0;
+    for (let i = 0; i < n; i++) if (syl[i].keep) kept++;
+    return kept;
+  };
+  // A line longer than its slot loses its WEAK syllables first — an elision, the
+  // thing a real speaker does under time pressure — and only then gets cut off.
+  // Speeding past MAX_SYL_RATE instead is what turns a read into a gabble.
+  for (let pass = 0; pass < 3 && count() / MAX_SYL_RATE > budget; pass++) {
+    for (let i = 1; i < n; i += 2) if (!syl[i].stress) syl[i].keep = false;
+    for (let i = 2; i < n; i += 3) if (!syl[i].stress) syl[i].keep = false;
+    if (pass === 2) for (let i = 0; i < n; i++) if (!syl[i].stress) syl[i].keep = false;
+  }
+  // Still over: truncate. A read that stops is a person interrupted; a read that
+  // runs under the next line is two people talking over each other.
+  if (count() / MAX_SYL_RATE > budget) {
+    let acc = 0;
+    for (let i = 0; i < n; i++) {
+      if (!syl[i].keep) continue;
+      acc += 1 / MAX_SYL_RATE;
+      if (acc > budget) { n = i; break; }
+    }
+  }
+  if (!count()) return null;
+  // Seconds per unit of syllable weight, solved so the read lands exactly on
+  // `kept / effRate` seconds with the punctuation gaps taken out of the middle.
+  const effRate = Number.isFinite(budget)
+    ? clamp(kept / budget, rate, MAX_SYL_RATE) : rate;
+  let weight = 0, gaps = 0;
+  for (let i = 0; i < n; i++) {
+    if (!syl[i].keep) continue;
+    weight += syl[i].stress ? 1.28 : 0.88;
+    gaps += syl[i].gap;
+  }
+  const unit = Math.max((kept / effRate - gaps) / Math.max(weight, 1e-3), 0.055);
+
+  /* ---- source ------------------------------------------------------- */
+  const dr = V.drive ?? 1;
+  const tract = V.tract ?? 1;
+  const f0 = V.f0 ?? 110;
+  const level = o.level ?? 1;
+  const out = gain(actx, LINE_TRIM);
+  const sources = [];
+
+  const src = actx.createOscillator();
+  // The warm end of the tilt range on purpose: talk, never a shout. `bark`
+  // straddles 1.45-1.9 with effort; a spoken line lives at the top of that.
+  src.setPeriodicWave(glottalWave(actx, clamp(1.88 - 0.22 * (dr - 1), 1.62, 1.92)));
+  const srcGain = gain(actx, 0.0001);
+  src.connect(srcGain);
+  sources.push(src);
+
+  // Same three-LFO larynx as a bark: without it the pitch is a held note and
+  // the whole thing collapses back into a synthesiser.
+  const lfoEnd = t0 + kept / effRate + 1.0;
+  for (const [hz, depth] of [[rng.range(4.4, 5.6), 0.011], [rng.range(0.6, 1.2), 0.013],
+    [rng.range(8.5, 12.5), 0.004]]) {
+    const l = actx.createOscillator();
+    l.type = 'sine';
+    l.frequency.value = hz;
+    const lg = gain(actx, f0 * depth);
+    l.connect(lg);
+    lg.connect(src.frequency);
+    l.start(t0);
+    l.stop(lfoEnd);
+    sources.push(l);
+  }
+
+  const breath = (V.breath ?? 0.18) * rng.range(0.85, 1.2);
+  // LOOPED, unlike the bark's: a chapter line runs past the noise bank's 2.4 s
+  // buffer, and a one-shot source simply stops breathing halfway through.
+  const noise = bank.source('white', rng, rng.range(0.9, 1.15), true);
+  const noiseBP = biquad(actx, 'bandpass', 1500, 0.55);
+  const noiseGain = gain(actx, 0.0001);
+  series(noise, noiseBP, noiseGain);
+  sources.push(noise);
+
+  const excite = gain(actx, 1);
+  srcGain.connect(excite);
+  noiseGain.connect(excite);
+
+  /* ---- formant bank -------------------------------------------------- */
+  const first = VOWELS[syl[0].v] ?? VOWELS.a;
+  const fs = [];
+  for (let i = 0; i < 3; i++) {
+    const f = first[i] * tract;
+    // Sharper than the shout: a quiet voice has clear vowels, and clarity is
+    // what keeps a low-level read intelligible as a VOICE without raising it.
+    const bp = biquad(actx, 'bandpass', f, clamp((f / first[i + 3]) * 1.35, 1.5, 14));
+    const g = gain(actx, [1.0, 0.52, 0.22][i]);
+    excite.connect(bp);
+    bp.connect(g);
+    fs.push({ bp, g });
+  }
+  {
+    const f4 = clamp(3350 * tract, 2600, 4200);
+    const bp = biquad(actx, 'bandpass', f4, f4 / 360);
+    const g = gain(actx, 0.26);
+    excite.connect(bp);
+    bp.connect(g);
+    fs.push({ bp, g });
+  }
+
+  /* ---- tract output -------------------------------------------------- */
+  const throat = biquad(actx, 'peaking', 450, 1.0, 4.4);
+  // A fifth of a shout's presence: the peak that makes a bark cut through at
+  // 30 m is exactly what makes a spoken line sound like a tannoy up close.
+  const presence = biquad(actx, 'peaking', 2450, 1.2, clamp(dr * 1.6 - 0.5, 0.8, 2.2));
+  const hp = biquad(actx, 'highpass', 115, 0.7);
+  const lp = biquad(actx, 'lowpass', 4300, 0.7);
+  const drv = shaper(actx, saturationCurve(0.85 * dr, 0.22), '2x');
+  const body = gain(actx, 1.5 * level);
+  for (const f of fs) f.g.connect(throat);
+  series(throat, presence, hp, lp, drv, body).connect(out);
+
+  /* ---- the read ------------------------------------------------------ */
+  const rising = syl[n - 1]?.rise === true;
+  let t = t0;
+  let idx = 0;
+  src.frequency.setValueAtTime(f0, t0);
+  for (let i = 0; i < n; i++) {
+    const s = syl[i];
+    if (!s.keep) continue;
+    const v = VOWELS[s.v] ?? VOWELS.a;
+    const d = (s.stress ? 1.28 : 0.88) * unit;
+    const amp = (s.stress ? 0.46 : 0.29) * level;
+    const u = kept > 1 ? idx / (kept - 1) : 0;
+    // Declination: a phrase drifts DOWN. A flat baseline across a sentence is
+    // the single loudest robot tell there is.
+    const decl = 1 - 0.13 * u;
+    const term = i === n - 1 ? (rising ? 1.14 : 0.86) : 1;
+    const pitch = f0 * decl * (s.stress ? 1.07 : 0.97) * term;
+
+    if (s.on) {
+      const ct = Math.max(t - (s.on === 'f' ? 0.045 : 0.014), 0);
+      const cs = bank.source('white', rng, rng.range(0.9, 1.25));
+      const cbp = biquad(actx, s.on === 'f' ? 'bandpass' : 'highpass',
+        s.on === 'f' ? rng.range(3600, 6000) : rng.range(1300, 2400),
+        s.on === 'f' ? 1.1 : 0.7);
+      const cg = gain(actx, 0);
+      series(cs, cbp, cg).connect(out);
+      sources.push(cs);
+      const a = ARTICULATION * level;
+      if (s.on === 'f') { ad(cg.gain, ct, 0.1 * a, 0.012, 0.05); cs.start(ct, cs._offset, 0.12); }
+      else if (s.on === 'n') { ad(cg.gain, ct, 0.02 * a, 0.01, 0.04); cs.start(ct, cs._offset, 0.08); }
+      else { hit(cg.gain, ct, 0.16 * a, 0.014); cs.start(ct, cs._offset, 0.05); }
+    }
+
+    for (let k = 0; k < 3; k++) {
+      const f = v[k] * tract * (1 + rng.range(-0.018, 0.018));
+      fs[k].bp.frequency.setTargetAtTime(f, Math.max(t - 0.035, t0), 0.018);
+      fs[k].bp.Q.setTargetAtTime(clamp((f / v[k + 3]) * 1.35, 1.5, 14), Math.max(t - 0.035, t0), 0.024);
+    }
+    src.frequency.setTargetAtTime(pitch, t, 0.035);
+    src.frequency.setTargetAtTime(pitch * 0.95, t + d * 0.62, 0.06);
+
+    /*
+     * THE ENVELOPE IS THE RHYTHM, and the rhythm is what makes a listener hear
+     * a person rather than a hum. MEASURED on the rendered read (the modulation
+     * spectrum of the amplitude envelope, which is the standard speech
+     * signature): a 0.55 inter-syllable dip with no stop closures gave 10 dB of
+     * modulation depth and 93% of the read voiced — a legato drone with slow
+     * swells. Real speech modulates 15-25 dB and is ~70-85% voiced, because
+     * every /p/, /t/ and /k/ is a SILENCE before a burst. So: a deeper dip
+     * inside the word, a real closure before a plosive, and a proper stop at a
+     * word boundary. None of it makes the read more word-like — the vowels are
+     * unchanged — it only makes the rhythm human, which is the half of speech
+     * this register is actually trying to deliver.
+     */
+    to(srcGain.gain, amp, t, 0.02);
+    to(noiseGain.gain, amp * breath, t, 0.02);
+    to(srcGain.gain, amp * 0.34, t + d * 0.62, 0.03);
+    if (s.gap > 0.05) {
+      to(srcGain.gain, 0.0001, t + d, 0.016);
+      to(noiseGain.gain, 0.0001, t + d, 0.024);
+    }
+    // The stop closure for the NEXT syllable, if it opens on a plosive and
+    // there is room for it without eating this vowel.
+    const next = i + 1 < n ? syl[i + 1] : null;
+    const shut = t + d + s.gap - 0.035;
+    if (next && next.keep && next.on === 'p' && shut > t + d * 0.5) {
+      to(srcGain.gain, 0.0001, shut, 0.010);
+      to(noiseGain.gain, 0.0001, shut, 0.012);
+    }
+    t += d + s.gap;
+    idx++;
+  }
+  to(srcGain.gain, 0.0001, t, 0.05);
+  to(noiseGain.gain, 0.0001, t, 0.05);
+
+  const end = t + 0.28;
+  const start = Math.max(t0 - 0.01, 0);
+  src.start(start);
+  src.stop(end);
+  noise.start(start, noise._offset);
+  noise.stop(end);
+
+  /* ---- speaker treatment (dispatch, a voice on the radio) ------------ */
+  if (o.radio ?? V.radio) {
+    const rout = gain(actx, 1);
+    const rhp = biquad(actx, 'highpass', 440, 0.8);
+    const rlp = biquad(actx, 'lowpass', 3000, 0.9);
+    const rdrv = shaper(actx, saturationCurve(5, 0.28), '2x');
+    series(out, rhp, rlp, rdrv, gain(actx, 1.15)).connect(rout);
+    return { node: rout, end: end + 0.1, send: 0.06, sources };
+  }
+  /*
+   * NEARLY DRY, and this is the single largest quality lever in the whole read.
+   * A bark is a shout across a street and wants the room (0.45); a story line is
+   * a man talking to you.
+   *
+   * MEASURED, envelope modulation depth of the rendered line — the property that
+   * separates "a person talking" from "a hum with swells", and the thing the
+   * shared 2.8 s street/open convolution destroys by filling every stop closure:
+   *
+   *     send 0.15 -> 10.3 dB modulation, 89% of the line voiced
+   *     send 0.06 -> 13.2 dB,            85%
+   *     send 0.035-> 15.9 dB,            80%   <- real speech is 15-25 dB, 70-85%
+   *     dry (0)   -> 21.6 dB,            76%
+   *
+   * The rhythm work in the envelope above was worth 0 dB until this came down:
+   * the closures were all there and the room was filling them back in.
+   */
+  return { node: out, end: end + 0.1, send: 0.035, sources };
+}
+
+/**
+ * How far each bus is pushed down while a story line is sounding, as a fraction
+ * of gain reduction. This — not the voice's own trim — is the lever that makes
+ * a line audible, because the voice bus compressor caps how loud a read can get
+ * before it stops sounding like speech (see LINE_TRIM).
+ *
+ * ASKED FOR AND HEARD ARE NOT THE SAME NUMBER, and the gap is the point of
+ * measuring the emitted radio rather than the gain: the music bus has its own
+ * compressor (-15 dBFS, 2.6:1, 0.3 s release), which gives back gain as soon as
+ * the duck takes it away. Asking for -9 dB (0.645) produced a MEASURED 6.6 dB
+ * drop at the output; 0.82 asks for -14.9 dB and produces a measured 12.4 dB,
+ * which is what puts the read 8.2 dB clear of the bed. The rest are scaled from
+ * it so the whole bed moves together rather than the radio alone stepping down.
+ */
+export const DIALOGUE_DUCK = { music: 0.82, ambience: 0.70, foley: 0.45, vehicles: 0.38 };
+/** The line stops over this long on a skip, a pause or a replacement. */
+const CUT_FADE = 0.07;
+
+/**
+ * ONE story line at a time, its side-chain, and its teardown.
+ *
+ * Split out of `AudioSystem` so the whole of it — voicing, ducking, stopping,
+ * the start/end callbacks — can be driven against a real `Mixer` on an
+ * OfflineAudioContext and MEASURED (`src/audio/duckprobe.mjs`). What stays in
+ * `src/audio/index.js` is only the glue: where the line comes from and which
+ * event it raises. That boundary is named in the probe's header, because a stub
+ * is an assertion that nothing downstream of it can be wrong.
+ *
+ * THE DUCK IS RE-ASSERTED EVERY FRAME rather than held. `Mixer.duckBus` only
+ * ever deepens a duck and `Mixer.update` is the only thing that releases one, so
+ * "hold it down for exactly this long" is not expressible; "keep asking while
+ * the line sounds, stop asking the instant it does not" is, and it releases on
+ * the mixer's own 400 ms recovery whether the line ended, was skipped, or was
+ * cut off by a pause. Call order matters and is the caller's job: `mixer.update`
+ * first, then this — the re-assert has to land after the decay, or the bed
+ * ripples at frame rate.
+ */
+export class DialogueVoice {
+  /**
+   * @param {object} opts { duck } — `duck: false` is the negative control the
+   *   probe runs against the LIVE code with no edit, same pattern as the pause
+   *   gates' `debugIgnorePause`.
+   */
+  constructor(actx, bank, mixer, rng, opts = {}) {
+    this.actx = actx;
+    this.bank = bank;
+    this.mixer = mixer;
+    this.rng = rng;
+    this.duckEnabled = opts.duck !== false;
+    this.bus = opts.bus ?? 'voice';
+    /** Called with the reused records below — read them, never retain them. */
+    this.onStart = null;
+    this.onEnd = null;
+
+    this.out = gain(actx, 1);
+    this.out.connect(mixer.bus(this.bus));
+    this._send = gain(actx, 0);
+    this.out.connect(this._send);
+    this._send.connect(mixer.busSend(this.bus));
+
+    /** The live line. `gate` is its own fader so a skip can cut it mid-word. */
+    this._live = null;
+    this._gate = null;
+    this._sources = null;
+    this._end = 0;
+    this._kill = 0;
+    this._syl = [];
+    /** Retired graphs still fading out. Drained in `update`, never in `stop`. */
+    this._dead = [];
+    this.id = '';
+    this.lines = 0;
+
+    /* Reused payloads — `update` runs every frame and allocates nothing. */
+    this._startRec = { id: '', text: '', dur: 0, syllables: 0, source: '' };
+    this._endRec = { id: '', reason: '' };
+  }
+
+  /** Is a line making sound right now? `bark` yields on this. */
+  sounding(now = this.actx.currentTime) {
+    return !!this._live && now < this._kill;
+  }
+
+  /**
+   * Speak one line. Replaces whatever was speaking — one voice at a time is the
+   * whole budget, and two overlapping reads is the failure mode that makes a
+   * synthesised voice unlistenable.
+   *
+   * @param {string} id speaker id (see VOICES)
+   * @param {string} text the authored line
+   * @param {number} dur seconds the line is on screen; 0 = pace it naturally
+   */
+  speak(id, text, dur = 0, opts = {}) {
+    const t = String(text ?? '');
+    if (!t.trim()) return false;
+    if (this._live) this.stop('replaced');
+    const actx = this.actx;
+    const when = actx.currentTime + 0.02;
+    // Deterministic per line: a replayed chapter must sound the same, and rule 4
+    // is about capture reproducibility, not just about Math.random.
+    this.rng.seed?.(hashId(id + '|' + t));
+    syllabify(t, this._syl);
+    const v = voiceLine(actx, this.bank, this.rng, {
+      when, text: t, id, voice: opts.voice, dur, level: opts.level ?? 1,
+      syllables: this._syl, radio: opts.radio,
+    });
+    if (!v) return false;
+
+    this._gate = gain(actx, 1);
+    v.node.connect(this._gate);
+    this._gate.connect(this.out);
+    this._send.gain.setValueAtTime(v.send ?? 0.2, actx.currentTime);
+    this._live = v.node;
+    this._sources = v.sources;
+    this._end = v.end;
+    this._kill = v.end;
+    this.id = String(id ?? '');
+    this.lines++;
+
+    const r = this._startRec;
+    r.id = this.id;
+    r.text = t;
+    r.dur = v.end - when;
+    r.syllables = this._syl.length;
+    r.source = opts.source ?? '';
+    this.onStart?.(r);
+    return true;
+  }
+
+  /**
+   * Cut the line. Fades rather than disconnecting, because a hard stop on a
+   * voiced vowel is a click, and a click is louder than the line was.
+   */
+  stop(reason = 'stopped') {
+    if (!this._live) return false;
+    const t = this.actx.currentTime;
+    const off = t + CUT_FADE;
+    try {
+      this._gate.gain.cancelScheduledValues(t);
+      this._gate.gain.setTargetAtTime(0.0001, t, CUT_FADE * 0.35);
+      for (const s of this._sources) {
+        try { s.stop(off); } catch { /* already stopped, or never started */ }
+      }
+    } catch { /* the graph is going away anyway */ }
+    this._kill = Math.min(this._kill, off);
+    this._end = Math.min(this._end, off);
+    const r = this._endRec;
+    r.id = this.id;
+    r.reason = reason;
+    // Detach BEFORE the callback: a listener may start the next line, and it
+    // must not find this one still live and stop it recursively.
+    this._retire(off);
+    this.onEnd?.(r);
+    return true;
+  }
+
+  /**
+   * Hand the graph to the teardown pass, keeping it audible until `off`.
+   * QUEUED rather than replaced: disconnecting a graph that is still fading is
+   * a click, and two lines replaced inside one fade is exactly when it happens.
+   */
+  _retire(off) {
+    if (this._live) this._dead.push({ node: this._live, gate: this._gate, at: off + 0.05 });
+    this._live = null;
+    this._gate = null;
+    this._sources = null;
+  }
+
+  /**
+   * Per frame. Allocates nothing.
+   * @param {number} now `actx.currentTime` — the ONLY clock this runs on. A
+   *   cutscene stops `time.scale`, and a story line has to play through it.
+   */
+  update(now = this.actx.currentTime) {
+    while (this._dead.length && now >= this._dead[0].at) {
+      const d = this._dead.shift();
+      try { d.node.disconnect(); } catch { /* gone */ }
+      try { d.gate.disconnect(); } catch { /* gone */ }
+    }
+    if (this._live && now >= this._end) {
+      const r = this._endRec;
+      r.id = this.id;
+      r.reason = 'done';
+      this._retire(now);
+      this.onEnd?.(r);
+    }
+    if (!this.duckEnabled || !this.sounding(now)) return;
+    const m = this.mixer;
+    // hold 0: the mixer starts recovering the instant this stops being called.
+    m.duckBus('music', DIALOGUE_DUCK.music, 0);
+    m.duckBus('ambience', DIALOGUE_DUCK.ambience, 0);
+    m.duckBus('foley', DIALOGUE_DUCK.foley, 0);
+    m.duckBus('vehicles', DIALOGUE_DUCK.vehicles, 0);
+  }
+
+  dispose() {
+    this.stop('dispose');
+    for (const d of this._dead) {
+      try { d.node.disconnect(); } catch { /* gone */ }
+      try { d.gate.disconnect(); } catch { /* gone */ }
+    }
+    this._dead.length = 0;
+    try { this.out.disconnect(); } catch { /* gone */ }
+    try { this._send.disconnect(); } catch { /* gone */ }
+    this.onStart = null;
+    this.onEnd = null;
   }
 }

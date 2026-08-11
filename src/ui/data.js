@@ -295,6 +295,14 @@ export const POI_STYLE = {
   mission: { c: '#ffb03a', g: 'mission', p: 9, label: 'MISSION' },
   waypoint: { c: '#ff3b8a', g: 'flag', p: 10, label: 'WAYPOINT' },
   race: { c: '#7bf0d8', g: 'flag', p: 5, label: 'STREET RACE' },
+  /**
+   * The NEXT story chapter's staging pin — a job the player has NOT accepted,
+   * so it must not wear `mission`'s live amber or the two become
+   * indistinguishable the moment a chapter is running. It lived in a private
+   * `EXTRA_STYLE` table in `citymap.js` for want of a home; the authored table
+   * is the home, and `styleFor()` finds it here first.
+   */
+  chapter: { c: '#7bc8ff', g: 'flag', p: 9, label: 'NEXT CHAPTER' },
   cop: { c: '#4c9dff', g: 'dot', p: 8, label: 'POLICE' },
   enemy: { c: '#ff3b4e', g: 'dot', p: 8, label: 'HOSTILE' },
   friend: { c: '#41e08a', g: 'dot', p: 6, label: 'ALLY' },

@@ -190,6 +190,11 @@ export const TRACKS = {
       if (c.track === 'deliver' && !M.hasTimer && g.diff.timedStory) {
         g.armTimer(M, TIMED_STORY.deliver);
       }
+      // A TIMED DELIVERY IS CLOCKED ON THE JOB, NOT ON THE CHAPTER NUMBER.
+      // See DELIVER_RATE — the authored `baseTimer` is overwritten on purpose.
+      if (c.track === 'timedDeliver') {
+        g.armTimer(M, dist(spot.x, spot.z, dest.x, dest.z) * DELIVER_RATE);
+      }
       M.aboard = false;
     },
     update(M, dt, g) {
@@ -429,6 +434,10 @@ export const TRACKS = {
         M.veh = g.spawnVehicle(M, g.boy.car ?? 'sports', p.x, p.z, p.yaw);
       }
       M.fleeT = 0;
+      // THE CHAPTER MUST NOT BE LOSABLE BEFORE IT IS PLAYABLE. See CHASE_GRACE.
+      M.graceT = CHASE_GRACE;
+      M.boardT = 0;
+      M.rolled = false;
     },
     update(M, dt, g) {
       const t = M.target;
@@ -437,7 +446,19 @@ export const TRACKS = {
       g.marker(M, 0, t.position.x, t.position.z, 'Target', 'X');
       const d = dist(t.position.x, t.position.z, g.px, g.pz);
       const hp = Math.round(clamp01(t.health / t.maxHealth) * 100);
+
+      // THE ARMING LATCH. One way: once he has driven anything at all the chase
+      // is on for good, so stepping out to shoot cannot freeze the target.
+      if (!M.rolled && g.wq.playerVehicle()) M.rolled = true;
+      M.boardT += dt;
+      const armed = M.rolled || M.boardT >= CHASE_BOARD;
+      if (!armed) {
+        g.objective(M, 'Get in a car — he is about to run', null,
+          `${Math.round(d)} m · ${hp}%`, 1 - t.health / t.maxHealth);
+        return;
+      }
       g.objective(M, 'Wreck the target', null, `${Math.round(d)} m · ${hp}%`, 1 - t.health / t.maxHealth);
+      M.graceT -= dt;
 
       // Flee: pick a point directly away from the player and drive at it,
       // re-picked every couple of seconds so he does not head into the river.
@@ -451,7 +472,7 @@ export const TRACKS = {
       }
       FLEE_OPTS.boost = d < 60;
       driveRoute(g.wq, t, g._input, M.fleeX, M.fleeZ, dt, FLEE_OPTS);
-      if (d > R.chaseLose) return g.fail(M, 'The target got away');
+      if (M.graceT <= 0 && d > R.chaseLose) return g.fail(M, 'The target got away');
       const fault = rideFault(M, dt, g);
       if (fault) return g.fail(M, faultReason(fault, 'Your car'));
     },
@@ -511,6 +532,7 @@ export const TRACKS = {
       // (!g.wq.playerVehicle()) g.spawnVehicle(...)`. Swim speed is 2.1 m/s
       // (3.4 sprinting), so a clocked salvage run with no boat is a chapter
       // that cannot be finished rather than one that is hard.
+      M.water = water;
       if (water && !waterCapable(g.wq.playerVehicle())) {
         const p = g.wq.findWaterSpot(BOAT_MIN, BOAT_MAX, a.x, a.z, undefined, true);
         M.veh = g.spawnVehicle(M, 'boat', p.x, p.z, p.yaw);
@@ -519,6 +541,19 @@ export const TRACKS = {
       }
     },
     update(M, dt, g) {
+      // THE HULL, not `rideFault`. A water salvage is the one track whose
+      // courtesy ride cannot be substituted: `rideFault` clears the fault the
+      // moment the player is in ANY other undestroyed vehicle, and a sports car
+      // is not a way to reach a crate 300 m out in the Ohio. Swim speed is
+      // 2.1 m/s, so the alternative is a clocked chapter that cannot be
+      // finished rather than one that is hard — the same argument `init` makes
+      // for spawning the boat in the first place.
+      if (M.water && M.veh) {
+        const fault = vehFault(M, dt, M.veh, '_faultHull');
+        if (fault && !waterCapable(g.wq.playerVehicle())) {
+          return g.fail(M, faultReason(fault, 'The boat'));
+        }
+      }
       const left = g.pickups.countMission();
       M.progress = M.goal - left;
       g.objective(M, 'Gather the crates', null, `${M.progress} / ${M.goal}`, M.progress / M.goal);
@@ -754,32 +789,65 @@ export const TRACKS = {
   /* recover — N marked stolen cars, each driven back to the home ring    */
   /* ------------------------------------------------------------------- */
   /* The marked cars glow green across the map, delivering one unmarks it,
-   * bumps progress and steps you OUT of it, a wrecked marked car fails the
-   * chapter, and hard+ puts 260 s on the whole job. */
+   * bumps progress and steps you OUT of it, wrecking one HE HAS SEEN fails the
+   * chapter (see RECOVER_SEEN — one he never got near is replaced instead), and
+   * hard+ puts 260 s on the whole job. */
   recover: {
     init(M, c, g) {
       M.dest = g.wq.poi(c.dest) ?? g.wq.nearestSafehouse(g.px, g.pz).poi;
-      const types = ['muscle', 'sedan', 'sports'];
       for (let i = 0; i < M.goal; i++) {
         // One car per third of the compass, 260-620 m out, so the map reads
         // as "they are all over the Burgh" and no two spawn on one street.
-        const bear = ((i + 0.5) / M.goal) * Math.PI * 2;
-        const s = g.wq.findRoadSpot(120, 320,
-          M.dest.x + Math.cos(bear) * 300, M.dest.z + Math.sin(bear) * 300);
-        const v = g.spawnVehicle(M, types[i % types.length], s.x, s.z, s.yaw, { tag: 'recover' });
-        if (v) g.markVehicle(M, v, MARK_GREEN);
+        this.place(M, g, i);
       }
       M.progress = 0;
       if (!M.hasTimer && g.diff.timedStory) g.armTimer(M, TIMED_STORY.recover);
     },
+
+    /** Put marked car `i` on a lane a third of the compass around the drop. */
+    place(M, g, i) {
+      const bear = ((i + 0.5) / M.goal) * Math.PI * 2;
+      const s = g.wq.findRoadSpot(120, 320,
+        M.dest.x + Math.cos(bear) * 300, M.dest.z + Math.sin(bear) * 300);
+      const v = g.spawnVehicle(M, RECOVER_TYPES[i % RECOVER_TYPES.length], s.x, s.z, s.yaw, { tag: 'recover' });
+      if (v) {
+        v.recoverSlot = i;
+        v.recoverSeen = false;
+        g.markVehicle(M, v, MARK_GREEN);
+      }
+      return v;
+    },
+
     update(M, dt, g) {
       let nearest = null;
       let nd = Infinity;
-      for (const v of g.vehiclesOf(M)) {
+      // Wrecks are collected, not acted on inside the walk: `place` pushes a
+      // replacement onto the very array being iterated.
+      let lost = null;
+      const list = g.vehiclesOf(M);
+      for (let i = list.length - 1; i >= 0; i--) {
+        const v = list[i];
         if (!v._marked) continue;
-        if (v.destroyed) return g.fail(M, 'A marked car was wrecked');
         const d = dist(v.position.x, v.position.z, g.px, g.pz);
+        // WITNESSED, ONCE, AND IT STAYS WITNESSED. See RECOVER_SEEN.
+        if (!v.recoverSeen && (d <= RECOVER_SEEN || g.wq.playerVehicle() === v)) v.recoverSeen = true;
+        if (v.destroyed) {
+          if (v.recoverSeen) return g.fail(M, 'A marked car was wrecked');
+          // He never laid eyes on it. Traffic, a stray cop or a streamed-in
+          // collision 600 m away is not a thing the player did, and ending his
+          // chapter for it is indistinguishable from a bug.
+          g.unmarkVehicle(v);
+          list.splice(i, 1);
+          g.wq.despawnVehicle(v, FORCE);
+          lost = v.recoverSlot ?? 0;
+          continue;
+        }
         if (d < nd) { nd = d; nearest = v; }
+      }
+      if (lost !== null) {
+        const rep = this.place(M, g, lost);
+        if (!rep) return g.fail(M, 'A marked car was wrecked');
+        if (!nearest) nearest = rep;
       }
       const pv = g.wq.playerVehicle();
       if (pv && pv._marked) {
@@ -968,6 +1036,101 @@ export const TRACKS = {
 
 /** A protect ward's health pool. Flat: he is family, not a difficulty knob. */
 const WARD_HP = 320;
+
+/* ------------------------------------------------------------------- */
+/* recover tuning                                                       */
+/* ------------------------------------------------------------------- */
+
+/** The three classes a recover chapter scatters, one per compass third. */
+const RECOVER_TYPES = Object.freeze(['muscle', 'sedan', 'sports']);
+
+/**
+ * Metres at which a marked car counts as SEEN, after which wrecking it fails
+ * the chapter.
+ *
+ * `recover` scatters its cars 260-620 m out and then fails the whole chapter
+ * the frame any one of them reports `destroyed` — from anywhere, for any
+ * reason. Mission vehicles are exempt from the streaming cull but nothing else:
+ * traffic rear-ends them, a pursuit drives through them, and a car left
+ * half-way up an off-camera incline rolls. The player gets a FAILED card for an
+ * event that happened outside his draw distance and that he could not have
+ * influenced, which is the exact shape of a bug report.
+ *
+ * So the fail is gated on WITNESS, and the witness latches: once he has been
+ * within 90 m of a car — inside the streamed-in shell, close enough that its
+ * marker and its glow are on screen — wrecking it is on him for the rest of the
+ * chapter, however far away it happens. An unwitnessed wreck is replaced on a
+ * fresh lane instead, so the goal count and the payout are unchanged and the
+ * chapter stays exactly as long as it was.
+ *
+ * 90 m is the marked-car glow's own working range rather than a new number: the
+ * ring is 3 m across and pulses, which is what "he can see it" means here.
+ */
+const RECOVER_SEEN = 90;
+
+/* ------------------------------------------------------------------- */
+/* timedDeliver tuning                                                  */
+/* ------------------------------------------------------------------- */
+
+/**
+ * SECONDS PER METRE OF HAUL. One number, every timed delivery, story or side
+ * job — which is the whole point of it.
+ *
+ * The two authored chapters were clocked by hand and the hands disagreed by a
+ * factor of six. MEASURED off the shipped defs and POI table: Aidan CH 3 "Hot
+ * Parts" runs to `shop_ammo` (384, -280) and is staged around the player, a
+ * ~300 m haul on 88 s — 0.293 s/m. Carson CH 5 "Air Mail" runs to `ap_east`
+ * (1032, -784), a 1959 m haul on 96 s — 0.049 s/m. The same player driving the
+ * same way passes one with half a minute spare and cannot physically finish the
+ * other, and nothing in either number says which is the intended difficulty.
+ *
+ * So the clock is derived from the job instead. Crow-flight, not road distance:
+ * a route length is a second opinion about the same fact (rule 12's spatial
+ * form) and it moves whenever the road graph is re-cut, so a chapter's clock
+ * would silently change under a `world` edit. The road factor is baked in here.
+ *
+ * 0.14 s/m is ~7.1 m/s of crow-flight progress: a ~1.3x road factor over a
+ * ~9.3 m/s (34 km/h) city average, which is what the streets actually deliver
+ * with lights, corners and traffic. It puts CH 3 at 42 s and CH 5 at 274 s —
+ * tighter than the authored 88 s on the short haul and four and a half times
+ * the authored 96 s on the long one, which is the direction the defect was in.
+ *
+ * `armTimer` still scales by `DIFFS.timerMul`, so hard and steel squeeze both
+ * chapters by the same fraction rather than one of them into impossibility.
+ *
+ * A gate on this must derive its own distance from the EMITTED spawn and the
+ * destination POI; `M.timer` divided by a distance this file also computed is
+ * a number compared to itself.
+ */
+const DELIVER_RATE = 0.14;
+
+/* ------------------------------------------------------------------- */
+/* chase tuning                                                         */
+/* ------------------------------------------------------------------- */
+
+/**
+ * Seconds after the chase ARMS before `R.chaseLose` may end it. The same 2.5 s
+ * `escape` gives the player before a zero-star frame can win it, and for the
+ * mirror-image reason: a track whose verdict is read on frame one reads it
+ * against the staging rather than against anything the player did.
+ */
+const CHASE_GRACE = 2.5;
+/**
+ * ...and the chase does not ARM until he is behind a wheel.
+ *
+ * MEASURED against the staging this track authors itself: the target spawns
+ * 180-320 m out (`findRoadSpot(180, 320)`) and the courtesy car 10-45 m from
+ * the player, who walks at 1.72 m/s and sprints at 6.4. A muscle car at full
+ * throttle opens ~24 m/s on a man on foot, so from a 250 m start it crosses
+ * `R.chaseLose` (620 m) in about 15 s — while the player is still walking to
+ * the car the chapter told him to take. 2.5 s of grace cannot cover that and
+ * no constant can, because the gap is a WALK, not a delay: so the target
+ * loiters and the lose-distance is disarmed until he has driven something.
+ *
+ * The ceiling is the anti-wedge: a player who never gets into any car has the
+ * chase start without him rather than a chapter that can never end.
+ */
+const CHASE_BOARD = 20;
 
 /* ------------------------------------------------------------------- */
 /* escort tuning                                                        */

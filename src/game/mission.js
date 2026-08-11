@@ -48,6 +48,29 @@ TRACKS.boss = bossTrack;
 /** Extra cash per second left on a mission clock. */
 const TIME_BONUS = 6;
 
+/**
+ * What a chapter you have ALREADY CLEARED pays the second time.
+ *
+ * `completeStoryChapter` never regresses the story frontier (GAMEPLAY.md §6),
+ * so replaying an old chapter is free and always has been — and it paid the
+ * full authored purse every time. Aidan CH 3 is 1400 plus up to ~250 of time
+ * bonus for a job that takes under a minute once you know the route, and it can
+ * be started from the pause menu as often as you like. That is not a difficulty
+ * problem, it is the economy having no floor: every price in `shops`, every
+ * respect tier and every unlock is denominated in a currency you can print.
+ *
+ * 25% is chosen to keep replay WORTH DOING and stop it being the best thing to
+ * do. On the CH 3 example it is 350 plus a quarter of the bonus — real money
+ * for five minutes, and about a sixth of what the same five minutes earns from
+ * the free-roam board (`jobs.js` pays 300-900 per offer with three standing at
+ * once), so grinding one chapter is strictly the worse play. Respect scales
+ * with it for the same reason; the tier ladder is progression, not income.
+ *
+ * It applies to STORY chapters only. A `side` mission (a race circuit) has no
+ * frontier to be past, and its own record-time reward is already once-only.
+ */
+const REPLAY_PURSE = 0.25;
+
 /** Marked cars a mission may glow at once (`recover` uses three). */
 const VEH_GLOWS = 4;
 /** Ward / partner NPC pool — a chapter never needs more than one of each. */
@@ -108,7 +131,9 @@ export class MissionRunner {
     this._startPayload = { id: '', chapter: '', name: '', zone: '', track: '' };
     /** Reused staging record — see `_stageOf`. Never handed out twice at once. */
     this._stagePoi = { id: '', name: '', x: 0, z: 0 };
-    this._endPayload = { id: '', name: '', cash: 0, respect: 0, reason: '' };
+    this._endPayload = {
+      id: '', name: '', cash: 0, respect: 0, bonus: 0, replay: false, reason: '', carded: true,
+    };
     this._rewards = [];
     /** Lazy pools: the glowing ground ring + marked-vehicle glows, ward NPCs. */
     this._glow = null;
@@ -1087,12 +1112,23 @@ export class MissionRunner {
     M.outroT = 0;
     M.sceneDone = false;
 
-    M.bonus = M.hasTimer ? Math.round(Math.max(0, M.timer) * TIME_BONUS) : 0;
-    M.cash = c.cash + M.bonus;
+    const cs = this.economy.char();
+    // BEFORE `cs.chapter` moves, because moving it is what makes a chapter
+    // cleared. A story chapter the frontier has already passed is a REPLAY.
+    M.replay = !M.side && M.idx >= 0 && cs.chapter > M.idx;
+    M.rate = M.replay ? REPLAY_PURSE : 1;
+
+    M.bonus = M.hasTimer ? Math.round(Math.max(0, M.timer) * TIME_BONUS * M.rate) : 0;
+    M.cash = Math.round(c.cash * M.rate) + M.bonus;
+    M.respect = Math.round(c.respect * M.rate);
 
     this.economy.addCash(M.cash, `chapter:${M.id}`);
-    const crossed = this.economy.addRespect(c.respect, `chapter:${M.id}`);
-    const cs = this.economy.char();
+    const crossed = this.economy.addRespect(M.respect, `chapter:${M.id}`);
+    if (M.replay) {
+      // HONESTLY, and with the number on it. A silent 75% cut reads as a
+      // payout bug; the player is owed the reason he was paid less.
+      this.notify('Replay rate', `${Math.round(REPLAY_PURSE * 100)}% — already cleared`, 'slag');
+    }
     if (!M.side) {
       cs.chapter = Math.max(cs.chapter, M.idx + 1);
       this.save.totals.missions++;
@@ -1182,9 +1218,16 @@ export class MissionRunner {
     p.name = M.def.name;
     p.cash = 0;
     p.respect = 0;
+    p.bonus = 0;
+    p.replay = false;
     p.reason = why;
+    // `_finish` draws this end's card itself, with the true kind — a death
+    // during a side mission is WASTED, which the generic listener cannot know.
+    p.carded = true;
     this.ctx.events.emit('mission:fail', p);
-    this.wq.uiSfx('damage', 0.9);
+    // NO SECOND STING. `ui.card('failed', ...)` — raised off the event on the
+    // line above — plays `mission_fail` at 0.9 already, in this same frame. A
+    // generic `damage` hit under it is the audible half of the double-fire.
     this._finish(M);
   }
 
@@ -1195,6 +1238,44 @@ export class MissionRunner {
     this.fail(M, why, kind);
   }
 
+  /**
+   * ONE CARD, ONE STING — and `carded` is how.
+   *
+   * `_finish` does BOTH halves of the same job: it emits `mission:complete` /
+   * `mission:fail` AND calls `ui.card(...)` itself. `src/ui/index.js:874` and
+   * `:881` raise a card off each of those events unconditionally, and
+   * `ui.card()` (`src/ui/index.js:1081`) plays `mission_pass` / `mission_fail`
+   * on every call — so every mission end in the game showed the big card TWICE
+   * and struck its sting twice in the same frame. The second `show()` restarts
+   * the reveal animation from t=0 and the two stings land as one flam, which is
+   * why it reads as "the card feels wrong" rather than as two of anything.
+   *
+   * Two subsystems deciding one fact (rule 12's spatial form), and BOTH have a
+   * real claim. This side has the only copy of the numbers that make the card
+   * worth reading — the split Payout / Time bonus / Respect rows, and the
+   * WASTED / BUSTED kinds, which the `mission:fail` listener flattens to
+   * MISSION FAILED. `ui`'s listener is the only thing that cards for an emitter
+   * with no card of its own, and `jobs._endLite` is exactly that emitter.
+   *
+   * So neither side stops emitting and neither stops listening. The PAYLOAD
+   * carries the answer: `carded: true` means "this end has already drawn its
+   * own card, stand down". Set here, unset by `jobs` (its `_endPayload` has no
+   * such field), and the fallback keeps working untouched for everyone else.
+   *
+   * ────────────────────────────────────────────────────────────────────────
+   * THE `ui` HALF IS NOT LANDED YET, AND IT IS TWO LINES. `src/ui/index.js` is
+   * not this change's to edit; until its owner adds
+   *
+   *     on('mission:complete', (e) => { if (e?.carded) { this.clearObjective(); return; } ... })
+   *     on('mission:fail',     (e) => { if (e?.carded) { this.clearObjective(); return; } ... })
+   *
+   * the second card still shows. What IS landed and gated is the contract on
+   * this side: `src/game/flowprobe.mjs` counts every card an end raises with a
+   * `ui` stand-in that mirrors both of those handlers INCLUDING the guard, and
+   * its negative control deletes `carded` from the payload and watches the
+   * count go to two. `src/game/escortprobe.mjs` counts the same way.
+   * ────────────────────────────────────────────────────────────────────────
+   */
   _finish(M) {
     const ui = this.wq.ui;
     const won = M.state === 'won';
@@ -1208,14 +1289,18 @@ export class MissionRunner {
       p.id = M.id;
       p.name = M.def.name;
       p.cash = M.cash;
-      p.respect = M.def.respect;
+      p.respect = M.respect ?? M.def.respect;
+      p.bonus = M.bonus;
+      p.replay = !!M.replay;
       p.reason = '';
+      p.carded = true;
       this.ctx.events.emit('mission:complete', p);
       this._rewards.push({ value: money(M.cash), label: 'Payout' });
       if (M.bonus > 0) this._rewards.push({ value: money(M.bonus), label: 'Time bonus' });
-      this._rewards.push({ value: `+${M.def.respect}`, label: 'Respect' });
+      this._rewards.push({ value: `+${p.respect}`, label: 'Respect' });
       ui?.card?.('passed', M.def.name, this._rewards);
     } else {
+      // `fail` published `mission:fail` with `carded` already set.
       ui?.card?.(M.failKind ?? 'failed', M.reason || M.def.name, this._rewards);
     }
     this.cleanup();
@@ -1322,6 +1407,46 @@ function startLineOf(c) {
   if (!t) return null;
   return { id: `grid_${t.id}`, name: `${t.name} start line`, x: t.points[0].x, z: t.points[0].z };
 }
+
+/**
+ * A BOSS ARENA IS A PLACE, SO IT SHOULD BE A TRAVEL LEG — AND IT IS NOT YET.
+ *
+ * WRITTEN DOWN BECAUSE IT IS BLOCKED, NOT BECAUSE IT IS DONE. The three finales
+ * name a zone on their chapter card — POINT MARINA, OLD BLAST FURNACE, FORT
+ * DUQUESNE BRIDGE — and then name no `at:`, so `startPoi` is null, `_afterIntro`
+ * goes straight to `_begin`, and `boss.js` puts the player on the arena with
+ * `wq.placePlayer` (`boss.js:152` for a driver, `:172` for a brute). The
+ * cutscene ends and he is simply somewhere else, up to a kilometre and a river
+ * from where he was standing, with the car he drove there left behind. That is
+ * the exact bug this file's header says the travel phase was written for, and
+ * the finale is the one chapter still doing it.
+ *
+ * THE CHANGE IS THREE LINES and they are these: add `?? arenaOf(c)` to the
+ * `startPoi` expression in `_start`, and have `arenaOf` return
+ * `{ id: 'arena_'+B.id, name: B.name, x: B.arena.x, z: B.arena.z }` for a
+ * `boss` track out of `BOSSES[c.bossId].arena`. `BOSSES[].arena` is already the
+ * single owner of where the fight happens — `boss.js` reads the same field for
+ * the same facts — so it adds no second opinion about the location. The
+ * smallest arena radius is 152 m against a 120 m `TRAVEL_ARRIVE`, so arriving
+ * means arriving INSIDE the arena.
+ *
+ * WHAT BLOCKS IT: `src/game/bossbarprobe.mjs:243` and
+ * `src/game/bossphaseprobe.mjs` both stage a finale with
+ *
+ *     s.missions.start(boy, idx);
+ *     for (let i = 0; i < 8 && s.missions.M.phase === 'intro'; i++) s.missions.update(1);
+ *
+ * and then read `M.bossEnt` / `M.bossVeh` on the next line. Their `wq` stand-in
+ * parks the player at the origin and `poi()` returns null for every id, so the
+ * chapter lands in 'travel' 742 m from Carson's arena, `bossTrack.init` never
+ * runs, and both probes throw on a null boss. Each needs ONE line —
+ * `s.missions.forceBegin();` after that loop, which is exactly what
+ * `forceBegin`'s header says it is for. Neither file is this change's to edit.
+ *
+ * `boss.js` would still reposition on top of the travel leg — 3 m for a driver,
+ * 25-60 m of dry ground for a brute — which becomes a local square-up inside
+ * the arena rather than a cross-map teleport. Removing that is `boss.js`'s.
+ */
 
 /**
  * `[['carson','line'], ...]` from `data.js` -> `[{who,text,name,colour}]`.

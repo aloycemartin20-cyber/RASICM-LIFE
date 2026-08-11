@@ -86,6 +86,31 @@ const T = {
 /** Above this the actor is thrown clear rather than stepping out. */
 const BAIL_SPEED = 7.0;
 
+/** World up, for the yaw the animator has already written onto the root. */
+const UP = new THREE.Vector3(0, 1, 0);
+/** A vehicle's nose is +Z and an actor's facing is -Z: `seatYaw = heading + PI`. */
+const FLIP = new THREE.Quaternion().setFromAxisAngle(UP, Math.PI);
+/** The tilt of a man who is not in a car. */
+const IDENTITY = new THREE.Quaternion();
+
+/**
+ * How fast the seated body adopts the car's roll and pitch, in seconds.
+ *
+ * It cannot be zero. A chassis quaternion carries the suspension, so it chatters
+ * over cobbles, tram rails and kerbs at the spring frequency — riding it raw
+ * puts that chatter straight into the head, one metre from the chase lens, and
+ * it reads as a flinch rather than as a road surface. MEASURED on the emitted
+ * skeleton (`camtest`, `tilt.cobbles` / `tilt.holds`): an 8 Hz, 4-degree
+ * peak-to-peak chatter riding on a 14-degree bank arrives at the head as
+ * **0.93 degrees peak-to-peak — 23% of the chassis** — while the mean body roll
+ * holds 13.99 degrees against the bank's 14.00.
+ *
+ * RATCHET. 0.085 is where this pass got to. The honest tuning wants a human on
+ * a real cobbled street — lower it if the head still twitches, and never raise
+ * it to make a gate go green.
+ */
+const TILT_TAU = 0.085;
+
 export class VehicleHandler {
   constructor(ctx, player) {
     this.ctx = ctx;
@@ -148,6 +173,36 @@ export class VehicleHandler {
      * which is the build that put the driver one fixed step off his seat.
      */
     this.debugSeatDrawnPose = true;
+
+    /**
+     * SEATED ATTITUDE — the roll and pitch the body wears in the seat.
+     *
+     * `setSeatTransform` carries a position and a YAW SCALAR, and the animator
+     * writes the root as `setFromAxisAngle(UP, faceYaw)` — so the driver was
+     * upright in world space whatever the car was doing. On the Mt. Washington
+     * inclines and every kerb ramp in the city that is a body standing through
+     * its own sheet metal: `drivetest`'s own facing check already carried the
+     * gap in prose ("the rider does not lean with the machine yet") and gave
+     * bikes a 12-degree tolerance to hide it.
+     *
+     * The fix is a rotation applied to the character root AFTER the animator
+     * has posed it, never a change to the pose request — the seated pose solves
+     * its pedals and wheel through `root.localToWorld`, so it is already
+     * body-local and a rigid post-rotation carries all of it.
+     *
+     * `_seatTilt` is the tilt in BODY space (the residual once the yaw the
+     * animator already applied is divided out), which is why it can be filtered
+     * without the filter ever fighting `faceYaw`.
+     */
+    this._seatTilt = new THREE.Quaternion();
+    this._tiltTarget = new THREE.Quaternion();
+    this._yawQuat = new THREE.Quaternion();
+    /**
+     * NEGATIVE CONTROL, read by `src/player/camtest.mjs --control=tilt` and by
+     * nothing else: false pins the tilt to identity, which is the build that
+     * drove the driver bolt upright through the roof on every slope.
+     */
+    this.debugSeatTilt = true;
     /** Local-space exit candidates, filled in `_pickExit`. */
     this._exitTry = [];
     for (let i = 0; i < 6; i++) this._exitTry.push(new THREE.Vector3());
@@ -178,10 +233,56 @@ export class VehicleHandler {
 
   /* ==================================================================== */
 
+  /**
+   * The tilt the body wears this frame, filtered toward the car's own.
+   *
+   * Runs on every phase, including `none`: coming out of a car on a hill the
+   * tilt has to decay to upright on the same curve it arrived on, or the actor
+   * pops vertical on the frame the door shuts. The target is identity for
+   * anything except `drive`, because that is the only phase whose yaw is
+   * `seatYaw` — through `open` / `in` / `out` the body is turning between the
+   * door and the seat, and a tilt resolved against a yaw the root does not have
+   * would tip him sideways.
+   */
+  _stepSeatTilt(dt) {
+    const want = this.phase === PHASE.drive && this.debugSeatTilt !== false
+      ? this._tiltTarget : IDENTITY;
+    const k = dt > 0 ? 1 - Math.exp(-dt / TILT_TAU) : 1;
+    this._seatTilt.slerp(want, k);
+  }
+
+  /**
+   * Wear it. `PlayerSystem` calls this immediately after `animator.update()`,
+   * which is the only moment it can be called: the animator opens by writing
+   * `root.quaternion` from the yaw alone and closes by solving the seated legs
+   * and arms against `root.localToWorld`, so the pose underneath is body-local
+   * and a rigid post-rotation carries every bone of it.
+   *
+   * The world matrices are rebuilt here rather than left to the renderer's own
+   * pass, because four things read a bone matrix between now and the draw —
+   * the weapon mount, the hitbox sync, `headPosition` and the shot harness —
+   * and a body that is banked on screen but upright to every query is the same
+   * class of bug in a different place. It is a hierarchy of ~30 bones, and only
+   * while somebody is in a seat.
+   *
+   * Returns true when it actually rotated the root, so a harness can tell "no
+   * tilt" apart from "not seated".
+   */
+  applySeatAttitude(root) {
+    if (!root) return false;
+    // 1 - |w| < 1e-6 is under a fifth of a degree of tilt: not worth a multiply
+    // and a world-matrix rebuild on every frame the player is on foot.
+    if (1 - Math.abs(this._seatTilt.w) < 1e-6) return false;
+    root.quaternion.multiply(this._seatTilt);
+    root.updateMatrixWorld(true);
+    return true;
+  }
+
   /** Called from PlayerSystem.update, before the camera solves. */
   update(dt, m) {
     const vehicles = this.ctx.peek('vehicles');
     if (this.phase === PHASE.none) {
+      this._stepSeatTilt(dt);
       // The bottle refills on foot too, so walking to the next car is not dead
       // time. Only `_stepDrive` can ever open the valve.
       this._stepNitro(dt, false);
@@ -205,6 +306,9 @@ export class VehicleHandler {
       case PHASE.out: this._stepOut(u, m); break;
       default: break;
     }
+    // After the step, so the filter reads the target this frame's
+    // `_composeAnchors` just wrote rather than the previous frame's.
+    this._stepSeatTilt(dt);
   }
 
   /* ---- prompt ------------------------------------------------------- */
@@ -534,6 +638,25 @@ export class VehicleHandler {
     this.doorYaw = Math.atan2(
       -(at.x - this.doorPos.x), -(at.z - this.doorPos.z)
     );
+
+    /**
+     * ...AND THE OTHER TWO AXES, which nothing carried at all.
+     *
+     * `heading` above throws the roll and the pitch away — it is the yaw of a
+     * quaternion that also describes a car sat at 14 degrees on a plaza kerb or
+     * hanging off an incline. The residual is what the body owes the car:
+     *
+     *     wanted root  = q * FLIP                  (the car's full attitude)
+     *     animator has = Ry(seatYaw)               (the yaw, and only the yaw)
+     *     so the tilt  = Ry(seatYaw)^-1 * q * FLIP
+     *
+     * which is a pure roll/pitch in BODY space, because `seatYaw` was extracted
+     * from this same `q` one line up. That is the property the filter in
+     * `update` needs: it can lag the tilt as hard as a cobbled street requires
+     * without ever putting the body's yaw behind the car's.
+     */
+    this._yawQuat.setFromAxisAngle(UP, this.seatYaw).invert();
+    this._tiltTarget.copy(this._yawQuat).multiply(q).multiply(FLIP);
   }
 
   /* ==================================================================== */

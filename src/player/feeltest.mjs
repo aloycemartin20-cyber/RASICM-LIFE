@@ -433,7 +433,39 @@ function runBench() {
     const rx = Math.cos(yaw), rz = -Math.sin(yaw);
     const gx = (sp ? sp.position.x : 0) + rx * lane;
     const gz = (sp ? sp.position.z : 0) + rz * lane;
-    const gy = phys.groundHeight(gx, gz, (sp ? sp.position.y : 0) + 8);
+    /**
+     * DROP HIM ON THE FLOOR A CAPSULE ACTUALLY MEETS, and take the datum from
+     * where he ends up.
+     *
+     * Every geometry test below is authored in metres above `base.y` — a
+     * 1.95 m wall, a 0.55 m vault, a 1.35 m soffit — so the datum has to be
+     * the floor the capsule stands on. Two things stop `groundHeight`'s
+     * default answer being that floor:
+     *
+     *   - it runs on `MASK.WORLD`, which by design cannot see `LAYER.CLIP` —
+     *     and `world`'s corridor floor and city-wide safety net are the sheets
+     *     a capsule most often rests on;
+     *   - it now answers the AUTHORED walkable surface when the streamed road
+     *     sector has not been built, which at boot — when this bench runs — is
+     *     up to 1.4 m above the collision that exists (MEASURED on a 10 m grid:
+     *     median 0.52 m at boot, 0.03 m once the sectors land).
+     *
+     * The bench read that answer, authored a 1.95 m wall from it, and the wall
+     * became a 2.7 m wall the player could not climb — a red row about
+     * climbing, in a change with no climbing in it.
+     *
+     * So: place with the RAW `MASK.CHARACTER` ray (the correction is what is
+     * being stepped around, so it is turned off across the query rather than
+     * worked around), then take `base.y` from `p.feetPosition` — the emitted
+     * capsule, which cannot disagree with the world it is about to be tested
+     * in. The frame count is unchanged deliberately: `recoilRun` A/Bs two
+     * sequential runs against a time-driven idle sway, so changing how many
+     * frames a `place` costs moves a residual that has nothing to do with it.
+     */
+    const wasLift = phys.debugWalkableFloor;
+    phys.debugWalkableFloor = false;
+    const gy = phys.groundHeight(gx, gz, (sp ? sp.position.y : 0) + 8, phys.MASK.CHARACTER);
+    phys.debugWalkableFloor = wasLift;
     const feet = Number.isFinite(gy) ? gy : 0;
     base.x = gx; base.y = feet; base.z = gz;
     base.yaw = yaw; base.fx = fx; base.fz = fz;
@@ -441,6 +473,7 @@ function runBench() {
     p.health.reset(true);
     p.health.effect = 0;
     step(4);
+    if (Number.isFinite(p.feetPosition.y)) base.y = p.feetPosition.y;
   };
   /** Point `d` metres in front of the placed player. */
   const ahead = (d) => ({ x: base.x + base.fx * d, z: base.z + base.fz * d });
