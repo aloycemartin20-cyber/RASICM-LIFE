@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { el, svg, setText, setStyle, setClass, Pool, ease, clamp, clamp01, metres } from './util.js';
+import { TITLE_SAFE } from './style.js';
 
 const _v = new THREE.Vector3();
 
@@ -8,7 +9,7 @@ const _v = new THREE.Vector3();
  * Returns the shared scratch object — never held past the call site.
  */
 const _proj = { x: 0, y: 0, dist: 0, behind: false, offscreen: false, angle: 0 };
-function project(pos, camera, w, h, margin) {
+function project(pos, camera, w, h, marginX, marginY) {
   _v.copy(pos);
   const dist = _v.distanceTo(camera.position);
   /**
@@ -49,8 +50,8 @@ function project(pos, camera, w, h, margin) {
   const cy = h * 0.5;
   let dx = x - cx;
   let dy = y - cy;
-  const mx = w * 0.5 - margin;
-  const my = h * 0.5 - margin;
+  const mx = w * 0.5 - marginX;
+  const my = h * 0.5 - marginY;
   /**
    * A BEHIND-CAMERA TARGET IS PUSHED OUT TO THE RIM, NOT LEFT NEAR THE MIDDLE.
    *
@@ -128,6 +129,11 @@ const CHEVRON_FLOOR = 0.8;
  *
  * On-screen markers are left alone: they are at their true projected position
  * and moving one would be a lie about where the thing is.
+ *
+ * The three helpers below are FILE-LOCAL. The gate for all of this is
+ * `src/ui/aircraftprobe.mjs` (area 6f), and it asserts the DRAWN separation of
+ * two marker nodes in laid-out CSS pixels rather than calling the maths — so
+ * there is no second consumer, and nothing here is exported as if there were.
  */
 /**
  * Minimum gap between two rim markers, CSS px before `k`.
@@ -151,7 +157,7 @@ const _rimI = new Int32Array(8);
  * (half-extents `mx`, `my`, centred on the origin). Runs clockwise from the
  * middle of the right edge; the total perimeter is `4 * (mx + my)`.
  */
-export function rimParam(dx, dy, mx, my) {
+function rimParam(dx, dy, mx, my) {
   // The clamp in `project()` scales by the SMALLER of mx/|dx| and my/|dy|, so
   // exactly one axis is pinned. Whichever is proportionally further out is the
   // edge the point is on; the corner case resolves either way and agrees.
@@ -164,7 +170,7 @@ export function rimParam(dx, dy, mx, my) {
 }
 
 /** Inverse of `rimParam` — writes into `out` (`{x, y}`), never allocates. */
-export function rimPoint(s, mx, my, out) {
+function rimPoint(s, mx, my, out) {
   const P = 4 * (mx + my);
   let t = s % P;
   if (t < 0) t += P;
@@ -190,7 +196,7 @@ export function rimPoint(s, mx, my, out) {
  * cluster too dense to separate degrades to evenly spaced rather than to a
  * pile. Returns the number of coordinates it moved.
  */
-export function spreadRim(s, n, sep, P) {
+function spreadRim(s, n, sep, P) {
   if (n < 2) return 0;
   let moved = 0;
   for (let pass = 0; pass < 2; pass++) {
@@ -309,7 +315,7 @@ export class WorldMarkers {
     this._pa = new Float64Array(cap);
     this._pe = new Uint8Array(cap);
     this._rimOut = { x: 0, y: 0 };
-    /** Negative control for `src/ui/rimprobe.mjs` — the overprinting build. */
+    /** Negative control for `src/ui/aircraftprobe.mjs` 6f — the overprinting build. */
     this.debugNoSpread = false;
   }
 
@@ -349,14 +355,30 @@ export class WorldMarkers {
   updateObjectives(list, camera, w, h, k) {
     const items = this.objPool.items;
     let n = 0;
-    const margin = 74 * k;
+    /**
+     * THE RIM IS THE TITLE-SAFE RECTANGLE, PER AXIS.
+     *
+     * It was a flat `74 * k` on both axes, which is a different thing on each:
+     * 3.9 % of a 1920 frame's width and 6.9 % of its height. So the chevron
+     * that says "your objective is THAT way" — the single most directional
+     * thing on screen — sat inside the 4 % band a television can overscan away
+     * on the left and right edges, while wasting 3 % of the height above and
+     * below it. `TITLE_SAFE` is the same number `--safe` publishes to the
+     * cascade, so the chevrons ride the same line as the money and the ammo.
+     *
+     * The old 74 px is kept as a floor for small windows, exactly as `--pad-x`
+     * keeps the old gutter: 5 % of a 900 px-wide window is 45 px, and pulling
+     * the rim in that far would put the chevrons over the crosshair.
+     */
+    const marginX = Math.max(74 * k, w * TITLE_SAFE);
+    const marginY = Math.max(74 * k, h * TITLE_SAFE);
     // PROJECT FIRST, DRAW SECOND. The rim spread is a decision about the whole
     // SET of markers, so no position can be written until every one is known.
     if (list) {
       for (let i = 0; i < list.length && n < items.length; i++) {
         const o = list[i];
         if (!o?.position) continue;
-        const p = project(o.position, camera, w, h, margin);
+        const p = project(o.position, camera, w, h, marginX, marginY);
         const it = items[n];
         if (!it.alive) {
           it.alive = true;
@@ -372,7 +394,7 @@ export class WorldMarkers {
         setText(it.node._name, o.name ?? '');
         n++;
       }
-      this._spreadEdges(n, w * 0.5, h * 0.5, w * 0.5 - margin, h * 0.5 - margin, k);
+      this._spreadEdges(n, w * 0.5, h * 0.5, w * 0.5 - marginX, h * 0.5 - marginY, k);
       for (let i = 0; i < n; i++) {
         const node = items[i].node;
         const gh = GLYPH * k * 0.5;
@@ -411,7 +433,11 @@ export class WorldMarkers {
 
   updateGrenades(dt, camera, w, h, k) {
     const items = this.nadePool.items;
-    const margin = 56 * k;
+    // Tighter than the objective rim on purpose: a grenade indicator is a
+    // proximity warning, not a navigation aid, and it wants to stay near the
+    // thing that is about to go off. Still clear of the title-safe line.
+    const marginX = Math.max(56 * k, w * TITLE_SAFE);
+    const marginY = Math.max(56 * k, h * TITLE_SAFE);
     for (let i = 0; i < items.length; i++) {
       const it = items[i];
       if (!it.alive) continue;
@@ -421,7 +447,7 @@ export class WorldMarkers {
         continue;
       }
       const node = it.node;
-      const p = project(node._pos, camera, w, h, margin);
+      const p = project(node._pos, camera, w, h, marginX, marginY);
       setStyle(node, 'transform', `translate(${p.x.toFixed(1)}px,${p.y.toFixed(1)}px)`);
       const close = p.dist < 9;
       setText(node._label, close ? 'DANGER CLOSE' : 'GRENADE');

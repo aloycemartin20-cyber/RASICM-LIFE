@@ -109,6 +109,17 @@ const NOCLOSE = !!args.noclose;
  * what it lays back in links is what it takes out in stubs.
  *
  * NEVER LOWER THESE. There is no such thing as an acceptable island.
+ *
+ * ONE ISLAND IS NOW POSSIBLE ON PURPOSE, and it still fails this gate. A
+ * fragment carrying the street that serves a safehouse, a service or a dock is
+ * KEPT rather than deleted when no legal link can reach it — `netgen`'s
+ * `PROTECT_R`, published as `closure.keptIslands` — because a player is put on
+ * that street and a loop he can drive beats a deleted road under his front
+ * door. That trade is a defect either way, so the failure below is the correct
+ * outcome: it says the generator could not give an authored place a road, and
+ * that is a decision for a human, not a bar to move. MEASURED over eight rng
+ * seeds: no stranded fragment is protected, this has never fired, and the
+ * emitted graph is byte-identical to the one before the protection existed.
  */
 const MIN_NODE_SHARE = 100;
 const MIN_KM_SHARE = 100;
@@ -458,9 +469,19 @@ console.log(`  reserve:               ${report.clearance} m clear of every site`
     : ' — OFF'));
 console.log(`  closure:               ` +
   (report.closure
-    ? `${report.closure.components} drivable component(s) in, ${report.closure.bridged} link(s) laid ` +
-      `(${report.closure.bridgedKm.toFixed(2)} km), ${report.closure.droppedEdges} unreachable edge(s) ` +
-      `dropped (${report.closure.droppedKm.toFixed(2)} km)`
+    ? `${report.closure.components} drivable component(s) in, ` +
+      // What it EMITTED, not what it meant to: `componentsOut` is 1 unless a
+      // protected fragment had to be kept. Printing the claim is how a kept
+      // island is read off this report rather than inferred from the shares.
+      `${report.closure.componentsOut ?? 1} out, ${report.closure.bridged} link(s) laid ` +
+      `(${report.closure.bridgedKm.toFixed(2)} km` +
+      `${report.closure.widened ? `, ${report.closure.widened} widened for a protected fragment` : ''}), ` +
+      `${report.closure.droppedEdges} unreachable edge(s) ` +
+      `dropped (${report.closure.droppedKm.toFixed(2)} km)` +
+      (report.closure.keptIslands
+        ? `; ${report.closure.keptIslands} island(s) KEPT — ${report.closure.keptIslandEdges} edge(s), ` +
+          `${report.closure.keptIslandKm.toFixed(2)} km serving an authored point`
+        : '')
     : '— OFF'));
 console.log(`  swept:                 ${report.edgesSwept} drivable edges, ${report.lanesSwept} lanes, ` +
   `${report.samples} samples at ${STEP} m`);
@@ -522,6 +543,14 @@ if (C.nodeShare < MIN_NODE_SHARE) {
 }
 if (C.kmShare < MIN_KM_SHARE) {
   fails.push(`only ${C.kmShare}% of drivable km is in one component (must be ${MIN_KM_SHARE}%)`);
+}
+// Named separately from the share lines above, which would report a kept
+// island as a bare percentage and send the reader looking for a bug in the
+// closure. This one says what happened and where it is written down.
+if (report.closure?.keptIslands) {
+  fails.push(`${report.closure.keptIslands} island(s) kept on purpose — the closure could not reach a ` +
+    `street serving an authored point (netgen PROTECT_R; closure.keptIslands). ` +
+    'A player is placed there, so this is a map defect to fix, not a bar to lower');
 }
 if (C.bridgesOff.length) fails.push(`bridge(s) islanded: ${C.bridgesOff.join(', ')}`);
 if (C.poisOff.length) fails.push(`POI(s) islanded or unresolved: ${C.poisOff.map((p) => p.id).join(', ')}`);

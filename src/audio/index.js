@@ -64,10 +64,11 @@
  * ARCHITECTURE.md's table because until now nothing needed one. So `_pollDialogue`
  * reads the live line off `ui` at runtime (`ctx.peek('ui')`, never an import —
  * rule 2, and the same shape as `_pollSky`), voices it, and RAISES the missing
- * events itself: `dialogue:start { id, text, dur, source }` and
- * `dialogue:end { id, reason }`. If `ui`/`game` ever emit those at the source,
- * this poller should be deleted in the same change — the emit is the contract,
- * the poll is the scaffolding under it.
+ * events itself: `dialogue:start { id, text, dur, syllables, source }` and
+ * `dialogue:end { id, reason }`, each a FRESH object a listener may keep. If
+ * `ui`/`game` ever emit those at the source, this poller should be deleted in
+ * the same change — the emit is the contract, the poll is the scaffolding
+ * under it.
  */
 
 import {
@@ -176,11 +177,29 @@ export class AudioSystem {
     this._cutIdx = -1;
     this._barkT = -1;
     this._dlgHeld = false;
+    /**
+     * NEVER HAND A REUSED RECORD TO THE BUS.
+     *
+     * `DialogueVoice` allocates nothing per line: `speak` and `stop` fill one
+     * `_startRec` / `_endRec` in place and hand it to these callbacks, which is
+     * the right contract for a callback — the callee reads it and returns. It
+     * is the wrong one for `ctx.events`, which is a broadcast to code neither
+     * file knows about, and a listener has every reason to stash what it is
+     * given: a mission log, an achievement counter, a subtitle-timing widget.
+     * The next line rewrites the object under all of them at once, and nothing
+     * in the tree would catch it — the only consumer today is `duckprobe.mjs`,
+     * which copies on receipt.
+     *
+     * A copy at the boundary is the whole fix and it is free: one small object
+     * per spoken line, and the budget is one voice at a time.
+     */
     this._onDlgStart = (r) => {
       this.stats.dialogue++;
-      this.ctx.events.emit('dialogue:start', r);
+      this.ctx.events.emit('dialogue:start', {
+        id: r.id, text: r.text, dur: r.dur, syllables: r.syllables, source: r.source,
+      });
     };
-    this._onDlgEnd = (r) => this.ctx.events.emit('dialogue:end', r);
+    this._onDlgEnd = (r) => this.ctx.events.emit('dialogue:end', { id: r.id, reason: r.reason });
     /** `actx.currentTime` at the last frame — the mixer's clock. See update(). */
     this._audioT = -1;
 

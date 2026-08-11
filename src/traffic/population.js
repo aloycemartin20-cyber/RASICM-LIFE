@@ -290,9 +290,10 @@ export class Director {
    * Distance from the populated FIELD — the nearer of the anchor and the far
    * ring's centre.
    *
-   * Every "is this car too far away" test uses this rather than the raw anchor
+   * `TrafficSystem.recycleFarthest` — the ONE live consumer, and the only path
+   * that retires a car for distance — uses this rather than the raw anchor
    * distance, or the lead above would make the cars it just placed the first
-   * ones `recycleFarthest` and `shouldDespawn` threw away.
+   * ones it threw away.
    */
   fieldDist(x, z) {
     const a = this.sys.anchor;
@@ -475,16 +476,6 @@ export class Director {
   _camDist(ctx, x, z) {
     ctx.camera.getWorldPosition(_cam);
     return Math.hypot(x - _cam.x, z - _cam.z);
-  }
-
-  /** Should this driver be recycled for being too far away? */
-  shouldDespawn(ctx, driver) {
-    const p = driver.vehicle?.position;
-    if (!p) return true;
-    const d = this.fieldDist(p.x, p.z);
-    if (d > TUNE.despawnHard) return true;
-    if (d < TUNE.despawnR) return false;
-    return !this._visible(ctx, p.x, p.z);
   }
 
   /* --------------------------------------------------------------- step -- */

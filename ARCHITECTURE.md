@@ -98,13 +98,27 @@ Los Angeles*.
 9. `npm run build` must pass and `node tools/capture.mjs --shot=hero` must
    produce a frame after your change. If you break the boot, nobody else can work.
 
-   Run **`npm run gate`** before you hand work back. MEASURED, wall clock, one
-   machine, in chain order: `lint` 0.2 s, `syntaxcheck` 3.3 s, `damageprobe`
-   0.2 s, `wreckprobe` 0.4 s, `sparkprobe` 0.1 s, `blastprobe` 0.1 s,
-   `copfireprobe` 0.1 s, `gaitprobe` 0.1 s, `crowdprobe` 1.1 s, `colprobe`
-   3.3 s, `headprobe` 5.1 s, `persistprobe` 0.2 s — **14.2 s for the lot.**
-   Kept out of `build` only because the seconds add up over a working day, not
-   because it is optional.
+   Run **`npm run gate`** before you hand work back. It is now 37 steps — two
+   linters and 35 node-only probes — and **MEASURED END TO END it is 29 s,
+   green.** Individually, in chain order:
+   `lint` 0.2 s, `syntaxcheck` 3.3 s, `damageprobe` 0.2 s, `wreckprobe` 0.4 s,
+   `sparkprobe` 0.1 s, `blastprobe` 0.1 s, `copfireprobe` 0.1 s, `gaitprobe`
+   0.1 s, `crowdprobe` 1.1 s, `colprobe` 3.3 s, `headprobe` 5.1 s,
+   `persistprobe` 0.2 s. Kept out of `build` only because the seconds add up
+   over a working day, not because it is optional.
+
+   Eleven node-only members landed in the wave that wrote this paragraph, and
+   every one of them was measured individually before it was chained —
+   `bossphase` 0.1 s (37/37), `plume` 0.1 s (21/21), `bossbar` 0.1 s (20/20),
+   `attrib` 0.1 s (6/6 live + 4/4 control red), `plaza` 0.1 s (13/13), `flow`
+   0.4 s (32/32), `dock` 0.4 s, `route` 0.6 s (127/127), `escort` 0.6 s, `roll`
+   1.2 s (62/62), `groundtruth` 1.6 s — about 5 s of probe time between them,
+   and the 29 s above is what the whole chain then actually cost when it was
+   run with a clock on it. Do not subtract those two numbers to price the wave:
+   the old figure in this paragraph was a SUM of twelve members, not a run of
+   the chain, so there is nothing here to difference against. **The next person
+   adding a member measures the CHAIN, not the probe** — see the paragraph on
+   `handoff` below for what happens when nobody does.
 
    **Every one of those is a NODE process that never opens a browser.** That is
    the entry price for `gate`, and it is the whole reason `gate` is worth
@@ -120,19 +134,27 @@ Los Angeles*.
    vite and the whole engine and steps ~9 000 frames — 50 s, of which 12 s is
    boot. Putting that on every gate run is a tax paid all day, every day.
 
-   **`handoff` MEASURED END TO END is 960 s — sixteen minutes.** That is not
-   what the per-probe list above suggests, and the gap is the point. Every
-   member, measured individually on one idle machine:
+   **`handoff` MEASURED END TO END was 960 s — sixteen minutes — and it has
+   grown since.** That was never what the per-probe list suggested, and the gap
+   is the point. Every member of the chain as it stood, measured individually on
+   one idle machine:
 
    | member | s | | member | s |
    |---|---|---|---|---|
-   | `gate` | 13 | | `pausegate` | 44 |
+   | `gate` | 29 | | `pausegate` | 44 |
    | `face` | 7 | | `pausefree` | 30 |
    | `cam` | 1 | | `pauseweap` | 51 |
    | `drive` | <1 | | `clockowner` | 47 |
    | **`ground`** | **357** | | `cover` | 42 |
    | `feel` | 45 | | `bootaudio` | 11 |
    | `melee` | 45 | | `camlag` | 22 |
+   | `credit` | 12 | | `duck` | 8 |
+
+   `gate` is re-measured (29 s, above); `credit` (4/4) and `duck` (25/25) are
+   the wave's two additions and are cheap. **The 960 s is therefore a LOWER
+   BOUND on the chain as it stands today, not a current measurement** — nobody
+   has run the whole thing since the members changed, and this document does not
+   get to quote a stale total as though they had.
 
    **`ground` alone is 357 s — more than half the chain, and it had never been
    costed here at all.** For years this section named `feeltest` as the
@@ -141,6 +163,26 @@ Los Angeles*.
    up already says what to do — *if one of these grows past a minute, split the
    chain rather than dropping the probe* — and `src/vehicles/groundprobe.mjs` is
    eight times past that line. Whoever owns `src/vehicles/` should split it.
+
+   **`ground` is now DETERMINISTIC, and that changed nothing about its cost.**
+   It used to grade a different city on every run: its forty sites are read off
+   `world.roads`, and `world.rng` is a `ctx.rng.fork()` seeded from
+   `Math.random()` unless `config.deterministic` is set — so the ROAD GRAPH
+   ITSELF was regenerated each time. MEASURED before the flag, three runs of one
+   unchanged build: 36 / 37 / 38 upright sites and 3 / 4 / 8 sites that ran into
+   something. It now boots `?capture=1`, which seeds the city and takes the
+   streaming budget work-denominated; MEASURED after, three consecutive runs are
+   BYTE-IDENTICAL over all 40 site lines and all four assertions, bar one third
+   decimal on a 28 % grade site the STEEP exclusion drops anyway. **Attributable
+   and still 357 s.** Determinism was the prerequisite for anyone being able to
+   split it; it is not the split, and the split is still owed.
+
+   **`gps` (`src/ui/gpsprobe.mjs`) is the second one over the line: MEASURED
+   431 s, 17/17, in `soak`.** It is now the most expensive single member this
+   document has costed, `ground` included. Same judgement, same owner rule —
+   whoever owns `src/ui/` should split it before anybody argues about promoting
+   it. Nothing about it being green changes that: cost is a correctness property
+   of a gate, not a comfort one.
 
    Note how this was found: not by reading the list, which looked fine, but by
    running `npm run handoff` with a clock on it. **A chain's cost is not the sum
@@ -166,7 +208,13 @@ Los Angeles*.
        .forEach(f=>console.log("ORPHAN",f))'
    ```
 
-   Run it when you add a probe. **It caught five more orphans that landed WHILE
+   Run it when you add a probe. **Re-run after the wave that added seventeen
+   probe files and nineteen script entries: it prints nothing — zero orphans.**
+   That is the invariant holding under exactly the conditions that broke it
+   before, and it held because the entries went in with the files rather than
+   after them.
+
+   **It caught five more orphans that landed WHILE
    the sweep was running** — `src/ui/controlsprobe.mjs`, `src/peds/seatprobe.mjs`,
    `src/player/blockblastprobe.mjs`, `src/vehicles/laneprobe.mjs`,
    `src/vehicles/toughprobe.mjs` — five in about two hours. That is the actual
@@ -180,9 +228,9 @@ Los Angeles*.
 
    | tier | what goes in | budget | when |
    |---|---|---|---|
-   | `gate` | node-only, green, **under ~3.5 s each** | 13 s MEASURED | every hand-back, no exceptions |
-   | `handoff` | + browser probes for movement / camera / pause / anything a person walks into | **960 s MEASURED**, and 357 s of that is one probe — see below | you touched `src/player/`, `src/vehicles/`, the camera or the pause path |
-   | `soak` | + every other green probe in the tree | ~30 min, estimated from the per-probe table below and NOT yet measured end to end — treat it as a lower bound | end of a wave, or a change too broad to reason about |
+   | `gate` | node-only, green, **under ~3.5 s each** | **29 s MEASURED** end to end, 37 steps | every hand-back, no exceptions |
+   | `handoff` | + browser probes for movement / camera / pause / anything a person walks into | 960 s measured BEFORE the current member list; 357 s of that is one probe — treat it as a lower bound and re-run it | you touched `src/player/`, `src/vehicles/`, the camera or the pause path |
+   | `soak` | + every other green probe in the tree | ~30 min was the estimate; `gps` alone is a MEASURED 431 s, so that estimate is stale too — never quoted as measured | end of a wave, or a change too broad to reason about |
 
    Those budgets are measurements, not intentions. Where a number says
    "estimated", it is a number nobody has earned yet; replace it when you run
@@ -236,11 +284,49 @@ Los Angeles*.
    | `pauseui` | `src/ui/pauseprobe.mjs` | 93 s | PASS | soak |
    | `dossier` | `src/game/dossierprobe.mjs` | 107 s | 32/32 | soak |
    | `spawn` | `src/game/spawnprobe.mjs` | 135 s | 23/23 | soak |
-   | `street` | `src/peds/streetprobe.mjs` | 195 s | PASS | soak |
+   | `street` | `src/peds/streetprobe.mjs --gate` | 140 s | PASS | soak |
    | `pedshadow` | `src/peds/shadowprobe.mjs` | 213 s | PASS | soak |
 
    Browser costs above were measured three-at-a-time on one machine and are
    therefore pessimistic; the ordering is what matters.
+
+   The wave that added the boss fights, the wayfinding layer, the docks and the
+   voices wired **eighteen** more. Each was measured on its own before it was
+   routed; costs below are one-at-a-time on one idle machine, so they are NOT
+   comparable with the pessimistic three-at-a-time numbers above.
+
+   | script | file | cost | result | tier |
+   |---|---|---|---|---|
+   | `bossphase` | `src/game/bossphaseprobe.mjs` | 0.1 s | 37/37 | gate |
+   | `plume` | `src/fx/plumeprobe.mjs` | 0.1 s | 21/21 | gate |
+   | `bossbar` | `src/game/bossbarprobe.mjs` | 0.1 s | 20/20 | gate |
+   | `attrib` | `src/physics/attribprobe.mjs` | 0.1 s | 6/6 live, control 4/4 red | gate |
+   | `plaza` | `src/physics/plazaprobe.mjs` | 0.1 s | 13/13 | gate |
+   | `dock` | `src/game/dockprobe.mjs` | 0.4 s | PASS | gate |
+   | `flow` | `src/game/flowprobe.mjs` | 0.4 s | 32/32 | gate |
+   | `route` | `src/world/routeprobe.mjs` | 0.6 s | 127/127 | gate |
+   | `escort` | `src/game/escortprobe.mjs` | 0.6 s | PASS | gate |
+   | `roll` | `src/vehicles/rollprobe.mjs` | 1.2 s | 62/62 | gate |
+   | `groundtruth` | `src/game/groundtruthprobe.mjs` | 1.6 s | PASSED, 6 seeds | gate |
+   | `lmsweep` | `src/world/lmsweep.mjs` | 5 s | LANDMARK GATE PASSED | soak |
+   | `duck` | `src/audio/duckprobe.mjs` | 8 s | 25/25 | handoff |
+   | `credit` | `src/peds/creditprobe.mjs` | 12 s | 4/4 | handoff |
+   | `lampgeom` | `src/props/lampgeomprobe.mjs` | 17 s | OK | soak |
+   | `tileleak` | `src/world/tileleakprobe.mjs` | 18 s | PASSED | soak |
+   | `street` | `src/peds/streetprobe.mjs --gate` | 140 s | PASS | soak |
+   | **`gps`** | `src/ui/gpsprobe.mjs` | **431 s** | 17/17 | soak |
+
+   `slotdrive` (`src/render/slotprobe.mjs --drive`) and `diag:mill`
+   (`src/materials/millstat.mjs`) landed in the same wave and are deliberately
+   NOT chain material: the first is a drive-time A/B instrument for the ground
+   pool budget, the second is a `diag:` report that exits 0 whatever it finds.
+
+   Two things in that table are worth reading twice. **`gps` at 431 s is now the
+   single most expensive gate in the tree** — it went into `soak` on cost, and it
+   wants splitting, exactly as `ground` does. And **eleven of the eighteen are
+   node-only and land in `gate` for 5 s between them**, which is the shape to
+   copy: a probe that never opens a browser can be run by everybody, every time,
+   and that is worth more than any amount of fidelity nobody pays for.
 
    **Runnable but deliberately NOT chained, and for two DIFFERENT reasons —
    the distinction is the point:**
@@ -279,7 +365,7 @@ Los Angeles*.
    | `npm run arsenal` | `src/weapons/arsenalprobe.mjs` | 247 s | 161/162 — the single red is `vehicle` 4/5; every other area is clean |
    | `npm run move` | `src/player/moveprobe.mjs` | **873 s** | 9/11 — sprint does not re-engage after ADS (67%) or on a direction change with Shift held (0%), and holding Shift does not make the car faster (gains −0.09 / −0.61 / −1.37 m/s over three matched runs) |
    | `npm run crew` | `src/peds/crewtest.mjs` | **623 s** | 88/92. Car-avoidance overshoots (5.64 m closest approach with it on vs 0.38 m off, want < 4), a brother trails 17.97 m, and 37.5 µs/ped with the crew vs 25.0 without — though that last one is 8 peds against a 100 µs timer quantum and may be measuring the clock, not the crew |
-   | `npm run controls` | `src/ui/controlsprobe.mjs` | 29 s | 21/24 — `J` is bound nowhere, and the "every key we name is read by a live subsystem" check is red. Landed mid-sweep |
+   | `npm run controls` | `src/ui/controlsprobe.mjs` | 41-45 s | **23/24, and it is a DIFFERENT red from the one recorded here before.** The old row said 21/24 with "`J` is bound nowhere"; `J` is bound now (`src/game/index.js:1121`) and the key-coverage checks in groups 3, 4, 6 and 7 all pass. What survives is one check, group 5, **deterministically over two consecutive runs of one unchanged build**: "the driving keys are read while driving", printing `DEAD IN A CAR: KeyH=act:horn · Space=NOTHING · ShiftLeft=NOTHING`. Note before debugging it that `Space` and `ShiftLeft` in a car are read inside `VehicleHandler._stepDrive` as `input.action('jump')` / `action('sprint')` rather than by a named key binding, so the first thing to establish is whether that is the build or the detector |
    | `npm run cheats` | `src/ui/cheatprobe.mjs` | 61 s | **was already wired and already red, and nobody had noticed** — `open false, time.scale 0` twice: the cheat panel closes and the clock stays stopped. That is a `claim`/`release` leak, i.e. an instance of the pause contract below, not a cheat-menu bug |
 
    **`move` at 873 s and `crew` at 623 s are on their own the reason `soak`
@@ -679,13 +765,53 @@ queued build work, in `world` or in any subsystem that builds off
 `RoadGraph` is the spine of traffic, police, peds and the minimap:
 
 ```js
-roads.nodes                   // { id, x, z, y, kind: 'junction'|'bend', links:[edgeId] }
+roads.nodes                   // { id, x, z, y, kind: 'junction'|'bend', links:[edgeId],
+                              //   component }  // DRIVABLE component id; -1 = rail-only
 roads.edges                   // { id, a, b, lanes, width, kind:'highway'|'arterial'|'street'|'alley', oneway }
 roads.laneCenter(edgeId, lane, t, out)  // Vector3 at parameter t along a lane
 roads.nearestEdge(x, z)                 // { edge, t, lane, dist }
 roads.route(fromNodeId, toNodeId)       // nodeId[] — A*, used by traffic + police
 roads.sampleSpawn(rng, nearXZ, minDist, maxDist)  // a legal spawn pose on a lane
+
+roads.driveMain               // the id of the largest DRIVABLE component
+roads.driveComponent          // Int32Array, per node, same labelling as node.component
+roads.closure                 // { components, bridged, bridgedKm, droppedEdges, droppedKm }
+roads.mainComponent           // Int32Array over EVERY edge — see the caveat below
 ```
+
+### ONE DRIVABLE NETWORK, and two different labellings of it
+
+`netgen` runs two passes at the end of generation and both publish:
+
+- **`closeNetwork(graph, terrain)`** bridges every stranded drivable fragment
+  onto the main component and DELETES what it cannot bridge, then publishes
+  `graph.closure` = `{ components, bridged, bridgedKm, droppedEdges, droppedKm }`
+  — the component count it started from, the links it laid, and the unreachable
+  road it dropped. A link is laid only where a car could take it: dry the whole
+  way (`terrain.waterDist > 8`), clear of a reserved landmark site, off airfield
+  and airbase pavement, under the grade limit, within `ISLAND_LINK_TOL` (2.5 m)
+  of the terrain, and at most `ISLAND_LINK_MAX` (70 m) long. It takes the
+  identity of the street it completes rather than a literal 'Connector', because
+  `streetAt` prints it beside the minimap. `?noclose=1` disables it — the A/B
+  arm `src/world/lmsweep.mjs` runs, which reports 9 components / 96.74 % of
+  nodes with the closure off against 1 / 100.00 % with it on.
+- **`pruneIslands(graph)` prunes nothing and never did** — read it as
+  "labelIslands"; `closeNetwork` is the pass that removes anything. It writes
+  `node.component` / `graph.driveComponent` / `graph.driveMain` over the
+  DRIVABLE edges only, and separately `graph.mainComponent` /
+  `mainComponentId` over EVERY edge.
+
+**Which one you want is not a detail, and conflating them has already cost this
+project a gate.** `roadgraph.sameComponent(a, b)` reads `mainComponent`, which
+counts RAIL as connectivity — mill trackage is in the graph so `roadmesh` can
+draw ballast, so two nodes joined only by a railway answer `true` to a question
+a car asked. Anything deciding whether a CAR can get there reads the drivable
+labelling instead: `game`'s spawn resolver (`_drivableTo` in `src/game/util.js`)
+rejects an edge whose `node.component !== roads.driveMain`, and `world/route.js`
+guards its A\* on `node.component` first, falling back to `mainComponent` only
+where the per-node id is absent. Because `closeNetwork` has already made the
+drivable graph a single component, every drivable node reads `driveMain` and
+everything else — rail-only — reads **-1**.
 
 A `Lot` is what `buildings` consumes:
 
@@ -852,6 +978,7 @@ Emit and listen via `ctx.events`. Payloads are plain objects. The canonical set:
 | `damage:dealt` | `{ target, amount, headshot, killed, point }` + optional `{ melee, source, from, incident, part }` | peds / police / physics / weapons / player |
 | ↳ | means *damage dealt **to** `target`*. `target` is the local player when a round connects (`'player'`, the player system, or anything with `isPlayer === true`) — filter it out before drawing a hitmarker. Damage is applied by the target's own listener, never by the emitter as well. | |
 | ↳ | **`melee: true`** marks a hit that came from a swing rather than a round (`src/player/melee.js:187,193` — both the swing and the riposte payload carry it). **`source`** is the actor that dealt it, so a listener can tell who swung: the player system for a player swing, the `Ped` for `peds.onPedPunch` (`src/peds/index.js:1305`). Both are OPTIONAL — most emitters omit them, so branch on presence, never assume the field is there. | |
+| ↳ | **THE `source` CONVENTION, and why it is now a backstop rather than the rule.** `ui._isPlayerSource` / `audio._isPlayerSource` answer "did the PLAYER deal this?" with `s == null` -> **true**. That was only ever true by accident of population, and it is one caller away from being false. So the player's own emitters now STAMP themselves `'player'` (`src/weapons/fire.js:75`, `src/weapons/melee.js:345`) and `Ballistics.shooter` defaults every projectile to the player system, while `physics.fireBullet(opts.source)` carries the shooter through the penetration solver onto the payload (`physics.emitImpact`'s 14th argument, or `_bulletSource` for a round traced through `fireBullet`). Everything that is not the player already stamped itself: the crew (`src/peds/crew.js:1269`), mission hostiles (`src/peds/hostile.js:549`), a ped's punch. **Treat an ABSENT `source` as a legacy backstop only** — emit the field. `npm run attrib` and `npm run credit` are the two gates, from opposite sides. | |
 | `damage:taken` | `{ amount, from: Vector3, health }` | player |
 | `actor:death` | `{ actor, point, impulse, headshot }` | peds / police |
 | ↳ | **Never raised for a brother.** `police` prices this (`killPed` / `killCop`), `game` counts it and `ui` draws it, so emitting it for the player's own crew would charge a wanted star and a kill notification every time one of them went down — `src/peds/ped.js:1175` guards on `!this.crew`. Mission enemies are ordinary pedestrians and DO raise it. | |
@@ -873,6 +1000,8 @@ Emit and listen via `ctx.events`. Payloads are plain objects. The canonical set:
 | `weather:change` | `{ state, wetness, rain, wind }` | sky |
 | `time:hour` | `{ hour }` | sky |
 | `mission:start` \| `mission:complete` \| `mission:fail` | `{ id }` | game |
+| `mission:boss` | `{ id, name, weak, colour, phase, phases, health, active }` | game (`src/game/boss.js`) |
+| ↳ | **A REUSED RECORD, emitted EVERY FRAME of a boss fight** — one object mutated in place, because a fresh literal per frame for a three-minute chapter is exactly the allocation hard rule 5 is about. Read it, never retain it; same contract as `peds.crewState()`. There is one `MissionRunner` and one live `M`, so two fights can never want two records. `health` is 0..1, `phase` counts from 0 to `phases - 1`, `weak` is the coaching string the flank model is built from, and **`active: false` is the LAST record** the fight publishes — the take-down signal, not a gap in the stream. `ui/hud.js` reads the bar's liveness off this stream alone and ages a record out after `BOSS_STALE` (0.35 s of SIMULATED time, so a pause cannot expire it), which covers every hole — a chapter that completes, fails or is replaced without ever saying `active: false` — by the record simply stopping. | |
 | `money:change` | `{ amount, total, reason }` | game |
 | `ui:map` | `{ open }` | ui |
 | `ui:waypoint` | `{ x, z, cleared }` | ui |
@@ -895,6 +1024,9 @@ Emit and listen via `ctx.events`. Payloads are plain objects. The canonical set:
 | `crew:exit` | `{ count, vehicle }` | peds |
 | `crew:line` | `{ id, line }` | peds — a scripted line, in his own colour |
 | `crew:friendlyfire` | `{ id, amount }` | peds — a round of the PLAYER'S landed on a brother. Already attenuated when it fires |
+| `dialogue:start` | `{ id, text, dur, syllables, source }` | **audio** |
+| `dialogue:end` | `{ id, reason }` | **audio** |
+| ↳ | **Raised by the wrong subsystem on purpose, and it should not stay that way.** Twenty-four chapters of dialogue are performed by `ui`'s cutscene player and its subtitle bar, and NEITHER raises an event — so `audio._pollDialogue` reads the live line off `ui` at runtime (`ctx.peek('ui')`, never an import), voices it, and raises the missing pair itself. `id` is the speaker, `dur` the seconds the read will take, `source` is `'cutscene'` or `'subtitle'` (`''` from a direct `audio.dialogue()` call). `reason` is why the line stopped: `replaced`, `paused`, `empty`, `scene-end`, or `stopped`. Both records are REUSED — the poller runs every frame and allocates nothing — so read, do not retain. **If `ui`/`game` ever emit these at the source, delete the poller in the same change**: the emit is the contract, the poll is scaffolding under it. | |
 
 ### Cross-subsystem methods worth knowing about
 
@@ -962,6 +1094,14 @@ by borrowing bodies and not giving them back); and **it keeps its bodies**
 far-LOD capsule to make room for a stranger, and is never streamed or
 distance-culled). `npm run crew` (`src/peds/crewtest.mjs`, group `roster`) is
 the gate on all three.
+
+**`vehicles`** — one cross-cutting entry point and two published scalars.
+
+| member | contract |
+|---|---|
+| `Vehicle.applyImpact(closing, px,py,pz, nx,ny,nz, other, ctx)` | **PRICE AN IMPACT BY ITS CLOSING SPEED**, in m/s, and return the speed it priced (0 if it declined). Contact is passed as SCALARS in `reportCollision`'s own argument order so a caller inside the physics step need not allocate a vector (hard rule 5). Everything ordinary — panel damage, `vehicle:collision`, `vehicle:destroyed` — goes down the paths it always did; the one thing this adds is the WRITE-OFF, an aircraft past `AIR_CRASH_DV` destroyed on the spot rather than dented, with the existing burn fuse doing the rest. Below `AIR_IMPACT_MIN` it declines. Live callers are the swept-fuselage test `_airSweep` and the touchdown check in `src/vehicles/plane.js`. |
+| `v.crashDv` | the closing speed of the last impact it priced, m/s. Published for the benches. |
+| `v.rollAssist` | how much of the roll-stability torque is engaged, 0..1. Published for `src/vehicles/rollprobe.mjs` and the drive benches. Zero on a bike (which owns its own roll axis), on an airborne or destroyed car, under `debugNoRollAssist`, and whenever `v.groundRef` — how much of a MEASUREMENT the low-passed contact normal currently is — has not armed. Alongside it `v.groundNormal` / `v.groundRef` are published for the same benches. |
 
 ### `ACTOR_TO_VEHICLE` — the one damage currency conversion
 
@@ -1050,6 +1190,13 @@ r.submitLight(x,y,z,color,intensity,range,priority,key)
                       // the pool's visible count never changes, so no submission
                       // can trigger a shader recompile. Use for headlights,
                       // muzzle flash, the nearest practicals.
+r.submitGroundPool(x,y,z,radius,color,intensity,aspect,yaw,height)
+                      // THE SANCTIONED CHEAP LIGHT. A projected pool on whatever
+                      // surface is really there, this frame — no handle, call it
+                      // every frame you want it. Costs no slot and no shader
+                      // permutation.
+r.poolBudget          // { slots, submitted, drawn, overflow, culled, fill,
+                      // fillBudget } — `fill` is the only one that predicts cost
 r.registerCullGroup(root, { center, radius, maxDistance })
                       // hierarchical cull for ONE streamed tile. Returns an
                       // unregister fn. Call on world:tile:load / :unload.
@@ -1062,6 +1209,21 @@ r.lightBudget         // { slots, submitted, overflow }
 in metres and `render` rescales them by `q.lodBias`, FOV and resolution.
 `mesh.userData.owStatic = true` skips per-frame velocity bookkeeping for geometry
 that never moves. `mesh.userData.owLodScale` biases one object.
+
+**`q.lodBias` runs the opposite way in `render` and in `peds`, and the numbers
+are not the ones people quote.** The preset values are **low 2.4, medium 1.8,
+high 1.4, ultra 0.85** — so **0.85 is the ULTRA bias**, not a low-end one.
+`render/cull.js:248` DIVIDES by it (`dist * lodBias * REF / pixelScale`), so a
+higher bias drops to a cheaper level SOONER, which is what a low preset wants.
+`src/peds/index.js:1253` MULTIPLIES a ring radius by it instead
+(`p.dist < LOD1 * bias`, `LOD1` = 58 m), so a higher bias keeps the expensive
+level further OUT. Worked through, the skinned-body ring is **ultra 49 m, high
+81 m, medium 104 m, and low 139 m** — against a `DESPAWN` of 145 m, i.e. on the
+cheapest preset very nearly every ped in the world carries a skinned body while
+on the most expensive preset almost none does. Both call sites are internally
+consistent and one of them is backwards; `src/peds/` owns which. State the
+preset when you quote a ped LOD distance, because "the LOD ring is 49 m" is only
+true of ultra.
 
 **`world`, `buildings` and `props` MUST adopt `registerCullGroup` and `THREE.LOD`.**
 `r.stats` currently reports `cullGroups: 0, lods: 0` in every capture, and draw
@@ -1101,13 +1263,52 @@ mesh.userData.owNoShadow  = true  // do not cast into the CSM cascades
 `owNoShadow` is the ONLY shadow-caster switch: the cascades draw with
 `scene.overrideMaterial` and never consult `mesh.castShadow`.
 
-### The point-light count is a shader permutation key
+### The visible light count is a shader permutation key — POINT *and* SPOT
 
 A night city is thousands of lamps. Three bakes the number of **visible** point
 lights into every material's program cache key, so one lamp crossing a threshold
 recompiles every lit material in the scene — measured at +33 to +36 programs and
 640-900 ms on that single frame. It is baked into the key of programs that never
 read a light at all, including `csm-depth` and `ow-prepass`.
+
+**`numSpotLights` is the SAME key, charged a second time, and for a long while
+nothing was watching it.** Only `_nPointLights` was counted and only
+`numPointLights` was pinned, so a change that took the headlight pool from one
+host of two spot lights to three hosts of two walked straight through: the
+visible spot count went 2 -> 6, three unrolls the spot loop so every lit
+fragment in the frame started iterating six cones, and the renderer reported
+nothing at all. MEASURED, `night` shot, q=high, 1600x900, governor off, seven
+interleaved 90-frame windows: p50 **45.6 ms at 6 lights against 33.5 ms at 2**,
+six of the seven pairs positive — about 1.5 ms per visible spot light on that
+machine, roughly 8 % of a `main` night frame each. `HEADLIGHT_LIGHTS` is 2 for
+ever because of that number, and hosts were decoupled from lights so the
+multi-host feature could survive it (`?owHeadlightHosts=N` clamps hosts 0..2 for
+an A/B and deliberately does NOT move the light count, because an arm that moved
+the permutation key would measure the recompile as well as the arm).
+
+`render` publishes both counts in `stats` — `pointLightCount` and
+**`spotLightCount`**, the number of visible spot lights in the last scene walk,
+not a budget somebody declared — plus `spotLightChanges`. There is no ballast
+for the spot count, so all `_enforceLightCount` can do is **warn** when it moves
+(`[render] visible spot lights N -> M; every lit material recompiles this
+frame`, first four crossings). That warning is the whole point: an unwatched
+permutation key is how six hundred milliseconds of compile arrives with no
+author.
+
+**What a slot actually costs, because the intuition is backwards.** The pool is
+`q.lightSlots` point lights created at init, added to the scene, and
+`visible = true` **permanently — never conditional, that is the contract**
+(`src/render/index.js:576`). Every slot is therefore shaded whether anything is
+using it or not, so **spending a slot is free and the pool SIZE is what costs.**
+An emitter that stops submitting saves nothing; a preset that raises
+`q.lightSlots` pays on every lit fragment in every frame. The same shape applies
+one level down to ground pools: `MAX_GROUND_POOLS` (32) bounds the geometry, but
+a pool is six vertices and a screen rectangle, so the number that predicts the
+cost is `poolBudget.fill` — screen area in whole frames, capped at
+`POOL_FILL_SCREENS` (3). MEASURED on `slotprobe --drive`, 900 frames, 223 m,
+108 km/h peak, night: at most 4 pools and at most 3.0 screens, so the area
+budget binds occasionally rather than never, and it drops the most DISTANT pool
+first — never the one under the player's own car.
 
 > **Corrected.** This section used to say the distance cull sets
 > `light.visible = false` once the fade reaches zero. **It does not, and never
@@ -1139,6 +1340,23 @@ emissive materials + bloom for the lamp itself and a small fixed pool of real
 lights reserved for what is near the camera (headlights, muzzle flash, the two
 nearest lamps). Budget: `q.lightSlots`.
 
+**`r.submitGroundPool` is the sanctioned cheap alternative, and it is what the
+rest of the night city runs on.** It is a screen-space proxy, not geometry: the
+fragment shader reads the prepass depth and normal, reconstructs the world
+position of the surface actually visible in that pixel, and lights that. So the
+pool wraps over the road crown, up a kerb face and across a car roof, is
+occluded for free, and cannot Z-fight or show a silhouette — which is the whole
+reason it exists, because the additive disc under every street lamp in this city
+spent years being cut in half by the 2 % road camber. It is a FAKE light: no
+shadow, no albedo. Keep intensities modest — MEASURED on the `night` shot, which
+meters ~5.7: **0.02 is a spill you have to look for, 0.06 reads clearly as a
+pool, 0.4 is a searchlight strike**, and anything near 1 clips the frame to
+white (the first cut of the facade spill shipped 0.42 and took the whole
+carriageway to 194/255). Anything that must read as a real source belongs in
+`submitLight`. Live callers: `buildings` (facade spill), `vehicles` (every
+headlit car that did not win one of the two spots), `police/heli.js` (the
+searchlight strike).
+
 ### Pre-warm
 
 `src/core/prewarm.js` runs before the first frame and calls
@@ -1155,6 +1373,70 @@ gameplay objects, drawing a gameplay frame, or touching the clock/RNG.**
   light count, which is only settled inside the first rendered frame.
 
 If you add a new subsystem that creates materials, implement `prewarmMaterials`.
+
+## Capture honesty — what a review frame actually photographs
+
+A review frame must be a frame of the shipping product. Three things follow, and
+all three have been got wrong here before.
+
+**`?capture=1` takes the DETECTED tier, like everything else.** It used to pin
+`ultra` unconditionally, which meant every review frame this project had ever
+produced photographed a preset **no player is ever booted into** — SSR,
+volumetrics, a 6 km draw distance and a 1 km stream radius that a shipping
+`medium` or `high` does not have. Every adversarial round was scoring a game
+nobody plays. `detectTier()` can never return `ultra` by design. `ultra` is still
+reachable, and only on purpose:
+
+| hatch | effect |
+|---|---|
+| `?q=ultra` | pins any tier, as it always has (`explicitQ`) |
+| `?ultra=1` | the capture-side opt-in |
+| `MARKETING_IDS` under `?capture=1` | **the one automatic exemption** |
+
+The marketing set (`MARKETING_IDS`, exported from `src/dev/shots.js`) takes
+`ultra` automatically under `?capture=1` because those frames are composed for a
+README rather than measured — nobody grades the build off them, and
+`tools/screenshots.mjs` shoots them at 2560x1440 where `detectTier()` correctly
+reports a mid tier for the pixel count. **Review shots deliberately do NOT get
+that exemption.** `main.js` logs which of the three applied on every capture
+boot, so a frame can always be traced to the preset that made it.
+
+**The shot contract, and the order that makes it work.** `src/player/` has
+published a full staging contract on `shot:applied` since long before anything
+used it, and the default branch of that handler is `this._shotHide = !req` — so
+a shot with no `player:` block hides the body outright. For a long stretch that
+was every shot in the file, and every critic round scored a third-person action
+game in frames with no protagonist in them.
+
+- **`player: { dist, at, yaw, state, shoulder, … }`** stages the man. It is read
+  at `shot:applied`, emitted LAST on both apply paths, so it composes against
+  the final camera. `state` must be a STATIONARY one (`idle`, `aim`): everything
+  else is a scripted input and a shot settles for 240-1500 frames, so `jog`
+  walks the subject out of frame by a different distance every run. `dist` is
+  chosen against the shot's own eye height and FOV, not by feel.
+- **`actorFrame: { dist, height, side, aimY }`** is the reverse — a camera
+  composed ON the staged man — and it runs at the SHUTTER (`shotChrome`), not
+  from `apply`. That ordering is the whole point: `character` composed from
+  `apply` and photographed the pre-staging position, MEASURED with the subject's
+  head at NDC x 2.85, nearly three screen half-widths off the right edge,
+  because `groundHeight` at the mark put him 2.2 m under a raised plaza and the
+  capsule then squirted 4.7 m sideways over ~800 frames while resolving. **The
+  last write before the photograph is the one that counts.**
+- `hud: false` is marketing-only. Review shots keep the HUD, because a critic
+  should be judging that too.
+
+**A/B hatches, so a fix that is only visible as an ABSENCE can still be
+measured.** An absence is exactly what a harness cannot tell from a harness that
+measured nothing, so each of these restores the old behaviour on a LIVE build
+with no edit (rule 12's negative control, and see also `?owNoLightLock=1`,
+`?owHeadlightHosts=N`, `?owHeadlightUnstable=1`, `?owWallClockBuild=1`):
+
+| hatch | puts back |
+|---|---|
+| `?owStaleTileLoads=1` | fires `world:tile:load` for tiles already unloaded — the orphan leak `_streamTiles` guards against. The control for `src/world/tileleakprobe.mjs` |
+| `?noclose=1` | disables `netgen.closeNetwork`. `src/world/lmsweep.mjs` runs both arms: 9 drivable components / 96.74 % of nodes off, 1 / 100.00 % on |
+| `?owNoAmortise=1` | the un-amortised sector attach and the one-shot 81x81 collision patch refill. `tools/perfcheck.mjs --drive` runs both arms off ONE build, which is the only honest way to A/B a frame time on a machine that is also doing something else |
+| `?owHeadlightHosts=N` | clamps how many CARS may hold a real light (0..2) **without moving the light count**, because an arm that moved the permutation key would measure the recompile as well as the arm |
 
 ## Quality bar
 

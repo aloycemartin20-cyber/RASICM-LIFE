@@ -318,7 +318,14 @@ const PAGE = `window.__RENDER__ = async (opts) => {
     camera,
     time: { scale: 1, raw: 0, dt: 0 },
     input: { enabled: true },
-    events: { emit: (type, p) => events.push({ type, id: p.id, reason: p.reason, t: actx.currentTime }) },
+    // raw is the payload object ITSELF, deliberately not copied — it is what
+    // the aliasing assertion in section 4 reads back after the scene has moved
+    // on. Everything else here is copied on receipt, which is exactly why the
+    // aliasing defect was invisible to this probe before. (No backticks in
+    // this snippet: it lives inside a page template literal — hard rule 10.)
+    events: {
+      emit: (type, p) => events.push({ type, id: p.id, reason: p.reason, t: actx.currentTime, raw: p }),
+    },
     peek: (id) => (id === 'ui' ? fakeUi : null),
   };
   const sys = new AudioSystem();
@@ -633,6 +640,20 @@ try {
   say(speakers.size === 4, `four speakers, four voices (${[...speakers].join(', ')})`);
   say(yields[0]?.yielded === true, 'a bark during a story line YIELDS');
   say(yields[1]?.yielded === false, 'and does not once the scene is over');
+  /**
+   * NO REUSED RECORD REACHES THE BUS. `DialogueVoice` fills one `_startRec` in
+   * place for every line — correct for a callback, wrong for a broadcast — and
+   * `AudioSystem` copies it at the boundary. This is the assertion that says so
+   * from OUTSIDE: the payload objects are kept uncopied and read back after the
+   * scene has finished, so if the copy is ever removed they are all one object
+   * and every one of them reads as the last speaker. Nothing that merely
+   * counted events could see that, which is why this probe could not before.
+   */
+  const distinct = new Set(sStarts.map((e) => e.raw)).size;
+  const mutated = sStarts.filter((e) => e.raw?.id !== e.id).length;
+  say(sStarts.length > 1 && distinct === sStarts.length && mutated === 0,
+    `every dialogue:start payload is its own object and still names its own speaker ` +
+    `(${distinct}/${sStarts.length} distinct, ${mutated} mutated under the listener)`);
   if (WAV_DIR) {
     writeWav(`${WAV_DIR}/duck_scene.wav`, scene.sig);
     const mixed = await render({ seconds: 12, script: [{ t: 1.2, cut: SCENE.slice(0, 3) }] });

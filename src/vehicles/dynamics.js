@@ -2224,10 +2224,20 @@ export class Vehicle {
    * a caller inside the step does not have to allocate a vector to report a
    * hit (hard rule 5).
    *
+   * IT OWNS THE COOLDOWN, because its callers cannot. One touchdown reaches
+   * this method from two places in the SAME step — the airborne -> down edge in
+   * `plane.js` fires from `stepPlane`, and the fuselage probe ring in `_collide`
+   * sees the gear buried a few lines later — and only `_collide` used to hold
+   * the guard. So a hard landing was priced twice: two repair bills, two
+   * `vehicle:collision` events, one arrival. Every path is now behind the same
+   * 0.1 s window, which is short enough that two genuinely separate strikes
+   * (a wingtip, then the nose) still both cost.
+   *
    * @returns the closing speed it priced, or 0 if it declined the hit.
    */
   applyImpact(closing, px, py, pz, nx, ny, nz, other, ctx) {
-    if (this.destroyed || !(closing > AIR_IMPACT_MIN)) return 0;
+    if (this.destroyed || !(closing > AIR_IMPACT_MIN) || this._impactCool > 0) return 0;
+    this._impactCool = 0.1;
     this.wake();
     this._lastImpulse = this.mass * closing;
     /** The closing speed of the last impact, m/s. Published for the benches. */
@@ -2313,6 +2323,12 @@ export class Vehicle {
    */
   _collide(dt, ctx) {
     const phys = this.sys.physics;
+    // The impact cooldown is a CLOCK, not a contact, so it ticks before either
+    // early return below. It used to be decremented after the probe loop, which
+    // meant a vehicle in a world with no static geometry — an aircraft over
+    // open terrain, every bench that stubs `staticWorld` — never decayed it at
+    // all once `applyImpact` had armed it.
+    this._impactCool = Math.max(0, this._impactCool - dt);
     // The anti-tunnelling sweep runs FIRST and on its own terms: it works off
     // the step's travel, so it has to see the position before the ring has
     // pushed it anywhere.
@@ -2324,6 +2340,12 @@ export class Vehicle {
     let hitPointX = 0, hitPointY = 0, hitPointZ = 0;
     let hitNX = 0, hitNY = 0, hitNZ = 0;
     let hitObj = null;
+    /**
+     * The CLOSING SPEED at the contact that produced `biggest`, kept alongside
+     * the impulse because the two are different physical quantities and the
+     * aircraft path is priced on this one. See the plane branch below.
+     */
+    let hitVn = 0;
     const near = this.sys.lodOf(this) < 2;
     const step = near ? 1 : 2;
     this.diag.contacts = 0;
@@ -2387,24 +2409,41 @@ export class Vehicle {
 
       if (j > biggest) {
         biggest = j;
+        hitVn = -vn;
         hitPointX = cts.px[best]; hitPointY = cts.py[best]; hitPointZ = cts.pz[best];
         hitNX = _n.x; hitNY = _n.y; hitNZ = _n.z;
         hitObj = phys.staticWorld.objectOf?.(cts.tri[best])?.mesh ?? null;
       }
     }
 
-    this._impactCool = Math.max(0, this._impactCool - dt);
-    if (biggest > this.mass * 0.55 && this._impactCool <= 0) {
-      this._impactCool = 0.1;
-      this._lastImpulse = biggest;
-      // An aircraft's contacts are priced by closing speed, because past the
-      // speed an airframe can absorb the answer is a write-off rather than a
-      // dent. See `applyImpact`.
+    if (biggest > this.mass * 0.55) {
+      /**
+       * An aircraft's contacts are priced by CLOSING SPEED, because past the
+       * speed an airframe can absorb the answer is a write-off rather than a
+       * dent (see `applyImpact`) — and that threshold is only meaningful if
+       * the number handed to it is a speed.
+       *
+       * `biggest` is not. It is the collision IMPULSE
+       * `j = -(1 + e) vn / (1/m + n . ((I^-1 (r x n)) x r))`, so `biggest/mass`
+       * is `1.12 |vn| / (1 + m n.(...))` — a delta-v that collapses toward zero
+       * as the contact lever grows. A nose-first contact hides it — the lever
+       * is parallel to the normal, so the term is zero and the answer comes out
+       * right by accident — but a WINGTIP is 5.1 m off the axis. MEASURED, the
+       * Skylark's wing into a pylon at 20 m/s (`flightprobe`'s wingtip section,
+       * which is this defect's gate): priced at 6.96 m/s, under `AIR_CRASH_DV`,
+       * so the aeroplane took a repair bill and flew on. `hitVn` is the relative
+       * velocity along the normal at that same contact, which is the quantity
+       * `AIR_CRASH_DV`'s "50 km/h at the skin" is written in.
+       *
+       * `reportCollision` still gets `biggest`: its argument IS an impulse.
+       */
       if (this.spec.kind === 'plane') {
         this.applyImpact(
-          biggest / this.mass, hitPointX, hitPointY, hitPointZ, hitNX, hitNY, hitNZ, hitObj, ctx
+          hitVn, hitPointX, hitPointY, hitPointZ, hitNX, hitNY, hitNZ, hitObj, ctx
         );
-      } else {
+      } else if (this._impactCool <= 0) {
+        this._impactCool = 0.1;
+        this._lastImpulse = biggest;
         this.sys.reportCollision(this, hitObj, hitPointX, hitPointY, hitPointZ, hitNX, hitNY, hitNZ, biggest);
       }
     }

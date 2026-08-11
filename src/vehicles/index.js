@@ -2009,6 +2009,12 @@ export class VehicleSystem {
     this._hlCand = [];
     for (let i = 0; i < HEADLIGHT_CANDIDATES; i++) this._hlCand.push({ v: null, score: 0 });
     this._nHlCand = 0;
+    /** This frame's arbitration winners, before they are placed in a slot. */
+    this._hlWin = new Array(HEADLIGHT_HOSTS).fill(null);
+    /** The road-pool slate, kept sorted nearest-first. See `_offerPool`. */
+    this._hlPool = [];
+    for (let i = 0; i < HEADLIGHT_POOLS; i++) this._hlPool.push({ v: null, d2: 0 });
+    this._nHlPool = 0;
   }
 
   /**
@@ -2028,12 +2034,19 @@ export class VehicleSystem {
    *   TRAFFIC   everything else, nearest-first, biased toward what is in front
    *             of the camera.
    *
-   * HYSTERESIS, not round-robin. Rotating the lights through the traffic would
-   * spread real light around, and it would also make an individual car's
-   * headlights fade up and down while it drove in a straight line, which reads
-   * as a fault in the car rather than as a budget. An incumbent instead gets a
-   * bonus on its contribution term (never across a band), so two near-tied cars
-   * cannot trade a light back and forth; the fair-share job is done by the
+   * HYSTERESIS, not round-robin, and not INCUMBENCY either. Rotating the lights
+   * through the traffic would spread real light around, and it would also make
+   * an individual car's headlights fade up and down while it drove in a
+   * straight line, which reads as a fault in the car rather than as a budget.
+   * So an incumbent gets a bonus on its contribution term — but only WITHIN its
+   * own band, and it still has to win the frame. The first cut of this held the
+   * slot outright (a live incumbent's score was zeroed and the assignment loop
+   * skipped any filled host), which made the 1.35 bonus dead code and meant the
+   * PLAYER band could never take a light off a traffic car: two AI cars parked
+   * in the two slots left the player's own car with no beams at all for as long
+   * as they stayed alive, driven and in range. The bands below are ORDERS OF
+   * MAGNITUDE apart in score exactly so one best-first pass ranks them and a
+   * within-band bonus can never cross one. The fair-share job is done by the
    * road pool below, which every headlit car in range gets whether or not it
    * won one.
    *
@@ -2068,7 +2081,8 @@ export class VehicleSystem {
     let bestCop = null;
     let bestCopD2 = Infinity;
     const render = this.render ?? (this.render = ctx.peek('render') ?? null);
-    let pools = 0;
+    const canPool = !!render?.submitGroundPool;
+    this._nHlPool = 0;
     for (let i = 0; i < this.vehicles.length; i++) {
       const v = this.vehicles[i];
       if (v.destroyed || !v.model?.root?.visible) continue;
@@ -2077,10 +2091,11 @@ export class VehicleSystem {
       if (d2 > HEADLIGHT_MAX_M * HEADLIGHT_MAX_M) continue;
       // The road pool: every headlit car in range gets one, including the ones
       // that will lose the arbitration below. This is what stops a night chase
-      // being five cars with glowing lamps over black asphalt.
-      if (render?.submitGroundPool && d2 < HEADLIGHT_POOL_M * HEADLIGHT_POOL_M && pools < HEADLIGHT_POOLS) {
-        pools++;
-        this._submitHeadlightPool(render, v, night);
+      // being five cars with glowing lamps over black asphalt. OFFERED here and
+      // submitted after the scan, because the cap has to be spent on the
+      // NEAREST cars and this loop is in spawn order — see `_offerPool`.
+      if (canPool && d2 < HEADLIGHT_POOL_M * HEADLIGHT_POOL_M) {
+        this._offerPool(v, v === pv ? -1 : d2);
       }
       if (v.lightbarOn && d2 < bestCopD2) {
         bestCopD2 = d2;
@@ -2094,6 +2109,9 @@ export class VehicleSystem {
       _v.copy(v.position).sub(_cam);
       const facing = _v.dot(_fwdCam) > 0 ? 1.6 : 1;
       e.score = (facing * 120) / (12 + Math.sqrt(d2));
+    }
+    for (let i = 0; i < this._nHlPool; i++) {
+      this._submitHeadlightPool(render, this._hlPool[i].v, night);
     }
     for (let i = 0; i < n; i++) {
       const e = cand[i];
@@ -2109,16 +2127,13 @@ export class VehicleSystem {
       }
     }
 
-    // ---- assignment: incumbents keep their host slot, then best-first -----
-    for (const h of this._hlHosts) {
-      if (h.car) {
-        let live = false;
-        for (let i = 0; i < n; i++) if (cand[i].v === h.car) { live = true; cand[i].score = -1; break; }
-        if (!live) h.car = null;
-      }
-    }
-    for (const h of this._hlHosts) {
-      if (h.car) continue;
+    // ---- arbitration: best-first over ALL hosts, every frame --------------
+    // A car that is no longer a live candidate simply cannot be picked, which
+    // is the release half. Everything else competes, incumbent or not, with the
+    // 1.35 bonus already folded into the traffic band's scores above.
+    const win = this._hlWin;
+    let nWin = 0;
+    for (let s = 0; s < this._hlHosts.length; s++) {
       let best = -1;
       let bestS = 0;
       for (let i = 0; i < n; i++) {
@@ -2128,23 +2143,53 @@ export class VehicleSystem {
         }
       }
       if (best < 0) break;
-      h.car = cand[best].v;
-      h.level = 0;
+      win[nWin++] = cand[best].v;
       cand[best].score = -1;
+    }
+    // SLOTS ARE STICKY even though the winners are recomputed from scratch: a
+    // car that won again keeps the host it already had, so its crossfade level
+    // and the light index it is posed through do not move under it. Only then
+    // are the losers evicted and the newcomers placed.
+    for (const h of this._hlHosts) {
+      if (!h.car) continue;
+      let kept = false;
+      for (let i = 0; i < nWin; i++) if (win[i] === h.car) { kept = true; break; }
+      if (!kept) h.car = null;
+    }
+    for (let i = 0; i < nWin; i++) {
+      let held = false;
+      for (const h of this._hlHosts) if (h.car === win[i]) { held = true; break; }
+      if (held) continue;
+      for (const h of this._hlHosts) {
+        if (h.car) continue;
+        h.car = win[i];
+        h.level = 0;
+        break;
+      }
     }
 
     // ---- distribute the two lights over the winners -----------------------
     // The player pairs; anyone else takes a single centreline cone. Decided
     // before the pose loop so a light is written exactly once per frame and the
     // leftovers can be zeroed without a second pass over the hosts.
+    // THE PLAYER IS ALLOCATED FIRST, wherever his car sits in the host array.
+    // Pairing used to require `assigned + 2 <= HEADLIGHT_LIGHTS`, i.e. that
+    // nothing had been handed out yet — so his car took both lamps only when it
+    // happened to occupy slot 0, and any host scanned ahead of it dropped him to
+    // one cone out of the middle of the bonnet. Which host a car lands in is an
+    // arbitration detail; how many lamps the player gets is the feature.
     let assigned = 0;
     for (const h of this._hlHosts) h.n = 0;
     for (const h of this._hlHosts) {
-      if (!h.car || assigned >= HEADLIGHT_LIGHTS) continue;
-      const pair =
-        h.car === pv && assigned + 2 <= HEADLIGHT_LIGHTS && this.debugHeadlightUnstable !== true;
-      h.n = pair ? 2 : 1;
-      assigned += h.n;
+      if (!h.car || h.car !== pv) continue;
+      h.n = this.debugHeadlightUnstable === true ? 1 : Math.min(2, HEADLIGHT_LIGHTS);
+      assigned = h.n;
+      break;
+    }
+    for (const h of this._hlHosts) {
+      if (!h.car || h.n > 0 || assigned >= HEADLIGHT_LIGHTS) continue;
+      h.n = 1;
+      assigned += 1;
     }
 
     // ---- pose + crossfade -------------------------------------------------
@@ -2167,6 +2212,35 @@ export class VehicleSystem {
       }
     }
     for (; li < this.headlights.length; li++) this._parkHeadlight(this.headlights[li]);
+  }
+
+  /**
+   * Offer one car for a road pool, keeping the NEAREST `HEADLIGHT_POOLS`.
+   *
+   * The cap used to be spent inline in the `this.vehicles` scan, which walks in
+   * SPAWN order — so on a street with more headlit cars than the cap, the pools
+   * went to whichever cars were created earliest and the ones the player is
+   * actually standing among got nothing. His own car, spawned last of all, could
+   * be the single car in the city lighting no asphalt at all; it is offered at
+   * -1 here so it is never the entry that falls off the end.
+   *
+   * Insertion into a preallocated fixed array (rule 5). At fourteen entries the
+   * shift is cheaper than the comparator allocation a sort would need, and the
+   * early-out means a distant car costs one compare.
+   */
+  _offerPool(v, d2) {
+    const list = this._hlPool;
+    const full = this._nHlPool >= HEADLIGHT_POOLS;
+    if (full && d2 >= list[HEADLIGHT_POOLS - 1].d2) return;
+    let i = full ? HEADLIGHT_POOLS - 1 : this._nHlPool;
+    while (i > 0 && list[i - 1].d2 > d2) {
+      list[i].v = list[i - 1].v;
+      list[i].d2 = list[i - 1].d2;
+      i--;
+    }
+    list[i].v = v;
+    list[i].d2 = d2;
+    if (!full) this._nHlPool++;
   }
 
   /**

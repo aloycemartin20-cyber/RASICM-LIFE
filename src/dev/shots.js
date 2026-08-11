@@ -177,6 +177,166 @@ function shotChrome(engine, shot) {
    * the one that counts.
    */
   if (shot.actorFrame) frameActor(engine, shot.actorFrame);
+
+  /**
+   * `hudFrame` — REPUBLISH A LIVE READOUT AT THE SHUTTER, same rule again.
+   *
+   * For a shot whose HUD is read off a system rather than authored (`pursuit`
+   * takes its stars and its blips from `police`), `apply` is hundreds of frames
+   * before the photograph and the tableau lives through all of them. Declared
+   * as a function on the shot so the shot owns what it publishes; called here
+   * so the last write before the shutter is the one in the picture.
+   */
+  if (shot.hudFrame) {
+    try { shot.hudFrame(engine); } catch { /* a shot must never take the boot down */ }
+  }
+}
+
+/**
+ * ---------------------------------------------------------------------------
+ * STAGING THE HUD ITSELF — the difference between MISSING and BROKEN
+ * ---------------------------------------------------------------------------
+ *
+ * A critic reviewing `shots/wave5-final` reported the driving frames as having
+ * no vehicle cluster, no GPS route and no objective panel, and the pursuit
+ * frame as having no wanted stars and no cop blips. Every one of those widgets
+ * WORKS — `gpsprobe`, `aircraftprobe` and `wardprobe` gate them — and the
+ * frames were still right: the review set was photographing a HUD no player
+ * ever sees.
+ *
+ * `driving` and `cockpit` staged a car with `vehicles.debugPose` and left the
+ * player standing on the pavement beside it. `player.getHudState().inVehicle`
+ * is therefore false, so `_pullState` hides the cluster, there is no route
+ * because nobody set a destination, and the contextual prompt fires because he
+ * is within reach of a door — which is why both frames carry `TAKE THE
+ * ALLEGHENY 4DR` stamped across the middle of the picture. The critic scored an
+ * on-foot HUD as a driving HUD and was told it was broken.
+ *
+ * `pursuit` had a second version of the same fault. `police.debugStage`
+ * genuinely sets the meter to three stars and binds four cruisers, but
+ * `__APPLY_SHOT__` pins `ui.debugState('clean')` on the way in, and `_pullState`
+ * skips the police, game and player reads entirely while a debug scene is
+ * pinned (`if (pol && !this._debug)`). So the live three stars and the four
+ * real cruiser blips were computed, published, and then dropped on the floor.
+ *
+ * TWO FIXES, because they are two different problems:
+ *
+ *   driving / cockpit   `ui.debugState('combat')` — the authored fiction, the
+ *                       path `hud` already uses and the only way a capture ever
+ *                       photographs the cluster, since no producer is running
+ *                       behind it. It sets `inVehicle`, which also turns the
+ *                       centre-screen `TAKE THE ...` into the docked EXIT chip
+ *                       a seated player actually gets. The objective is then
+ *                       re-authored to a DRIVING one and a waypoint is dropped
+ *                       on the far end of the scene's own route, so the ring's
+ *                       route line has a destination on it rather than running
+ *                       off the disc to nothing.
+ *
+ *   pursuit             the opposite — publish what `police` ACTUALLY has.
+ *                       `setWanted` and `setBlips` are public, and both survive
+ *                       a pinned debug scene (`_collectBlips` returns early
+ *                       while one is set, and the `clean` scene declares no
+ *                       blips of its own to re-arm over the top). So the stars
+ *                       in the frame are the meter's, and every blip on the
+ *                       ring is a cruiser that is in the photograph.
+ *
+ * `cockpit` IS A CAR, not an aircraft — first person from the driver's seat of
+ * a staged muscle car, on a downtown street, which is what its `doc` promises
+ * and what the frame shows. It gets the cluster's DRIVING face (speed, gear,
+ * tach) accordingly. The flying face — altitude, climb, rotor — has no frame in
+ * this set and cannot honestly be given one here: painting an altimeter over a
+ * car dashboard would be the same class of defect this whole note is about.
+ * A flying shot is worth adding; it is a shot, not a caption.
+ */
+/**
+ * A destination the ROAD GRAPH can actually route to, `ahead` metres down the
+ * street the lens is already pointed at.
+ *
+ * The first cut of this dropped the pin on the last leg of `debugState`'s own
+ * synthetic route — a random 7-leg wander — and MEASURED the result: `game`'s
+ * GPS solved it, `world.routeTo` came back with nothing (the wander ends in a
+ * river, a rail cut or off the graph entirely), and `_gpsTick`'s failure branch
+ * called `ui.setRoute(null)`. The frame lost the line it was staged to show.
+ * Snapping to a lane centre is the same `nearestEdge` / `laneCenter` pair the
+ * `onRoad` framing above uses, and for the same reason: a coordinate this file
+ * made up is a coordinate the city has never heard of.
+ */
+function roadMark(e, ahead) {
+  const cam = e.ctx.camera;
+  cam.updateMatrixWorld();
+  const m = cam.matrixWorld.elements;
+  const fl = Math.hypot(m[8], m[10]) || 1;
+  const x = cam.position.x - (m[8] / fl) * ahead;
+  const z = cam.position.z - (m[10] / fl) * ahead;
+  const roads = e.ctx.peek('world')?.roads;
+  const hit = roads?.nearestEdge?.(x, z);
+  if (hit?.edge != null && roads.laneCenter) {
+    const a = new THREE.Vector3();
+    roads.laneCenter(hit.edge.id ?? hit.edge, hit.lane ?? 0, 0.5, a);
+    return { x: a.x, z: a.z };
+  }
+  return { x, z };
+}
+
+function driveHud(e, objective, ahead = 460) {
+  const ui = e.ctx.peek('ui');
+  if (!ui?.debugState) return null;
+  // `combat` is the one scene that authors the vehicle cluster.
+  const out = ui.debugState('combat');
+  ui.setObjective(objective);
+  /**
+   * THE ROUTE IS SOLVED, NOT DRAWN FROM MEMORY.
+   *
+   * `ui:waypoint` is the published door — it is the event the pause map fires
+   * when the player drops a pin — and `game._gpsTick` answers it by routing
+   * over the real graph and calling `ui.setRoute` with the result. That is a
+   * strictly better frame than the scene's authored polyline, and it is also
+   * the only one that survives: `_gpsTick` is NOT gated on `ui._debug`, so a
+   * settle long enough for its 1 Hz poll to come round clears any route the
+   * debug scene put up. Give it a destination and it draws one instead.
+   */
+  const mark = roadMark(e, ahead);
+  e.events.emit('ui:waypoint', mark);
+  ui.setWaypoint(mark);
+  return out;
+}
+
+/**
+ * Re-assert the driving fiction AT THE SHUTTER — third instance of the rule.
+ *
+ * `debugState` sets `state.inVehicle`, and `player:state` takes it straight
+ * back: that event carries `inVehicle: false` (the staged man is beside the
+ * car, not in it) and `ui` consumes it on a listener that no debug pin gates.
+ * It fires on any change to his stance, gait or grounded flag, so a settle of
+ * hundreds of frames always contains at least one. MEASURED after apply on the
+ * `driving` shot: cluster up, `inVehicle` false — which draws the on-foot
+ * player glyph on the ring instead of the car, and offers the on-foot
+ * contextual prompt across the middle of the picture instead of the docked
+ * EXIT chip a seated player gets.
+ *
+ * Same fix as the viewmodel flag and the held camera pose: the last write
+ * before the photograph is the one that counts.
+ */
+function driveFrame(e) {
+  const s = e.ctx.peek('ui')?.state;
+  if (!s) return;
+  s.inVehicle = true;
+  s.speed = 24;
+}
+
+/** Put `police`'s real meter and its real cruisers on the ring. */
+function policeHud(e) {
+  const ui = e.ctx.peek('ui');
+  const hs = e.ctx.peek('police')?.getHudState?.();
+  if (!ui?.setBlips || !hs) return 0;
+  ui.setWanted(hs.wanted ?? 0, hs.cooldown ?? 1);
+  const out = [];
+  for (const c of hs.cops ?? []) {
+    if (!c?.position) continue;
+    out.push({ x: c.position.x, z: c.position.z, kind: c.kind ?? 'cop', heading: c.heading });
+  }
+  ui.setBlips(out);
+  return out.length;
 }
 
 /**
@@ -764,16 +924,38 @@ const STEEL_CITY_SHOTS = {
     clearTraffic: 26,
     weather: 'overcast',
     viewmodel: false,
-    apply: (e) => e.ctx.peek('vehicles')?.debugPose?.('chase'),
-    doc: 'Chase camera behind the player car on a downtown avenue — the camera model, body roll, motion blur.',
+    apply: (e) => {
+      e.ctx.peek('vehicles')?.debugPose?.('chase');
+      // See the STAGING THE HUD ITSELF note. Without this the frame is an
+      // on-foot HUD photographed behind a car nobody is driving.
+      driveHud(e, {
+        eyebrow: 'CH 4 · SALVAGE RIGHTS',
+        text: 'Run the crates to the yard on Bingham',
+        count: '4 / 6 ABOARD',
+        timer: 96,
+        progress: 0.66,
+      });
+    },
+    hudFrame: driveFrame,
+    doc: 'Chase camera behind the player car on a downtown avenue — the camera model, body roll, motion blur, and the DRIVING HUD over it: the vehicle cluster, the GPS route on the ring and the objective panel.',
   },
   cockpit: {
     pos: [-232, 6, 150], look: [-232, 6, -40], fov: 65, time: 17.2, ground: true,
     onRoad: { near: [-232, 64], eye: 1.6, aheadM: 30 },
     clearTraffic: 26,
     weather: 'overcast',
-    apply: (e) => e.ctx.peek('vehicles')?.debugPose?.('cockpit'),
-    doc: 'From the driver seat on a real street — interior modelling, dash, wheel, hands, glass from inside.',
+    apply: (e) => {
+      e.ctx.peek('vehicles')?.debugPose?.('cockpit');
+      driveHud(e, {
+        eyebrow: 'CH 4 · SALVAGE RIGHTS',
+        text: 'Run the crates to the yard on Bingham',
+        count: '4 / 6 ABOARD',
+        timer: 96,
+        progress: 0.66,
+      });
+    },
+    hudFrame: driveFrame,
+    doc: 'From the driver seat on a real street — interior modelling, dash, wheel, hands, glass from inside, with the vehicle instruments (speed, gear, tach, fuel, nitro) read from the seat they belong to.',
   },
 
   // ---- characters / gameplay ----
@@ -809,7 +991,10 @@ const STEEL_CITY_SHOTS = {
   },
   chase: {
     pos: [-180, 8, 120], look: [-260, 3, 20], fov: 65, time: 20.2, ground: true,
-    apply: (e) => e.ctx.peek('police')?.debugStage?.('pursuit'),
+    apply: (e) => { e.ctx.peek('police')?.debugStage?.('pursuit'); policeHud(e); },
+    // Its `doc` has always claimed the wanted HUD and the frame has never had
+    // one, for the reason in the STAGING THE HUD ITSELF note.
+    hudFrame: policeHud,
     weather: 'scattered',
     viewmodel: false,
     doc: 'Police pursuit — cruisers, lightbars at dusk, traffic reacting, wanted HUD.',
@@ -846,7 +1031,11 @@ const STEEL_CITY_SHOTS = {
     onRoad: { near: [-232, 124], eye: 1.35, aheadM: 46 },
     weather: 'overcast',
     viewmodel: false,
-    apply: (e) => framePursuit(e),
+    apply: (e) => { framePursuit(e); policeHud(e); },
+    // The stars and the blips are `police`'s, not an authored guess — and they
+    // are republished at the shutter because the tableau lives through the
+    // whole settle. See `hudFrame` in `shotChrome`.
+    hudFrame: policeHud,
     // `at` and `yaw` are FILLED IN BY `framePursuit` against the staged car —
     // the values here are only the shape, and are nulled on every apply so a
     // failed staging can never photograph the last shot's mark. `idle` because

@@ -127,11 +127,21 @@ const ROUTE_MIN = 40;
 /** The destination moving this far re-solves immediately rather than at 1 Hz. */
 const DEST_MOVE = 40;
 /**
- * A held leg waypoint further than this from the car cannot be ours. Vehicle
- * handles are POOLED (`vehicles.despawn` recycles them), so a cruiser can be
- * handed back to `heat` still carrying the route state of its previous life.
- * Nothing else notices, because a stale waypoint steers exactly like a live
- * one — it just points at a road on the other side of the city.
+ * A held leg waypoint further than this from the car cannot still be ours.
+ *
+ * The plan is cached on the handle and the car is not the only thing that
+ * moves it: an `unwedgeVehicle` snap onto the nearest lane, a mission
+ * `setPose`, a physics launch off a bridge, a spawn-director relocation. None
+ * of those clears `v._route`, and a stale waypoint steers exactly like a live
+ * one — it just points at a road on the other side of the city, so the car
+ * drives confidently back to where its last plan came from. 220 m is past any
+ * leg this file aims at (`LEG_MIN` is 22 m and a solved leg is tens of metres)
+ * and inside every displacement that is really a teleport.
+ *
+ * NOT about handle reuse: `vehicles.spawn` builds a `new Vehicle` on every
+ * call and `despawn` drops the handle and disposes its per-instance geometry
+ * (`src/vehicles/index.js`), so `v._route` dies with the car and cannot be
+ * inherited by the next one. `traffic`'s "recycle" is despawn-then-spawn.
  */
 const LEG_STALE = 220;
 

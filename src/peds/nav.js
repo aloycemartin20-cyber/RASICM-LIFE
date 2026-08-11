@@ -33,6 +33,43 @@ const INSET = {
   service: 1.4,
 };
 
+/**
+ * The pavement inset for a road kind, or null where that kind has no pavement.
+ *
+ * NOT `INSET[kind] ?? INSET.street`. `??` falls back on null as well as on
+ * undefined, so that expression answered 1.9 for `highway` — whose entry is an
+ * EXPLICIT null meaning "no pavement here" — and every filter written as
+ * `(INSET[kind] ?? INSET.street) === null` was therefore dead code that could
+ * not fire. A six-lane parkway is 28.6 m wide, so the pavement it was handing
+ * out sat 16.2 m off the centreline, on the far shoulder of a 33 m/s road.
+ * `in` distinguishes "the table says no pavement" from "the table has never
+ * heard of this kind", which is the only case `INSET.street` is a default for.
+ */
+function insetOf(kind) {
+  return kind in INSET ? INSET[kind] : INSET.street;
+}
+
+/**
+ * MAY A WALKER ADOPT THIS EDGE? Three clauses, and all three sites that pick
+ * an edge need all three or the crowd ends up somewhere a person cannot be:
+ *
+ *   - RAIL is in the graph so `roadmesh` can draw ballast, and it is not a
+ *     road. `netgen.railLines` emits mill trackage as `kind: 'alley'`, which
+ *     `INSET` admits at 1.15 m, so the KIND cannot rule it out — only the
+ *     `rail` flag can. A "pavement" beside trackage is a pedestrian on the
+ *     sleepers, and `net.next()` will happily walk him down the spur;
+ *   - a HIGHWAY has no pavement at all (see `insetOf`);
+ *   - an edge shorter than a stride is a weld artefact, not a street. Only
+ *     `attach` tests that one — a pick that lands on a stub is still a legal
+ *     place to stand, it is just not worth sampling a destination on.
+ *
+ * `attach` was the only site that filtered on `rail`, which was invisible for
+ * as long as `nearestLink` had no callers. `Ped._rejoinPavement` gave it one.
+ */
+function walkable(e) {
+  return !!e && !e.rail && insetOf(e.kind) !== null;
+}
+
 const _v = new THREE.Vector3();
 
 export class SidewalkNet {
@@ -59,9 +96,7 @@ export class SidewalkNet {
     this._edgeCount = roads.edges.length;
     this._walkable.length = 0;
     for (const e of roads.edges) {
-      if (!e || e.rail) continue;
-      const inset = INSET[e.kind] ?? INSET.street;
-      if (inset === null) continue;
+      if (!walkable(e)) continue;
       if (!(e.len > 6)) continue;
       this._walkable.push(e);
     }
@@ -71,7 +106,7 @@ export class SidewalkNet {
 
   /** Half the road width plus the pavement inset — the pavement centreline. */
   offsetOf(edge) {
-    const inset = INSET[edge.kind] ?? INSET.street;
+    const inset = insetOf(edge.kind);
     return (edge.width ?? 7) * 0.5 + (inset ?? 1.9);
   }
 
@@ -138,13 +173,32 @@ export class SidewalkNet {
    * walker facing the way he already is. Without it a walker adopting this
    * link would about-face on the spot half the time, which reads as a glitch
    * rather than as somebody stepping back onto the pavement.
+   *
+   * PASS `y` WHEN YOU HAVE ONE. Steel City has eleven bridges and every one of
+   * them flies over a riverfront quay: in PLAN a man on the Allegheny Quay is
+   * two metres from the Sixth Street deck and eighteen metres below it, so a
+   * 2D query hands him the deck, `pointOn` interpolates the deck's node
+   * heights, and he spends the rest of his life walking under the bridge
+   * toward a point on top of it. `RoadGraph.nearestEdge` takes the height for
+   * exactly this and scores a wrong deck out of contention; the caller still
+   * has to check the height it gets back, because the penalty picks the BEST
+   * candidate and cannot invent a right one. See `Ped._rejoinPavement`.
+   *
+   * `maxDist` sizes the ring search. The default is the whole-city reach a
+   * caller with no opinion wants; a caller whose accept radius is metres
+   * should pass that instead, because `nearestEdge` scans ceil(maxDist/CELL)
+   * rings whether or not the answer can possibly be accepted.
+   *
+   * Returns null rather than a second-best when the nearest edge is not
+   * `walkable`: the alternative is to keep scanning outward past trackage or
+   * a parkway for something that would fail the caller's own reach test
+   * anyway, and a walker who finds nothing simply goes on wandering.
    */
-  nearestLink(x, z, out = {}, heading = null) {
+  nearestLink(x, z, out = {}, heading = null, y = NaN, maxDist = 160) {
     if (!this.ready || typeof this.roads.nearestEdge !== 'function') return null;
-    const near = this.roads.nearestEdge(x, z, 160);
-    if (!near || !near.edge) return null;
+    const near = this.roads.nearestEdge(x, z, maxDist, y);
+    if (!near || !walkable(near.edge)) return null;
     const e = near.edge;
-    if ((INSET[e.kind] ?? INSET.street) === null) return null;
     const na = this.roads.nodes[e.a];
     const px = x - (na.x + (this.roads.nodes[e.b].x - na.x) * near.t);
     const pz = z - (na.z + (this.roads.nodes[e.b].z - na.z) * near.t);
@@ -175,8 +229,11 @@ export class SidewalkNet {
     const heading = this.headingOf(link);
     for (let i = 0; i < node.links.length; i++) {
       const e = roads.edges[node.links[i]];
-      if (!e || e === link.edge) continue;
-      if ((INSET[e.kind] ?? INSET.street) === null) continue;
+      if (e === link.edge) continue;
+      // Same predicate as `attach` — a junction is exactly where a rail spur
+      // welds onto the road grid (`railsweep` documents the weld), so this is
+      // the site at which a walker would turn onto the sleepers.
+      if (!walkable(e)) continue;
       const dir = e.a === nodeId ? 1 : -1;
       const h = Math.atan2(e.dx * dir, e.dz * dir);
       let dh = h - heading;

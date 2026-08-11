@@ -72,6 +72,33 @@ export const STATE = {
 const REJOIN_MARGIN = 4;
 
 /**
+ * Height disagreement, metres, past which a pavement is a DIFFERENT DECK and
+ * not this man's pavement at all.
+ *
+ * The reach test below is 2D, and so was the pick until `nearestLink` learned
+ * to take a height: on the Allegheny Quay under the Sixth Street bridge the
+ * deck's pavement is two metres away in plan and eighteen metres up, which
+ * passes a plan reach test by a wide margin. 2.5 m is a storey short of any
+ * crossing in the city and comfortably over the camber, kerb and terrain-grid
+ * slack between a man's feet and the pavement centreline he is standing on.
+ */
+const REJOIN_RISE = 2.5;
+
+/**
+ * Search radius handed to `nearestLink`, metres.
+ *
+ * A CONSERVATIVE BOUND ON `reach`, not a range of interest: the accept test is
+ * `offsetOf(edge) + REJOIN_MARGIN`, and the widest pavement in the emitted
+ * graph is a four-lane arterial's at 9.5 m (MEASURED over `generateCity`'s
+ * output — the 16.2 m figure belongs to a six-lane parkway, which has no
+ * pavement). 24 m clears that with room for a wider road than the city
+ * currently lays. The old value was 160 m, which made a ped in a park with no
+ * road anywhere near him — the one certain to be rejected — scan every ring
+ * out to the horizon on a 1.6-3.4 s timer.
+ */
+const REJOIN_SEARCH = 24;
+
+/**
  * Hit capsules: [part, headBone, tailBone, radius, damageScale]. `part` is what
  * `physics` reports back on the impact, and `damage:dealt` turns a `head` hit
  * into a headshot.
@@ -309,6 +336,17 @@ export class Ped {
     this.ragdoll = null;
     this.__ragdoll = null;
     this.velocity.set(0, 0, 0);
+    /**
+     * THE POOL HANDS BACK A PED, NOT A BLANK ONE. `this.link` is a reused
+     * object and nothing else clears it, so without this a recycled body
+     * carries the PREVIOUS pedestrian's edge — and the spawner's own
+     * `navMode = 'wander'` does not undo that, because `_calmDown` resumes
+     * link mode from `this.link.edge` alone. The new man would then walk a
+     * pavement belonging to wherever the old one happened to die.
+     */
+    this.link.edge = null;
+    this.t = 0;
+    this.navMode = 'wander';
     this._decision = rng.range(0, 3);
     this._rejoinT = rng.range(0, 2.4);
     this._waterTime = 0;
@@ -666,6 +704,14 @@ export class Ped {
    * (5.5 m out) and a man in the middle of a four-lane arterial (9.9 m out)
    * are both inside it, while a man in a park a block away is not and goes on
    * wandering. `REJOIN_MARGIN` is the slack past the pavement itself.
+   *
+   * AND THE RANGE IS 3D, because the reach test above is not. Every bridge in
+   * the city flies over a quay, so "two metres away" is a claim about the plan
+   * that says nothing about whether the man and the pavement are on the same
+   * piece of ground. His height goes into the pick (`nearestLink` scores a
+   * wrong deck out of contention) and the height that comes back is checked
+   * against `REJOIN_RISE` before he adopts anything — the penalty picks the
+   * best candidate and cannot invent a right one.
    */
   _rejoinPavement() {
     const net = this.sys?.net;
@@ -673,16 +719,32 @@ export class Ped {
     const link = net.nearestLink(
       this.position.x, this.position.z,
       this._rejoinLink ?? (this._rejoinLink = {}),
-      this.yaw
+      this.yaw,
+      this.position.y,
+      REJOIN_SEARCH
     );
     if (!link) return false;
-    const p = net.pointOn(link.edge, link.side, link.t, this._v);
+    if (!this._nearLink(link)) return false;
+    this.setLink(link);
+    return true;
+  }
+
+  /**
+   * Is this link's pavement close enough to stand on — in plan AND in height?
+   *
+   * Shared by the rejoin above and by `_calmDown`, which has the same question
+   * to answer about a link the ped has been carrying since before he ran.
+   */
+  _nearLink(link) {
+    const net = this.sys?.net;
+    if (!net?.ready || !link?.edge) return false;
+    const t = link.t ?? this.t;
+    const p = net.pointOn(link.edge, link.side, t, this._v);
     const dx = p.x - this.position.x;
     const dz = p.z - this.position.z;
     const reach = net.offsetOf(link.edge) + REJOIN_MARGIN;
     if (dx * dx + dz * dz > reach * reach) return false;
-    this.setLink(link);
-    return true;
+    return Math.abs(p.y - this.position.y) <= REJOIN_RISE;
   }
 
   _updateWalk(dt) {
@@ -786,7 +848,33 @@ export class Ped {
     } else {
       this.state = STATE.WALK;
       this.stateTime = 0;
-      this.navMode = this.link.edge ? 'link' : 'wander';
+      /**
+       * A LINK HE RAN AWAY FROM IS NOT A LINK HE CAN RESUME.
+       *
+       * `this.link` is never cleared, and `this.t` is still the parameter he
+       * had before he panicked — so resuming on nothing but "he has an edge"
+       * aims him at `pointOn(edge, side, t + ahead)`, a pavement point up to
+       * 46 m back the way he came, and `_advanceLink` then ticks `t` forward
+       * whether or not he is anywhere near that edge. He walks a line offset
+       * from a pavement, back into the gunfire he fled, crossing carriageway
+       * on the way. Before `_rejoinPavement` existed a pure wanderer had no
+       * edge at all and this read as harmless; now essentially every crowd ped
+       * carries one.
+       *
+       * So the test is the same one the rejoin uses to ADOPT a link: is that
+       * pavement close enough to be standing on. If it is not, he wanders from
+       * where he actually is, and the next rejoin poll hands him back to the
+       * network properly.
+       */
+      if (this._nearLink(this.link)) {
+        this.navMode = 'link';
+      } else {
+        this.navMode = 'wander';
+        this.link.edge = null;
+        this.wander = this.wander ?? new Wander();
+        this.wander.reset(this.rng, this.position, 26);
+        this.wanderTarget = this.wander.target;
+      }
       this._decision = this.rng.range(3, 9);
     }
   }

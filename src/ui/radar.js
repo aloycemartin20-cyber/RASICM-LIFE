@@ -45,6 +45,53 @@ const SPAN_FAST = 440;
 const LABEL_SPAN = 360;
 
 /**
+ * ---------------------------------------------------------------------------
+ * THE OFF-DISC CHEVRON — the arrow that says "your waypoint is that way"
+ * ---------------------------------------------------------------------------
+ *
+ * Everything below is in DESIGN px: the disc is authored at 190 across (`u`,
+ * further down, converts to device px), so its rim is at 95 and one design px
+ * is 0.94 CSS px at `--k` 1.
+ *
+ * IT WAS TOO SMALL AND IT WAS CLIPPED. The old triangle was 9 design px tall
+ * and 9.2 wide — 8.4 x 8.6 CSS px, a 12 px diagonal — orbiting at `half * 0.9`,
+ * i.e. 85.5 design px with a tip reaching 90.5. That is 4.5 design px OUTSIDE
+ * the rim the canvas is clipped to, so the point of the arrow, the one part
+ * that carries the bearing, was shaved off on every frame it appeared. At
+ * couch distance the remainder is a smudge, and directly under the health and
+ * armour arcs — which run just outside the iron, radius 100-112 CSS px from the
+ * same centre (`vitals.js`, r 54 of a 100-unit box, 6 wide) — a green arc and
+ * an orange smudge separated by a few px of dark bezel read as one object.
+ *
+ * So: roughly double the glyph, notch it into a chevron rather than a solid
+ * triangle so it has a direction at a glance, outline it 8-way like everything
+ * else on this HUD, and orbit it at a radius that RESERVES the band rather
+ * than sitting in it.
+ *
+ * `CHEV_GAP` is the clear bezel between the tip and the iron. With the tip at
+ * 95 - 3 = 92 design px (86 CSS px from centre) and the arcs starting at 100
+ * CSS px, there is now ~14 CSS px of unlit iron between the two — a gap wide
+ * enough to read as a gap, at the cost of 5 design px of orbit.
+ *
+ * `CHEV_TAG` is the second reservation and it is the bottom of the disc: the
+ * district tag is an HTML plate parked 13 CSS px up from the rim, ~16 tall, so
+ * its top edge is 64 design px from the centre. A chevron pointing due south
+ * lands straight on the word. The inset is weighted by the SQUARE of how far
+ * down the bearing points, which reaches full strength only at six o'clock and
+ * has faded out by the time the chevron is level with the centre — a hard
+ * sector would pop the arrow inward as the player turned.
+ */
+const CHEV_H = 11.6;
+const CHEV_W = 9.8;
+const CHEV_TAIL = 8.4;
+/** How deep the notch cuts back into the tail, so it reads as a chevron. */
+const CHEV_NOTCH = 4.6;
+const CHEV_GAP = 3;
+const CHEV_TAG = 27;
+/** Outline offset, matching `--o1`'s 1.5 px at `--k` 1. */
+const CHEV_INK = 1.6;
+
+/**
  * Negative-control hatch for the AFB findability gate (src/ui/afbprobe.mjs):
  * `?nomilitary=1` drops the Ridgeline AFB pin from the minimap too, matching
  * `pausemap.js` / `cheats.js`, so the probe's "blip when near" check measures
@@ -271,7 +318,9 @@ export class SlagRing {
         // nothing about where anyone actually is.
         const off = Math.hypot(p[0] - half, p[1] - half) > half * 0.94;
         if (off && !objective) continue;
-        if (objective) this._clampToDisc(p, half, half * 0.9);
+        // The same reserved rim the chevron rides — an objective pip pinned at
+        // six o'clock landed on the district tag exactly as the chevron did.
+        if (objective) this._clampToRim(p, half, u);
         if (b.kind === 'cop') {
           // Police flash blue/white on the radar, in step with the lightbar.
           const t = (this.time * 2.6 + i * 0.31) % 1;
@@ -288,7 +337,7 @@ export class SlagRing {
     // ---- waypoint ---------------------------------------------------------
     if (s.waypoint) {
       const p = proj(s.waypoint.x, s.waypoint.z, this._pt);
-      const clamped = this._clampToDisc(p, half, half * 0.9);
+      const clamped = this._clampToRim(p, half, u);
       const st = POI_STYLE.waypoint;
       if (clamped) {
         // an arrow on the rim pointing at an off-disc waypoint
@@ -296,16 +345,7 @@ export class SlagRing {
         g.save();
         g.translate(p[0], p[1]);
         g.rotate(a + Math.PI / 2);
-        g.fillStyle = st.c;
-        g.strokeStyle = 'rgba(3,6,9,.9)';
-        g.lineWidth = 1.4 * u;
-        g.beginPath();
-        g.moveTo(0, -5 * u);
-        g.lineTo(4.6 * u, 4 * u);
-        g.lineTo(-4.6 * u, 4 * u);
-        g.closePath();
-        g.fill();
-        g.stroke();
+        this._chevron(g, u, st.c);
         g.restore();
       } else {
         drawIcon(g, st.g, p[0], p[1], 6.8 * u, st.c, 1);
@@ -416,11 +456,56 @@ export class SlagRing {
     g.restore();
   }
 
-  /** Clamp a screen point into the disc. Returns true if it was outside. */
-  _clampToDisc(p, half, radius) {
+  /**
+   * The off-disc chevron, pointing up the local +Y of whatever transform the
+   * caller has already rotated into place.
+   *
+   * Drawn as a dark silhouette at eight offsets and then filled — the canvas
+   * spelling of `--o1`, the 8-way text outline the rest of the HUD uses. A
+   * plain stroke is not equivalent and the difference is the whole point: a
+   * stroke straddles the edge, so half of it eats the coloured shape, and at
+   * this size on a map full of POI pips and a magenta route the arrow needs
+   * its own fence WITHOUT going thin. Nine path builds a frame for one glyph.
+   */
+  _chevron(g, u, colour) {
+    const path = () => {
+      g.beginPath();
+      g.moveTo(0, -CHEV_H * u);
+      g.lineTo(CHEV_W * u, CHEV_TAIL * u);
+      g.lineTo(0, CHEV_NOTCH * u);
+      g.lineTo(-CHEV_W * u, CHEV_TAIL * u);
+      g.closePath();
+    };
+    const o = CHEV_INK * u;
+    g.fillStyle = '#05080b';
+    for (let i = 0; i < 8; i++) {
+      const a = (i * Math.PI) / 4;
+      g.save();
+      g.translate(Math.cos(a) * o, Math.sin(a) * o);
+      path();
+      g.fill();
+      g.restore();
+    }
+    g.fillStyle = colour;
+    path();
+    g.fill();
+  }
+
+  /**
+   * Clamp a screen point onto the reserved rim. Returns true if it was outside.
+   *
+   * The radius is not a constant: it holds the glyph clear of the iron (and so
+   * of the vitals arcs just beyond it) everywhere, and pulls further in the
+   * more southerly the bearing, where the district tag is. See the CHEV_ block
+   * at the top of this file for the measurements.
+   */
+  _clampToRim(p, half, u) {
     const dx = p[0] - half;
     const dy = p[1] - half;
     const d = Math.hypot(dx, dy);
+    if (d < 1e-4) return false;
+    const down = Math.max(0, dy / d);
+    const radius = half - (CHEV_H + CHEV_GAP + CHEV_TAG * down * down) * u;
     if (d <= radius) return false;
     p[0] = half + (dx / d) * radius;
     p[1] = half + (dy / d) * radius;

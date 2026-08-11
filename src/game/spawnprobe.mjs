@@ -52,7 +52,13 @@ const sample = (label) =>
     if (!pos) return { label: l, ok: false, surface: null, note: 'no player' };
     const surface = w?.surfaceAt?.(pos.x, pos.z) ?? null;
     const water = w?.isWater?.(pos.x, pos.z) ?? false;
-    const road = w?.roads?.nearestEdge?.(pos.x, pos.z, 300);
+    // COPY the distance out immediately: `nearestEdge` returns a REUSED
+    // record, and the enclosure ray loop below reaches `walkableHeightAt`,
+    // whose own `nearestEdge(x, z, 40, y≈200)` overwrites it — the height
+    // penalty at ray altitude elects a bridge deck and this probe once read
+    // 3.8 m before the loop and 80.6 m after, off the same capture.
+    const roadRec = w?.roads?.nearestEdge?.(pos.x, pos.z, 300);
+    const road = roadRec ? { dist: roadRec.dist, edge: roadRec.edge } : roadRec;
 
     // ENCLOSURE — measured against the COLLISION WORLD, not against `world`.
     // Every check above this line asks `surfaceAt`, which is the same question

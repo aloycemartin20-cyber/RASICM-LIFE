@@ -213,6 +213,8 @@ export class MissionRunner {
       outroT: 0,
       timer: c.baseTimer ? c.baseTimer * (this.diff.timerMul ?? this.diff.time) : 0,
       hasTimer: !!c.baseTimer,
+      /** A clock a TRACK armed to stop a hang, not one the author priced. */
+      timerIsWatchdog: false,
       goal: c.goal ?? 1,
       progress: 0,
       lap: 0,
@@ -226,11 +228,15 @@ export class MissionRunner {
       spawnedVehicles: [],
       spawnedHostiles: [],
       spawnedPickups: [],
+      /** `recover`'s lost slots for THIS frame — see its wreck walk. */
+      _lostSlots: [],
       rivals: [],
       arena: { x: 0, z: 0, r: 0 },
       hold: { x: 0, z: 0 },
       _anchor: { x: 0, z: 0 },
       veh: null,
+      /** The courtesy ride has been superseded — see `tracks.rideFault`. */
+      rideReleased: false,
       dest: null,
       target: null,
       ally: null,
@@ -638,10 +644,23 @@ export class MissionRunner {
    * Arm a countdown on a track that authored none — the `timedStory` half of
    * the difficulty table. Base seconds come from `TIMED_STORY`, the scale from
    * `DIFFS.timerMul`.
+   *
+   * A WATCHDOG IS NOT A CHALLENGE, and the third argument is the difference.
+   * `escort` arms a clock for one reason: a truck wedged against a bollard
+   * neither wins nor fails, and the chapter runs until the player quits. That
+   * bound must not be squeezed by difficulty (on steel `timerMul` 0.72 turned
+   * a 1.7x allowance into 1.23x, i.e. a chapter that could be lost on time
+   * where the author gave it no clock) and must not be PAID: `win` prices
+   * `max(0, timer) * TIME_BONUS` for anything carrying `hasTimer`, which
+   * quietly turned an anti-hang bound into $1500 of unauthored time bonus on
+   * a $2900 purse (MEASURED — `src/game/escortprobe.mjs`).
+   *
+   * @param {boolean} watchdog  unscaled by difficulty, and never a time bonus.
    */
-  armTimer(M, seconds) {
-    M.timer = seconds * (this.diff.timerMul ?? this.diff.time ?? 1);
+  armTimer(M, seconds, watchdog = false) {
+    M.timer = watchdog ? seconds : seconds * (this.diff.timerMul ?? this.diff.time ?? 1);
     M.hasTimer = true;
+    M.timerIsWatchdog = watchdog;
   }
 
   /**
@@ -1118,7 +1137,10 @@ export class MissionRunner {
     M.replay = !M.side && M.idx >= 0 && cs.chapter > M.idx;
     M.rate = M.replay ? REPLAY_PURSE : 1;
 
-    M.bonus = M.hasTimer ? Math.round(Math.max(0, M.timer) * TIME_BONUS * M.rate) : 0;
+    // A WATCHDOG CLOCK PAYS NOTHING. `armTimer(M, s, true)` is a bound the code
+    // invented to stop a hang, not seconds the author priced — see `armTimer`.
+    const paidClock = M.hasTimer && !M.timerIsWatchdog;
+    M.bonus = paidClock ? Math.round(Math.max(0, M.timer) * TIME_BONUS * M.rate) : 0;
     M.cash = Math.round(c.cash * M.rate) + M.bonus;
     M.respect = Math.round(c.respect * M.rate);
 
@@ -1242,13 +1264,13 @@ export class MissionRunner {
    * ONE CARD, ONE STING — and `carded` is how.
    *
    * `_finish` does BOTH halves of the same job: it emits `mission:complete` /
-   * `mission:fail` AND calls `ui.card(...)` itself. `src/ui/index.js:874` and
-   * `:881` raise a card off each of those events unconditionally, and
-   * `ui.card()` (`src/ui/index.js:1081`) plays `mission_pass` / `mission_fail`
-   * on every call — so every mission end in the game showed the big card TWICE
-   * and struck its sting twice in the same frame. The second `show()` restarts
-   * the reveal animation from t=0 and the two stings land as one flam, which is
-   * why it reads as "the card feels wrong" rather than as two of anything.
+   * `mission:fail` AND calls `ui.card(...)` itself. `src/ui/index.js`'s two
+   * mission listeners raise a card off each of those events, and `ui.card()`
+   * plays `mission_pass` / `mission_fail` on every call — so every mission end
+   * in the game showed the big card TWICE and struck its sting twice in the
+   * same frame. The second `show()` restarts the reveal animation from t=0 and
+   * the two stings land as one flam, which is why it reads as "the card feels
+   * wrong" rather than as two of anything.
    *
    * Two subsystems deciding one fact (rule 12's spatial form), and BOTH have a
    * real claim. This side has the only copy of the numbers that make the card
@@ -1262,19 +1284,14 @@ export class MissionRunner {
    * own card, stand down". Set here, unset by `jobs` (its `_endPayload` has no
    * such field), and the fallback keeps working untouched for everyone else.
    *
-   * ────────────────────────────────────────────────────────────────────────
-   * THE `ui` HALF IS NOT LANDED YET, AND IT IS TWO LINES. `src/ui/index.js` is
-   * not this change's to edit; until its owner adds
-   *
-   *     on('mission:complete', (e) => { if (e?.carded) { this.clearObjective(); return; } ... })
-   *     on('mission:fail',     (e) => { if (e?.carded) { this.clearObjective(); return; } ... })
-   *
-   * the second card still shows. What IS landed and gated is the contract on
-   * this side: `src/game/flowprobe.mjs` counts every card an end raises with a
-   * `ui` stand-in that mirrors both of those handlers INCLUDING the guard, and
-   * its negative control deletes `carded` from the payload and watches the
-   * count go to two. `src/game/escortprobe.mjs` counts the same way.
-   * ────────────────────────────────────────────────────────────────────────
+   * BOTH HALVES ARE LANDED. `ui`'s `mission:complete` / `mission:fail`
+   * listeners clear the objective and then return on `carded` (see the comment
+   * above them in `src/ui/index.js`, which names this method). The contract is
+   * gated from this side too: `src/game/flowprobe.mjs` counts every card an
+   * end raises with a `ui` stand-in that mirrors both of those handlers
+   * INCLUDING the guard, and its negative control re-emits the same payload
+   * with `carded` deleted and watches the count go to two.
+   * `src/game/escortprobe.mjs` counts the same way.
    */
   _finish(M) {
     const ui = this.wq.ui;

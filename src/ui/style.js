@@ -47,6 +47,38 @@ const CSS = `
   --u: calc(4px * var(--k));
   --pad: calc(var(--u) * 7);
 
+  /**
+   * ---- TITLE SAFE ----
+   *
+   * --pad is a GUTTER, not a safe area, and on a television those are not the
+   * same measurement. 28 px at 1080p is 1.5 % of the width: MEASURED on
+   * shots/wave5-final, the money read ends at x 1892 (28 px, 1.5 %), the
+   * wanted rack, the clock and the weapon chip sit on the same 28 px line, and
+   * the HP/ARM arcs and their labels finish ~30 px off the bottom. Broadcast
+   * overscan eats up to 5 % of each edge, so on a set that overscans at all,
+   * the player's cash, his heat and his ammo count are the first three things
+   * off the picture.
+   *
+   * --safe is that inset as a PERCENTAGE of each edge — one number, and the
+   * two axes derive from it, because a title-safe area is per-axis: 5 % of
+   * 1920 is 96 px and 5 % of 1080 is 54 px, and insetting the top by 96 px to
+   * match the sides would throw away a centimetre of screen for nothing.
+   * Percentages also make it resolution-independent by construction: the same
+   * 5 % lands at 128/72 px on a 1440p frame with no second number to keep in
+   * step.
+   *
+   * max() against the old gutter is the floor, so a small desktop window —
+   * where 5 % of 900 px is 45 px — never ends up TIGHTER than it was.
+   *
+   * EVERY screen-edge anchor in this file reads --pad-x / --pad-y rather than
+   * --pad, which is what makes this one number move them all. --pad survives
+   * for the things that are padding rather than an edge (the title card's
+   * bleed, the map panel's own gutters).
+   */
+  --safe: 5;
+  --pad-x: max(var(--pad), calc(var(--safe) * 1vw));
+  --pad-y: max(var(--pad), calc(var(--safe) * 1vh));
+
   /* ---- design tokens ---- */
   --ink0:  #080a0e;
   --ink1:  #10141c;
@@ -211,11 +243,17 @@ const CSS = `
 /* ===================================================== THE SLAG RING ==== */
 /* The dock is the bottom-left cluster. It is deliberately LARGER than the
    ring: the vitals arcs and the heat bloom both live outside the iron, and if
-   the dock is the same size as the bezel they get clipped by the viewport. */
+   the dock is the same size as the bezel they get clipped by the viewport.
+   The negative offsets claw some of that surplus back so the IRON sits near
+   the gutter rather than the dock's empty corner — but they used to claw back
+   20 and 12 px, which against the title-safe inset put the dock's own box at
+   3.96 % / 3.89 % of the edges. Trimmed to 12 and 6: MEASURED at 1920x1080 the
+   box now clears at 4.38 % / 4.44 % and the painted HP/ARM arcs at 5.4 % /
+   5.8 %, so both the element and its ink are outside the band. */
 .ow-dock {
   position:absolute;
-  left: calc(var(--pad) - 20px * var(--k));
-  bottom: calc(var(--pad) - 12px * var(--k));
+  left: calc(var(--pad-x) - 12px * var(--k));
+  bottom: calc(var(--pad-y) - 6px * var(--k));
   width: calc(252px * var(--k)); height: calc(252px * var(--k));
   will-change: opacity;
 }
@@ -333,7 +371,7 @@ const CSS = `
    be four absolutely-positioned blocks with hand-tuned tops, which collided
    the moment the objective ran to two lines. */
 .ow-topright {
-  position:absolute; right: var(--pad); top: var(--pad);
+  position:absolute; right: var(--pad-x); top: var(--pad-y);
   display:flex; flex-direction:column; align-items:flex-end;
   gap: calc(var(--u) * 2);
   width: calc(360px * var(--k));
@@ -345,8 +383,34 @@ const CSS = `
   gap: calc(var(--u) * 1.2);
   will-change: opacity;
 }
-.ow-stars { width: calc(166px * var(--k)); height: calc(33px * var(--k)); overflow:visible; }
-.ow-stars .back { fill:#0b0f15; stroke: rgba(150,166,188,.55); stroke-width:1.5; }
+/**
+ * THE UNLIT STAR IS A READOUT, NOT A GAP.
+ *
+ * "Two of five" is only legible if the three you have NOT got are legible, and
+ * they were a near-black fill (#0b0f15) behind a 55 %-alpha steel hairline —
+ * i.e. dark grey on whatever the sky happens to be. Over the overcast noon of
+ * the 'driving' and 'hud' frames the empty half of the rack all but vanished
+ * and the rack read as "some stars", which is the one thing a wanted meter may
+ * not say.
+ *
+ * Two changes, the same pair the RESPECT label and the clock get below: lift
+ * the ink one step (the hairline goes to --ink-2's value at 0.85 and gains a
+ * third of a pixel) and give the shape the 8-way outline. --o1 is a
+ * text-shadow and does not apply to SVG geometry, so the filter is the
+ * equivalent: four chained dark drop-shadows compound into a ring on the
+ * diagonals as well as the axes, which is what makes an outline an outline.
+ * On the rack, not on .back, so the lit stars keep their halo too and the
+ * whole widget separates from the sky as one object.
+ */
+.ow-stars {
+  width: calc(166px * var(--k)); height: calc(33px * var(--k)); overflow:visible;
+  filter:
+    drop-shadow(calc(1.2px * var(--k)) 0 0 var(--oc))
+    drop-shadow(calc(-1.2px * var(--k)) 0 0 var(--oc))
+    drop-shadow(0 calc(1.2px * var(--k)) 0 var(--oc))
+    drop-shadow(0 calc(-1.2px * var(--k)) 0 var(--oc));
+}
+.ow-stars .back { fill:#0b0f15; stroke: rgba(196,209,222,.85); stroke-width:1.8; }
 .ow-stars .fill { fill: var(--gold); filter: drop-shadow(0 0 calc(7px * var(--k)) rgba(255,201,60,.9)); }
 .ow-wanted-bar {
   width: calc(150px * var(--k)); height: calc(2.6px * var(--k));
@@ -381,9 +445,29 @@ const CSS = `
   font-size: calc(24px * var(--k)); line-height:.9; letter-spacing:.01em;
   color: var(--gold); text-shadow: var(--o1), 0 0 calc(16px * var(--k)) rgba(255,201,60,.35);
 }
+/**
+ * THE 11 PX FLOOR FOR SECONDARY READOUTS, and why this label set it.
+ *
+ * --steel (#7d8ca3) and --ink-2 are the HUD's quiet inks and they are
+ * correct ON A PLATE — the weapon chip, the radio strip, the pause map all
+ * give them a dark panel to sit on. The four readouts that have no plate are
+ * this label, the unlit stars above, and the clock and weather line below, and
+ * every one of them was set between 8.6 and 9.5 px with --sh — a soft drop
+ * shadow, which under a bright sky lifts nothing: the letterform and its
+ * shadow are both mid-grey against 200-plus, so the word RESPECT read as a
+ * smudge in the review frames and the weather word next to the clock read as
+ * nothing at all.
+ *
+ * The fix is the pair, not either half. 11 px is the floor because the outline
+ * costs ~1.5 px of the stroke's own width either side, so below it the counter
+ * of an e closes up and legibility goes DOWN as the outline goes on; and the
+ * ink goes up one step on the ladder (--steel -> --ink-2, --ink-2 ->
+ * --ink) so the glyph is genuinely lighter than the sky rather than only
+ * better fenced from it.
+ */
 .ow-respect-l {
-  font-family: var(--fm); font-size: calc(8.6px * var(--k));
-  letter-spacing:.26em; color: var(--steel); text-shadow: var(--sh);
+  font-family: var(--fm); font-size: calc(11px * var(--k));
+  letter-spacing:.26em; color: var(--ink-2); text-shadow: var(--sh-o1);
 }
 .ow-respect-d {
   font-family: var(--fm); font-size: calc(11px * var(--k)); letter-spacing:.1em;
@@ -395,15 +479,18 @@ const CSS = `
   display:flex; align-items:baseline; gap: calc(var(--u) * 2.2);
   font-family: var(--fm); letter-spacing:.16em; text-shadow: var(--sh-o1);
 }
-.ow-clock .t { font-size: calc(14px * var(--k)); color: var(--ink-2); }
-.ow-clock .w { font-size: calc(9.5px * var(--k)); color: #a9b7c8; letter-spacing:.26em; }
+/* Same floor and the same one-step lift as .ow-respect-l. The weather word
+   was the worst case in the set: 9.5 px of #a9b7c8 with no outline of its own,
+   directly under a bright horizon in every daylight frame. */
+.ow-clock .t { font-size: calc(14px * var(--k)); color: var(--ink); }
+.ow-clock .w { font-size: calc(11px * var(--k)); color: var(--ink-2); letter-spacing:.26em; }
 
 /* ================================================ vehicle meter cluster */
 /* Health / fuel / nitro while driving, stacked above the weapon chip. Rows
    hide individually when their producer is absent; the fuel bar's low-state
    flash is driven from dt in vitals.js, never from a CSS keyframe. */
 .ow-vehm {
-  position:absolute; right: var(--pad); bottom: calc(var(--pad) + 88px * var(--k));
+  position:absolute; right: var(--pad-x); bottom: calc(var(--pad-y) + 88px * var(--k));
   display:flex; flex-direction:column; gap: calc(var(--u) * 1.1);
   padding: calc(var(--u) * 1.6) calc(var(--u) * 2.2);
   background: linear-gradient(180deg, rgba(26,32,42,.72), rgba(8,11,16,.82));
@@ -452,7 +539,7 @@ const CSS = `
 
 /* ============================================================== weapon */
 .ow-weap {
-  position:absolute; right: var(--pad); bottom: var(--pad);
+  position:absolute; right: var(--pad-x); bottom: var(--pad-y);
   display:flex; align-items:center; gap: calc(var(--u) * 2.5);
   padding: calc(var(--u) * 2) calc(var(--u) * 3);
   background: linear-gradient(180deg, rgba(26,32,42,.80), rgba(8,11,16,.88));
@@ -513,8 +600,8 @@ const CSS = `
 
 /* ================================================================= zone */
 .ow-zone {
-  position:absolute; left: var(--pad);
-  bottom: calc(var(--pad) + 250px * var(--k));
+  position:absolute; left: var(--pad-x);
+  bottom: calc(var(--pad-y) + 250px * var(--k));
   will-change: opacity, transform;
 }
 .ow-zone-rule {
@@ -535,7 +622,7 @@ const CSS = `
 
 /* =========================================================== title card */
 .ow-title {
-  position:absolute; left: var(--pad); bottom: 31%;
+  position:absolute; left: var(--pad-x); bottom: 31%;
   display:flex; gap: calc(var(--u) * 3.5); align-items:stretch;
   padding: calc(var(--u) * 4) calc(var(--u) * 16) calc(var(--u) * 4) 0;
   will-change: opacity;
@@ -544,7 +631,7 @@ const CSS = `
    ground. Feathers to nothing on the right and top/bottom so it never reads as
    a rectangle laid over the scene. */
 .ow-title::before {
-  content:''; position:absolute; inset: 0 0 0 calc(var(--pad) * -1); z-index:-1;
+  content:''; position:absolute; inset: 0 0 0 calc(var(--pad-x) * -1); z-index:-1;
   background: linear-gradient(to bottom,
     rgba(4,7,10,0) 0%, rgba(4,7,10,.62) 26%, rgba(4,7,10,.62) 74%, rgba(4,7,10,0) 100%);
   -webkit-mask-image: linear-gradient(to right, #000 0%, #000 52%, rgba(0,0,0,0) 100%);
@@ -576,7 +663,7 @@ const CSS = `
 
 /* ============================================================ subtitles */
 .ow-subs {
-  position:absolute; left:50%; bottom: calc(var(--pad) + 22px * var(--k));
+  position:absolute; left:50%; bottom: calc(var(--pad-y) + 22px * var(--k));
   transform: translateX(-50%);
   width: min(56%, calc(760px * var(--k)));
   text-align:center; will-change: opacity;
@@ -656,7 +743,7 @@ const CSS = `
 
 /* ================================================================= feed */
 .ow-feed {
-  position:absolute; left: var(--pad); top: var(--pad);
+  position:absolute; left: var(--pad-x); top: var(--pad-y);
   display:flex; flex-direction:column; gap: calc(var(--u) * 1.4);
   width: calc(320px * var(--k));
 }
@@ -683,7 +770,7 @@ const CSS = `
 
 /* ================================================================ radio */
 .ow-radio {
-  position:absolute; left:50%; top: var(--pad); transform: translateX(-50%);
+  position:absolute; left:50%; top: var(--pad-y); transform: translateX(-50%);
   display:flex; align-items:center; gap: calc(var(--u) * 3);
   padding: calc(var(--u) * 1.6) calc(var(--u) * 4);
   background: var(--glass); border:1px solid var(--line);
@@ -706,7 +793,7 @@ const CSS = `
 /* A burner, not a menu: a steel chassis with a screen in it, parked in the
    bottom right where it cannot cover the ring or the objective. */
 .ow-phone {
-  position:absolute; right: var(--pad); bottom: calc(var(--pad) + 84px * var(--k));
+  position:absolute; right: var(--pad-x); bottom: calc(var(--pad-y) + 84px * var(--k));
   width: calc(310px * var(--k));
   padding: calc(var(--u) * 2.4);
   border-radius: calc(12px * var(--k));
@@ -781,7 +868,7 @@ const CSS = `
 }
 .ow-map-canvas { position:absolute; inset:0; width:100%; height:100%; display:block; cursor:crosshair; }
 .ow-map-top {
-  position:absolute; left: var(--pad); top: var(--pad); right: var(--pad);
+  position:absolute; left: var(--pad-x); top: var(--pad-y); right: var(--pad-x);
   display:flex; align-items:flex-end; gap: calc(var(--u) * 6);
   pointer-events:none;
 }
@@ -807,7 +894,7 @@ const CSS = `
   letter-spacing:.2em; color: var(--steel); padding-bottom: calc(var(--u) * 1.5);
 }
 .ow-map-legend {
-  position:absolute; left: var(--pad); bottom: var(--pad);
+  position:absolute; left: var(--pad-x); bottom: var(--pad-y);
   display:grid; grid-template-columns: 1fr 1fr; gap: calc(var(--u) * 1.4) calc(var(--u) * 5);
   padding: calc(var(--u) * 3);
   background: rgba(9,12,17,.82); border:1px solid var(--line);
@@ -823,7 +910,7 @@ const CSS = `
   box-shadow: 0 0 0 1px rgba(0,0,0,.6);
 }
 .ow-map-hint {
-  position:absolute; right: var(--pad); bottom: var(--pad);
+  position:absolute; right: var(--pad-x); bottom: var(--pad-y);
   text-align:right; font-family: var(--fm); font-size: calc(10px * var(--k));
   letter-spacing:.16em; color: var(--steel); opacity:.72;
   line-height:1.9; pointer-events:none; text-shadow: var(--sh-hard);
@@ -1599,8 +1686,8 @@ const CSS = `
 /* ------------------------------------------------------------- nav buttons */
 .ow-tnav {
   position: absolute;
-  left: calc(var(--pad) + var(--tsafe-l));
-  top: var(--pad);
+  left: calc(var(--pad-x) + var(--tsafe-l));
+  top: var(--pad-y);
   display: flex; gap: calc(9px * var(--tk));
 }
 .ow-tnav-btn {
@@ -1655,7 +1742,7 @@ const CSS = `
    starts below BOTH the nav row and the radio strip's slot, so the two never
    land on top of each other when a station change and a pickup coincide. */
 .ow-hud.ow-touch .ow-feed {
-  top: calc(var(--pad) + var(--tnav, 46px) + 64px * var(--k));
+  top: calc(var(--pad-y) + var(--tnav, 46px) + 64px * var(--k));
   width: min(calc(320px * var(--k)), 52vw);
 }
 .ow-hud.ow-touch .ow-topright { width: min(calc(360px * var(--k)), 44vw); }
@@ -1666,8 +1753,8 @@ const CSS = `
    through the money. It moves under the nav row, on the left, where the feed
    will be a moment later — both are short-lived and never both urgent. */
 .ow-hud.ow-touch .ow-radio {
-  left: var(--pad); right: auto; transform: none;
-  top: calc(var(--pad) + var(--tnav, 46px) + 10px);
+  left: var(--pad-x); right: auto; transform: none;
+  top: calc(var(--pad-y) + var(--tnav, 46px) + 10px);
   padding: calc(var(--u) * 1.2) calc(var(--u) * 2.4);
 }
 /* The centre prompt is the DESKTOP face of the contextual action. On touch the
@@ -1898,6 +1985,17 @@ const DEFS = `
     </filter>
   </defs>
 </svg>`;
+
+/**
+ * The title-safe inset as a fraction of each screen edge — the number `--safe`
+ * publishes to CSS, exported so the widgets that clamp in JS use the same one.
+ *
+ * `markers.js` is the only such widget: its off-screen chevrons are clamped to
+ * a rectangle in raw pixels rather than laid out by the cascade, so without
+ * this it kept its own hand-tuned 74 px (3.9 % of 1920 — inside the band) while
+ * every DOM widget moved. One number, two consumers, no way for them to drift.
+ */
+export const TITLE_SAFE = 0.05;
 
 let installed = false;
 

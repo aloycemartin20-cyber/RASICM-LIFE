@@ -338,6 +338,36 @@ function closureDisabled() {
 }
 
 /**
+ * A/B hatch for the two CLEARANCE tests `closeNetwork`'s `linkOk` applies — the
+ * block test and the crossing test — leaving the rest of the closure live.
+ * `?nolinkclear=1` on the page, or `OW_NO_LINKCLEAR=1` from Node.
+ *
+ * Separate from `noclose` on purpose: `noclose` measures what the closure is
+ * worth, this measures what the LEGALITY of a link is worth, and the two
+ * answers are different roads.
+ *
+ * MEASURED over eight rng seeds, against the KEPT blocks (`generateCity`
+ * returns step 9's survivors, so these are the polygons `subdivide` really
+ * lays lots on): with the tests off, 23 links laid, of which 2 ran through a
+ * kept block and 1 crossed a live street mid-span; with them on, 17 links,
+ * 0 and 0. The 6 links that went away are fragments whose only legal candidate
+ * was an illegal one, so they are deleted instead — 26 -> 37 dropped edges,
+ * 1.19 -> 1.74 km over the eight seeds. That is the trade this file already
+ * makes one paragraph down: unreachable road is deleted rather than shipped,
+ * and a link through somebody's ground floor is worse than a deleted stub.
+ * Both arms end at one drivable component, which is what `lmsweep` gates.
+ */
+function linkClearanceDisabled() {
+  try {
+    if (typeof location !== 'undefined' && new URLSearchParams(location.search).get('nolinkclear') === '1') return true;
+  } catch { /* no location */ }
+  try {
+    if (typeof process !== 'undefined' && process?.env?.OW_NO_LINKCLEAR === '1') return true;
+  } catch { /* no process */ }
+  return false;
+}
+
+/**
  * The point on the segment `p -> beyond` where the reserve isoline is crossed,
  * pushed `LM_SPUR` metres further in so the last segment CROSSES the ring's
  * centreline instead of stopping on it — `intersect()` needs a crossing, and a
@@ -982,7 +1012,7 @@ export function generateCity(terrain, rng) {
   const dd = dedupeCorridors(withFields, terrain);
 
   /* ---- 8. solve the planar graph --------------------------------------- */
-  const graph = buildGraph(dd.corridors, terrain);
+  const graph = buildGraph(dd.corridors, terrain, blocks);
   graph.dedup = dd;
   graph.landmarkReserve = lr;
 
@@ -1691,7 +1721,7 @@ function gridDistrict(d, terrain, rng, corridors, blocks) {
 
 const WELD = 7;
 
-function buildGraph(corridors, terrain) {
+function buildGraph(corridors, terrain, blocks) {
   const graph = new RoadGraph();
 
   // --- segment soup with a spatial hash --------------------------------
@@ -1899,8 +1929,9 @@ function buildGraph(corridors, terrain) {
   // Bridge every stranded fragment onto the main component, or delete it.
   // Runs after the height solve so a closing link is a chord between two
   // SOLVED nodes and its grade is the grade the player drives, and before
-  // `finalise` because it re-indexes the node and edge arrays.
-  closeNetwork(graph, terrain);
+  // `finalise` because it re-indexes the node and edge arrays. `blocks` is
+  // step 5's output, uncut and unfiltered — see `closeNetwork`'s header.
+  closeNetwork(graph, terrain, blocks);
 
   graph.finalise();
 
@@ -2182,6 +2213,160 @@ const ISLAND_LINK_MAX = 70;
  * Raising it further buys nothing — 3.0 m deletes exactly the same stubs.
  */
 const ISLAND_LINK_TOL = 2.5;
+/**
+ * How far a closing link must stay from a BLOCK — the lot polygon `subdivide`
+ * lays houses along and `buildings/tile.js` raises facades on.
+ *
+ * The blocks are cut by `gridDistrict` at step 5, long before the graph is
+ * solved, and step 9's block filter only drops blocks in water, on a cliff or
+ * on a landmark site — it never re-cuts them against a road laid afterwards.
+ * So a link across a kept block's interior is a two-lane street drawn through
+ * somebody's ground floor, with traffic spawned on it wedging against the
+ * building collision inside the streamed patch. Seed-dependent, and invisible
+ * to `lmsweep`'s connectivity assertion, which counts components rather than
+ * clearance.
+ *
+ * 4 m HAS TO CLEAR THE GAP A STREET IS MEANT TO OCCUPY, or this would refuse
+ * the links most worth laying. `gridDistrict` cuts its blocks back
+ * `corridorHalfWidth(kind, lanes) + wander * 0.55` from the grid line, which
+ * for a two-lane downtown street is 6.3 + 1.9 = 8.2 m — so a link laid down
+ * the middle of that gap sits 8.2 m off the lot line and keeps 4.2 m of slack
+ * over this bar. 4 m is meanwhile half a lane plus a kerb past the centreline
+ * of the two-lane street a link is emitted as, so a link this test admits has
+ * its carriageway edge outside the lot.
+ */
+const ISLAND_LINK_LOT = 4;
+/**
+ * How far from its own ends a crossing has to be before it counts as one.
+ *
+ * A closing link starts and ends ON graph nodes, so every edge already at those
+ * nodes meets it at a parameter of exactly 0 or 1, and welded neighbours meet
+ * it within a metre or two of them. Those are junctions, not crossings. Past
+ * this, the link and the edge genuinely pass through each other.
+ */
+const ISLAND_LINK_END = 3;
+
+/**
+ * How close a drivable edge has to pass an AUTHORED POINT before it counts as
+ * THE STREET THAT SERVES IT.
+ *
+ * The authored points are the ones `plan.js` publishes and `game` stages life
+ * on: `SAFEHOUSES` (every fresh spawn and every brother switch), `SERVICES`
+ * (the pumps, resprays, ammo counters and diners `resolvePoi` gives a
+ * forecourt), and `DOCKS` (where the boats are). They are the coordinates a
+ * player is PUT AT, not ones he happens to drive past.
+ *
+ * 60 m because that is the bar the placement code itself works to:
+ * `world.poiSpot` calls a spot resolved when the road is within 80 m,
+ * `director.groundPose` steps a spawn onto the kerb of the nearest edge, and
+ * `src/game/spawnprobe.mjs` fails a spawn whose road is 60 m away or more. An
+ * edge inside this radius is the one those three will hand the player, so
+ * deleting it moves him — or leaves him on a pavement with no road at all.
+ */
+const PROTECT_R = 60;
+/**
+ * The widened link search a PROTECTED fragment gets, in order, after the
+ * ordinary one (`ISLAND_LINK_MAX` at `MAX_GRADE`) has failed for it.
+ *
+ * THE LEGALITY TESTS ARE NOT ON THIS LADDER. A longer or steeper link is still
+ * a road a car can take; a link through a lot polygon is a street drawn through
+ * somebody's ground floor and a link across a live street is a junction with no
+ * node in it, and neither becomes acceptable because a safehouse is at stake.
+ * What is widened is REACH and GRADE. Reach is also the candidate set — the
+ * search is exhaustive over node pairs within it, so a longer reach is strictly
+ * more endpoints to try, on both sides.
+ *
+ *   110 m  past `ISLAND_LINK_MAX`'s "this is a road of its own" line, which is
+ *          a judgement about tidiness, not about drivability;
+ *   150 m  and at 32% — Canton Avenue, the steepest street in the United
+ *          States, and the number `MAX_GRADE` is derived from. A link this
+ *          steep is at the edge of what Steel City already ships; a link
+ *          steeper than this is not a street anywhere.
+ *
+ * MEASURED over eight rng seeds. On the shipped `PROTECT_R` no stranded
+ * fragment is protected at all, so this ladder fires on no seed and the graph
+ * emitted is the same one — same links, same drops, seed for seed — as before
+ * it existed. Under the control that forces every fragment protected
+ * (`PROTECT_R` at 4000 m, `ISLAND_LINK_MAX` starved to 20 m) it fires and it
+ * bridges: 1-2 fragments a seed that the ordinary search had given up on.
+ *
+ * WHAT IT CANNOT DO, measured rather than assumed: on this map the fragments
+ * that survive the ordinary search are stranded by the GROUND, not by reach.
+ * Tallying the refusals over the whole widened search, they are 60-80% terrain
+ * fit at 110-150 m and, once the chord is broken into 12 m pieces laid on the
+ * ground, 70-90% GRADE — the ground between those fragments and the network is
+ * steeper than any street. That is why a link that follows the terrain was
+ * tried and then removed rather than shipped: it never once laid a link. A
+ * fragment above a cliff cannot be given a road, which is exactly the case the
+ * keep-the-island fallback below exists for.
+ */
+const PROTECT_RUNGS = [
+  { reach: 110, grade: MAX_GRADE },
+  { reach: 150, grade: 0.32 },
+];
+
+/**
+ * A uniform grid over line segments, keyed by whatever payload the caller hands
+ * in. Built per call and thrown away.
+ *
+ * NOT `graph.edgesInRect`: `closeNetwork` runs before `graph.finalise()`, which
+ * is what builds the graph's own edge index, and it has to — `compactGraph`
+ * re-indexes the arrays that index would be built over.
+ */
+function segGrid(cell) {
+  const map = new Map();
+  const key = (cx, cz) => cx * 73856093 ^ cz * 19349663;
+  const span = (ax, az, bx, bz, fn) => {
+    const x0 = Math.floor(Math.min(ax, bx) / cell);
+    const x1 = Math.floor(Math.max(ax, bx) / cell);
+    const z0 = Math.floor(Math.min(az, bz) / cell);
+    const z1 = Math.floor(Math.max(az, bz) / cell);
+    for (let cz = z0; cz <= z1; cz++) for (let cx = x0; cx <= x1; cx++) fn(key(cx, cz));
+  };
+  return {
+    add(ax, az, bx, bz, payload) {
+      span(ax, az, bx, bz, (k) => {
+        let list = map.get(k);
+        if (!list) map.set(k, (list = []));
+        list.push(payload);
+      });
+    },
+    /** Everything whose cells the query segment touches, de-duplicated. */
+    near(ax, az, bx, bz, out) {
+      out.clear();
+      span(ax, az, bx, bz, (k) => {
+        const list = map.get(k);
+        if (list) for (let i = 0; i < list.length; i++) out.add(list[i]);
+      });
+      return out;
+    },
+  };
+}
+
+/**
+ * Where segment p->q crosses segment a->b, as the parameter along p->q, or -1.
+ *
+ * Same arithmetic as `crosses`, which answers yes/no; a clearance test needs to
+ * know WHERE, because a crossing at a shared endpoint is a junction.
+ */
+function crossParam(px, pz, qx, qz, ax, az, bx, bz, out) {
+  const rx = qx - px;
+  const rz = qz - pz;
+  const sx = bx - ax;
+  const sz = bz - az;
+  const den = rx * sz - rz * sx;
+  if (Math.abs(den) < 1e-9) return -1;
+  const ox = ax - px;
+  const oz = az - pz;
+  const t = (ox * sz - oz * sx) / den;
+  const u = (ox * rz - oz * rx) / den;
+  if (t < 0 || t > 1 || u < 0 || u > 1) return -1;
+  out.u = u;
+  return t;
+}
+
+const _cross = { u: 0 };
+const _seg2 = { d2: 0, t: 0 };
 
 /**
  * ONE DRIVABLE NETWORK. Bridge every stranded fragment onto the main
@@ -2197,20 +2382,61 @@ const ISLAND_LINK_TOL = 2.5;
  *
  * A link is laid only where it is a road a car can take — dry the whole way,
  * clear of a reserved landmark site, off airfield and airbase pavement, under
- * the city grade limit, and hugging the terrain within `ISLAND_LINK_TOL`. The
- * candidate is the CHEAPEST legal pair between the fragment and everything
+ * the city grade limit, hugging the terrain within `ISLAND_LINK_TOL`, CLEAR OF
+ * EVERY BLOCK the buildings will be raised on, and CROSSING NO EXISTING EDGE.
+ * The candidate is the CHEAPEST legal pair between the fragment and everything
  * already joined to the main component, not the geometrically nearest pair:
  * the nearest pair is usually the one separated by a 12 m step, and the pair
  * 10 m further along is flat.
+ *
+ * THE LAST TWO CHECKS ARE NOT COSMETIC, and they are here rather than in the
+ * planar solver because a link is added AFTER it:
+ *
+ *   - `buildGraph` splits every corridor at every intersection, so the emitted
+ *     graph is planar by construction. A link appended afterwards is not: an
+ *     `addEdge` whose chord passes through a live street makes no node at the
+ *     crossing, so `traffic/lights.js` has no signal there, `LaneNet` has no
+ *     conflict record, drivers on the two edges are mutually invisible and
+ *     drive through each other, the two road meshes z-fight, and `routeTo`
+ *     will cost a route over the link that can never turn at the crossing
+ *     because there is no node to turn at. Splitting both edges and inserting
+ *     a node would be the other answer; refusing the candidate is the one that
+ *     cannot re-enter `compactGraph` with half-built indices, and the search
+ *     below is exhaustive, so refusing one pair just picks another;
+ *   - the block test is the same argument about a different consumer. See
+ *     `ISLAND_LINK_LOT`.
+ *
+ * `blocks` is `gridDistrict`'s output, threaded down from `generateCity`
+ * unfiltered — step 9 has not run yet. Testing against the pre-filter set is
+ * deliberately conservative: a block that step 9 will drop is one this refuses
+ * to build through anyway, and refusing a candidate costs a longer link or a
+ * deleted stub, while building through a kept block costs a house.
+ *
+ * ONE FRAGMENT IS NOT LIKE THE OTHERS. "Delete what cannot be bridged" is the
+ * right trade for a rim stub nobody was ever sent to, and the wrong one for the
+ * street under a safehouse: `plan.js` publishes the coordinates `game` PUTS A
+ * PLAYER AT, and `director.groundPose` walks a spawn to the nearest edge, so
+ * deleting the edge that serves one of those points does not tidy the map, it
+ * moves the player to the next street over — or leaves him standing on a
+ * pavement with nothing drivable in reach. So an edge within `PROTECT_R` of an
+ * authored point makes its fragment PROTECTED, and a protected fragment is
+ * escalated through `PROTECT_RUNGS` before anything is deleted and KEPT, not
+ * deleted, if even that fails. An island a player can drive within beats a
+ * deleted street under a safehouse; `graph.closure.keptIslands` says so out
+ * loud rather than letting the one-component claim quietly become a lie.
  */
-function closeNetwork(graph, terrain) {
+function closeNetwork(graph, terrain, blocks) {
   if (closureDisabled()) return;
   const N = graph.nodes.length;
   const comp = drivableComponents(graph);
   let nc = 0;
   for (let i = 0; i < N; i++) if (comp[i] + 1 > nc) nc = comp[i] + 1;
   if (nc <= 1) {
-    graph.closure = { components: nc, bridged: 0, bridgedKm: 0, droppedEdges: 0, droppedKm: 0 };
+    graph.closure = {
+      components: nc, componentsOut: nc, bridged: 0, bridgedKm: 0, droppedEdges: 0, droppedKm: 0,
+      protectedEdges: 0, protectedFragments: 0, widened: 0,
+      keptIslands: 0, keptIslandEdges: 0, keptIslandKm: 0, links: [],
+    };
     return;
   }
 
@@ -2229,10 +2455,106 @@ function closeNetwork(graph, terrain) {
     return c;
   };
 
-  const linkOk = (a, b) => {
+  /**
+   * WHICH FRAGMENTS SERVE AUTHORED LIFE. One sweep of the drivable edges
+   * against the three published tables — the safehouses a brother wakes up in,
+   * the drive-in services with a stamped forecourt, the docks. `plan.js` is the
+   * one owner of those coordinates and `game`'s tables agree with it by
+   * contract, so this asks the same table `applyPoiPads` and `resolvePoi` do
+   * rather than a copy (ARCHITECTURE.md rule 2 — no cross-subsystem import).
+   */
+  const served = [...SAFEHOUSES, ...SERVICES, ...DOCKS];
+  const protectedComp = new Uint8Array(nc);
+  const _pd = { d2: 0, t: 0 };
+  let protectedEdges = 0;
+  for (const e of graph.edges) {
+    if (e.rail) continue;
+    const c = comp[e.a] >= 0 ? comp[e.a] : comp[e.b];
+    if (c < 0) continue;
+    const na = graph.nodes[e.a];
+    const nb = graph.nodes[e.b];
+    let serves = false;
+    for (const p of served) {
+      segDist2(p.x, p.z, na.x, na.z, nb.x, nb.z, _pd);
+      if (_pd.d2 <= PROTECT_R * PROTECT_R) {
+        serves = true;
+        break;
+      }
+    }
+    if (!serves) continue;
+    protectedEdges++;
+    protectedComp[c] = 1;
+  }
+  let protectedFragments = 0;
+  for (let c = 0; c < nc; c++) if (protectedComp[c] && c !== main) protectedFragments++;
+
+  /**
+   * The two things a link has to miss that are not a property of the ground:
+   * the lot polygons and the roads already laid. Indexed once per closure at
+   * `ISLAND_LINK_MAX` so a candidate test touches a couple of cells.
+   */
+  const lotGrid = segGrid(ISLAND_LINK_MAX);
+  for (const bl of blocks ?? []) {
+    const p = bl.poly;
+    for (let i = 0; i < p.length; i++) {
+      const q = p[(i + 1) % p.length];
+      lotGrid.add(p[i][0], p[i][1], q[0], q[1], bl);
+    }
+  }
+  const edgeGrid = segGrid(ISLAND_LINK_MAX);
+  for (const e of graph.edges) {
+    if (e.rail) continue;
+    const na = graph.nodes[e.a];
+    const nb = graph.nodes[e.b];
+    edgeGrid.add(na.x, na.z, nb.x, nb.z, e);
+  }
+  const nearLots = new Set();
+  const nearEdges = new Set();
+  const noClear = linkClearanceDisabled();
+
+  /**
+   * Is (x, z) inside this block's quad? `blockFromQuad` builds the polygon
+   * from a rectangle in lot space, so it is convex and "inside" is "on the
+   * same side of all four edges".
+   */
+  const inBlock = (bl, x, z) => {
+    const p = bl.poly;
+    let sign = 0;
+    for (let i = 0; i < p.length; i++) {
+      const a = p[i];
+      const b = p[(i + 1) % p.length];
+      const side = (x - a[0]) * (b[1] - a[1]) - (z - a[1]) * (b[0] - a[0]);
+      if (side === 0) continue;
+      const s = side > 0 ? 1 : -1;
+      if (sign === 0) sign = s;
+      else if (sign !== s) return false;
+    }
+    return true;
+  };
+
+  /** Closest approach, squared, between segment p-q and segment a-b. */
+  const segSegDist2 = (px, pz, qx, qz, ax, az, bx, bz) => {
+    if (crosses(px, pz, qx, qz, ax, az, bx, bz)) return 0;
+    let best = Infinity;
+    segDist2(px, pz, ax, az, bx, bz, _seg2); if (_seg2.d2 < best) best = _seg2.d2;
+    segDist2(qx, qz, ax, az, bx, bz, _seg2); if (_seg2.d2 < best) best = _seg2.d2;
+    segDist2(ax, az, px, pz, qx, qz, _seg2); if (_seg2.d2 < best) best = _seg2.d2;
+    segDist2(bx, bz, px, pz, qx, qz, _seg2); if (_seg2.d2 < best) best = _seg2.d2;
+    return best;
+  };
+
+  /**
+   * REACH AND GRADE ARE ARGUMENTS, not the constants they default to, because a
+   * PROTECTED fragment gets the widened ladder — see `PROTECT_RUNGS`. They are
+   * the only two things a rung moves: every test below them is the same test at
+   * every rung, because water, a reserved site, live pavement, ground the road
+   * would float over, a lot polygon and a live street are not things a link may
+   * take on for being important.
+   */
+  const linkOk = (a, b, reach = ISLAND_LINK_MAX, grade = MAX_GRADE) => {
     const d = Math.hypot(b.x - a.x, b.z - a.z);
-    if (d < 0.5 || d > ISLAND_LINK_MAX) return 0;
-    if (Math.abs(b.y - a.y) / d > MAX_GRADE) return 0;
+    if (d < 0.5 || d > reach) return 0;
+    if (Math.abs(b.y - a.y) / d > grade) return 0;
     const steps = Math.max(3, Math.ceil(d / 4));
     for (let k = 0; k <= steps; k++) {
       const t = k / steps;
@@ -2244,58 +2566,130 @@ function closeNetwork(graph, terrain) {
       const yLin = a.y + (b.y - a.y) * t;
       if (Math.abs(terrain.heightAt(x, z) - yLin) > ISLAND_LINK_TOL) return 0;
     }
+    if (noClear) return d;
+    // NOT ON THE SAMPLE CADENCE. A 4 m step can straddle a 3 m-wide corner of
+    // a block, and a crossing is a point, not a band — both of these are
+    // segment-against-segment questions and are asked as such.
+    const lot2 = ISLAND_LINK_LOT * ISLAND_LINK_LOT;
+    for (const bl of lotGrid.near(a.x, a.z, b.x, b.z, nearLots)) {
+      // Both halves are needed: a link wholly inside a block crosses none of
+      // its sides, and a link that only clips a corner contains no vertex.
+      if (inBlock(bl, (a.x + b.x) * 0.5, (a.z + b.z) * 0.5)) return 0;
+      const p = bl.poly;
+      for (let i = 0; i < p.length; i++) {
+        const q = p[(i + 1) % p.length];
+        if (segSegDist2(a.x, a.z, b.x, b.z, p[i][0], p[i][1], q[0], q[1]) < lot2) return 0;
+      }
+    }
+    for (const e of edgeGrid.near(a.x, a.z, b.x, b.z, nearEdges)) {
+      if (e.a === a.id || e.b === a.id || e.a === b.id || e.b === b.id) continue;
+      const na = graph.nodes[e.a];
+      const nb = graph.nodes[e.b];
+      const t = crossParam(a.x, a.z, b.x, b.z, na.x, na.z, nb.x, nb.z, _cross);
+      if (t < 0) continue;
+      // A junction with an edge that merely ENDS near the link is what the
+      // welder is for; a crossing is where both segments are mid-span.
+      if (t * d < ISLAND_LINK_END || (1 - t) * d < ISLAND_LINK_END) continue;
+      if (_cross.u * e.len < ISLAND_LINK_END || (1 - _cross.u) * e.len < ISLAND_LINK_END) continue;
+      return 0;
+    }
     return d;
   };
 
   let bridged = 0;
   let bridgedM = 0;
+  const laid = [];
+
+  /**
+   * The cheapest legal link out of component `c` at this reach and grade, laid
+   * if there is one. Returns true if the fragment merged.
+   */
+  const closeOne = (c, reach, grade) => {
+    const root = find(c);
+    if (root === find(main)) return false;
+    let best = null;
+    for (const i of members[c]) {
+      const a = graph.nodes[i];
+      for (let j = 0; j < N; j++) {
+        if (comp[j] < 0 || find(comp[j]) === root) continue;
+        const b = graph.nodes[j];
+        if (Math.abs(b.x - a.x) > reach || Math.abs(b.z - a.z) > reach) continue;
+        if (best && Math.hypot(b.x - a.x, b.z - a.z) >= best.d) continue;
+        const d = linkOk(a, b, reach, grade);
+        if (d > 0) best = { d, a, b };
+      }
+    }
+    if (!best) return false;
+    // A LINK IS THE MISSING END OF A STREET, so it takes that street's
+    // identity — see `linkIdentity`. 'Connector' was a literal that reached
+    // the player: it is what `streetAt` returns under the car and therefore
+    // what the HUD prints beside the minimap, and CONNECTOR is not a place
+    // in Pittsburgh or anywhere else.
+    const ident = linkIdentity(graph, best.a, best.b);
+    graph.addEdge(best.a.id, best.b.id, {
+      kind: 'street',
+      lanes: 2,
+      corridor: ident.corridor,
+      name: ident.name,
+    });
+    // Geometry of what was laid, for the clearance assertions a gate wants
+    // to make on the emitted graph. A handful of records per city.
+    laid.push({ ax: best.a.x, az: best.a.z, bx: best.b.x, bz: best.b.z, len: best.d });
+    parent[find(comp[best.b.id])] = root;
+    bridged++;
+    bridgedM += best.d;
+    return true;
+  };
+
   for (let pass = 0; pass < nc; pass++) {
     let merged = 0;
-    for (let c = 0; c < nc; c++) {
-      const root = find(c);
-      if (root === find(main)) continue;
-      let best = null;
-      for (const i of members[c]) {
-        const a = graph.nodes[i];
-        for (let j = 0; j < N; j++) {
-          if (comp[j] < 0 || find(comp[j]) === root) continue;
-          const b = graph.nodes[j];
-          if (Math.abs(b.x - a.x) > ISLAND_LINK_MAX || Math.abs(b.z - a.z) > ISLAND_LINK_MAX) continue;
-          if (best && Math.hypot(b.x - a.x, b.z - a.z) >= best.d) continue;
-          const d = linkOk(a, b);
-          if (d > 0) best = { d, a, b };
-        }
-      }
-      if (!best) continue;
-      // A LINK IS THE MISSING END OF A STREET, so it takes that street's
-      // identity — see `linkIdentity`. 'Connector' was a literal that reached
-      // the player: it is what `streetAt` returns under the car and therefore
-      // what the HUD prints beside the minimap, and CONNECTOR is not a place
-      // in Pittsburgh or anywhere else.
-      const ident = linkIdentity(graph, best.a, best.b);
-      graph.addEdge(best.a.id, best.b.id, {
-        kind: 'street',
-        lanes: 2,
-        corridor: ident.corridor,
-        name: ident.name,
-      });
-      parent[find(comp[best.b.id])] = root;
-      bridged++;
-      bridgedM += best.d;
-      merged++;
-    }
+    for (let c = 0; c < nc; c++) if (closeOne(c, ISLAND_LINK_MAX, MAX_GRADE)) merged++;
     if (!merged) break;
   }
 
+  /*
+   * WIDEN FOR WHAT SERVES AUTHORED LIFE, and only for that. It runs AFTER the
+   * ordinary search has reached its fixpoint, so every fragment that could be
+   * closed the tidy way already has been, and it touches nothing unprotected —
+   * on a city with no protected straggler, which is every seed measured, this
+   * loop makes no call that can change the graph.
+   */
+  let widened = 0;
+  for (const rung of PROTECT_RUNGS) {
+    for (let pass = 0; pass < nc; pass++) {
+      let merged = 0;
+      for (let c = 0; c < nc; c++) {
+        if (!protectedComp[c] || find(c) === find(main)) continue;
+        if (closeOne(c, rung.reach, rung.grade)) {
+          merged++;
+          widened++;
+        }
+      }
+      if (!merged) break;
+    }
+  }
+
   // Whatever is still off the main component is road nobody can reach. It is
-  // drawn, it is spawned on and it is routed over; delete it.
+  // drawn, it is spawned on and it is routed over; delete it — UNLESS it is the
+  // street that serves a safehouse, a service or a dock, in which case a player
+  // is going to be put on it and a loop he can drive is worth more than a tidy
+  // component count. Those are counted and published, never quietly kept.
   const kill = new Uint8Array(graph.edges.length);
   let dropped = 0;
   let droppedM = 0;
+  let keptEdges = 0;
+  let keptM = 0;
+  const keptComps = new Set();
   for (const e of graph.edges) {
     if (e.rail) continue;
     const c = comp[e.a] >= 0 ? comp[e.a] : comp[e.b];
     if (c < 0 || find(c) === find(main)) continue;
+    if (protectedComp[c]) {
+      keptComps.add(find(c));
+      keptEdges++;
+      keptM += e.len;
+      continue;
+    }
     kill[e.id] = 1;
     dropped++;
     droppedM += e.len;
@@ -2303,15 +2697,38 @@ function closeNetwork(graph, terrain) {
   if (dropped) compactGraph(graph, kill);
   graph.closure = {
     components: nc,
+    /**
+     * What came out. `components` is what the closure was handed;
+     * `componentsOut` is what it emitted, and it is 1 + `keptIslands` — the
+     * one-component claim, stated as a number rather than as an assumption.
+     */
+    componentsOut: 1 + keptComps.size,
     bridged,
     bridgedKm: bridgedM / 1000,
     droppedEdges: dropped,
     droppedKm: droppedM / 1000,
+    /** Drivable edges within `PROTECT_R` of an authored point, anywhere. */
+    protectedEdges,
+    /** Stranded fragments that held one of them when the closure began. */
+    protectedFragments,
+    /** How many of those needed a `PROTECT_RUNGS` rung to bridge at all. */
+    widened,
+    /** Protected fragments no legal link could reach, and so KEPT as islands. */
+    keptIslands: keptComps.size,
+    keptIslandEdges: keptEdges,
+    keptIslandKm: keptM / 1000,
+    /** Endpoints of every link laid, in world space. See `laid` above. */
+    links: laid,
   };
   console.log(
-    `[world] network closure: ${nc} drivable component(s) -> 1; ` +
-    `${bridged} link(s) laid (${(bridgedM / 1000).toFixed(2)} km), ` +
-    `${dropped} unreachable edge(s) dropped (${(droppedM / 1000).toFixed(2)} km)`
+    `[world] network closure: ${nc} drivable component(s) -> ${1 + keptComps.size}; ` +
+    `${bridged} link(s) laid (${(bridgedM / 1000).toFixed(2)} km` +
+    `${widened ? `, ${widened} widened for a protected fragment` : ''}), ` +
+    `${dropped} unreachable edge(s) dropped (${(droppedM / 1000).toFixed(2)} km)` +
+    (keptComps.size
+      ? `; ${keptComps.size} island(s) KEPT — ${keptEdges} edge(s) (${(keptM / 1000).toFixed(2)} km) ` +
+        'serving a safehouse, service or dock that no legal link could reach'
+      : '')
   );
 }
 

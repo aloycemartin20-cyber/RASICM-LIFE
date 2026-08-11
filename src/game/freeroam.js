@@ -142,6 +142,31 @@ const EXIT_SIDE = 1;
  */
 const AIRBORNE_DROP = 1.2;
 /**
+ * HOW OFTEN THE GROUND UNDER THE DOOR IS ACTUALLY MEASURED.
+ *
+ * `_exitPlacement`'s four world queries — a `surfaceY` ground raycast, a water
+ * level, `surfaceAt` and `isWater` — are the whole cost of this feature, and
+ * all four answer a question about (x, z) ALONE. Re-asking them 60 times a
+ * second for a car parked at a kerb, or for a Skylark holding a heading, is
+ * paying a raycast to be told the same number again.
+ *
+ * So the sample is re-taken when the DOOR POINT has moved `STEP` metres, when
+ * the vehicle has changed altitude by `RISE` (a climb can put a bridge deck
+ * between the ray's origin and the ground it used to find), or when `T`
+ * seconds have passed — the last one because the physics collision patch
+ * STREAMS, so the same coordinate can honestly change its answer under a
+ * parked car. Worst-case staleness is therefore 2.5 m or 0.4 s.
+ *
+ * 2.5 m is chosen against `AIRBORNE_DROP`: at 40 m/s the terrain under a
+ * street climbs well under half a metre in that distance, so a cached surface
+ * cannot flip the airborne classifier on the ground. The drop itself is
+ * recomputed every frame from the live belly height against the cached
+ * surface, which is what keeps a descent reading smoothly.
+ */
+const EXIT_SAMPLE_STEP = 2.5;
+const EXIT_SAMPLE_RISE = 8;
+const EXIT_SAMPLE_T = 0.4;
+/**
  * How close a brother has to be to the car to hop in with you.
  *
  * A 30 m ring is fine when the allies are ACTORS trailing 5 m behind you. Here
@@ -232,6 +257,14 @@ export class FreeRoam {
     this.exitPlace = {
       active: false, x: 0, y: 0, z: 0, drop: 0, over: null, water: false, airborne: false,
     };
+    /**
+     * Where and when `exitPlace`'s surface fields were last MEASURED, so the
+     * four world queries are not re-asked every frame. See EXIT_SAMPLE_STEP.
+     */
+    this._placeX = Infinity;
+    this._placeZ = Infinity;
+    this._placeY = 0;
+    this._placeT = 0;
     this._prompt = { key: 'F', text: '', sub: '', progress: undefined, place: null };
     this._promptShown = false;
     this._atHome = false;
@@ -703,6 +736,10 @@ export class FreeRoam {
     a.key = 'F'; a.available = false; a.target = null;
     // Stale placement is worse than none: a reader that sees `active` and a
     // 210 m drop from the frame before he landed would warn about the kerb.
+    // `active` here is still LAST frame's answer, so this is also where a
+    // change of seat expires the cached surface sample (EXIT_SAMPLE_STEP):
+    // the first frame of a new EXIT always measures rather than inheriting.
+    if (!this.exitPlace.active) this._placeT = 0;
     this.exitPlace.active = false;
     this.status.text = ''; this.status.sub = ''; this.status.progress = undefined;
     this._statusOn = false;
@@ -726,7 +763,7 @@ export class FreeRoam {
       // The button underneath a running service is still SWAP or EXIT, always.
       if (!this.missions.running && this._race(x, z, veh)) return;
       if (this._swapTarget(veh)) return;
-      this._exitPlacement(veh);
+      this._exitPlacement(veh, dt);
       this._setAction('exit', 'EXIT', `LEAVE THE ${nameOf(veh)}`, '', veh);
       return;
     }
@@ -771,8 +808,14 @@ export class FreeRoam {
    * half-width — so the sampled point is the one he steps onto, not the middle
    * of the car.
    *
+   * AND NO RAYCAST PER FRAME EITHER. The trig above is free; the four world
+   * queries are not, and they are gated on the door point having actually
+   * moved — see EXIT_SAMPLE_STEP for what that costs and what it bounds.
+   *
    * Published on the prompt payload as `place` and mirrored onto the touch
-   * button's payload. Fields, all metres and all world space:
+   * button's payload; `ui.setPrompt` / `ui.setAction` carry the field through
+   * and the prompt is what turns it into the airborne / water / drop rows.
+   * Fields, all metres and all world space:
    *
    *   x, z      where he lands
    *   y         the surface there — terrain, or the water plane over it
@@ -781,7 +824,7 @@ export class FreeRoam {
    *   water     that tag is water, hoisted so the common case needs no compare
    *   airborne  nothing is carrying the wheels — `drop` is a fall, not a step
    */
-  _exitPlacement(veh) {
+  _exitPlacement(veh, dt = 0) {
     const p = this.exitPlace;
     const q = veh.quaternion;
     const yaw = Math.atan2(2 * (q.w * q.y + q.x * q.z), 1 - 2 * (q.y * q.y + q.x * q.x));
@@ -791,13 +834,26 @@ export class FreeRoam {
     const sz = -Math.sin(yaw) * off * EXIT_SIDE;
     p.x = veh.position.x + sx;
     p.z = veh.position.z + sz;
-    p.y = this.wq.surfaceY(p.x, p.z, veh.position.y + 30);
+    const y = veh.position.y;
+    this._placeT -= dt;
+    const dx = p.x - this._placeX;
+    const dz = p.z - this._placeZ;
+    if (this._placeT <= 0 ||
+        dx * dx + dz * dz > EXIT_SAMPLE_STEP * EXIT_SAMPLE_STEP ||
+        Math.abs(y - this._placeY) > EXIT_SAMPLE_RISE) {
+      this._placeT = EXIT_SAMPLE_T;
+      this._placeX = p.x;
+      this._placeZ = p.z;
+      this._placeY = y;
+      p.y = this.wq.surfaceY(p.x, p.z, y + 30);
+      p.over = this.wq.surfaceAt(p.x, p.z);
+      p.water = p.over === 'water' || this.wq.isWater(p.x, p.z);
+    }
+    // EVERY FRAME, because these two are what the player is watching change.
     // From the BELLY, not the centre of mass: the belly is what he is standing
     // on the inside of, so a tall van reads the same step as a low sports car.
-    const belly = veh.position.y - (veh.spec?.comY ?? 0.5);
+    const belly = y - (veh.spec?.comY ?? 0.5);
     p.drop = Math.max(0, belly - p.y);
-    p.over = this.wq.surfaceAt(p.x, p.z);
-    p.water = p.over === 'water' || this.wq.isWater(p.x, p.z);
     p.airborne = p.drop > AIRBORNE_DROP;
     p.active = true;
     return p;

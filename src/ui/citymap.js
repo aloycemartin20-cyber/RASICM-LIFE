@@ -33,20 +33,17 @@ import {
 } from './data.js';
 
 /**
- * Blip kinds the authored POI table does not carry, and the one lookup both
- * projections use. `chapter` is the NEXT story chapter's staging pin: a job
- * the player has NOT accepted, so it must not wear the live-mission amber or
- * the two become indistinguishable the moment a chapter is running. One owner,
- * two consumers (`radar.js`, `pausemap.js`) — the same rule the blip array
- * itself follows.
+ * The one style lookup both projections use (`radar.js`, `pausemap.js`).
+ * Never invents a colour.
+ *
+ * Every kind is authored in `data.js`, including the blip-only ones the pause
+ * map never draws as a POI — `chapter`, the NEXT story chapter's staging pin,
+ * is there with the rest. This file used to keep a private second table for
+ * those, which meant two files both claiming to own one colour: an arrangement
+ * that is correct exactly until somebody edits one of them.
  */
-const EXTRA_STYLE = {
-  chapter: { c: '#7bc8ff', g: 'flag', p: 9, label: 'NEXT CHAPTER' },
-};
-
-/** POI/blip style for a kind, or null. Never invents a colour. */
 export function styleFor(kind) {
-  return POI_STYLE[kind] ?? EXTRA_STYLE[kind] ?? null;
+  return POI_STYLE[kind] ?? null;
 }
 
 /* ------------------------------------------------------------- palette --- */
@@ -637,10 +634,16 @@ export class CityMap {
   _streetLabels(g, v, cos, sin, ids) {
     const { w, h, ppm } = v;
     if (!this.live || !this.nameAt) return;
-    const px = v.px ?? 1;
     const rot = v.rot ?? 0;
-    const minRun = 84 * px; // device px of road under the name
-    const fs = clamp(9.2 * px, 8, 22);
+    // TYPOGRAPHY, NOT GEOMETRY. `v.px` is device px per authored px and is what
+    // road widths are drawn at. A producer that scales its TYPE on a second
+    // axis — the pause map does, so a tall screen gets readable names — passes
+    // that scale as `v.typeScale`, and BOTH the size of the name and the length
+    // of road it needs are measured in it. Falls back to `px` for the disc,
+    // where the two are the same number.
+    const tpx = v.typeScale ?? v.px ?? 1;
+    const minRun = 84 * tpx; // device px of road under the name
+    const fs = clamp(9.2 * tpx, 8, 22);
     // Preallocated candidate records, linear-scanned (rule 5). A dozen names
     // fit on the widest view this ever draws, so a Map would cost more in
     // per-frame entry churn than the scan costs in comparisons.
@@ -694,7 +697,16 @@ export class CityMap {
       // actually looking at.
       const d2 = (sx - w * 0.5) ** 2 + (sy - h * 0.5) ** 2;
       if (d2 >= r.d2) continue;
+      // NORMALISE BEFORE THE FLIP TEST. `atan2` lands in (-PI,PI] but `v.rot`
+      // does not: the Slag Ring integrates its rotation with shortest-arc
+      // damping and never wraps the accumulator, so one clockwise lap of the
+      // city leaves it at exactly -2PI and it keeps drifting from there. The
+      // test below only answers "is this upside down" for an angle already
+      // inside (-PI,PI] — MEASURED against that integrator, a rot of -2PI draws
+      // 35 of 72 road bearings upside down while the map itself looks correct.
+      // The pause map pins rot to 0, which is why only the disc ever showed it.
       let a = Math.atan2(bz - az, bx - ax) + rot;
+      a = ((a + Math.PI) % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2) - Math.PI;
       if (a > Math.PI * 0.5 || a < -Math.PI * 0.5) a += Math.PI;
       r.d2 = d2;
       r.x = sx;

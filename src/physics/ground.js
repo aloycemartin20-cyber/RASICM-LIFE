@@ -84,11 +84,17 @@ export class GroundFallback {
   /**
    * Bind to `world`. Prefers `walkableHeightAt` (the surface a man or a car
    * stands on) and falls back to `heightAt` only if an older `world` is loaded.
+   *
+   * THE THIRD ARGUMENT IS CARRIED. `world.walkableHeightAt(x, z, y?)` uses `y`
+   * to disambiguate `roads.nearestEdge` across levels, and without it falls back
+   * to a coarse "more than 2.5 m off terrain means flyover" heuristic. The
+   * closure here used to take two arguments and drop it, so every query through
+   * this class was level-blind however exact the caller's height was.
    */
   bind(world) {
     if (this.ready || !world) return false;
     if (typeof world.walkableHeightAt === 'function') {
-      this._hf = (x, z) => world.walkableHeightAt(x, z);
+      this._hf = (x, z, y) => world.walkableHeightAt(x, z, y);
     } else if (typeof world.heightAt === 'function') {
       this._hf = (x, z) => world.heightAt(x, z);
       console.warn(
@@ -108,11 +114,19 @@ export class GroundFallback {
     return true;
   }
 
-  /** Walkable surface height, or NaN outside the city footprint. */
-  heightAt(x, z) {
+  /**
+   * Walkable surface height, or NaN outside the city footprint.
+   *
+   * `fromY` is the height the question is being asked FROM, and it is optional
+   * only because the march in `ray` genuinely has none to give — it is walking
+   * an unknown surface looking for the crossing. A caller that knows where it is
+   * standing should pass it: it is what tells `world` which deck of a crossing
+   * it is under. `NaN` reproduces the old level-blind answer exactly.
+   */
+  heightAt(x, z, fromY = NaN) {
     if (!this._hf) return NaN;
     if (x < -HALF || x > HALF || z < -HALF || z > HALF) return NaN;
-    const y = this._hf(x, z);
+    const y = this._hf(x, z, fromY);
     return Number.isFinite(y) ? y : NaN;
   }
 

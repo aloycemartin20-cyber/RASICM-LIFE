@@ -97,8 +97,9 @@ The harness is what makes the quality loop work.
 | `tools/playtest.mjs` | Scripted movement/fire smoke test |
 
 Beyond those there are 66 gate files under `src/`, one per subsystem area, wired
-into three tiers: `npm run gate` (~13 s, the line every change pays),
-`npm run handoff` (adds the browser probes) and `npm run soak` (everything).
+into three tiers: `npm run gate` (two linters and 35 node-only probes, a measured
+29 s — the line every change pays), `npm run handoff` (adds the browser probes)
+and `npm run soak` (everything).
 
 The rule they all obey is worth stating here, because it is the one that keeps
 them honest: **a gate must not re-use the code's own inputs.** Nine gates in this

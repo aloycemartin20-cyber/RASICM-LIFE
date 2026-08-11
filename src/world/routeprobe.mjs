@@ -882,6 +882,64 @@ for (const r of RIVERS) {
   check(router.stats.solves - before2 === 1, 'cache', '40 m away re-solves');
 }
 
+/* --- the cache: two callers, one plan cell, two decks -------------------- */
+
+/**
+ * The case the plan-only key could not see. There is ONE Router per World and
+ * `world.routeTo` is shared, so the calls interleaved in it are not one caller
+ * moving through time: `game/util.js`'s `driveRoute` runs it once per AI
+ * vehicle with that vehicle's own `fromY`. Two of them in the same 8 m plan
+ * cell on different decks — a car on a bridge and a car on the quay under it —
+ * must not share a route, because the entry waypoint `_repoint` never touches
+ * is the one that says which road the route starts on.
+ *
+ * The pair is FOUND, not authored: any bridge edge with a drivable edge within
+ * the plan quantum and a storey or more below it will do, and the assertion is
+ * skipped rather than guessed at if this seed grows no such crossing.
+ */
+{
+  let deck = null;
+  let under = null;
+  for (const e of graph.edges) {
+    if (!e.bridge || e.rail) continue;
+    const na = graph.nodes[e.a];
+    const nb = graph.nodes[e.b];
+    const mx = (na.x + nb.x) * 0.5;
+    const mz = (na.z + nb.z) * 0.5;
+    const my = (na.y + nb.y) * 0.5;
+    for (const o of graph.edges) {
+      if (o === e || o.rail || o.bridge) continue;
+      const hit = edgeDist(o, mx, mz);
+      if (hit.d > 8) continue;
+      const oa = graph.nodes[o.a];
+      const ob = graph.nodes[o.b];
+      const oy = oa.y + (ob.y - oa.y) * hit.t;
+      if (my - oy < 6) continue;
+      deck = { x: mx, z: mz, y: my };
+      under = { x: mx, z: mz, y: oy };
+      break;
+    }
+    if (deck) break;
+  }
+  if (!deck) {
+    check(true, 'deck', 'no bridge-over-road crossing on this seed — case skipped');
+  } else {
+    const dst = poiById.get('gas_strip');
+    const before = { solves: router.stats.solves, hits: router.stats.hits };
+    const hi = router.routeTo(deck.x, deck.z, dst.x, dst.z, { fromY: deck.y });
+    const hiEntry = hi ? hi[Math.min(1, hi.length - 1)].y : null;
+    const lo = router.routeTo(under.x, under.z, dst.x, dst.z, { fromY: under.y });
+    const loEntry = lo ? lo[Math.min(1, lo.length - 1)].y : null;
+    const solves = router.stats.solves - before.solves;
+    const hits = router.stats.hits - before.hits;
+    check(solves === 2 && hits === 0, 'deck',
+      `two callers ${(deck.y - under.y).toFixed(1)} m apart in one plan cell both solved ` +
+      `(${solves} solves, ${hits} hits)`);
+    check(hiEntry !== null && loEntry !== null && Math.abs(hiEntry - loEntry) > 3, 'deck',
+      `each got its own deck's entry waypoint (${Number(hiEntry).toFixed(1)} m vs ${Number(loEntry).toFixed(1)} m)`);
+  }
+}
+
 /* --- the published surface ----------------------------------------------- */
 
 {

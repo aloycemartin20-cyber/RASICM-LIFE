@@ -72,6 +72,32 @@ const ENTRY_MAX = 60;
  * so a hit is never a waypoint list that starts somewhere the caller is not.
  */
 const QUANT = 8;
+/**
+ * Cache quantum for the DECK, metres, and the band a call with no height at all
+ * lands in.
+ *
+ * The plan quantum above is sized against ONE CALLER MOVING THROUGH TIME, and
+ * for that the argument holds — nobody changes deck without also moving 8 m.
+ * There is one `Router` per `World` and `world.routeTo` is a shared entry
+ * point, so the calls interleaved in it are not one caller: `game/util.js`'s
+ * `driveRoute` runs it once per AI vehicle, staggered across eight phases, each
+ * with its own `_routeOpts.fromY`. Two of those in the same 8 m plan cell on
+ * different decks — one on the Sixth Street bridge, one on the Allegheny Quay
+ * eighteen metres beneath it — is not a caller moving, it is two callers, and
+ * the second would take the first's deck route with its stubs re-pointed at the
+ * quay. It would then steer for a bridge waypoint from underneath the bridge,
+ * i.e. into the abutment. `_repoint` cannot save it: it moves the two off-graph
+ * stubs in PLAN only, and never touches `p[1]`, the entry waypoint that carries
+ * the road the route starts on.
+ *
+ * 4 m is under `DECK_SLACK * 2` — anything the entry search would call the same
+ * deck lands in the same band or the one beside it, and a real deck separation
+ * is a storey or more. `NO_DECK` is its own band so that callers who pass no
+ * height (the mission and marker paths, which are plan queries by nature) still
+ * share a cache line with each other and with nobody else.
+ */
+const DECK_QUANT = 4;
+const NO_DECK = -32768;
 /** Search radius for `streetAt`. Covers the widest corridor plus its slack. */
 const STREET_MAX = 20;
 /**
@@ -88,6 +114,15 @@ const DECK_SLACK = 1.5;
 const DECK_PENALTY = 12;
 
 const _seg = { d2: 0, t: 0 };
+
+/**
+ * The cache band a route endpoint's height falls in. A number always, never
+ * NaN — a NaN in the key would never compare equal to itself and every
+ * heightless caller would miss.
+ */
+function deckBand(y) {
+  return Number.isFinite(y) ? Math.round(y / DECK_QUANT) : NO_DECK;
+}
 
 /** Min-heap on f. Same shape as `roadgraph.js`'s, which is not exported. */
 class Heap {
@@ -167,7 +202,10 @@ export class Router {
     this._cameEdge = null;
     this._open = null;
     this._closed = null;
-    this._cache = { fx: NaN, fz: NaN, tx: NaN, tz: NaN, stamp: -1, valid: false, ok: false };
+    this._cache = {
+      fx: NaN, fz: NaN, tx: NaN, tz: NaN, fy: NaN, ty: NaN,
+      stamp: -1, valid: false, ok: false,
+    };
     /** Diagnostics for the dev overlay. Never read by the solver itself. */
     this.stats = { solves: 0, hits: 0, expanded: 0, refusals: 0 };
   }
@@ -202,9 +240,8 @@ export class Router {
    * Waypoints from (fromX, fromZ) to (toX, toZ) by road, or null.
    *
    * `opts.fromY` / `opts.toY` disambiguate a bridge deck from the quay beneath
-   * it, exactly as in `streetAt`. They are NOT part of the cache key — a route
-   * is keyed on where you are in plan, and a caller does not change deck
-   * without also moving 8 m.
+   * it, exactly as in `streetAt`, and they ARE part of the cache key — see
+   * `DECK_QUANT` for the two-callers-one-cell case that says they must be.
    */
   routeTo(fromX, fromZ, toX, toZ, opts = null) {
     const roads = this.roads;
@@ -215,7 +252,13 @@ export class Router {
     const qfz = Math.round(fromZ / QUANT);
     const qtx = Math.round(toX / QUANT);
     const qtz = Math.round(toZ / QUANT);
-    if (c.valid && c.stamp === stamp && c.fx === qfx && c.fz === qfz && c.tx === qtx && c.tz === qtz) {
+    const qfy = deckBand(opts?.fromY);
+    const qty = deckBand(opts?.toY);
+    if (
+      c.valid && c.stamp === stamp &&
+      c.fx === qfx && c.fz === qfz && c.tx === qtx && c.tz === qtz &&
+      c.fy === qfy && c.ty === qty
+    ) {
       this.stats.hits++;
       if (!c.ok) return null;
       return this._repoint(fromX, fromZ, toX, toZ);
@@ -226,6 +269,8 @@ export class Router {
     c.fz = qfz;
     c.tx = qtx;
     c.tz = qtz;
+    c.fy = qfy;
+    c.ty = qty;
     c.ok = false;
     this.stats.solves++;
 

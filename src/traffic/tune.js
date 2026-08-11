@@ -142,7 +142,7 @@ export const TUNE = {
    * measurements was cars in free fall.
    *
    * THAT REASON EXPIRED. `world`'s terrain patch is `TCOL_HALF` = 320 m
-   * (src/world/index.js:171, raised from 192 for exactly the same class of
+   * (src/world/index.js:184, raised from 192 for exactly the same class of
    * complaint), the always-resident CLIP safety net covers +/-1600 m, and
    * `physics.raycast` closes the ray path analytically city-wide. `solidGroundY`
    * still refuses any point the collision world cannot answer for, so the
@@ -161,9 +161,38 @@ export const TUNE = {
    * the lens, on the hillside behind the shot. The signature composition of the
    * game photographed a downtown with no traffic in it whatsoever.
    *
-   * 380 m sits inside `TCOL_HALF` + a margin and comfortably inside `despawnR`,
-   * so nothing here can strand a car outside the collision world or spawn one
-   * that is despawned on its first frame.
+   * WHAT THE FAR RING IS ACTUALLY OUTSIDE OF. It is NOT inside `TCOL_HALF`,
+   * which is 320 m (src/world/index.js:184), and `farLead` below pushes the
+   * ring's CENTRE up to 420 m down the view axis from a vantage, so a far car
+   * can be placed as much as `spawnFar + farLead` = 800 m from the anchor.
+   *
+   * It is not despawned there, and that is `Director.fieldDist`'s doing rather
+   * than a property of this number: the one path that retires a car for
+   * distance is `recycleFarthest`, which scores on the distance to the nearer
+   * of the anchor and the far ring's own centre. A car 800 m from the player
+   * is 380 m from the FIELD, well inside `despawnHard`.
+   *
+   * That is safe for the free-fall reason this ring was first argued about and
+   * unsafe for a different one, so both are written down here:
+   *
+   *   - GROUND is answered analytically city-wide (`physics/ground.js` closes
+   *     the ray path off `world.walkableHeightAt`, and the always-resident CLIP
+   *     sheet covers +/-1600 m), so wheel rays find a surface and nothing falls
+   *     out of the world at any distance the ring can reach;
+   *   - STATIC GEOMETRY does not exist out there. The terrain collision patch
+   *     stops at `TCOL_HALF`, buildings and props are colliders only inside
+   *     `q.streamRadius` (190-1000 m by preset), and capsule sweeps and
+   *     overlaps are triangles only (`physics/index.js`). A far-ring car at
+   *     500-800 m therefore drives with no building, kerb or bridge-deck
+   *     collision at all: it can take a corner through a facade in the very
+   *     establishing shot the ring exists to populate.
+   *
+   * The traffic harness cannot see the second one — it measures impacts, and
+   * there is nothing out there to impact. It only becomes visible at all with
+   * `farShare` above zero, which it is only in the air (see below). Capping
+   * `farLead` so the ring's outer edge stayed inside `TCOL_HALF` would fix it
+   * and would also undo the measurement the lead exists for; whoever wants
+   * both needs the collision patch to follow the ring, not the anchor.
    */
   spawnFar: 380,
   /**
@@ -247,16 +276,25 @@ export const TUNE = {
    */
   popSafe: 110,
   /**
-   * Despawn beyond this, when not on screen.
+   * How far an ABANDONED wreck may sit from the anchor before the ager is
+   * allowed to delete it (`TrafficSystem._ageAbandoned`, together with a 45 s
+   * dwell). Anchor distance, not `fieldDist`: a wreck is scenery on the ground
+   * the player left, not part of the populated field.
    *
-   * MUST stay clear of `spawnFar` with a margin, or a far-ring car is deleted
-   * on the frame after it is created and the far ring is a spawn loop that
-   * produces nothing. It costs no frame time to widen: `Director.step`
-   * recycles down to `desired()` every frame, so the LIVE COUNT is set by the
-   * budget and this only decides which cars are the ones that survive.
+   * This is the only thing that reads it. It used to be half of a live-driver
+   * despawn rule as well, and the comment here used to argue that it had to
+   * stay clear of `spawnFar` or the far ring would be a spawn loop producing
+   * nothing — but that rule (`Director.shouldDespawn`) had no callers and has
+   * been deleted. Driver retirement is `recycleFarthest`, on `fieldDist` and
+   * `despawnHard`.
    */
   despawnR: 460,
-  /** Despawn beyond this even if on screen. */
+  /**
+   * Recycle a surplus driver beyond this even if it is on screen; inside it,
+   * only when nobody can see it go. Scored on `Director.fieldDist`, which is
+   * the distance to the nearer of the anchor and the far ring's centre — so
+   * this is a radius around the POPULATED FIELD, not around the player.
+   */
   despawnHard: 640,
   /** Spawns per second at steady state. */
   spawnRate: 2.2,

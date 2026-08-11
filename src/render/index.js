@@ -1491,10 +1491,13 @@ export class RenderSystem {
     if (!this._pools || !(intensity > 0) || !(radius > 0)) return;
     if (this._nPools >= MAX_GROUND_POOLS) {
       this._poolOverflow++;
+      this._poolOverflowFrame = (this._poolOverflowFrame ?? 0) + 1;
       return;
     }
-    // Reject before it costs a vertex: a pool whose whole footprint is behind
-    // the camera or past the draw distance contributes nothing.
+    // Reject before it costs a vertex: a pool whose whole footprint is past the
+    // draw distance contributes nothing. This test is RADIAL and therefore says
+    // nothing about direction — the behind-the-camera rejection is a view-space
+    // one and lives in `_updateGroundPools`, which is where the near plane is.
     const dx = x - this._camPos.x;
     const dy = y - this._camPos.y;
     const dz = z - this._camPos.z;
@@ -1529,14 +1532,21 @@ export class RenderSystem {
    * `fill` is the number of whole frames the drawn proxies covered, which is
    * the only one of these numbers that predicts the cost — see
    * `POOL_FILL_SCREENS`. `culled` counts pools dropped by the area budget, not
-   * by the count.
+   * by the count; `overflow` counts pools refused for want of a slot.
+   *
+   * EVERY FIELD HERE IS THIS FRAME'S except `overflowTotal`, which says so in
+   * its name. `overflow` used to be the lifetime counter sitting among four
+   * per-frame ones, so a single busy frame left it permanently non-zero and
+   * anything reading it the way it reads `culled` saw a stale spike for the
+   * rest of the session.
    */
   get poolBudget() {
     return {
       slots: MAX_GROUND_POOLS,
       submitted: this._nPoolsLast ?? 0,
       drawn: this._nPoolsDrawn ?? 0,
-      overflow: this._poolOverflow ?? 0,
+      overflow: this._poolOverflowLast ?? 0,
+      overflowTotal: this._poolOverflow ?? 0,
       culled: this._poolCulled ?? 0,
       fill: +(this._poolFill ?? 0).toFixed(2),
       fillBudget: POOL_FILL_SCREENS,
@@ -1560,7 +1570,10 @@ export class RenderSystem {
     this._nPools = 0;
     this._nPoolsLast = 0;
     this._nPoolsDrawn = 0;
+    /** Lifetime refusals, the frame being filled, and the frame just reported. */
     this._poolOverflow = 0;
+    this._poolOverflowFrame = 0;
+    this._poolOverflowLast = 0;
     this._poolCulled = 0;
     this._poolFill = 0;
     /** Nearest-first draw order and its sort key. Preallocated (rule 5). */
@@ -1636,6 +1649,10 @@ export class RenderSystem {
     const n = this._nPools;
     this._nPoolsLast = n;
     this._nPools = 0;
+    // Latched and reset with the submission count it belongs to, so `poolBudget`
+    // can report this frame's refusals next to this frame's everything else.
+    this._poolOverflowLast = this._poolOverflowFrame ?? 0;
+    this._poolOverflowFrame = 0;
     if (!this._poolMesh) return;
     const u = this._poolUniforms;
     u.uDepth.value = this.depthTexture;
@@ -1692,6 +1709,16 @@ export class RenderSystem {
       const rad = Math.max(e.rx, e.rz) + e.height;
       _poolV.set(e.x, e.y, e.z).applyMatrix4(camera.matrixWorldInverse);
       const vz = -_poolV.z;
+      // WHOLLY BEHIND THE NEAR PLANE — free, and it has to be free.
+      //
+      // Without this a pool behind the camera fell through to the full-frame
+      // rectangle below and was charged the whole 4 NDC units of the 12-unit
+      // budget. Nearest-first ordering makes the pools around and behind the
+      // camera the FIRST spenders, so three facade or headlight pools a few
+      // metres up the street could exhaust `POOL_FILL_SCREENS` and break the
+      // loop — culling every pool further down the road in favour of three
+      // whose every pixel the fragment shader then discarded.
+      if (vz + rad <= near) continue;
       let x0 = -1;
       let y0 = -1;
       let x1 = 1;
@@ -1711,6 +1738,27 @@ export class RenderSystem {
         x1 = Math.min(1, cx + sx * 1.06);
         y0 = Math.max(-1, cy - sy * 1.06);
         y1 = Math.min(1, cy + sy * 1.06);
+        if (x1 <= x0 || y1 <= y0) continue;
+      } else {
+        // STRADDLING the near plane. The exact bound above divides by a `vz`
+        // that is heading for zero, so bound the axis-aligned BOX containing
+        // the sphere against the near plane instead: the visible part of the
+        // pool lies in x in [vx-rad, vx+rad], y likewise, z in [near, vz+rad],
+        // and x/z is extremal at the near plane on whichever side of the axis
+        // the edge falls. Conservative — it covers the sphere — but it is a
+        // rectangle rather than the whole frame, which is what the area budget
+        // is charged for.
+        const pm = camera.projectionMatrix.elements;
+        const zf = near;
+        const zb = vz + rad;
+        const xa = _poolV.x - rad;
+        const xb = _poolV.x + rad;
+        const ya = _poolV.y - rad;
+        const yb = _poolV.y + rad;
+        x0 = Math.max(-1, (xa * pm[0]) / (xa <= 0 ? zf : zb));
+        x1 = Math.min(1, (xb * pm[0]) / (xb >= 0 ? zf : zb));
+        y0 = Math.max(-1, (ya * pm[5]) / (ya <= 0 ? zf : zb));
+        y1 = Math.min(1, (yb * pm[5]) / (yb >= 0 ? zf : zb));
         if (x1 <= x0 || y1 <= y0) continue;
       }
       // Spend the area budget. Charged BEFORE the rectangle is emitted and

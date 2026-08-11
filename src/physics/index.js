@@ -48,8 +48,13 @@
  *   c.teleport(x,y,z)  c.landingSpeed  c.steppedUp  c.lastMoveBlocked
  *
  * BALLISTICS  (weapons)
- *   fireBullet({origin, dir, damage, penetration, maxDist, mask, rng}) -> impacts[]
+ *   fireBullet({origin, dir, damage, penetration, maxDist, mask, rng, source})
+ *                                          -> impacts[]
  *   emits `bullet:impact` on entry AND exit of every layer.
+ *   `source` is the ACTOR that fired and rides into every `damage:dealt` the
+ *   trace raises. PASS IT. An absent source is read as the LOCAL PLAYER by
+ *   `ui` and `audio`, so an AI shooter that omits it draws the player a
+ *   hitmarker for its own rounds — see `src/peds/creditprobe.mjs`.
  *   explode({position, radius, damage, impulse})
  *
  * DYNAMICS  (fx, weapons)
@@ -1000,7 +1005,13 @@ export class PhysicsSystem {
    *
    * The analytic value is `world.walkableHeightAt` reached through the ground
    * proxy, and it is a no-op everywhere the proxy is not armed (every node
-   * bench, and any boot before `world` has initialised).
+   * bench, and any boot before `world` has initialised). `fromY` is PASSED
+   * THROUGH to it, not just compared against its answer: it is the query height
+   * `world` uses to pick which deck of a crossing the caller is under, and
+   * without it the analytic side falls back to a coarse "2.5 m off terrain means
+   * flyover" guess — which is a second guard this correction otherwise does not
+   * have. Nothing in today's generated city stacks a road within 2.5 m of the
+   * terrain beneath it; the correction should not depend on that staying true.
    *
    * WHAT IT COSTS, measured in the live build over 20 000 calls, twice each
    * way: **1.25 us -> 2.30 us per call**, the extra being
@@ -1017,7 +1028,7 @@ export class PhysicsSystem {
     const h = this.raycast(x, fromY, z, 0, -1, 0, 1000, mask);
     const gy = h.hit ? h.point.y : -Infinity;
     if (this.debugWalkableFloor === false || (mask & LAYER.STATIC) === 0) return gy;
-    const wy = this.ground.heightAt(x, z);
+    const wy = this.ground.heightAt(x, z, fromY);
     if (!Number.isFinite(wy) || wy > fromY || !(wy - gy > WALKABLE_FLOOR_MIN)) return gy;
     this.walkableFloorLifts++;
     return wy;

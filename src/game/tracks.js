@@ -122,13 +122,29 @@ function vehFault(M, dt, v, key) {
  * throttle). `escape` cools down on foot, `escort`'s truck now drives itself
  * to the drop, and VIPER LANE can be shot off her wheels by a man standing
  * still; all three stay winnable, so none of them calls this.
+ *
+ * THE RELEASE IS LATCHED, NOT THE FAULT, and that ordering is the whole point.
+ * Testing "is he in another car RIGHT NOW" only suppresses the fail on the
+ * frames he happens to be seated: `_faultRide` keeps climbing while the
+ * abandoned car lies on its roof, so the first frame `playerVehicle()` went
+ * null — a wreck, a step out to shoot, a respawn — the chapter ended with
+ * "Your car ended up on its roof" for a car he left two minutes and a
+ * kilometre ago. Once he has adopted ANY other vehicle the courtesy car stops
+ * being this chapter's ride for good and is never watched again.
+ *
+ * On foot with no substitute the fail stays, because that is the hang this
+ * exists for. Wrecking the SUBSTITUTE after the release is not our clock
+ * either: `race` still has its authored `baseTimer` and `chase` still has
+ * `R.chaseLose`, so both tracks keep a fail path without borrowing this one.
  */
 function rideFault(M, dt, g) {
-  if (!M.veh) return null;
-  const fault = vehFault(M, dt, M.veh, '_faultRide');
-  if (!fault) return null;
+  if (!M.veh || M.rideReleased) return null;
   const pv = g.wq.playerVehicle();
-  return pv && pv !== M.veh && !pv.destroyed ? null : fault;
+  if (pv && pv !== M.veh && !pv.destroyed) {
+    M.rideReleased = true;
+    return null;
+  }
+  return vehFault(M, dt, M.veh, '_faultRide');
 }
 
 /** Fail text for a fault, so all seven tracks word it the same way. */
@@ -638,8 +654,10 @@ export const TRACKS = {
       M.stuckT = 0;
       M.unwedged = 0;
       // THE HARD TIMER. Without one, a truck jammed against a wall neither
-      // wins nor fails and the chapter runs until the player quits.
-      if (!M.hasTimer) g.armTimer(M, ESCORT_TIMER);
+      // wins nor fails and the chapter runs until the player quits. A WATCHDOG
+      // clock: unscaled by difficulty and not paid as a time bonus — see
+      // ESCORT_TIMER and `MissionRunner.armTimer`.
+      if (!M.hasTimer) g.armTimer(M, ESCORT_TIMER, true);
       if (!g.wq.playerVehicle()) {
         const p = g.wq.findRoadSpot(10, 36, s.x, s.z);
         M.veh = g.spawnVehicle(M, g.boy.car ?? 'sports', p.x, p.z, p.yaw);
@@ -823,7 +841,16 @@ export const TRACKS = {
       let nd = Infinity;
       // Wrecks are collected, not acted on inside the walk: `place` pushes a
       // replacement onto the very array being iterated.
-      let lost = null;
+      //
+      // ALL OF THEM, not the last one seen. A single `lost` slot despawned
+      // every unwitnessed wreck it walked past and replaced ONE, so two cars
+      // lost on the same frame — a pursuit through a junction, one explosion
+      // near two of them — left the chapter permanently a car short of `goal`
+      // with no fail path and nothing on the map to fetch. Preallocated on `M`
+      // (rule 5); emptied here rather than at the end so an early `return`
+      // cannot leave stale slots behind.
+      const lost = M._lostSlots;
+      lost.length = 0;
       const list = g.vehiclesOf(M);
       for (let i = list.length - 1; i >= 0; i--) {
         const v = list[i];
@@ -839,13 +866,16 @@ export const TRACKS = {
           g.unmarkVehicle(v);
           list.splice(i, 1);
           g.wq.despawnVehicle(v, FORCE);
-          lost = v.recoverSlot ?? 0;
+          lost.push(v.recoverSlot ?? 0);
           continue;
         }
         if (d < nd) { nd = d; nearest = v; }
       }
-      if (lost !== null) {
-        const rep = this.place(M, g, lost);
+      for (let k = 0; k < lost.length; k++) {
+        const rep = this.place(M, g, lost[k]);
+        // No road spot for a replacement is the one case where the goal really
+        // has moved out of reach, and it must end the chapter rather than
+        // quietly leave it a car short.
         if (!rep) return g.fail(M, 'A marked car was wrecked');
         if (!nearest) nearest = rep;
       }
@@ -1137,13 +1167,23 @@ const CHASE_BOARD = 20;
 /* ------------------------------------------------------------------- */
 
 /**
- * The hard chapter clock, seconds at `timerMul` 1.
+ * The anti-hang bound, in seconds — a WATCHDOG, not a challenge.
  *
  * MEASURED on the only escort in the story — Aidan CH 5, sh_aidan (632,-464)
  * to sh_dylan (-504,432) over the Monongahela: the routed truck covers the
  * 2.2 km road distance in ~210 s of headless sim at throttle 0.62. 360 s is
  * 1.7x that, which is slack for the ambushers, the stuck recoveries and a
  * player who stops to fight, and is still a bound rather than a wait.
+ *
+ * ARMED AS A WATCHDOG (`armTimer`'s third argument), which is what keeps that
+ * 1.7x true and what keeps it out of the payout. Difficulty-scaled it was
+ * 259 s on steel — 1.23x the measured run, i.e. a chapter that could now be
+ * lost on time where the author never gave it a clock at all. And `win` pays
+ * `max(0, timer) * TIME_BONUS` for anything carrying `hasTimer`: MEASURED by
+ * `escortprobe`, the routed truck reaches the drop with ~250 s still on this
+ * clock, which was $1500 of time bonus on a $2900 authored purse. A bound the
+ * code invented to stop a hang must cost the player nothing and pay him
+ * nothing.
  */
 const ESCORT_TIMER = 360;
 /** Metres the truck must make in `STUCK_T` or it is wedged. */

@@ -24,12 +24,21 @@ const MIN_PPM = 0.13;
 const MAX_PPM = 2.4;
 /**
  * A POI at or above this priority is ALWAYS named, at every zoom the pin is
- * drawn at. Safehouses, resprays and packages are places the player is trying
- * to FIND — an unlabelled icon on a full-screen map is a puzzle, and the
- * `nameAt` zoom gate meant the only view that showed you the whole city was
- * also the only view that told you nothing about it.
+ * drawn at. A place the player is trying to FIND has to say what it is — an
+ * unlabelled icon on a full-screen map is a puzzle, and the `nameAt` zoom gate
+ * meant the only view that showed you the whole city was also the only view
+ * that told you nothing about it.
+ *
+ * FIVE, NOT SIX, and the number names its own coverage: `data.js` gives the
+ * respray p 5, and the respray is the one pin a WANTED player opens the full
+ * map to hunt for. At 6 it drew its purple icon unlabelled beside five labelled
+ * safehouses, which reads as a bug rather than as a threshold. Of everything
+ * `buildPoiList` carries, 5 admits exactly those five safehouses (p 6) and that
+ * one respray; the ammunation (p 4) and below still wait for the zoom. Hidden
+ * packages are not in this at all — they are drawn by the found-only pass
+ * further down, which writes no text either way.
  */
-const ALWAYS_NAMED = 6;
+const ALWAYS_NAMED = 5;
 
 /**
  * Negative-control hatch for the AFB findability gate (src/ui/afbprobe.mjs):
@@ -105,15 +114,23 @@ export class PauseMap {
     this.h = 0;
     this.dpr = Math.min(2, window.devicePixelRatio || 1);
     /**
-     * TYPE AND STROKE SCALE, device px per authored px.
+     * TYPOGRAPHIC SCALE, device px per authored px.
      *
      * `dpr` alone is not it. The full map is authored against a 1080-tall
      * window, and on anything taller every label, pin and rule stays the size
      * it was while the map under it gets bigger — so a 1440p player reads
-     * 8.6 px type across a metre-wide picture. Geometry still uses `dpr`
-     * (a metre must project the same however big the words are); everything
-     * that is TYPOGRAPHY uses this. At 1920x1080 dpr 1 it is exactly 1, so the
-     * reference capture is unchanged.
+     * 8.6 px type across a metre-wide picture. The OVERLAY this file draws on
+     * top of the map — type, pin radius, graticule, the route line, the scale
+     * bar — is sized in `u` so it grows with the picture it annotates.
+     *
+     * THE ROAD NETWORK UNDERNEATH IS NOT OVERLAY, and it does not. A metre must
+     * project the same however big the words are, so `CityMap`'s stroke
+     * geometry stays on `dpr`: it reads `v.px`, and the type scale travels
+     * beside it as `v.typeScale`, which only the street names read. Handing
+     * `u` to `v.px` instead widened every road, casing and bridge deck by up to
+     * 2x on a tall screen while the projection under them did not move — and at
+     * 1920x1080 dpr 1 the two numbers are equal, which is what hid it from the
+     * reference capture.
      */
     this.u = this.dpr;
     this.found = new Set();
@@ -128,7 +145,7 @@ export class PauseMap {
     this._view = {
       cx: 0, cz: 0, ppm: 1, rot: 0, w: 0, h: 0,
       alleys: true, tint: true, labels: true, streets: true, streetMax: 18,
-      labelScale: 1, px: 1, font: FONT_STACK,
+      labelScale: 1, px: 1, typeScale: 1, font: FONT_STACK,
     };
 
     setStyle(this.root, 'display', 'none');
@@ -274,7 +291,9 @@ export class PauseMap {
     // CSS ppm, not the device one: a dpr-2 screen must not label a view a
     // dpr-1 screen leaves bare. Same reasoning as `radar.js`'s LABEL_SPAN.
     v.streets = this.ppm > 0.5;
-    v.px = this.u;
+    // Geometry on `dpr`, type on `u` — the split `u` is declared for.
+    v.px = this.dpr;
+    v.typeScale = this.u;
     v.labelScale = this.u * clamp(0.7 + ppm * 0.7, 0.9, 1.9);
     this.map.draw(g, v);
 

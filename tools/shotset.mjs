@@ -77,7 +77,7 @@ mkdirSync(OUTDIR, { recursive: true });
 const report = { ok: true, outDir: OUTDIR, size: `${W}x${H}`, shots: [], errors: [] };
 
 try {
-  await page.goto(`http://127.0.0.1:${PORT}/?capture=1`, { waitUntil: 'domcontentloaded', timeout: 90000 });
+  await page.goto(`http://127.0.0.1:${PORT}/?capture=1${args.ultra ? '&ultra=1' : ''}`, { waitUntil: 'domcontentloaded', timeout: 90000 });
   await page.waitForFunction('window.__READY__ === true', null, { timeout: 90000 });
 
   const all = await page.evaluate('Object.keys(window.__SHOTS__ ?? {})');

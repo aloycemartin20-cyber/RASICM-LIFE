@@ -238,8 +238,17 @@ export class BossBar {
      * could be told from the foliage behind them. A soft vertical fade behind
      * the whole widget costs one gradient and makes it legible over anything.
      */
+    /*
+     * TOP OF THE TITLE-SAFE AREA, not of the screen. `var(--u) * 9` is 36 px
+     * at 1080p — 3.3 % of the height, inside the 4 % a television can overscan
+     * away, and this widget is a fail condition. `--pad-y` is the HUD's
+     * title-safe top edge (see the `--safe` note in style.js); the extra 8 px
+     * is the offset this bar has always had below the radio strip, which docks
+     * on the same centre line.
+     */
     this.root.style.cssText =
-      'position:absolute;left:50%;top:calc(var(--u) * 9);transform:translateX(-50%);' +
+      'position:absolute;left:50%;top:calc(var(--pad-y) + 8px * var(--k));' +
+      'transform:translateX(-50%);' +
       'display:flex;flex-direction:column;align-items:center;pointer-events:none;' +
       'width:calc(460px * var(--k));padding:calc(var(--u) * 2) 0;';
 

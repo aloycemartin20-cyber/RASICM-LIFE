@@ -38,6 +38,20 @@ export class Prompt {
     const col = el('div', null, this.root);
     this.txt = el('div', 'ow-prompt-txt', col, 'INTERACT');
     this.sub = el('div', 'ow-prompt-sub', col, '');
+    /**
+     * WHAT IS UNDER THE DOOR — two rows the seated EXIT grows when the answer
+     * is not "a kerb". See `_placement`.
+     *
+     * Styled here rather than in `style.js` because the docked chip's layout is
+     * this widget's own and the stylesheet belongs to another subsystem; the
+     * metrics match `.ow-prompt-sub` so the rows read as part of the same chip.
+     */
+    this.hazard = el('div', 'ow-prompt-haz', col, '');
+    this.hazard.style.cssText =
+      'font-size:calc(10px * var(--k));letter-spacing:.2em;color:var(--red);display:none';
+    this.drop = el('div', 'ow-prompt-drop', col, '');
+    this.drop.style.cssText =
+      'font-size:calc(9.5px * var(--k));letter-spacing:.2em;color:var(--slag-hot);display:none';
     const bar = el('div', null, col);
     bar.style.cssText =
       'margin-top:calc(var(--u)*1);height:calc(1.5px * var(--k));background:rgba(255,255,255,.16);width:100%';
@@ -57,10 +71,12 @@ export class Prompt {
   }
 
   /**
-   * @param {object} p { key, text, sub, progress, placement, host, dim }
+   * @param {object} p { key, text, sub, progress, placement, host, dim,
+   *                     airborne, water, drop, exitLine }
    *   placement  'centre' (default) | 'dock'
    *   host       the node a 'dock' placement parents into; ignored otherwise
    *   dim        0..1 opacity multiplier once the chip has settled
+   *   airborne / water / drop / exitLine   see `_placement`
    */
   set(p) {
     this.active = true;
@@ -72,6 +88,40 @@ export class Prompt {
     setStyle(this.bar, 'display', p.progress !== undefined ? '' : 'none');
     this.dim = p.dim ?? 1;
     this.setPlacement(p.placement ?? 'centre', p.host ?? null);
+    this._placement(p);
+  }
+
+  /**
+   * WHAT IS UNDER THE DOOR.
+   *
+   * `game.freeroam` raycasts the surface below the driver's door on every frame
+   * the seated EXIT is the live action and publishes the answer; `ui.setPrompt`
+   * copies it onto the record as `airborne` / `water` / `drop`. Only `game` can
+   * measure it (the terrain and the water plane are not reachable from here),
+   * and only `ui` can decide how it reads — this is the second half.
+   *
+   * Two rows, because they answer two different questions. The HAZARD is what
+   * stops the thumb; the DROP is the number the player wants once it has.
+   *
+   * AND THE EXIT LINE ITSELF IS SUPPRESSED IN THE AIR. "LEAVE THE SKYLARK" is
+   * a description of stepping out of a parked aeroplane, and at 210 m over the
+   * Allegheny it is simply false: F is a fall. Only the line that IS that
+   * offer is taken away (`exitLine`, matched upstream on the same opening verb
+   * the touch button's icon comes from) — a service line, a race start or a
+   * hold-progress prompt is live information about something else and stays.
+   */
+  _placement(p) {
+    const air = p.airborne === true;
+    const water = p.water === true;
+    const hazard = air ? 'F IS A FALL' : (water ? 'WATER UNDER THE DOOR' : '');
+    setText(this.hazard, hazard);
+    setStyle(this.hazard, 'display', hazard ? '' : 'none');
+    const drop = air
+      ? `${Math.round(p.drop ?? 0)} M TO THE ${water ? 'WATER' : 'GROUND'}`
+      : '';
+    setText(this.drop, drop);
+    setStyle(this.drop, 'display', drop ? '' : 'none');
+    setStyle(this.txt, 'display', air && p.exitLine === true ? 'none' : '');
   }
 
   /** Reparent + restyle. A no-op unless the placement actually changed. */

@@ -32,7 +32,12 @@ arsenal unreachable from the keyboard.
 | `LMB` | fire (a melee weapon swings — melee is a WEAPON, not a separate key) |
 | `RMB` | aim |
 | `B` | fire mode · **`Shift`+`B`** flips the minimap north-up / heading-up |
-| `M` | map · `Tab` weapon wheel · `X` character switch · `P` phone · `N` radio station |
+| `I` | inspect the weapon |
+| **`J`** | **the mission key** — start the next chapter, take the offered side job, or skip a chapter intro that is playing |
+| **`K`** | **abandon the live chapter or job. It ASKS FIRST**: one press arms and toasts `PRESS K AGAIN`, a second within 4 s commits, **`Shift`+`K`** commits outright |
+| `U` | cycle to the next brother (refused mid-chapter, with a toast) |
+| `M` | map · `O` story overview · `Tab` weapon wheel · `X` character switch · `P` phone · `N` radio station |
+| `1`–`6` | pick straight out of this brother's loadout, in wheel order |
 | `Esc` | pause |
 
 Mouse drag rotates the camera; wheel zooms the chase distance (radius clamped
@@ -56,6 +61,38 @@ are reserved by the user agent and cannot be cancelled at all. Crouching and
 walking forward closed the tab. Separately, `B` was flipping the fire mode and
 the minimap at once. Anything that has to share a key takes `Shift`, and both
 readers test the modifier — `src/weapons/index.js` declines a `B` carrying it.
+
+## The mission keys, and the panel that names one of them
+
+**`J` is the key the game tells you to press.** The HUD's objective panel shows
+`NEXT CHAPTER`, the chapter's number and title, and the line **`PRESS J`**; when
+the story is finished it shows the nearest `SIDE JOB` and the same line. Every
+mission toast ends the same way — `PRESS J` to start, `PRESS J TO RETRY` after a
+failure, `REPLAY · PRESS J` on a chapter you have already cleared. A touch build
+has no J, so `ui._touchify` rewrites that exact phrase to **`TAP JOB`** at the
+one choke point every toast flows through. The literal string is load-bearing:
+do not reword it in a toast without reading `_touchify`.
+
+**`K` abandons, and it asks first.** `K` sits one key from `J`, and it used to
+throw a live chapter away on a single press with a FAILED card as the only
+warning it had happened. Now the first press ARMS it and toasts `PRESS K AGAIN`;
+a second press within **4 s** commits; **`Shift`+`K` commits outright** for
+anyone who knows what the key does. The window is measured in UNSCALED time
+(`ctx.time.raw`), because a chapter runs at whatever the clock is doing — 0.22
+under the weapon wheel, 0.12 in a hitstop — and a confirmation measured in
+simulated seconds would be a different length every time it was offered. It also
+cannot survive a pause: raw time keeps running behind a menu, so a window armed
+before the menu has expired by the time it comes down. The arming is keyed to
+the chapter it was armed on, so a question asked about one chapter can never
+answer for the next. A side job takes the same key on the same terms, from
+`src/game/jobs.js`, and the two can never collide — at most one of them is live.
+
+**The vehicle instrument cluster has no keys at all.** Speed, gear and RPM, and
+the aircraft faces — altitude, climb rate, rotor, pitch and bank — appear when
+you are in something that publishes them and vanish when you get out. A field
+with no producer reads -1 and its row is hidden rather than drawn as a zero, so
+a boat shows no rev counter and a car shows no altimeter. There is nothing to
+toggle and nothing to learn.
 
 ## Flying the Riverhop
 
@@ -92,15 +129,21 @@ Three things that surprise people, all of them deliberate:
 > `Shift`-to-climb had never worked at all, because the sprint control is
 > routed through the nitro bottle and a helicopter has no throttle to open it.
 
-**`Shift`-to-descend is not live yet, and this is the same defect, unfixed.**
-`Space` climbs today because `handbrake` reaches the vehicle raw. `Shift` still
-goes through the nitro bottle, which needs an open throttle to fill and a
-helicopter has none — measured, a pilot at 87.7 m holding the descend control
-for 25 seconds ended up at 93.0 m. **He cannot land.** The fix is four lines in
-`VehicleHandler._stepDrive` (`src/player/vehicle.js`), which `src/vehicles`
-does not own; the patch is written out in the handoff for this change. With it
-applied the same pilot lands, four skid points down. Until then the collective
-is one-way and this table is describing the intent, not the build.
+**`Shift`-to-descend is live now.** It was not, and the reason is worth keeping:
+`Space` reached the machine raw as `handbrake`, but `Shift` went through the
+NITRO BOTTLE, which only opens above a throttle pedal — and a helicopter has no
+throttle pedal to open it with. Measured on that build, a pilot at 87.7 m
+holding the descend control for 25 seconds ended up at 93.0 m: **he could not
+land.** The fix is in `VehicleHandler._stepDrive` (`src/player/vehicle.js`): a
+`plane` or `heli` now takes the sprint channel STRAIGHT THROUGH as `boost`
+rather than through the bottle, and the car path is untouched. The same defect
+was grounding the aeroplanes, which read `boost` as the throttle lever — holding
+`Shift` in a Skylark delivered `input.boost 0` for ten seconds, so the lever
+stayed at zero and it never rolled. One fix, both aircraft.
+
+So the collective is two-way and this table describes the build. If you are
+looking for the shape of the original bug: it was a resource meter sitting in
+the middle of a flight control, invisible from either end.
 
 ## Mobile / touch — the part we do not have at all
 

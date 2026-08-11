@@ -267,6 +267,70 @@ try {
     ` (${entered.phase}) · F did [${entered.acts.join(', ')}]`);
 
   /* =================================================================== */
+  area = 'seated exit';
+  /* =================================================================== */
+
+  /**
+   * "LEAVE THE SKYLARK" is written off the vehicle's NAME and nothing else, so
+   * the line reads the same at a kerb and at 210 m over the Allegheny. `game`
+   * is the only side that can tell them apart (`wq.surfaceY` and `surfaceAt`
+   * are not reachable from `ui`), and it publishes the answer on the prompt
+   * payload as `place`. These read that LIVE record while the player is seated.
+   *
+   * It is also the gate on the sampling. Those world queries are cached against
+   * the DOOR POINT'S own movement rather than re-asked every frame, and a
+   * vehicle that changes altitude without moving in x or z is precisely the
+   * case a naive cache would answer wrongly — so the fall below is measured
+   * from a car that has not moved an inch horizontally.
+   */
+  const kerb = await run(`
+    const p = game.freeroam.exitPlace;
+    return { id: game.getAction().id, active: p.active, over: p.over,
+             drop: +p.drop.toFixed(2), airborne: p.airborne, water: p.water };`);
+  rec('seated, the EXIT publishes the landing under the door',
+    kerb.id === 'exit' && kerb.active === true && kerb.airborne === false && kerb.drop < 1.2,
+    `id "${kerb.id}" · ${kerb.drop} m onto ${kerb.over ?? '-'} · airborne ${kerb.airborne}`);
+
+  await run(`
+    const v = player.vehicles.vehicle;
+    game.__exitY = v.position.y;
+    v.position.y += 210;`);
+  await pump(3);
+  const high = await run(`
+    const p = game.freeroam.exitPlace;
+    return { active: p.active, drop: +p.drop.toFixed(1), airborne: p.airborne,
+             y: +player.vehicles.vehicle.position.y.toFixed(1) };`);
+  rec('210 m over the same patch of ground, it reads as a FALL',
+    high.active === true && high.airborne === true && high.drop > 150,
+    `${high.drop} m of air under the belly at ${high.y} m · airborne ${high.airborne}`);
+
+  await run(`player.vehicles.vehicle.position.y = game.__exitY;`);
+  await pump(3);
+  const back = await run(`
+    const p = game.freeroam.exitPlace;
+    return { drop: +p.drop.toFixed(2), airborne: p.airborne };`);
+  rec('...and back on its wheels it is a step again, not a fall',
+    back.airborne === false && back.drop < 1.2,
+    `${back.drop} m under the belly · airborne ${back.airborne}`);
+
+  // AND WHAT IT COSTS. `surfaceY` is a ground raycast; it used to be run once
+  // per frame for every second the player was in any vehicle, alongside
+  // `surfaceAt` and `isWater`. Counted on the REAL `WorldQuery` method, over a
+  // second of frames, in a parked car — where the honest answer is that the
+  // ground has not moved and there is nothing to ask.
+  await run(`
+    const wq = game.wq;
+    const raw = wq.surfaceY.bind(wq);
+    let n = 0;
+    wq.surfaceY = (x, z, y) => { n++; return raw(x, z, y); };
+    game.__surfaceDone = () => { wq.surfaceY = raw; return n; };`);
+  await pump(60);
+  const cost = await run(`return { n: game.__surfaceDone() };`);
+  rec('the landing is SAMPLED, not raycast every frame',
+    cost.n <= 20,
+    `${cost.n} ground samples across 60 frames parked (one per frame was the cost before)`);
+
+  /* =================================================================== */
   area = 'grand theft auto';
   /* =================================================================== */
 

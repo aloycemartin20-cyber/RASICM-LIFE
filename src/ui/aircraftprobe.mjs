@@ -991,6 +991,52 @@ try {
     `opacity ${c0.promptOp} on boarding -> ${c1.promptOp} after the beat, still visible ${c1.promptVis}`);
 
   /**
+   * THE PLACEMENT ROWS — the `ui` half of the seated-EXIT contract.
+   *
+   * `game.freeroam._exitPlacement` raycasts the surface below the driver's door
+   * every frame the seated EXIT is live and publishes it as `place`. What is
+   * asserted here is the other half: what the CHIP does with one. The numbers
+   * are `game`'s to measure and are not re-derived — they are handed in, which
+   * is also the only way to put the airborne case and its own negative control
+   * on the same chip in the same second with nothing else about the frame
+   * different.
+   *
+   * HANDED IN AND READ BACK INSIDE ONE `evaluate`, with no frame between them,
+   * because `freeroam` re-publishes its own real kerbside placement on the very
+   * next frame — a pumped read would be measuring the car this is parked in
+   * rather than the case under test. Everything asserted is drawn DOM: the row
+   * text, and whether the exit line is displayed at all.
+   */
+  const chipFor = (place) => page.evaluate((pl) => {
+    const ui = window.__ENGINE__.ctx.peek('ui');
+    ui.setPrompt({ key: 'F', text: 'LEAVE THE SKYLARK', sub: '', place: pl });
+    const shown = (s) => {
+      const n = document.querySelector(s);
+      return n && getComputedStyle(n).display !== 'none' ? (n.textContent || '').trim() : '';
+    };
+    return { txt: shown('.ow-prompt-txt'), haz: shown('.ow-prompt-haz'), drop: shown('.ow-prompt-drop') };
+  }, place);
+
+  const kerb = await chipFor({ active: true, airborne: false, water: false, drop: 0.4, over: 'asphalt' });
+  rec('NEG CONTROL — at a kerb the chip is the exit line and nothing else',
+    /LEAVE/.test(kerb.txt) && !kerb.haz && !kerb.drop,
+    `line "${kerb.txt}", hazard "${kerb.haz}", drop "${kerb.drop}"`);
+
+  const overAir = await chipFor({ active: true, airborne: true, water: true, drop: 212.4, over: 'water' });
+  rec('airborne: the chip grows the DROP, in metres, and names what is down there',
+    /212/.test(overAir.drop) && /WATER/.test(overAir.drop),
+    `hazard "${overAir.haz}", drop "${overAir.drop}"`);
+  rec('...and the exit line is SUPPRESSED, because F up there is a fall, not a way out',
+    !overAir.txt && /FALL/.test(overAir.haz),
+    `line "${overAir.txt}" (empty = suppressed), hazard "${overAir.haz}"`);
+
+  const wet = await chipFor({ active: true, airborne: false, water: true, drop: 0.2, over: 'water' });
+  rec('in the shallows the water row shows and the exit line SURVIVES (it is a step, not a fall)',
+    /WATER/.test(wet.haz) && /LEAVE/.test(wet.txt) && !wet.drop,
+    `line "${wet.txt}", hazard "${wet.haz}", drop "${wet.drop}"`);
+  await pump(4);
+
+  /**
    * THE DROWNED ENGINE AND THE DRY TANK — both off the car's OWN published
    * fields, both read back as drawn text and drawn colour.
    *

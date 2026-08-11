@@ -119,6 +119,16 @@ dead — clears cops, restores health, exits the vehicle, restarts the chapter.
 (`Save.data.chapter = Math.max(saved, current + 1)`), so replaying an old chapter
 cannot cost you progress.
 
+**The by-hand recovery path is `K`, `K`, then `J`** — and the first toast after
+a sim error says exactly that: `Something broke · PRESS K TWICE THEN J`. It is
+two presses of `K` because `K` asks before it abandons anything (one press arms
+and toasts, a second inside 4 s commits); **`Shift`+`K` then `J`** is the same
+path for anyone who does not want to be asked. `J` then starts the chapter
+again. That text is load-bearing rather than decorative: `ui._touchify` rewrites
+`PRESS K` and `PRESS J` into `TAP JOB` for a build with no keyboard, so a
+reworded toast silently strands a touch player at the one moment the game has
+already admitted something went wrong.
+
 UI is throttled deliberately: minimap/HUD at 0.08 s, interaction prompt at 0.25 s.
 
 ---

@@ -92,6 +92,8 @@ export class GameSystem {
     /** Cached "CH n · NAME", rebuilt only when the chapter def changes. */
     this._nextKey = null;
     this._nextTitle = '';
+    /** `nextChapter`'s reused answer — read it, do not retain it. See there. */
+    this._chapterRec = { index: 0, def: null };
     /** The delayed "press J" toast — see `_announceNext` / `_announceTick`. */
     this._announceArmed = false;
     this._announceRaw = 0;
@@ -382,24 +384,31 @@ export class GameSystem {
     h.wanted = this.heat.wanted;
     h.objective = this.missions.hudObjective();
     /**
-     * THE PERSISTENT "WHAT NOW" LINE IS A SEPARATE FIELD, and it has to be.
+     * THE PERSISTENT "WHAT NOW" LINE IS A SEPARATE FIELD, and it still has to
+     * be — but no longer for the reason this paragraph used to give.
      *
-     * The obvious version of this — fall `objective` back to the NEXT state —
-     * silently kills a backstop three files away: `src/ui/hud.js`'s boss bar
-     * hides itself on `this._bossOn && hud?.objective`, precisely because
-     * `objective` is null the instant no chapter is live and that is the one
-     * condition an event which never fired cannot miss. Making `objective`
-     * always truthy left the boss bar on screen in free roam after an abort —
-     * MEASURED at 39.9 px of a dead rival's health bar over an empty street,
-     * caught by `src/ui/wardprobe.mjs`.
+     * The old reason was a coupling: `src/ui/hud.js`'s boss bar hid itself on
+     * `this._bossOn && hud?.objective`, so making `objective` fall back to the
+     * NEXT state left a dead rival's health bar on screen over an empty street
+     * (MEASURED at 39.9 px, caught by `src/ui/wardprobe.mjs`). That inference
+     * is GONE: the bar now reads its own `mission:boss` stream and ages the
+     * record out on `BOSS_STALE`, and hud.js's comment there names this
+     * paragraph as the reason it was wrong to lean on another producer's
+     * field. Nothing three files away breaks if this one changes any more.
      *
-     * So `objective` keeps its meaning — THE RUNNING CHAPTER'S objective, null
-     * when there is none — and `ui` falls back to this one for the panel.
+     * What keeps the split is the MEANING. `objective` is THE RUNNING
+     * CHAPTER'S line — null when no chapter is live — and every reader that
+     * asks "is a chapter under way" gets a straight answer from it. The panel
+     * wants something else: what to do when none is. Two questions, two
+     * fields, and `ui` picks the fallback for the panel itself.
      */
-    h.nextObjective = h.objective ? null : this._nextObjective();
+    // ONE resolve per frame, shared by both readers below: `nextChapter` hands
+    // back a reused record, and asking it twice is only wasted work.
+    const n = this.nextChapter();
+    h.nextObjective = h.objective ? null : this._nextObjective(n);
     /** `{ name, health 0..1 }` while a protect chapter is live, else null. */
     h.ward = this.missions.hudWard();
-    h.next = this.missions.active ? null : this._nextPinPoint();
+    h.next = this.missions.active ? null : this._nextPinPoint(n);
     h.storyDone = this.economy.char().chapter >= this.characters.boy.story.length;
     if (prev !== h.money) {
       this.wq.ui?.setMoney?.(h.money, h.money - prev);
@@ -417,12 +426,24 @@ export class GameSystem {
   /* chapters                                                             */
   /* ==================================================================== */
 
-  /** The chapter this brother is up to, or null when his arc is finished. */
+  /**
+   * The chapter this brother is up to, or null when his arc is finished.
+   *
+   * THE RECORD IS PREALLOCATED AND REUSED — read it, do not retain it, the
+   * same rule `getAction()` publishes. `_syncHud` runs this every free-roam
+   * frame (twice, before it was hoisted), and a `{ index, def }` literal per
+   * call is 120 short-lived objects a second out of the one method whose own
+   * header says it must not allocate. Every caller in the repo reads both
+   * fields in the same statement it asks for them.
+   */
   nextChapter(id = this.characters.activeId) {
     const c = this.economy.char(id);
     const boy = BOYZ[id];
     if (c.chapter >= boy.story.length) return null;
-    return { index: c.chapter, def: boy.story[c.chapter] };
+    const r = this._chapterRec;
+    r.index = c.chapter;
+    r.def = boy.story[c.chapter];
+    return r;
   }
 
   /**
@@ -452,9 +473,8 @@ export class GameSystem {
    * toast (a 4 s event, easily missed, and fired underneath a full-screen card)
    * and a readout.
    */
-  _nextObjective() {
+  _nextObjective(n = this.nextChapter()) {
     const o = this._nextObj;
-    const n = this.nextChapter();
     if (n) {
       // `_syncHud` runs every frame, so the title string is built only when the
       // chapter actually changes (rule 5) — the key is the def itself.
@@ -478,8 +498,7 @@ export class GameSystem {
   }
 
   /** `{x,z,name}` for the next chapter's pin, or null. Reused record. */
-  _nextPinPoint() {
-    const n = this.nextChapter();
+  _nextPinPoint(n = this.nextChapter()) {
     const site = n ? this._chapterSite(n.def) : null;
     if (!site || !Number.isFinite(site.x) || !Number.isFinite(site.z)) return null;
     const p = this._nextPin;
@@ -584,7 +603,10 @@ export class GameSystem {
     g.next = raw + GPS_PERIOD;
     g.wpX = w.x;
     g.wpZ = w.z;
-    const path = this.wq.world?.routeTo?.(pos.x, pos.z, w.x, w.z, { fromY: pos.y });
+    // Reused options record, the same shape and the same reason as `util.js`'s
+    // `_routeOpts`: `routeTo` reads it and returns, so one literal is enough.
+    GPS_OPTS.fromY = pos.y;
+    const path = this.wq.world?.routeTo?.(pos.x, pos.z, w.x, w.z, GPS_OPTS);
     if (!path || path.length < 2) {
       if (g.on) {
         g.on = false;
@@ -654,12 +676,18 @@ export class GameSystem {
   /**
    * Every point the map should pin: the free-roam furniture plus the three
    * standing side jobs.
+   *
+   * NO CHAPTER PIN HERE, DELIBERATELY. It looks like the obvious place for
+   * one and it would be dead ink: the next chapter already reaches BOTH map
+   * projections by the other route — `getHudState().next`, which `ui` pushes
+   * into the blip array the minimap and the pause map share, so the two views
+   * cannot disagree about where the chapter is. Adding it here would draw it
+   * twice on any surface that polled both, and this method has no caller in
+   * `src/` or `tools/` at all.
    */
   mapPoints(out = this._mapPoints) {
     this.freeroam.mapPoints(out);
     this.jobs.mapPoints(out);
-    const n = this.missions.active ? null : this._nextPinPoint();
-    if (n) out.push({ x: n.x, z: n.z, kind: 'chapter', name: n.name });
     return out;
   }
 
@@ -1565,6 +1593,8 @@ const ANNOUNCE_HOLD = 1.1;
  */
 const GPS_PERIOD = 1;
 const GPS_SAME2 = 4;
+/** Reused `routeTo` options — `fromY` is what keeps a bridge deck off its quay. */
+const GPS_OPTS = { fromY: 0 };
 
 const STAGES = [
   'clean', 'chapter', 'race', 'firefight', 'boss', 'ending', 'packages',

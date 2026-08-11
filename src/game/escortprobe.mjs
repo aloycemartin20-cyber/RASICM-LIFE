@@ -385,7 +385,9 @@ function scene({ routing = true } = {}) {
   const wq = new WorldQuery(ctx).init();
   const economy = {
     cash: 0, respect: 0, char: (who = 'aidan') => save.chars[who],
-    addCash() {}, addRespect: () => [], unlockWeapon: () => false,
+    /** Every credit the runner actually moved, so a payout can be read back. */
+    paid: [],
+    addCash(n) { this.paid.push(n); }, addRespect: () => [], unlockWeapon: () => false,
   };
   const heat = { wanted: 0, raise() {}, clear() {}, heat() {}, setPursuitEnabled() {} };
   const pickups = { spawn: () => null, despawn() {}, clearMission() {}, countMission: () => 0, nearestMission: () => null };
@@ -396,7 +398,7 @@ function scene({ routing = true } = {}) {
   const wins = [];
   events.on('mission:fail', (p) => fails.push({ ...p }));
   events.on('mission:complete', (p) => wins.push({ ...p }));
-  return { save, ui, wq, events, world, vehicles, ctx, missions, time, player, fails, wins };
+  return { save, ui, wq, events, world, vehicles, ctx, missions, time, player, fails, wins, economy };
 }
 
 /** Start Aidan CH 5 and walk it out of the intro into the run phase. */
@@ -519,6 +521,21 @@ const main = { steps: 0, wet: 0, samples: 0, offRoad: 0, worstRoad: 0, maxAmbush
     main.wet === 0 && main.samples > 200,
     `${main.wet} of ${main.samples} sampled positions in a river (bridge decks excluded)`);
 
+  /**
+   * THE ANTI-HANG CLOCK IS NOT A PAYOUT. `win` prices
+   * `max(0, timer) * TIME_BONUS * rate` for anything carrying `hasTimer`, and
+   * this chapter authors no `baseTimer` at all — so arming a watchdog to stop
+   * a wedged truck hanging the chapter quietly handed the player hundreds of
+   * unauthored dollars on top of a 2900 purse, scaled by how fast the TRUCK
+   * drove itself. Read off the money that actually moved (`economy.addCash`)
+   * and off the emitted payload the card prints, never off `M.bonus`.
+   */
+  const paid = s.economy.paid.reduce((a, b) => a + b, 0);
+  check('the anti-hang clock pays no time bonus',
+    won && s.wins[0].bonus === 0 && paid === M.def.cash,
+    `bonus ${s.wins[0]?.bonus}, $${paid} paid against an authored purse of $${M.def.cash}, ` +
+    `with ${Math.max(0, M.timer).toFixed(0)} s still on the clock`);
+
   // RATCHET (ARCHITECTURE.md rule 13). MEASURED at 4.0% on the run this was
   // written against; the goal is ~0, and what is left is cornering overshoot
   // where `driveToward` aims 22 m ahead through a tight junction. LOWER THIS
@@ -541,6 +558,52 @@ const main = { steps: 0, wet: 0, samples: 0, offRoad: 0, worstRoad: 0, maxAmbush
     console.log(`    route: ${(main.steps * DT).toFixed(0)} s, peak ${main.maxAmbush} ambushers, ` +
       `${main.spawns} spawned, hull ${(main.hull * 100).toFixed(0)}%`);
   }
+}
+
+/* ---- the watchdog clock, against difficulty and against the purse -------- */
+
+/**
+ * A bound the CODE invented to stop a hang must cost the player nothing and
+ * pay him nothing. Squeezed by `timerMul` it was 259 s on steel against a
+ * ~210 s measured run — a chapter that could be lost on time where the author
+ * gave it no clock at all — and paid as a time bonus it was a raise nobody
+ * wrote. Both halves are read off a live chapter, one difficulty apart.
+ */
+{
+  /** Arm the chapter at `diff` and report the clock it ends up carrying. */
+  const clockAt = (diff) => {
+    const s = scene();
+    s.missions.difficulty = diff;
+    startEscort(s);
+    return s.missions.M.timer;
+  };
+  const normal = clockAt('normal');
+  const steel = clockAt('steel');
+  check('the watchdog clock is the same bound at every difficulty',
+    normal === steel && normal > 300,
+    `${normal.toFixed(0)} s on normal, ${steel.toFixed(0)} s on steel ` +
+    `(timerMul 0.72 used to make it ${(normal * 0.72).toFixed(0)} s)`);
+
+  /** Win the chapter on the spot, with the watchdog flag as given. */
+  const winWith = (watchdog) => {
+    const s = scene();
+    startEscort(s);
+    const M = s.missions.M;
+    M.timerIsWatchdog = watchdog;
+    // Into the drop ring; the track's own arrival test is what wins it. Then
+    // run the outro out, because the payload the card prints is published by
+    // `_finish` rather than by `win` — the cash moves several seconds before
+    // the event that reports it does.
+    M.ally.position.set(M.dest.x, M.ally.position.y, M.dest.z);
+    drive(s, null, Math.ceil(30 / DT));
+    return { bonus: s.wins[0]?.bonus ?? -1, paid: s.economy.paid.reduce((a, b) => a + b, 0) };
+  };
+  const watchdog = winWith(true);
+  const priced = winWith(false);
+  check('NEG CONTROL: the same win with the flag cleared DOES pay a time bonus',
+    watchdog.bonus === 0 && priced.bonus > 500 && priced.paid > watchdog.paid,
+    `watchdog $${watchdog.paid} with $${watchdog.bonus} bonus against ` +
+    `$${priced.paid} with $${priced.bonus} — the counter can tell them apart`);
 }
 
 /* ========================================================================== */

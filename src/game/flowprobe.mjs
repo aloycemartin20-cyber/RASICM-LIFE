@@ -25,8 +25,15 @@
  *      the two authored chapters disagree by a factor of six per metre of haul.
  *   4. EVERY mission end raised the result card TWICE and struck its sting
  *      twice, because `_finish` both emitted `mission:complete`/`mission:fail`
- *      AND called `ui.card` itself, while `src/ui/index.js:874` and `:881`
- *      raise a card off each of those events.
+ *      AND called `ui.card` itself, while `src/ui/index.js`'s own two mission
+ *      listeners raise a card off each of those events.
+ *   5. `rideFault` watched the COURTESY CAR forever. Its guard asked whether
+ *      the player was in another car right now, while the inverted-car clock
+ *      latched — so the chapter failed on the first frame he was out of one,
+ *      naming a car he had abandoned two minutes and a kilometre earlier.
+ *   6. `recover` remembered ONE lost slot per frame but despawned every
+ *      unwitnessed wreck it walked past, so two losses on one frame left the
+ *      chapter a car short of `goal` with no fail path.
  *
  * ────────────────────────────────────────────────────────────────────────────
  * WHY IT ASSERTS WHAT IT ASSERTS  (ARCHITECTURE.md rule 12)
@@ -261,12 +268,12 @@ function fakeUi() {
     say() {}, setCharacter() {}, setMoney() {}, setStation() {}, setWaypoint() {},
     setObjectives() {}, clearObjective() {}, titleCard() {}, playScene() {},
     /**
-     * `src/ui/index.js`'s own two mission listeners, PLUS the `carded` guard
-     * `mission.js:_finish` publishes for them. The guard is two lines and is
-     * not landed in `ui` yet — see the note in `_finish` — so this mock is what
-     * holds the contract, and the negative control below is what proves the
-     * mock is not just agreeing with itself: delete `carded` from the payload
-     * and the count goes to two, which is the shipped double.
+     * `src/ui/index.js`'s own two mission listeners, INCLUDING the `carded`
+     * guard `mission.js:_finish` publishes for them — the same two handlers,
+     * in the same order, as the shipped file. The negative control below is
+     * what proves the mock is not just agreeing with itself: re-emit the
+     * payload with `carded` deleted and the count goes to two, which is the
+     * double the guard exists to stop.
      */
     wire(events) {
       events.on('mission:complete', (e) => {
@@ -461,6 +468,117 @@ function dist2(a, b) {
   return Math.hypot(a.x - b.x, a.z - b.z);
 }
 
+/** Scratch for rolling a harness car onto its roof. Declared before its use —
+ *  `const` does not hoist and every section below runs at module load. */
+const _flip = new THREE.Euler(0, 0, 0, 'YXZ');
+/** Seconds `vehFault` has been holding against the courtesy car. */
+function _faultOf(M) {
+  return M._faultRide ?? 0;
+}
+
+/* ========================================================================== */
+/* 1b — the COURTESY CAR is released the moment he adopts another one         */
+/* ========================================================================== */
+
+/**
+ * `rideFault` fails `race` and `chase` when the car the track handed the
+ * player ends up on its roof, because neither chapter can be finished without
+ * something to drive. Its guard used to be a live test — "is he in another car
+ * RIGHT NOW" — while `_faultRide` latched past `VEH_FAULT_T` and stayed there.
+ * So the chapter did not fail while he drove the car he stole; it failed on the
+ * first frame he was out of one, minutes and a kilometre later, naming a car he
+ * had abandoned. This is that exact sequence.
+ *
+ * The chase's own two fail paths are held off deliberately — the target is
+ * parked on the player each frame — so the ONLY thing that can end the chapter
+ * here is the courtesy-car watchdog, which is the thing under test.
+ */
+{
+  /** Roll `v` onto its roof and hold it there against `stepCar`'s pose write. */
+  const invert = (v) => {
+    v.quaternion.setFromEuler(_flip.set(Math.PI, v.yaw, 0, 'YXZ'));
+    v.speed = 0;
+    v.forwardSpeed = 0;
+  };
+
+  const { boy, idx } = chapterOf('dylan', 'chase');
+  const s = scene();
+  const at = s.wq.poi(boy.story[idx].at) ?? { x: 0, z: 0 };
+  const M = begin(s, boy, idx, at);
+  const courtesy = M.veh;
+  const target = M.target;
+
+  check('a chase chapter hands the player a courtesy car',
+    !!courtesy && courtesy !== target,
+    courtesy ? `a ${courtesy.type} at (${courtesy.position.x.toFixed(0)}, ${courtesy.position.z.toFixed(0)})`
+      : 'no courtesy car spawned');
+
+  // He steals better two streets away and drives off in it. The courtesy car
+  // is left on its roof at the grid, exactly where he rolled it.
+  const stolen = s.vehicles.spawn('muscle',
+    { x: at.x + 40, y: courtesy.position.y, z: at.z + 40 }, 0);
+  board(s, stolen);
+  // A clock that has ALREADY latched past `VEH_FAULT_T` — the state the old
+  // live guard left lying around while it suppressed the fail. The release has
+  // to beat a latched fault, not merely stop one from starting.
+  M._faultRide = 20;
+  const holdChase = () => {
+    // Park the target on him so `R.chaseLose` can never be the thing that ends
+    // this, and keep the abandoned car inverted and still.
+    target.setPose({ x: s.player.position.x + 8, y: target.position.y, z: s.player.position.z }, 0);
+    target.health = target.maxHealth;
+    invert(courtesy);
+    s.player.position.set(stolen.position.x, 0, stolen.position.z);
+  };
+  invert(courtesy);
+  drive(s, Math.ceil(14 / DT), holdChase);
+
+  const released = M.rideReleased === true;
+  check('driving a substitute RELEASES the courtesy car for good',
+    released && s.missions.M?.phase !== 'over',
+    `rideReleased ${released}, ${(_faultOf(M)).toFixed(1)} s on the inverted-car clock, ` +
+    `chapter ${s.missions.M?.phase === 'over' ? `FAILED "${s.fails[0]?.reason}"` : 'still running'}`);
+
+  // AND THE FRAME THAT USED TO KILL IT: the substitute is wrecked and he is on
+  // foot. The old guard collapsed here and returned the latched fault.
+  s.vehicles.damage(stolen, stolen.maxHealth * 2);
+  s.player.inVehicle = false;
+  s.player.vehicle = null;
+  drive(s, Math.ceil(3 / DT), holdChase);
+
+  check('...so losing the substitute does NOT fail him for the car he left',
+    s.missions.M?.phase !== 'over' && s.fails.length === 0,
+    s.fails.length ? `FAILED: "${s.fails[0]?.reason}"`
+      : `on foot, substitute wrecked, chapter still running after ${(s.time.frame * DT).toFixed(0)} s`);
+}
+
+/* ---- NEGATIVE CONTROL: he never adopts anything -------------------------- */
+{
+  // The hang this watchdog exists for is still a fail: same inverted courtesy
+  // car, same clock, but he walks away instead of taking another car.
+  const { boy, idx } = chapterOf('dylan', 'chase');
+  const s = scene();
+  const at = s.wq.poi(boy.story[idx].at) ?? { x: 0, z: 0 };
+  const M = begin(s, boy, idx, at);
+  const courtesy = M.veh;
+  const target = M.target;
+  // Long enough to clear `CHASE_BOARD` (the chase does not arm, and so does not
+  // watch the ride, until he has driven something or 20 s have passed) and then
+  // `VEH_FAULT_T` on top of it.
+  drive(s, Math.ceil(34 / DT), () => {
+    target.setPose({ x: s.player.position.x + 8, y: target.position.y, z: s.player.position.z }, 0);
+    target.health = target.maxHealth;
+    courtesy.quaternion.setFromEuler(_flip.set(Math.PI, courtesy.yaw, 0, 'YXZ'));
+    courtesy.speed = 0;
+    courtesy.forwardSpeed = 0;
+  });
+  const f = s.fails[0];
+  check('NEG CONTROL: on foot with no substitute, the roll DOES end the chapter',
+    M.rideReleased === false && !!f && /roof/i.test(f.reason ?? ''),
+    f ? `"${f.reason}" after ${(s.time.frame * DT).toFixed(1)} s`
+      : `never failed — ${_faultOf(M).toFixed(1)} s on the clock`);
+}
+
 /* ========================================================================== */
 /* 2 — RECOVER: a wreck he never saw is not a wreck he caused                 */
 /* ========================================================================== */
@@ -528,6 +646,71 @@ function markedAlive(M) {
   check('NEG CONTROL: wrecking a car he HAS been up to fails the chapter',
     sawIt && !!f && /marked car was wrecked/i.test(f.reason ?? ''),
     `witnessed ${sawIt}, wrecked ${Math.round(away)} m away -> ${f ? `"${f.reason}"` : 'no fail'}`);
+}
+
+/* ---- TWO lost on ONE frame: every slot is replaced, not just the last ---- */
+
+/**
+ * The replacement walk despawned every unwitnessed wreck it found and put back
+ * ONE, because the slot it remembered was a single variable each wreck
+ * overwrote. Two cars lost on the same frame — a pursuit through a junction, an
+ * explosion between two of them — therefore left the chapter permanently a car
+ * short of `goal`, with nothing on the map to fetch and no fail path: only the
+ * pause menu could end it.
+ *
+ * Read off the CARS THE WORLD HOLDS (`markedAlive`) and the slots they carry,
+ * never off `M._lostSlots`, which is the fix reporting on itself.
+ */
+{
+  const { boy, idx } = chapterOf('aidan', 'recover');
+  const s = scene();
+  const at = s.wq.poi(boy.story[idx].at) ?? { x: 0, z: 0 };
+  const M = begin(s, boy, idx, at);
+  // On the drop, so neither victim can ever have been witnessed.
+  s.player.position.set(M.dest.x, 0, M.dest.z);
+  drive(s, 4);
+
+  const [a, b] = markedAlive(M);
+  const slots = [a.recoverSlot, b.recoverSlot];
+  const far = Math.min(dist2(s.player.position, a.position), dist2(s.player.position, b.position));
+  s.vehicles.damage(a, a.maxHealth * 2);
+  s.vehicles.damage(b, b.maxHealth * 2);
+  const bothUnseen = a.recoverSeen === false && b.recoverSeen === false;
+  drive(s, 6);
+
+  const live = markedAlive(s.missions.M);
+  check('two marked cars wrecked on ONE frame are BOTH replaced',
+    bothUnseen && live.length === M.goal && s.fails.length === 0,
+    `${live.length} marked cars in play against goal ${M.goal}, both unseen ${bothUnseen}, ` +
+    `nearer wreck was ${Math.round(far)} m away`);
+  check('...and the replacements cover both of the emptied slots',
+    slots.every((k) => live.some((v) => v.recoverSlot === k)),
+    `lost slots [${slots}] against slots in play [${live.map((v) => v.recoverSlot)}]`);
+}
+
+/* ---- NEGATIVE CONTROL: the pre-fix collector, on the same staging -------- */
+{
+  const { boy, idx } = chapterOf('aidan', 'recover');
+  const s = scene();
+  const at = s.wq.poi(boy.story[idx].at) ?? { x: 0, z: 0 };
+  const M = begin(s, boy, idx, at);
+  // `let lost = null`, exactly: a collector that keeps only the most recent
+  // slot pushed into it. Nothing else about the track changes.
+  const lastOnly = [];
+  lastOnly.push = function (v) { this[0] = v; this.length = 1; return 1; };
+  M._lostSlots = lastOnly;
+
+  s.player.position.set(M.dest.x, 0, M.dest.z);
+  drive(s, 4);
+  const [a, b] = markedAlive(M);
+  s.vehicles.damage(a, a.maxHealth * 2);
+  s.vehicles.damage(b, b.maxHealth * 2);
+  drive(s, 6);
+
+  const live = markedAlive(s.missions.M);
+  check('NEG CONTROL: with the old one-slot collector the chapter is left short',
+    live.length === M.goal - 1 && s.fails.length === 0 && s.missions.M?.phase !== 'over',
+    `${live.length} of goal ${M.goal} in play, chapter still running with no fail path — unwinnable`);
 }
 
 /* ========================================================================== */

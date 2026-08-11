@@ -703,14 +703,34 @@ export class UiSystem {
      *   verb       'TAKE' | 'EXIT' | 'SPRAY' | 'FUEL' | 'SLEEP' ...
      *   label      'TAKE THE ALLEGHENY 4DR' — the full line
      *   source     'prompt' | 'vehicle' | 'api'
+     *   place      what is under the door if this is the seated EXIT, else
+     *              null — the live `_place` record, not a copy of it
      */
     this.action = {
       available: false, verb: 'USE', icon: 'hand', label: '', sub: '',
-      key: 'F', source: 'prompt',
+      key: 'F', source: 'prompt', place: null,
     };
     this._promptActive = false;
     this._missT = 0;
     this._apiAction = null;
+    /**
+     * WHAT IS UNDER THE DRIVER'S DOOR — one reused record, refreshed per frame.
+     *
+     * `game.freeroam` measures it while the seated EXIT is the live action and
+     * publishes it on BOTH faces: as `place` on the prompt record (every frame)
+     * and on the `setAction` record (only when the label changes). The fields
+     * are COPIED rather than aliased, for the reason `setPrompt` copies the
+     * rest — that record is `game`'s and it rewrites it in place, so holding
+     * the reference would make this HUD's state somebody else's variable.
+     *
+     * ONE record for both faces, so the change-guarded action side reads the
+     * live numbers the per-frame prompt side keeps current instead of a
+     * snapshot frozen at the last label change: the drop under an aeroplane
+     * moves every frame the label does not. `active` false means nothing
+     * published a placement this frame — on foot, or a prompt that is not that
+     * exit.
+     */
+    this._place = { active: false, airborne: false, water: false, drop: 0, over: '' };
     this._exitPromptT = 0;
     this._exitPromptShown = false;
     this._exitPrompt = { key: 'F', text: 'EXIT', sub: '', placement: 'dock', host: null, dim: 1 };
@@ -718,6 +738,7 @@ export class UiSystem {
     this._promptRec = {
       key: 'F', text: '', sub: '', progress: undefined,
       placement: 'centre', host: null, dim: 1,
+      airborne: false, water: false, drop: 0, exitLine: false,
     };
     this._lastPromptText = '';
     this._promptVerb = 'USE';
@@ -1218,14 +1239,21 @@ export class UiSystem {
    * instead of (or alongside) `setPrompt` when the short verb it wants on the
    * touch button is not derivable from the prompt line.
    *
-   * @param {?object} a { label, verb, icon, sub, available, key }
+   * @param {?object} a { label, verb, icon, sub, available, key, place }
    *                    pass null / omit to fall back to the prompt.
+   *
+   * `place` is the seated EXIT's landing data. It is copied out here rather
+   * than held, and into the same record `setPrompt` refreshes every frame —
+   * this face is change-guarded by its caller, so on its own it would freeze
+   * the drop at whatever it was when the label last changed. See `_place`.
    */
   setAction(a) {
     if (!a) {
       this._apiAction = null;
+      this._place.active = false;
       return;
     }
+    this._takePlace(a.place);
     this._apiAction = {
       available: a.available !== false,
       label: a.label ?? a.text ?? '',
@@ -1321,6 +1349,7 @@ export class UiSystem {
       a.sub = s.sub;
       a.key = s.key;
       a.source = 'api';
+      a.place = this._place.active ? this._place : null;
     } else if (inVeh) {
       /**
        * IN A VEHICLE THE BUTTON SAYS EXIT, WHATEVER ELSE IS ON OFFER.
@@ -1346,6 +1375,7 @@ export class UiSystem {
       a.sub = '';
       a.key = 'F';
       a.source = 'vehicle';
+      a.place = this._place.active ? this._place : null;
       /**
        * THE SEATED CHIP IS DOCKED, NOT CENTRED, AND IT FADES RATHER THAN
        * VANISHING.
@@ -1359,11 +1389,20 @@ export class UiSystem {
        *
        * SUPPRESSED IN THE AIR. `F` in a flying aircraft is a fall, and an
        * always-on chip offering it a thousand feet up is an invitation the HUD
-       * should not be extending. Above `EXIT_ALT` metres the chip goes away
-       * entirely and comes back on the ground. Never over a real prompt
-       * `game` is publishing, in any placement.
+       * should not be extending. The chip goes away entirely and comes back on
+       * the ground. Never over a real prompt `game` is publishing, in any
+       * placement.
+       *
+       * The MEASURED answer wins when there is one: `game` raycasts the surface
+       * under the door and `_place.airborne` is that, which is right over a
+       * bridge deck and a hillside where an altitude alone is not. `EXIT_ALT`
+       * is the fallback for the frames nothing published a placement — and
+       * those are the frames this branch runs on, so it is not dead.
        */
-      const airborne = this.state.veh.flying && this.state.veh.altitude > EXIT_ALT;
+      const pl = this._place;
+      const airborne = pl.active
+        ? pl.airborne
+        : this.state.veh.flying && this.state.veh.altitude > EXIT_ALT;
       if (!this._promptActive && !airborne) {
         this._exitPrompt.dim = this._exitPromptT > 0 ? 1 : EXIT_DIM;
         this._exitPrompt.host = this.vehm.promptSlot;
@@ -1381,6 +1420,7 @@ export class UiSystem {
       a.sub = '';
       a.key = 'F';
       a.source = 'prompt';
+      a.place = null;
     } else {
       a.available = false;
       a.verb = 'USE';
@@ -1389,6 +1429,7 @@ export class UiSystem {
       a.sub = '';
       a.key = 'F';
       a.source = 'prompt';
+      a.place = null;
       if (this._exitPromptShown) {
         this._exitPromptShown = false;
         this.prompt.clear();
@@ -1715,6 +1756,14 @@ export class UiSystem {
     r.progress = p?.progress;
     r.placement = this.state.inVehicle ? 'dock' : 'centre';
     r.host = this.vehm.promptSlot;
+    // The placement under the door, copied field by field — see `_place`. The
+    // widget draws the hazard and the drop from these and drops the exit line
+    // itself when the ground is not there to step onto.
+    const pl = this._takePlace(p?.place);
+    r.airborne = pl.active && pl.airborne;
+    r.water = pl.active && pl.water;
+    r.drop = pl.active ? pl.drop : 0;
+    r.exitLine = this._promptIsExit;
     /**
      * A LINE THAT ONLY SAYS "THIS IS HOW YOU GET OUT" FADES AFTER THE ENTRY
      * BEAT; ANYTHING ELSE STAYS FULL.
@@ -1725,16 +1774,37 @@ export class UiSystem {
      * information about something in progress and must not dim. Matched on the
      * line's own opening verb, which is the same handle `verbFor` uses to fill
      * the touch button — one convention, not two.
+     *
+     * NOT WHILE IT IS A WARNING. The dim is for a line the player has already
+     * read and does not need again; an airborne placement is the opposite of
+     * that, and a fall warning at 40% opacity is a fall warning nobody reads.
      */
     r.dim = r.placement === 'dock' && this._exitPromptT <= 0 && this._promptIsExit
-      ? EXIT_DIM : 1;
+      && !r.airborne ? EXIT_DIM : 1;
     this.prompt.set(r);
     this._promptActive = true;
+  }
+
+  /**
+   * Copy `game`'s placement record into ours and return ours. See `_place`.
+   * Allocates nothing: one record, rewritten.
+   */
+  _takePlace(pl) {
+    const q = this._place;
+    q.active = !!pl && pl.active !== false;
+    if (q.active) {
+      q.airborne = pl.airborne === true;
+      q.water = pl.water === true;
+      q.drop = pl.drop ?? 0;
+      q.over = pl.over ?? '';
+    }
+    return q;
   }
 
   clearPrompt() {
     this.prompt.clear();
     this._promptActive = false;
+    this._place.active = false;
     if (this._lastPromptText) {
       this._onPromptChanged(this._lastPromptText, '');
       this._lastPromptText = '';

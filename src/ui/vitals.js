@@ -536,9 +536,20 @@ let _clipSeq = 0;
  * protection works to hold. A pilot who can see where the band is can fly the
  * approach; a pilot who cannot is guessing, which is what he has been doing.
  *
- * Everything moves by TRANSFORM on a group built once — no geometry is rebuilt
- * per frame, and the only per-frame text writes are the three numerals, each
- * quantised so a settled instrument writes nothing at all (rule 5).
+ * Everything moves by TRANSFORM on a group built once: no SVG geometry is
+ * rebuilt per frame, and the tapes, the VSI needle and the horizon are moved by
+ * writing a transform rather than by re-laying-out the panel.
+ *
+ * WHAT IS AND IS NOT QUANTISED (rule 5), because the answer here is not
+ * "everything". Behind a change guard, so a settled instrument writes nothing:
+ * the three numerals, the stall word, the spool fill and percentage, the rotor
+ * name and the blade. NOT behind one: the five transform strings, which are
+ * rebuilt every frame and handed to `setStyle` — its own cache drops the DOM
+ * write when the string is identical, but the string is still built, and that
+ * allocation is what an idle panel costs. Every `setAttribute` on this path is
+ * inside a guard for the opposite reason: unlike `setStyle` it has no cache at
+ * all, so an unguarded one is a real DOM write on every frame of a parked
+ * aircraft.
  */
 export class FlightCluster {
   constructor(parent) {
@@ -578,6 +589,7 @@ export class FlightCluster {
     this._wroteVsi = null;
     this._wroteWarn = null;
     this._wroteSpool = -1;
+    this._wroteBlade = null;
   }
 
   /**
@@ -830,8 +842,15 @@ export class FlightCluster {
     }
     // The blade turns at a rate the spool sets — a stopped rotor reads as
     // stopped, which is the difference between "spooling up" and "running".
+    // Guarded on the tenth of a degree it is actually DRAWN at: `setAttribute`
+    // has no change cache, so without this a parked aircraft writes the same
+    // 'rotate(0.0)' into the DOM sixty times a second.
     this._blade = (this._blade + dt * rot * 640) % 360;
-    this.blade.setAttribute('transform', `translate(200 87) rotate(${this._blade.toFixed(1)})`);
+    const b = Math.round(this._blade * 10) / 10;
+    if (b !== this._wroteBlade) {
+      this._wroteBlade = b;
+      this.blade.setAttribute('transform', `translate(200 87) rotate(${b.toFixed(1)})`);
+    }
   }
 
   setVisible(on) {

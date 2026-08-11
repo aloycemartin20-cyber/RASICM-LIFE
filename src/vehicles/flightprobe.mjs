@@ -45,6 +45,11 @@
  *     written off. NEGATIVE CONTROL: the same flight with the pre-fix corner
  *     ring installed on the live vehicle, which flies the fuselage 74 m (the
  *     Skylark) and 1532 m (the jet) past the wall without touching it.
+ *   - THE WINGTIP: a wing into a pylon at 20 m/s — under the speed the sweep
+ *     arms at, so the probe RING is the only thing that can price it — is
+ *     priced at the speed it arrived at and written off. It used to be priced
+ *     at 6.96 m/s, because an off-centre contact's IMPULSE over mass is not
+ *     its closing speed. Its negative control is the same clip at 8 m/s.
  *   - ON ITS BACK: an inverted aircraft reports itself GROUNDED. Its gear rays
  *     point at the sky, so it used to report itself as flying — and the
  *     self-righting that is meant to recover it arms off `grounded`.
@@ -537,6 +542,90 @@ function makeWall(at, halfWidth = 3, thick = 0.6) {
 }
 
 /**
+ * THE PYLON: a 5 m wide column standing off to the RIGHT of the centreline at
+ * z = `at`, out where only a WING can reach it.
+ *
+ * It exists to isolate the one contact the hangar wall cannot produce: a hit
+ * whose only probe is a LEVERED one. Down the centreline the deepest contact is
+ * always the nose, whose lever arm about the CoM is parallel to the contact
+ * normal and therefore zero, so the impulse solver's denominator collapses to
+ * `1/m` and any pricing derived from the impulse comes out roughly right by
+ * accident. Put the obstacle 4 m off the axis and the only probe that touches
+ * is a wingtip, 5.1 m out — which is the case an impulse-derived delta-v gets
+ * wrong by a factor of three.
+ *
+ * `capsuleCast` reports no hit, and that is the TRUTH here rather than a stub:
+ * the swept capsule is the fuselage centreline at a 0.6 m radius and this
+ * column starts 4 m off it, so the sweep genuinely never touches the pylon.
+ * The ring is the only thing that can price this contact — which is the point.
+ */
+function makePylon(at, xLo = 4, xHi = 9, thick = 2) {
+  const sys = makeWorld(0);
+  const contacts = {
+    depth: new Float32Array(1),
+    nx: new Float32Array(1), ny: new Float32Array(1), nz: new Float32Array(1),
+    px: new Float32Array(1), py: new Float32Array(1), pz: new Float32Array(1),
+    tri: new Int32Array(1),
+  };
+  sys.physics.staticWorld = {
+    contacts,
+    objectOf: () => null,
+    overlapCapsule(x0, y0, z0, x1, y1, z1, r) {
+      const z = Math.max(z0, z1);
+      if (x0 + r < xLo || x0 - r > xHi) return 0;
+      if (!(z + r > at) || !(z - r < at + thick)) return 0;
+      contacts.depth[0] = Math.min(z + r - at, thick + r);
+      contacts.nx[0] = 0; contacts.ny[0] = 0; contacts.nz[0] = -1;
+      contacts.px[0] = x0; contacts.py[0] = y0; contacts.pz[0] = at;
+      contacts.tri[0] = 0;
+      return 1;
+    },
+  };
+  sys.physics.capsuleCast = (p0, p1, radius) => ({
+    hit: Math.max(p0.x, p1.x) + radius > xLo && Math.min(p0.x, p1.x) - radius < xHi,
+    distance: Infinity, fraction: 1,
+    point: new THREE.Vector3(), normal: new THREE.Vector3(0, 0, -1),
+    object: null, surface: 'concrete',
+  });
+  return sys;
+}
+
+/**
+ * Fly one aircraft, wings level and at a HELD speed, into whatever `sys`
+ * contains, and report what the contact was priced at.
+ *
+ * The speed is re-imposed every step so the arms differ in the one quantity
+ * under test and in nothing else — this is a claim about the PRICING of a
+ * contact, not about the flight model that got the aeroplane there, and that
+ * model is gated to death by the envelope section already.
+ */
+function strike(type, sys, speed, at) {
+  // Long enough for the SLOWEST arm to cover the run-in and be resolved, so a
+  // negative control can never pass by simply not arriving (rule 12).
+  const seconds = at / speed + 3;
+  const spec = finalizeSpec(VEHICLE_SPECS[type]);
+  const v = new Vehicle(sys, spec, STUB, {});
+  v.damage = new DamageModel(v, MATS, probeRng());
+  v.setPose(new THREE.Vector3(0, 80, 0), 0);
+  v.driver = { isPlayer: true };
+  const from = EVENTS.length;
+  for (let i = 0; i < Math.round(seconds * 120); i++) {
+    v.velocity.set(0, 0, speed);
+    v.input.throttle = 0;
+    v.input.steer = 0;
+    v.input.brake = 0;
+    v.fixedStep(DT, CTX);
+    if (v.crashDv || v.position.z > at + 30) break;
+  }
+  return {
+    dv: v.crashDv ?? 0,
+    destroyed: v.destroyed,
+    frac: v.health / v.maxHealth,
+    hits: EVENTS.slice(from).filter((e) => e.id === 'vehicle:collision').length,
+  };
+}
+
+/**
  * THE PRE-FIX PROBE RING, rebuilt from the bounding box exactly as
  * `Vehicle`'s constructor used to build it for every kind. Installed on a LIVE
  * aircraft so the wall section has a real negative control: the geometry is
@@ -688,6 +777,45 @@ function testArrival() {
         !box.destroyed,
         `corner-ring arm destroyed ${box.destroyed}, nose ${box.deepest.toFixed(0)} m past the wall`);
     }
+  }
+
+  /**
+   * ────────────────────────────────────────────────────────────────────────
+   * THE WINGTIP — what the RING prices a contact at, in m/s
+   * ────────────────────────────────────────────────────────────────────────
+   * Between the sink-rate edge in `plane.js` (which hands `applyImpact` a real
+   * sink rate) and `_airSweep` (which hands it a real closing speed, and only
+   * arms above ~36 m/s for a Skylark), there is a whole band of speeds where
+   * the fuselage probe RING is the only thing pricing an aircraft contact —
+   * every building strike from `AIR_CRASH_DV` up to the arming speed.
+   *
+   * That path used to hand `applyImpact` `biggest / mass`, where `biggest` is
+   * the collision IMPULSE. Divided by mass that is a delta-v, not a closing
+   * speed: `1.12 |vn| / (1 + m n.((I^-1 (r x n)) x r))`, which collapses as the
+   * contact lever grows. MEASURED on this pylon, Skylark, 20 m/s: it priced the
+   * strike at 6.96 m/s and the aeroplane flew on with a repair bill.
+   *
+   * Three arms, all on the emitted `crashDv` and `destroyed`:
+   *   20 m/s  past `AIR_CRASH_DV` — a write-off, priced at the speed it
+   *           actually arrived at rather than at a third of it.
+   *    8 m/s  the NEGATIVE CONTROL. Same pylon, same wing, same code path,
+   *           under the threshold: damaged and still flying. Without it "it is
+   *           destroyed" would pass on a model that destroys everything.
+   */
+  {
+    const D = 60;
+    const hard = strike('plane', makePylon(D), 20, D);
+    check('wingtip', 'a wing into a pylon is priced at the speed it arrived at',
+      hard.dv > 18 && hard.dv < 22,
+      `priced at ${hard.dv.toFixed(2)} m/s of closing speed against 20.00 m/s of travel`);
+    check('wingtip', 'and past `AIR_CRASH_DV` that writes the airframe off',
+      hard.destroyed && hard.hits === 1,
+      `destroyed ${hard.destroyed}, ${hard.hits} collision event(s)`);
+
+    const soft = strike('plane', makePylon(D), 8, D);
+    check('wingtip', 'NEGATIVE CONTROL — the same clip at 8 m/s costs a repair only',
+      !soft.destroyed && soft.dv > 6 && soft.dv < 10 && soft.frac < 1,
+      `priced at ${soft.dv.toFixed(2)} m/s, health ${(soft.frac * 100).toFixed(0)}%, destroyed ${soft.destroyed}`);
   }
 
   // ON ITS BACK: the gear points at the sky, and the aircraft must still know
