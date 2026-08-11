@@ -153,6 +153,25 @@ function shotChrome(engine, shot) {
     engine.camera.position.set(c.px, c.py, c.pz);
     engine.camera.lookAt(c.tx, c.ty, c.tz);
   }
+
+  /**
+   * `actorFrame` — COMPOSE ON THE PLAYER AT THE SHUTTER, and only then.
+   *
+   * A shot whose subject is the player cannot compose from `apply`: the
+   * `player:` block is honoured on `shot:applied`, which is emitted AFTER
+   * `apply` returns, and the capsule then resolves against the world for the
+   * whole settle. `character` did compose from `apply` — and photographed the
+   * pre-staging position. MEASURED at the shutter with the staged block in
+   * place: the subject's head projected to NDC x 2.85, i.e. nearly three screen
+   * half-widths off the right edge, because `groundHeight` at the mark put him
+   * 2.2 m under a raised plaza and the capsule then squirted 4.7 m sideways
+   * over ~800 frames while resolving.
+   *
+   * Composing here reads where he ENDED UP. Same rule as `holdCamera` and the
+   * re-pinned sky clock two files over: the last write before the photograph is
+   * the one that counts.
+   */
+  if (shot.actorFrame) frameActor(engine, shot.actorFrame);
 }
 
 /**
@@ -207,6 +226,53 @@ function frameActor(e, { dist = 3.0, height = 1.62, side = 0.55, aimY = 1.45 } =
   cam.lookAt(p.x + rx * side * 0.35, p.y + aimY, p.z + rz * side * 0.35);
   return true;
 }
+
+/**
+ * ---------------------------------------------------------------------------
+ * `player:` — PUTTING THE PROTAGONIST IN THE PICTURE.
+ * ---------------------------------------------------------------------------
+ *
+ * `src/player/` has published a full staging contract on `shot:applied` since
+ * long before this comment (`PlayerSystem._onShotApplied`), and until now NOT
+ * ONE shot in this file used it: `grep -c "player:" src/dev/shots.js` was 0. The
+ * default branch of that handler is `this._shotHide = !req` — so with no block
+ * the body is hidden outright, and every critic round this project has ever run
+ * scored a third-person action game in frames with no protagonist anywhere in
+ * them. Worse for `character`, whose whole job is to frame a brother: it derived
+ * the camera from him with `frameActor` and then hid him.
+ *
+ * The block is read at `shot:applied`, which is emitted LAST on both apply
+ * paths, so it composes against the final camera — including a pose an `apply`
+ * helper has just re-derived. A shot that wants the reverse, a camera composed
+ * on the STAGED man, declares `actorFrame` instead of calling `frameActor` from
+ * `apply`; that runs at the shutter (see `shotChrome`) and is the only order
+ * that survives the capsule settling.
+ *
+ *   dist      metres in front of the shot camera to drop him (default 4). He is
+ *             then dropped onto `physics.groundHeight` at that x/z.
+ *   at        [x,y,z] instead, for a shot that wants an exact mark
+ *   yaw       world yaw; omitted, he turns to face the camera
+ *   state     `player.debugState` name. Use ONLY a STATIONARY one — `idle` or
+ *             `aim`. Every other state is a scripted input, and a shot settles
+ *             for 240-1500 frames, so `jog` walks the subject out of frame
+ *             before the shutter and does it by a different distance each run.
+ *   shoulder  +1 / -1, which side the third-person camera sits on
+ *   aim / brother / camera / camYaw / camPitch — see the handler.
+ *
+ * WHERE IT DOES NOT BELONG, deliberately: aerials (`point`), long sightlines
+ * (`skyline`, `farview`), landmark elevations (`mill`, `incline`, `bridge`), the
+ * macro material shots (`detail`), the searchlight pair (`frameBeam` stands the
+ * camera on the player's own mark and holds it), and the vehicle shots (their
+ * subject is the car, and `vehicles.debugPose` already seats or stages a
+ * driver). A man 6 m from a 1.2 km lens is four pixels of noise.
+ *
+ * `dist` is chosen against the shot's own eye height and FOV, not by feel: the
+ * subject's head sits `eye - 1.75` m below the lens, so the angle below the
+ * optical axis is `atan((eye - 1.75) / dist)` and it has to stay well inside
+ * `fov / 2`. That is why the raised establishing shots (`hero`, `night`,
+ * `mkt_hero`, eye 5.0-5.5) stand him 15-18 m out while the eye-level ones
+ * (`street`, `mkt_rain_street`) stand him at 7-8.
+ */
 
 export const SHOTS = {
   // ---- environment / lighting ----
@@ -322,7 +388,8 @@ const STEEL_CITY_SHOTS = {
     pos: [-232, 6, 150], look: [-232, 24, -40], fov: 62, time: 17.4, ground: true,
     onRoad: { near: [-232, 64], eye: 5.5, aheadM: 55 },
     clearTraffic: 34,
-    doc: 'Street level looking down a Golden Triangle avenue — the overall art direction read.',
+    player: { dist: 18, state: 'idle' },
+    doc: 'Street level looking down a Golden Triangle avenue with a brother in the road — the overall art direction read.',
   },
   skyline: {
     pos: [-528, 60, 464], look: [-232, 40, 40], fov: 50, time: 19.2, ground: true,
@@ -351,7 +418,8 @@ const STEEL_CITY_SHOTS = {
     onRoad: { near: [680, -552], eye: 2.2, ahead: 0.35 },
     clearTraffic: 34,
     weather: 'overcast',
-    doc: 'Lawrenceville brick rowhouses at eye level — shopfronts, ground-floor density, no visible repetition.',
+    player: { dist: 8, state: 'idle' },
+    doc: 'Lawrenceville brick rowhouses at eye level — shopfronts, ground-floor density, no visible repetition. A brother stands in the street for scale.',
   },
   mill: {
     pos: [820, 20, 320], look: [872, 40, 248], fov: 58, time: 18.8, ground: true,
@@ -391,7 +459,8 @@ const STEEL_CITY_SHOTS = {
     pos: [-232, 5, 150], look: [-232, 22, -40], fov: 62, time: 1.5, ground: true,
     onRoad: { near: [-232, 64], eye: 5.0, ahead: 0.3 },
     clearTraffic: 34,
-    doc: 'Downtown at night — sodium pools on wet asphalt, lit windows, exposure adaptation, bloom.',
+    player: { dist: 15, state: 'idle' },
+    doc: 'Downtown at night — sodium pools on wet asphalt, lit windows, exposure adaptation, bloom. The brother is in frame so the night exposure is judged on a lit character too.',
   },
   dawnfog: {
     pos: [-620, 24, 120], look: [-300, 30, -60], fov: 60, time: 6.2, ground: true,
@@ -404,7 +473,8 @@ const STEEL_CITY_SHOTS = {
     clearTraffic: 34,
     weather: 'storm',
     viewmodel: false,
-    doc: 'Storm downtown — rain streaks, wet road reflections, puddles, spray. Core to this game s look.',
+    player: { dist: 15, state: 'idle' },
+    doc: 'Storm downtown — rain streaks, wet road reflections, puddles, spray. Core to this game s look. The brother is in frame because a man in rain is where wet cloth and hair are judged.',
   },
 
   /*
@@ -498,20 +568,33 @@ const STEEL_CITY_SHOTS = {
   // ---- characters / gameplay ----
   character: {
     // Placed on a real street so the brother has a city behind him rather than
-    // a blank wall; the camera is then derived from the player in `apply`.
+    // a blank wall. `player` stands him 5 m down the pavement from that mark;
+    // `actorFrame` then composes the over-the-shoulder camera on him AT THE
+    // SHUTTER, once the capsule has settled — see `shotChrome`. It used to
+    // compose in `apply`, before the staging existed, and photographed a
+    // shoulder at the very edge of frame.
     pos: [-232, 5, 96], look: [-232, 5, 60], fov: 45, time: 16.5, ground: true,
     onRoad: { near: [-232, 64], eye: 1.7, aheadM: 8, side: 4.2 },
     clearTraffic: 20,
     weather: 'overcast',
     viewmodel: false,
-    apply: (e) => { frameActor(e, { dist: 2.9, height: 1.66, side: 0.6, aimY: 1.42 }); },
+    actorFrame: { dist: 3.6, height: 1.66, side: 0.62, aimY: 1.42 },
+    // The shot that made the case for the whole `player:` block. Its camera was
+    // already derived from the brother, and the default `_shotHide` branch then
+    // hid him: the one frame in the set whose named subject is a character had
+    // no character in it, through every review round this project has run.
+    player: { dist: 5.0, state: 'idle', shoulder: 1 },
     doc: 'Over-the-shoulder on a DeCarlo brother — character quality, cloth, skin, hair, third-person framing. The brother must be the subject and must fill a useful part of the frame.',
   },
   crowd: {
     pos: [-200, 4, 90], look: [-240, 3, 30], fov: 55, time: 12.5, ground: true,
     weather: 'overcast',
     viewmodel: false,
-    doc: 'Pedestrians on a downtown sidewalk — crowd density, variety, animation, the city feeling alive.',
+    // 11 m. The lens sits 4.1 m above his feet, and MEASURED at 7 m his feet
+    // projected to NDC -1.05 — off the bottom of the picture. Deep inside
+    // `debugStage`'s 4.5-30 m band, so he reads as part of the crowd.
+    player: { dist: 11, state: 'idle' },
+    doc: 'Pedestrians on a downtown sidewalk with the player among them — crowd density, variety, animation, the city feeling alive.',
   },
   chase: {
     pos: [-180, 8, 120], look: [-260, 3, 20], fov: 65, time: 20.2, ground: true,
@@ -524,7 +607,15 @@ const STEEL_CITY_SHOTS = {
     pos: [-210, 4, 100], look: [-260, 3, 40], fov: 65, time: 16.5, ground: true,
     apply: (e) => e.ctx.peek('peds')?.debugStage?.('firefight'),
     weather: 'overcast',
-    doc: 'Firefight on the street — third-person gunplay, impact FX, ped reactions.',
+    // Aiming, inside the tableau (`firefight` stages its reactions from 5 m out
+    // and aims them at a ground mark 11 m ahead of the lens). `aim` is
+    // STATIONARY — a scripted gait would walk him into the crowd over a settle
+    // of hundreds of frames, and by a different distance each run. Nothing here
+    // shoots AT him, so he reaches the shutter at full health; MEASURED 130/130.
+    // 9 m rather than 6: at 6 his feet projected to NDC -0.83, hard against the
+    // bottom edge of a 65 degree frame from a lens 3.4 m above them.
+    player: { dist: 9, state: 'aim', shoulder: 1 },
+    doc: 'Firefight on the street — third-person gunplay, impact FX, ped reactions. The player is the aiming subject; without him this is a shot of bystanders.',
   },
 
   // ---- material / detail ----
@@ -539,7 +630,11 @@ const STEEL_CITY_SHOTS = {
     pos: [-232, 6, 150], look: [-232, 24, -40], fov: 62, time: 17.4, ground: true,
     apply: (e) => e.ctx.peek('ui')?.debugState?.('combat'),
     viewmodel: false,
-    doc: 'Full HUD — minimap, wanted stars, health/armour, weapon, typography and readability.',
+    // The HUD is read OVER a third-person frame in play, and half of what the
+    // critic is scoring is contrast against what sits behind it. An empty road
+    // is the easiest background this HUD will ever be given.
+    player: { dist: 14, state: 'idle' },
+    doc: 'Full HUD over a third-person frame — minimap, wanted stars, health/armour, weapon, typography and readability.',
   },
 };
 
@@ -609,7 +704,9 @@ const MARKETING_SHOTS = {
     pos: [-232, 5, 132], look: [-232, 12, -30], fov: 62, time: 20.4, ground: true,
     onRoad: { near: [-232, 64], eye: 1.62, aheadM: 34 },
     clearTraffic: 0, weather: 'storm', viewmodel: false, hud: false, marketing: true,
-    doc: 'Downtown in a storm at eye level — wet asphalt, lit windows, traffic left in deliberately because a living street is the point.',
+    // Eye-level lens (1.62 m), so a close mark still frames him head to foot.
+    player: { dist: 7, state: 'idle' },
+    doc: 'Downtown in a storm at eye level with a brother walking it — wet asphalt, lit windows, traffic left in deliberately because a living street is the point.',
   },
   mkt_incline: {
     pos: [-424, 46, 458], look: [-556, 62, 372], fov: 54, time: 7.1, ground: true,
@@ -653,7 +750,10 @@ const MARKETING_SHOTS = {
     pos: [-232, 6, 150], look: [-232, 24, -40], fov: 62, time: 17.4, ground: true,
     onRoad: { near: [-232, 64], eye: 5.5, aheadM: 55 },
     clearTraffic: 0, viewmodel: false, hud: false, marketing: true,
-    doc: 'A Golden Triangle avenue in clear afternoon light — the one bright frame, and the closest thing to a box-art shot.',
+    // Box art with nobody in it is a photograph of a road. Same 18 m mark as the
+    // review `hero` it shares a pose with, so the two stay comparable.
+    player: { dist: 18, state: 'idle' },
+    doc: 'A Golden Triangle avenue in clear afternoon light with a brother in it — the one bright frame, and the closest thing to a box-art shot.',
   },
 };
 
@@ -691,6 +791,11 @@ export function installShotApi(engine, { capture, lockstep = false } = {}) {
       shot = SHOTS[name];
     }
     if (!shot) return { error: `unknown shot "${name}"`, available: Object.keys(SHOTS) };
+
+    // Re-arm the settle predicate: the streaming curve it measures restarts at
+    // this teleport. Before the early-returning `onRoad` branch, so both apply
+    // paths get it — see `resetSettle`.
+    resetSettle();
 
     // Freeze live input and hand the camera to the shot.
     engine.input.frozen = true;
@@ -946,6 +1051,36 @@ export function installShotApi(engine, { capture, lockstep = false } = {}) {
   let _stableFor = 0;
   let _lastCalls = -1;
   let _lastTris = -1;
+  /**
+   * Engine frame at which the CURRENT shot was applied. Everything the settle
+   * predicate measures is relative to this, never to `engine.time.frame`.
+   *
+   * THE BUG THIS EXISTS FOR. `MIN_FRAMES` is a knee-clearing minimum for the
+   * streaming curve that starts at the TELEPORT — but the predicate read the
+   * free-running engine counter, which does not restart between shots. So in
+   * any session that applies more than one shot (`skyprobe`, `shotprobe`, every
+   * review sweep, `tools/screenshots.mjs` if it ever batches) the test
+   * `engineFrame >= 240` was already true on the first poll after the second
+   * teleport, and the `streamingIdle` veto above it — gated on the same
+   * comparison — never ran at all. Shot 2 onwards could therefore settle on a
+   * few consecutive polls of an EMPTY frame's draw count, which is exactly the
+   * shape of `mkt_hero` shipping without a lamp, a tree or a bin in it while
+   * `hero` at the same pose has all three.
+   *
+   * Zero until the first shot is applied, so a harness that never applies one
+   * (`playtest --quick`) sees precisely the old behaviour.
+   */
+  let _shotFrame = 0;
+  /** Re-arm the settle predicate. Called on every apply, on both apply paths. */
+  function resetSettle() {
+    _shotFrame = engine.time.frame;
+    _settleFrame = 0;
+    _stableFor = 0;
+    _lastCalls = -1;
+    _lastTris = -1;
+    _ring.fill(0);
+    _ringT.fill(0);
+  }
   window.__SETTLED__ = () => {
     /*
      * MEASURED trajectory for `hero`, draw calls per frame after the shot is
@@ -976,13 +1111,16 @@ export function installShotApi(engine, { capture, lockstep = false } = {}) {
     const TOL = 0.02;
 
     _settleFrame++;
-    const engineFrame = engine.time.frame;
+    // Frames since THIS shot's teleport — see `_shotFrame`. The streaming curve
+    // the numbers above describe restarts at every apply, so the free-running
+    // engine counter is the wrong clock and silently retires the veto below.
+    const sinceShot = engine.time.frame - _shotFrame;
     // `streamingIdle` is a NECESSARY condition early on, but it flickers — it
     // reports a lull in an amortised queue, not completion — so past the knee it
     // is allowed to stop vetoing. Letting it reset the stability counter forever
     // is why this predicate never fired at all and every capture burned the
     // whole 1200-frame budget.
-    if (engineFrame < MIN_FRAMES) {
+    if (sinceShot < MIN_FRAMES) {
       const w0 = engine.ctx.peek('world');
       if (w0 && typeof w0.streamingIdle === 'function') {
         try { if (w0.streamingIdle() !== true) _stableFor = 0; } catch { /* ignore */ }
@@ -1008,7 +1146,7 @@ export function installShotApi(engine, { capture, lockstep = false } = {}) {
       const w1 = engine.ctx.peek('world');
       let idle = true;
       try { idle = !w1?.streamingIdle || w1.streamingIdle() === true; } catch { /* ignore */ }
-      return idle && engineFrame >= MIN_FRAMES;
+      return idle && sinceShot >= MIN_FRAMES;
     }
 
     /*
@@ -1041,7 +1179,7 @@ export function installShotApi(engine, { capture, lockstep = false } = {}) {
     _lastCalls = calls;
     _lastTris = tris;
     _stableFor = steady ? _stableFor + 1 : 0;
-    return engineFrame >= MIN_FRAMES && _stableFor >= STABLE_CHECKS;
+    return sinceShot >= MIN_FRAMES && _stableFor >= STABLE_CHECKS;
   };
 
   window.__RENDER_INFO__ = null;

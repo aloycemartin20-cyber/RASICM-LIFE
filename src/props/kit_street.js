@@ -126,30 +126,132 @@ function acornGlobe() {
  * not light, no matter how it is blended. Volumetric shafts belong to `sky`,
  * which owns the fog that would scatter them.
  *
- * What is left is the thing GTA V actually shows and DESIGN.md actually asks
- * for: "wet asphalt that mirrors sodium lamps at night". A disc lying FLAT on
- * the road, additive, with a radial falloff baked into the vertex colours so it
- * reaches exactly zero at the rim and can never show a silhouette. Flat on the
- * ground, an over-bright pool still reads as light on the road; a standing cone
- * never does.
+ * What replaced it was a flat disc at the lamp's base, and the review measured
+ * what that produced: "saturated orange ribbons hugging both gutters with
+ * razor-straight silhouette edges and the road crown between them at RGB
+ * 10-25". Two separate causes, and the SMALL one is the one that looks like the
+ * whole story:
+ *
+ *   THE FALLOFF, which is most of it. Ring k of 4 sat at radius `r * t * t`
+ *   with alpha `smootherstep(1 - t)`. Work it through: alpha is 0.90 at 0.06 r,
+ *   0.50 at 0.25 r and 0.10 at 0.56 r. On a 5.4 m disc that is a hot spot about
+ *   a metre across with nothing left by three metres out — and the disc's
+ *   centre is the mast arm's reach, i.e. the KERB. The pool never reached the
+ *   carriageway at all. It was not a pool of light on a road; it was a bright
+ *   ring around a gutter, which is exactly what it photographed as.
+ *
+ *   THE PLANE. The disc sat 2 cm over the lamp's own footing, and the ground is
+ *   not that plane: MEASURED on `night` with `src/props/lampgeomprobe.mjs`, the
+ *   carriageway crown runs 8-20 cm BELOW it (the kerb is 15 cm proud) while the
+ *   pavement side of the same disc runs 2-5 cm ABOVE it, and the per-instance
+ *   lean (`layout.js` tilts every column by up to 0.0175 rad) is another 9 cm
+ *   across the disc. So one edge of it was reliably cut by the depth test along
+ *   a straight line — the razor edge in the review — and nothing about that is
+ *   a shading problem.
+ *
+ * Three things fix it, and all three are geometry:
+ *
+ *   REACH  `POOL_GATHER` flattens the radius mapping so the pool covers the
+ *          carriageway it is lighting instead of the gutter it stands over, and
+ *          `r` is sized to actually cross the road.
+ *   LIFT   the pool is a shallow DOME, higher in the middle and settling toward
+ *          the ground at the rim, clearing the camber, the kerb and the lean.
+ *          Kept as LOW as those three allow: an additive layer standing off the
+ *          road parallaxes across it as the camera moves, and
+ *          `src/props/lampprobe.mjs` — which measures per-frame steps in the
+ *          road luminance under a lamp — is sensitive to exactly that. A 0.65 m
+ *          centre lift took its worst normalised step to 0.213 against a 0.20
+ *          ratchet, in BOTH arms of its own negative control, which is how you
+ *          can tell it was the geometry moving and not the light handover.
+ *   ZERO   the falloff still reaches exactly zero at the rim, so the one edge
+ *          the dome does have carries no light and cannot be a silhouette. The
+ *          rim is modulated so no two lamps in a row cut the same outline, and
+ *          the modulation moves the RADIUS, never the alpha, so the zero
+ *          survives it.
+ *
+ * `r` is the half-width across the street; the pool runs `POOL_ASPECT` times
+ * that along it, because a cobra head throws an ellipse down the road.
  */
-function lightPool(r) {
-  const RINGS = 4;
-  const SEG = 14;
+const POOL_ASPECT = 1.3;
+/**
+ * Peak of the vertex-colour ramp, and how fast the ramp gets there
+ * (`POOL_GATHER` is the exponent mapping ring index to radius: lower is a
+ * broader core and a shorter tail).
+ *
+ * NEITHER IS A TASTE KNOB. The old disc was mostly buried, so what a critic
+ * saw was the dim OUTER ring of the falloff; unburying it put the hot centre on
+ * screen for the first time and the first tuning attempt turned the whole
+ * carriageway into paint. MEASURED on `night` — mean display luma of the road
+ * crown 6-11 m ahead, and of the gutter under the nearest lamp:
+ *
+ *   buried (shipped)         r 5.4  23.2 / 41.9  the defect. Crown p50 13.4
+ *   peak 1.00 aspect 1.34    r 5.4  50.3 / 70.8  crown lit, gutter gone to paint
+ *   peak 0.62 aspect 1.34    r 5.4  38.1 / 62.7  crown back under the 40 target
+ *   peak 0.72 aspect 2.60    r 5.4  54.6 / 63.4  pools MERGE
+ *   peak 0.80 aspect 1.62    r 6.8  68.6 / 78.9  paint again, in both bands
+ *   peak 0.72 aspect 1.30    r 6.4  60.2 / 68.1  shipped
+ *
+ * And on `src/props/lampgeomprobe.mjs`, which measures the road CENTRELINE
+ * beside each carriageway lamp rather than a fixed crop: median 49, mean 40.5
+ * over the four lamps in frame, against the review's 40/255 acceptance.
+ *
+ * The 2.60 row is the one to learn from: it scores WELL on the crown number and
+ * is plainly the worst frame of the set, because a pool that reaches the next
+ * lamp's pool is not a pool any more — the carriageway comes out as one flat
+ * orange sheet with no shape in it. `POOL_ASPECT` is bounded above by the
+ * 21-29 m lamp pitch and NOT by the luminance target; the crown is bought with
+ * the radius and the core width instead, which is also what a real cobra head
+ * does with a 2 m mast arm over a 9 m carriageway.
+ *
+ * The other thing the sweep shows, and the reason none of these run hot: this
+ * pool is ADDITIVE and knows nothing about albedo, so every stop it gains
+ * flattens the difference between asphalt and the concrete pavement beside it.
+ * Past about 0.8 the road is measurably BRIGHTER than the pavement, which is
+ * backwards and reads instantly as decal. The real punctual lamps
+ * (`props._submitLamps` -> `render.submitLight`) are what light the road
+ * properly near the camera; this fills in behind them.
+ */
+const POOL_PEAK = 0.72;
+const POOL_GATHER = 1.25;
+
+function lightPool(r, seed = 0) {
+  const RINGS = 6;
+  const SEG = 20;
+  // Clearance over the ground the lamp stands on: enough to clear the 2-5 cm
+  // the pavement side rises and the 9 cm of column lean, and no more than that,
+  // because every centimetre of it is parallax (see LIFT above).
+  const rimY = Math.max(0.10, r * 0.016);
+  const midY = Math.max(0.28, r * 0.045);
   const a = new Accum('pool');
-  const c = a.vert(0, 0, 0, 0, 1, 0, 0.5, 0.5, 1, 1, 1);
+  const c = a.vert(0, midY, 0, 0, 1, 0, 0.5, 0.5, POOL_PEAK, POOL_PEAK, POOL_PEAK);
   let prev = null;
   for (let k = 1; k <= RINGS; k++) {
     const t = k / RINGS;
-    const rr = r * t * t; // more samples near the hot centre
+    // Denser rings near the hot centre; the gradient is read there.
+    const rho = Math.pow(t, POOL_GATHER);
     // smootherstep to zero at the rim
     const f = 1 - t;
-    const v = f * f * f * (f * (f * 6 - 15) + 10);
+    let v = f * f * f * (f * (f * 6 - 15) + 10);
+    // A pool with a perfectly smooth gradient reads as a decal. Break it by a
+    // percent or two per ring, deterministically.
+    v *= POOL_PEAK * (0.94 + hash3i(seed, k, 3) * 0.12);
+    // The tail desaturates. Sodium arriving off the road at the edge of a pool
+    // has the ambient mixed into it; a falloff that holds one hue all the way
+    // out is what makes an additive disc read as tinted glass.
+    const vg = Math.min(1, v * (1 + 0.14 * (1 - v)));
+    const vb = Math.min(1, v * (1 + 0.42 * (1 - v)));
+    const y = rimY + (midY - rimY) * (1 - t * t);
     const ring = [];
     for (let i = 0; i < SEG; i++) {
       const th = (i / SEG) * TAU;
-      ring.push(a.vert(Math.cos(th) * rr, 0, Math.sin(th) * rr, 0, 1, 0,
-        0.5 + Math.cos(th) * 0.5, 0.5 + Math.sin(th) * 0.5, v, v, v));
+      // Rim modulation: two low harmonics, phased off the seed.
+      const wob =
+        1 +
+        0.085 * Math.sin(th * 2 + seed * 1.7) +
+        0.055 * Math.sin(th * 3 - seed * 0.9);
+      const rr = r * rho * wob;
+      ring.push(a.vert(Math.cos(th) * rr, y, Math.sin(th) * rr * POOL_ASPECT, 0, 1, 0,
+        0.5 + Math.cos(th) * 0.5, 0.5 + Math.sin(th) * 0.5, v, vg, vb));
     }
     if (!prev) for (let i = 0; i < SEG; i++) a.tri(c, ring[(i + 1) % SEG], ring[i]);
     else for (let i = 0; i < SEG; i++) a.quad(prev[i], ring[i], ring[(i + 1) % SEG], prev[(i + 1) % SEG]);
@@ -175,8 +277,9 @@ export function registerLamps(K) {
       return g;
     }, 'sodium_lamp', { castShadow: false, noShadow: true });
     P(K, `lamp_cobra_glow_${i}`, () => {
-      const g = lightPool(5.4 + i * 0.4);
-      g.translate(2.06 + i * 0.35, 0.02, 0);
+      // No vertical offset here: the dome carries its own ground clearance.
+      const g = lightPool(6.4 + i * 0.45, 3 + i);
+      g.translate(2.06 + i * 0.35, 0, 0);
       return g;
     }, 'sodium_glow', { castShadow: false, noShadow: true, noPrepass: true, renderOrder: 4 });
   });
@@ -207,8 +310,8 @@ export function registerLamps(K) {
   }, 'sodium_lamp', { castShadow: false, noShadow: true });
   P(K, 'lamp_twin_glow', () => {
     const mk = (s) => {
-      const g = lightPool(5.6);
-      g.translate(2.26 * s, 0.02, 0);
+      const g = lightPool(6.6, s > 0 ? 7 : 8);
+      g.translate(2.26 * s, 0, 0);
       return g;
     };
     return combine([[mk(1), null], [mk(-1), null]], 'lamptwinglow');
@@ -222,11 +325,8 @@ export function registerLamps(K) {
       g.translate(0, h - 0.30, 0);
       return g;
     }, 'sodium_lamp', { castShadow: false, noShadow: true });
-    P(K, `lamp_${tag}_glow`, () => {
-      const g = lightPool(3.6);
-      g.translate(0, 0.02, 0);
-      return g;
-    }, 'sodium_glow', { castShadow: false, noShadow: true, noPrepass: true, renderOrder: 4 });
+    P(K, `lamp_${tag}_glow`, () => lightPool(4.2, tag === 'park' ? 11 : 12),
+      'sodium_glow', { castShadow: false, noShadow: true, noPrepass: true, renderOrder: 4 });
   });
 }
 

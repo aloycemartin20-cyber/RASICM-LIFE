@@ -247,8 +247,31 @@ export const LIBRARY = {
       detail: [9, 0.7, 0.36, 16],
       macro: [0.10, 0.30, 0.14, 0.4],
       weather: [0.25, 0.4, 0.5, 0.35],
-      wearColor: 0x8c8f93,
-      wearMaterial: [0.28, 1.0, 0, 0.85],
+      /**
+       * WEAR ON RUSTED STEEL IS MORE OXIDE, NOT LESS.
+       *
+       * These two lines used to be `0x8c8f93` at `[0.28, 1.0, 0, 0.85]` — a
+       * light neutral grey pushed over 85% of the albedo with metalness driven
+       * to 1.0 and roughness to 0.28, i.e. polished chrome. That reads as an
+       * arris rubbed back to bright metal, which is what a hand tool or a door
+       * edge does; it is not what a vertex mask means on this surface. The
+       * Old Blast Furnace paints masks of 0.7-0.85 across whole 40 m pressure
+       * vessels (`buildings/landmarks.js` blastFurnace), so the entire landmark
+       * — stack, four hot-blast stoves, dust catcher, skip hoist — was
+       * chrome-plated. MEASURED on `--shot=mill` before: the wear collar on the
+       * furnace shell was rgb 110,96,99, g-b -3.3, with 60.6% of its pixels
+       * COLDER than neutral. Iron oxide cannot be blue.
+       *
+       * So: the oxide colour `owRustColour` already bakes (its mid/mature
+       * stops), metalness 0 because Fe2O3 is a dielectric (ARCHITECTURE: metals
+       * are 0 or 1, and this end is the physical one), roughness 0.86 because
+       * corrosion product is powder, and the tint amount pulled back to 0.6 so
+       * the baked bloom, flake and pitting survive under the mask instead of
+       * being painted flat. A worn patch is still LIGHTER than deep pitting,
+       * which is what keeps the mask readable as wear at all.
+       */
+      wearColor: 0x6e3a1e,
+      wearMaterial: [0.86, 0.0, 0, 0.6],
     },
   },
   metal_painted: {

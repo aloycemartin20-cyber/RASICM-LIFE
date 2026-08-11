@@ -384,6 +384,7 @@ async function caseGameHotkeys() {
     armed = (await snap()).mission;
   }
   await tap('KeyK', 30);
+  await tap('KeyK', 30); // abort is arm-then-confirm: second press inside the window commits
   const gone = await snap();
   rec(A, 'CONTROL — K abandons the chapter in play',
     armed !== null && gone.mission === null,

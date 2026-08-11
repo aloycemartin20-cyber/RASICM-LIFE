@@ -603,10 +603,10 @@ function runBench() {
   }
   settle(); place(0);
   {
-    dn('ControlLeft'); step(2); up('ControlLeft'); step(30);
+    dn('KeyC'); step(2); up('KeyC'); step(30);
     out.gait.crouch = topSpeed(['KeyW'], 70);
     settle();
-    dn('ControlLeft'); step(2); up('ControlLeft'); step(30);
+    dn('KeyC'); step(2); up('KeyC'); step(30);
   }
   settle(); place(0);
   {
@@ -764,14 +764,14 @@ function runBench() {
     release(); step(10);
 
     place(0);
-    dn('ControlLeft'); step(2); up('ControlLeft'); step(35);
+    dn('KeyC'); step(2); up('KeyC'); step(35);
     out.stance.crouchStance = p.stance;
     dn('KeyW');
     for (let i = 0; i < 320; i++) step(1);
     out.stance.crouchTravel = forwardTravel();
     out.stance.crouchPassed = ok && out.stance.crouchTravel > SOFFIT + 1.5;
     release(); step(10);
-    dn('ControlLeft'); step(2); up('ControlLeft'); step(35);
+    dn('KeyC'); step(2); up('KeyC'); step(35);
     dropBox(id);
     notes.push(`soffit at ${SOFFIT}m: standing reached ${out.stance.standTravel.toFixed(2)}m, ` +
       `crouched reached ${out.stance.crouchTravel.toFixed(2)}m`);
@@ -779,12 +779,12 @@ function runBench() {
   settle(); place(0); step(25);
   {
     const stand = p.headPosition.y - p.feetPosition.y;
-    dn('ControlLeft'); step(2); up('ControlLeft'); step(40);
+    dn('KeyC'); step(2); up('KeyC'); step(40);
     const crouch = p.headPosition.y - p.feetPosition.y;
     out.stance.headDrop = stand - crouch;
     out.stance.headStand = stand;
     out.stance.headCrouch = crouch;
-    dn('ControlLeft'); step(2); up('ControlLeft'); step(35);
+    dn('KeyC'); step(2); up('KeyC'); step(35);
   }
 
   /* ---- auto vault (0.55 m) --------------------------------------------- */

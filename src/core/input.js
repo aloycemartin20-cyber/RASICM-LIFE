@@ -22,6 +22,17 @@
  * The layout below follows GTA convention.
  * `ui` already owns M (map), Tab (weapon wheel), X (character switch),
  * P (phone) and N (radio station) — those are deliberately NOT duplicated here.
+ *
+ * NO MODIFIER KEY IS EVER A HELD GAME CONTROL. `crouch` was `ControlLeft` as
+ * well as `KeyC`, and holding it turned the whole keyboard into browser
+ * shortcuts: `_onKeyDown` exempts `e.ctrlKey` from `preventDefault` so devtools
+ * and refresh still work, and that flag is true for EVERY key pressed while
+ * crouch is held. Crouched, R reloaded the page instead of the magazine and S
+ * opened Save Page As — and Ctrl+W, Ctrl+T and Ctrl+N are reserved by the user
+ * agent and cannot be cancelled at all, so crouch-and-walk-forward closed the
+ * tab and ended the run. C alone crouches. `src/player/feeltest.mjs` and
+ * `tools/demo-driver.js` still press `ControlLeft` for it and want the same
+ * substitution.
  */
 export const ACTIONS = {
   forward: ['KeyW', 'ArrowUp'],
@@ -29,7 +40,7 @@ export const ACTIONS = {
   left: ['KeyA', 'ArrowLeft'],
   right: ['KeyD', 'ArrowRight'],
   jump: ['Space'],              // on foot: jump · in a vehicle: handbrake
-  crouch: ['ControlLeft', 'KeyC'],
+  crouch: ['KeyC'],
   sprint: ['ShiftLeft', 'ShiftRight'],
   reload: ['KeyR'],
   use: ['KeyF'],                // enter / exit / carjack / interact
@@ -37,18 +48,23 @@ export const ACTIONS = {
   prevWeapon: ['KeyQ'],
   camera: ['KeyV'],             // cycle chase / bonnet / far
   horn: ['KeyH'],
-  grenade: ['KeyG'],
-  flashlight: ['KeyT'],
   pause: ['Escape'],
 
   // Retained so nothing that still queries them throws; unbound because the
-  // mechanics they drove (lean, prone) are not part of this game.
+  // mechanics they drove (lean, prone) are not part of this game. `grenade` (G)
+  // and `flashlight` (T) are GONE rather than emptied: nothing in the tree ever
+  // read either one, so they were two keys a player presses once and concludes
+  // the game is broken, and `_onKeyDown` swallowed them from the browser on the
+  // way past. Bind a key here only with the line that consumes it.
   melee: [],
   leanLeft: [],
   leanRight: [],
   prone: [],
   swapWeapon: ['Digit1', 'Digit2'],
 };
+
+/** How long a lock request is given to be granted before it is written off. */
+const LOCK_GRANT_MS = 400;
 
 export class Input {
   constructor(canvas, config) {
@@ -83,6 +99,17 @@ export class Input {
      * the story overview.
      */
     this.pointerLockGuard = null;
+
+    /**
+     * Has this browser EVER granted us the pointer? Only then is a click on the
+     * canvas a request for mouse-look rather than a plain trigger pull — see
+     * `_onMouseDown`. Headless Chromium, a cross-origin embed and a denied
+     * permission all leave it false for ever, and in those a swallowed click
+     * would be a dead fire button.
+     */
+    this.pointerLockWorks = false;
+    /** When a swallowed click asked for the lock, or -1. Milliseconds. */
+    this._lockClickAt = -1;
 
     this.gamepadIndex = null;
     this.stick = { moveX: 0, moveY: 0, lookX: 0, lookY: 0 };
@@ -140,6 +167,11 @@ export class Input {
     this.canvas.removeEventListener('contextmenu', this._bound.contextmenu);
   }
 
+  /**
+   * @returns {boolean} true when a request was actually handed to the browser —
+   * NOT that the lock was granted, which is asynchronous. `_onMouseDown` needs
+   * to know whether this click became a lock request before the frame ends.
+   */
   requestPointerLock() {
     // A UI modal that owns the mouse must not have the pointer yanked out from
     // under it. `menu.close()` re-requests the lock on the way back to the game,
@@ -148,20 +180,23 @@ export class Input {
     // player is trying to click, and the browser then starts eating Escape.
     // A throwing guard must never break input, so it is wrapped.
     try {
-      if (typeof this.pointerLockGuard === 'function' && this.pointerLockGuard()) return;
+      if (typeof this.pointerLockGuard === 'function' && this.pointerLockGuard()) return false;
     } catch {
       /* a broken guard is not a reason to refuse the lock */
     }
+    if (typeof this.canvas.requestPointerLock !== 'function') return false;
     // Chrome returns a promise that rejects if the document is not eligible
     // (headless capture, an iframe, a lock request too soon after an exit).
     // An unhandled rejection there shows up as a page error in the harness, so
     // swallow it: failing to lock is not a game error.
     try {
-      const p = this.canvas.requestPointerLock?.();
+      const p = this.canvas.requestPointerLock();
       if (p && typeof p.catch === 'function') p.catch(() => {});
     } catch {
       /* not eligible — keep running unlocked */
+      return false;
     }
+    return true;
   }
 
   _onKeyDown(e) {
@@ -187,7 +222,26 @@ export class Input {
     // `.ow-hud` is `pointer-events:none`, so an empty-world click still falls
     // through to the canvas and locks exactly as before.
     if (!this.pointerLocked && e.button === 0 && e.target === this.canvas) {
-      this.requestPointerLock();
+      const asked = this.requestPointerLock();
+      /**
+       * THE CLICK THAT BUYS MOUSE-LOOK BACK IS NOT A TRIGGER PULL. Every route
+       * out of an overlay used to leave the camera dead until the player
+       * clicked the world, and that click ALSO discharged a round — feedback
+       * for the wrong verb, and a wanted star if a pedestrian was in front of
+       * it. `ui._syncPause` now re-locks on its own when the last overlay
+       * closes, so this path is the fallback for the cases the browser refuses
+       * (Chrome bars a programmatic lock for ~1 s after the user pressed
+       * Escape), and the round stays swallowed there too.
+       *
+       * `pointerLockWorks` is the whole reason this is safe: where the browser
+       * has never granted a lock, a canvas click CANNOT be a request for
+       * mouse-look, so it stays an ordinary trigger pull. Without that test an
+       * embed or a denied permission would have a permanently dead fire button.
+       */
+      if (asked && this.pointerLockWorks) {
+        this._lockClickAt = performance.now();
+        return;
+      }
     }
     this._pendingDown.add(`Mouse${e.button}`);
   }
@@ -219,6 +273,9 @@ export class Input {
     // Same guard, applied to the grant: if the UI needs the cursor now, give
     // the lock straight back.
     if (this.pointerLocked) {
+      // A grant is the only proof the browser does pointer lock at all.
+      this.pointerLockWorks = true;
+      this._lockClickAt = -1;
       try {
         if (typeof this.pointerLockGuard === 'function' && this.pointerLockGuard()) {
           this.exitPointerLock();
@@ -239,6 +296,16 @@ export class Input {
   beginFrame() {
     this._pressed.clear();
     this._released.clear();
+
+    // A swallowed click that never bought a lock must not become a dead trigger.
+    // The grant lands in single-digit milliseconds when it lands at all, so a
+    // window this wide can only close on an environment that stopped granting —
+    // and then exactly ONE click has been eaten before the next fires again.
+    if (this._lockClickAt >= 0 && !this.pointerLocked &&
+        performance.now() - this._lockClickAt > LOCK_GRANT_MS) {
+      this._lockClickAt = -1;
+      this.pointerLockWorks = false;
+    }
 
     for (const code of this._pendingDown) {
       if (!this.down.has(code)) {

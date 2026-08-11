@@ -1,10 +1,10 @@
 {
   "name": "decarlo-boyz",
   "version": "1.0.0",
-  "description": "DECARLO BOYZ \u2014 an open-world Steel City game in Three.js. No art assets: every texture, mesh, animation and sound is generated procedurally at load time.",
+  "description": "DECARLO BOYZ — an open-world Steel City game in Three.js. No art assets: every texture, mesh, animation and sound is generated procedurally at load time.",
   "type": "module",
   "private": true,
-  "comment:scripts": "SCRIPT NAMING IS PART OF THE CONTRACT. A probe with no entry here is not a gate, it is a file (ARCHITECTURE.md rule 9). Groups below, in order: build/dev \u00b7 CHAINS \u00b7 node-only gates (fast, no browser) \u00b7 browser gates (each boots its own vite) \u00b7 known-RED (runnable, deliberately unchained) \u00b7 diag (reports that ALWAYS exit 0 \u2014 never chain these, they cannot fail). Costs and green/red status are tabulated in ARCHITECTURE.md under 'Which chain does my probe go in'.",
+  "comment:scripts": "SCRIPT NAMING IS PART OF THE CONTRACT. A probe with no entry here is not a gate, it is a file (ARCHITECTURE.md rule 9). Groups below, in order: build/dev · CHAINS · node-only gates (fast, no browser) · browser gates (each boots its own vite) · known-RED (runnable, deliberately unchained) · diag (reports that ALWAYS exit 0 — never chain these, they cannot fail). Costs and green/red status are tabulated in ARCHITECTURE.md under 'Which chain does my probe go in'.",
   "scripts": {
     "dev": "vite",
     "play": "vite build && vite preview --port 4173 --open",
@@ -19,9 +19,9 @@
     "screenshots": "node tools/screenshots.mjs",
     "baseline": "node tools/baseline.mjs",
     "profile": "node tools/profile.mjs",
-    "gate": "node tools/lintticks.mjs && node tools/syntaxcheck.mjs && node src/vehicles/damageprobe.mjs && node src/vehicles/wreckprobe.mjs && node src/vehicles/toughprobe.mjs && node src/vehicles/despawnprobe.mjs && node src/vehicles/flightprobe.mjs && node src/fx/sparkprobe.mjs && node src/peds/blastprobe.mjs && node src/police/copfireprobe.mjs && node src/peds/gaitprobe.mjs && node src/peds/crowdprobe.mjs && node src/peds/airpedprobe.mjs && node src/physics/colprobe.mjs && node src/player/character/headprobe.mjs && node src/player/character/shirtprobe.mjs && node src/player/character/shirtcamprobe.mjs && node src/vehicles/shapeprobe.mjs && node src/game/persistprobe.mjs && node src/world/railsweep.mjs && node src/world/airsweep.mjs && node src/vehicles/funicularprobe.mjs && node src/vehicles/tramprobe.mjs && node src/world/basesweep.mjs && node src/vehicles/milprobe.mjs && node src/game/shellprobe.mjs",
+    "gate": "node tools/lintticks.mjs && node tools/syntaxcheck.mjs && node src/vehicles/damageprobe.mjs && node src/vehicles/wreckprobe.mjs && node src/vehicles/toughprobe.mjs && node src/vehicles/despawnprobe.mjs && node src/vehicles/flightprobe.mjs && node src/fx/sparkprobe.mjs && node src/peds/blastprobe.mjs && node src/police/copfireprobe.mjs && node src/peds/gaitprobe.mjs && node src/peds/crowdprobe.mjs && node src/peds/airpedprobe.mjs && node src/physics/colprobe.mjs && node src/player/character/headprobe.mjs && node src/player/character/shirtprobe.mjs && node src/player/character/shirtcamprobe.mjs && node src/vehicles/shapeprobe.mjs && node src/game/persistprobe.mjs && node src/world/railsweep.mjs && node src/world/airsweep.mjs && node src/vehicles/funicularprobe.mjs && node src/vehicles/tramprobe.mjs && node src/world/basesweep.mjs && node src/vehicles/milprobe.mjs && node src/game/shellprobe.mjs && node src/game/bossphaseprobe.mjs && node src/vehicles/rollprobe.mjs",
     "handoff": "npm run gate && npm run face && npm run cam && npm run drive && npm run ground && npm run feel && npm run melee && npm run camlag && npm run pausegate && npm run pausefree && npm run pauseweap && npm run clockowner && npm run cover && npm run bootaudio && npm run floatfb && npm run tracer && npm run aimpose && npm run mute && npm run lockux && npm run onboard && npm run dens && npm run fountain && npm run skyfb && npm run lamps && npm run assault && npm run copkill && npm run aircraft && npm run aircraftbody",
-    "soak": "npm run handoff && npm run pedpose && npm run pauseui && npm run touch && npm run ward && npm run lifecycle && npm run blips && npm run interact && npm run onboard && npm run shape && npm run pose && npm run solid && npm run skyline && npm run wind && npm run spawn && npm run dossier && npm run erase && npm run pedlight && npm run pedshadow && npm run street && npm run keylight && npm run shotgate && npm run slotgate && npm run live && npm run blockblast && npm run worldgate && npm run unstick && npm run drivesweep && npm run eyeprobe && npm run voxwarmth && npm run mute && npm run afb",
+    "soak": "npm run handoff && npm run pedpose && npm run pauseui && npm run touch && npm run ward && npm run lifecycle && npm run blips && npm run interact && npm run onboard && npm run shape && npm run pose && npm run solid && npm run skyline && npm run wind && npm run spawn && npm run dossier && npm run erase && npm run pedlight && npm run pedshadow && npm run street && npm run keylight && npm run shotgate && npm run slotgate && npm run live && npm run blockblast && npm run worldgate && npm run unstick && npm run drivesweep && npm run eyeprobe && npm run voxwarmth && npm run mute && npm run afb && npm run lampgeom && npm run tileleak",
     "vehdamage": "node src/vehicles/damageprobe.mjs",
     "wreck": "node src/vehicles/wreckprobe.mjs",
     "spark": "node src/fx/sparkprobe.mjs",
@@ -128,7 +128,12 @@
     "basesweep": "node src/world/basesweep.mjs",
     "aimpose": "node src/player/anim/aimposeprobe.mjs",
     "eyeprobe": "node src/peds/eyeprobe.mjs",
-    "voxwarmth": "node src/audio/voxwarmthprobe.mjs"
+    "voxwarmth": "node src/audio/voxwarmthprobe.mjs",
+    "bossphase": "node src/game/bossphaseprobe.mjs",
+    "roll": "node src/vehicles/rollprobe.mjs",
+    "lampgeom": "node src/props/lampgeomprobe.mjs",
+    "tileleak": "node src/world/tileleakprobe.mjs",
+    "diag:mill": "node src/materials/millstat.mjs"
   },
   "dependencies": {
     "three": "^0.180.0"

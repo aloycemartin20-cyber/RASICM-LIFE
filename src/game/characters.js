@@ -19,6 +19,10 @@
  *
  * `ui` already built the switch wheel and emits `ui:character { id }`. This
  * listens for it. It does not build a wheel.
+ *
+ * A live STORY chapter refuses the switch outright, and that refusal lives in
+ * `switchTo` rather than in `GameSystem` because this is where all three entry
+ * points meet — the game system's own call, the `U` key, and the wheel's event.
  */
 
 import { BOYZ, BOY_ORDER } from './data.js';
@@ -31,6 +35,8 @@ export class Characters {
     this.heat = deps.heat;
     this.director = deps.director;
     this.save = deps.save;
+    /** The mission runner, for the live-chapter refusal in `switchTo`. */
+    this.missions = deps.missions ?? null;
 
     this.activeId = save0(deps.save);
     this.boy = BOYZ[this.activeId];
@@ -152,11 +158,49 @@ export class Characters {
   /* ==================================================================== */
 
   /**
+   * IS A STORY CHAPTER LIVE? Wider than `missions.running` on both sides, and
+   * both halves were paid for:
+   *
+   *   - `active`, not `running`, because the intro cutscene and the travel leg
+   *     are part of the job. `running` is only the middle of it, so a switch
+   *     during the drive to the zone slipped through;
+   *   - `!M.side`, because a side race or a phone job is disposable free-roam
+   *     work that writes no chapter progression, and locking the brothers
+   *     behind one would be a worse game.
+   */
+  _chapterLive() {
+    const m = this.missions;
+    return !!m?.active && !m.M?.side;
+  }
+
+  /**
    * @param {'carson'|'aidan'|'dylan'} id
-   * @returns {boolean} false if the id is unknown or it is already him.
+   * @returns {boolean} false if the id is unknown, it is already him, or a
+   *   chapter is live.
    */
   switchTo(id) {
     if (!BOYZ[id] || id === this.activeId || this.switching) return false;
+    // THE REFUSAL LIVES HERE because this is the only place all three entry
+    // points meet: `game.switchTo`, the `U` key through `cycle()`, and the X
+    // wheel through the `ui:character` listener above. It used to sit in
+    // `GameSystem.switchTo` alone, so two of the three walked past it — and a
+    // switch mid-chapter is not a cosmetic bug: `win` writes
+    // `cs.chapter = max(cs.chapter, M.idx + 1)` against whoever is ACTIVE when
+    // the chapter ends, so finishing Carson's CH8 as Dylan sets Dylan's
+    // frontier to 8, plays his ending and skips all eight of his chapters.
+    // `Math.max` never regresses, so it is not recoverable.
+    if (this._chapterLive()) {
+      this.wq.ui?.notify?.('Not during a job', null, 'bad');
+      // THE X WHEEL COMMITS OPTIMISTICALLY: `ui._closeCharWheel` calls
+      // `ui.setCharacter(picked)` — accent, vitals maxima, weapon loadout — and
+      // only then emits the `ui:character` this class listens for. Nothing in
+      // `ui` polls back for the ANSWER, so a refusal would leave the HUD
+      // wearing the other brother's colours over the man actually on screen.
+      // Push the truth back at it; `setCharacter` re-emits, and the listener
+      // above drops an event naming the brother we are already playing.
+      this.wq.ui?.setCharacter?.(this.activeId);
+      return false;
+    }
     this.switching = true;
     const from = this.activeId;
 

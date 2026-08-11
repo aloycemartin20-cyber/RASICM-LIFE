@@ -1251,7 +1251,17 @@ export class WeaponSystem {
        */
       if (input.actionPressed('nextWeapon')) this.nextWeapon();
       else if (input.actionPressed('prevWeapon')) this.prevWeapon();
-      if (input.pressed('KeyB')) this.cycleFireMode();
+      /**
+       * B ALONE. SHIFT+B is the minimap's north-up toggle in `ui`, and the two
+       * shared the bare edge — so every fire-mode change also rotated the radar
+       * out of heading-up, silently, while the pause panel advertised them as
+       * separate bindings. The modifier is tested here as well as there because
+       * neither subsystem may read the other (rule 2): one key, one meaning,
+       * enforced at both ends.
+       */
+      if (input.pressed('KeyB') && !input.held('ShiftLeft') && !input.held('ShiftRight')) {
+        this.cycleFireMode();
+      }
       if (input.pressed('KeyI')) this.inspect();
       /* 1..6 pick straight out of the brother's own loadout, in wheel order. */
       for (let i = 0; i < Math.min(6, this.loadout.length); i++) {

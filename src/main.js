@@ -24,7 +24,7 @@ import { HudSystem } from './ui/hud.js';
 import { AudioSystem } from './audio/index.js';
 import { GameSystem } from './game/index.js';
 
-import { installShotApi } from './dev/shots.js';
+import { installShotApi, MARKETING_IDS } from './dev/shots.js';
 import { prewarm } from './core/prewarm.js';
 import { Governor, detectTier } from './core/governor.js';
 
@@ -36,16 +36,48 @@ const capture = params.get('capture') === '1';
 // free-run. See the long comment in src/dev/shots.js.
 const lockstep = capture && params.get('lockstep') === '1';
 
-// Quality: capture pins `ultra` so review frames are always the best the engine
-// can do; PLAY auto-detects and then lets the governor tune to the machine.
-// Defaulting play to `ultra` made the game too slow to play — that preset is a
-// 6 km draw distance, 4096 shadow maps, 24k particles and a 1 km stream radius.
-// It is a benchmark setting.
+/**
+ * QUALITY — and a review frame must be a frame of the shipping product.
+ *
+ * PLAY auto-detects and then lets the governor tune to the machine. Defaulting
+ * play to `ultra` made the game too slow to play: that preset is a 6 km draw
+ * distance, 4096 shadow maps, 24k particles and a 1 km stream radius. It is a
+ * benchmark setting, and `detectTier()` says so — it can never return `ultra`,
+ * by design (see the table in `governor.js`: booting at ultra and letting the
+ * governor walk down is permanently worse than booting at `high`, because the
+ * city `world`/`buildings`/`props` streamed at init stays resident).
+ *
+ * CAPTURE used to pin `ultra` unconditionally. That is what is being fixed
+ * here: it meant every review frame this project has ever produced photographed
+ * a preset NO PLAYER IS EVER BOOTED INTO, so every adversarial round scored a
+ * game nobody plays — with SSR, volumetrics, a 6 km draw distance and a 1 km
+ * stream radius that a shipping `medium` or `high` does not have. Capture now
+ * detects the tier like everything else.
+ *
+ * `ultra` is still reachable, and only on purpose:
+ *
+ *   ?q=ultra    pins any tier, as it always has (`explicitQ`)
+ *   ?ultra=1    the capture-side opt-in
+ *
+ * and the MARKETING set takes it automatically under `?capture=1`, because
+ * those frames are composed for a README rather than measured — nobody grades
+ * the build off them, and `tools/screenshots.mjs` shoots them at 2560x1440
+ * where `detectTier()` correctly reports a mid tier for the pixel count. Review
+ * shots deliberately do NOT get that exemption.
+ */
 const explicitQ = params.get('q');
+const wantsUltra =
+  params.get('ultra') === '1' || (capture && MARKETING_IDS.includes(params.get('shot') ?? ''));
 const config = createConfig({
-  quality: explicitQ ?? (capture ? 'ultra' : detectTier()),
+  quality: explicitQ ?? (wantsUltra ? 'ultra' : detectTier()),
   deterministic: capture,
 });
+if (capture) {
+  console.info(
+    `[boot] capture quality ${config.quality}` +
+      (explicitQ ? ' (pinned by ?q=)' : wantsUltra ? ' (ultra opt-in)' : ' (detected)')
+  );
+}
 
 const canvas = document.getElementById('game');
 

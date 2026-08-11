@@ -58,9 +58,29 @@ export const UNITS = {
  * `tileBuildBudgetMs` per-frame ceiling for streamed geometry construction
  * `lightSlots`        FIXED number of punctual light slots. The visible count is
  *                     a shader permutation key, so this never varies at runtime
- *                     (see ARCHITECTURE.md). Street lamps are emissive+bloom, not
- *                     real lights; slots are for headlights / muzzle flash / the
- *                     nearest few practicals.
+ *                     (see ARCHITECTURE.md). Slots are for muzzle flash, the
+ *                     helicopter's searchlight and the two or three nearest
+ *                     street practicals; everything else in a night city is
+ *                     emissive + bloom.
+ *
+ *                     RAISING THIS IS ALMOST NEVER THE ANSWER, and it is worth
+ *                     saying why here because it is the first thing anyone
+ *                     reaches for when the night frame is dark. A slot is
+ *                     charged twice: once per lit fragment in the shading loop,
+ *                     and once — far more expensively — as a program cache key,
+ *                     which is why `render._enforceLightCount` exists at all.
+ *                     Two cheaper mechanisms carry the load instead, and both
+ *                     scale to hundreds of emitters at a fixed cost:
+ *                       - emissive material + bloom, for anything that is a
+ *                         SOURCE you look at (lamp lenses, windows, neon);
+ *                       - `render.submitGroundPool`, for anything that is a
+ *                         POOL you look at light ON (headlit traffic, a
+ *                         searchlight strike, spill off a lit shopfront). It
+ *                         resolves against the prepass depth, so it costs six
+ *                         vertices and some fill, and no permutation at all.
+ *                     `vehicles` also owns a small FIXED pool of spot lights
+ *                     for the cars whose beams the player is actually reading,
+ *                     sized off this number at boot for the same reason.
  * `drawDistance`      camera far plane, metres — the skyline has to be visible
  * `shadowDistance`    far edge of the last cascade
  * `trafficBudget`     CEILING on live moving cars near the camera. `traffic`

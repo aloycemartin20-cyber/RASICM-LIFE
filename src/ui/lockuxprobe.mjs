@@ -17,6 +17,20 @@
  *      dead until you pressed ESC. FIX: a click on a UI element never grabs the
  *      lock (input.js checks the mousedown target), and no lock is grabbed
  *      while `ui.isPaused()` (the pause guard `ui` installs on `input`).
+ *   3. THE OTHER HALF OF THE SAME DOOR: nothing ever gave the lock BACK.
+ *      `ui._syncPause` released it on the rising edge of "an overlay needs the
+ *      cursor" and had no falling edge, so after every cutscene, every result
+ *      card and every map the camera was dead until the player clicked the
+ *      world — and `Input._onMouseDown` pushed `Mouse0` on that very click, so
+ *      restoring mouse-look fired a round. FIX: the falling edge re-requests
+ *      the lock, and the click that asks for it no longer queues a trigger
+ *      pull. Both are gated below, each with a negative control.
+ *
+ * NOTE ON WHAT CHANGED IN THIS FILE. "Let's Ride returns to a running game with
+ * NO pointer lock" used to be an assertion here and is now inverted: the lock
+ * coming back on its own IS the fix for bug 3. That is not rule 13 — the
+ * threshold did not move to make a run go green, the requirement changed, and a
+ * probe still asserting the old shape would pin the build to the defect.
  *
  * ---------------------------------------------------------------------------
  * WHY IT SHIMS THE BROWSER
@@ -231,6 +245,53 @@ async function runDesktop() {
   rec(label, 'NEG CONTROL: a mousedown on the canvas DOES ask for pointer lock',
     gate.world === 1, `requestPointerLock calls ${gate.world}`);
 
+  /**
+   * --- micro-test: the click that restores mouse-look does not fire ---------
+   * MEASURED on the EMITTED EDGE — `input._pendingDown`, the set `beginFrame`
+   * turns into `firePressed` and `weapons` turns into a round — not on a flag
+   * saying we meant to swallow it.
+   *
+   * `requestPointerLock` is shadowed by a stub that RETURNS TRUE and grants
+   * nothing, which is the browser's "request accepted, grant later" contract
+   * without the async grant landing mid-probe and dragging the page state with
+   * it. Naming the stub's assertion (rule 12): everything downstream of the
+   * request — whether Chrome actually grants it — is proven by the world click
+   * two checks below, which locks for real through the model.
+   *
+   * Three arms, and the second two are why the first means anything:
+   *   relock  unlocked, in a browser that HAS granted a lock -> swallowed
+   *   virgin  unlocked, in a browser that never grants (headless, an embed,
+   *           a denied permission) -> NOT swallowed, or the fire button is
+   *           dead for ever
+   *   playing already locked -> NOT swallowed; this is an ordinary trigger
+   */
+  const swallow = await page.evaluate(() => {
+    const input = window.__ENGINE__.input;
+    const saved = { works: input.pointerLockWorks, locked: input.pointerLocked };
+    input.requestPointerLock = () => true;             // own-property shadow
+    const arm = (locked, works) => {
+      input.pointerLocked = locked;
+      input.pointerLockWorks = works;
+      input._pendingDown.clear();
+      input.canvas.dispatchEvent(new MouseEvent('mousedown',
+        { bubbles: true, cancelable: true, button: 0, buttons: 1 }));
+      const queued = input._pendingDown.has('Mouse0');
+      input._pendingDown.clear();
+      return queued;
+    };
+    const out = { relock: arm(false, true), virgin: arm(false, false), playing: arm(true, true) };
+    delete input.requestPointerLock;                   // back to the prototype
+    input.pointerLocked = saved.locked;
+    input.pointerLockWorks = saved.works;
+    return out;
+  });
+  rec(label, 'the click that restores mouse-look does not also pull the trigger',
+    swallow.relock === false, `Mouse0 queued ${swallow.relock}`);
+  rec(label, 'NEG CONTROL: where the browser never grants a lock, the click DOES fire',
+    swallow.virgin === true, `Mouse0 queued ${swallow.virgin}`);
+  rec(label, 'NEG CONTROL: a click while already locked is an ordinary trigger pull',
+    swallow.playing === true, `Mouse0 queued ${swallow.playing}`);
+
   // --- click into the world: now we are playing, pointer locked -----------
   await page.evaluate(() => window.__CLICK__(innerWidth / 2, innerHeight / 2));
   await pump(20);
@@ -291,15 +352,17 @@ async function runDesktop() {
     !inStory.locked && inStory.grants === grantsBefore,
     `locked ${inStory.locked}, grants ${grantsBefore} -> ${inStory.grants}`);
 
-  // "Let's Ride" returns to a RUNNING free-roam game, still no lock — the
-  // primary seamless-return check.
+  // "Let's Ride" returns to a RUNNING free-roam game — and to mouse-look. The
+  // click must not be stolen on the way (bug 2) and the camera must be live on
+  // arrival without a second click (bug 3); this one transition is where the
+  // two requirements meet, which is why it asserts both.
   const rideAt = await centreOf('.ow-story .ow-btn.primary', /ride/);
   const rideClick = await clickCentre(rideAt);
   await pump(16);
   const back = await snap();
   const ran = await simRuns();
-  rec(label, "Let's Ride returns to a running game with no pointer lock",
-    !!rideClick && !rideClick.stolen && !back.storyOpen && !back.menu && !back.locked && ran.ran,
+  rec(label, "Let's Ride returns to a running game WITH mouse-look, no second click",
+    !!rideClick && !rideClick.stolen && !back.storyOpen && !back.menu && back.locked && ran.ran,
     `stolen ${rideClick?.stolen}, story ${back.storyOpen}, locked ${back.locked}, elapsed ${ran.from} -> ${ran.to}`);
 
   // A chapter row is also a live, clickable target that grabs no lock. Starting
@@ -327,6 +390,99 @@ async function runDesktop() {
     rec(label, 'a chapter row is clickable without a mouse-lock dance', false,
       'no playable chapter row rendered');
   }
+
+  /* --- the falling edge, through the real overlay path ---------------------
+   * NOT ONE CLICK IS ISSUED IN THIS BLOCK. The map goes up and comes down
+   * through `ui`'s own methods, and the lock has to come back from
+   * `_syncPause` alone — which is the whole of bug 3. Measured on the model's
+   * grant counter and `document.pointerLockElement`, never on a `ui` flag.
+   */
+  // Back to free roam first, and PROVEN back: the chapter row above can leave a
+  // mission intro running, and a live cutscene is itself a cursor-needing
+  // overlay — so the transition below would not be a falling edge at all, and
+  // the block would report a broken re-lock that is really a dirty fixture.
+  await page.evaluate(() => {
+    const e = window.__ENGINE__;
+    const ui = e.ctx.peek('ui');
+    e.ctx.peek('game')?.abortMission?.();
+    ui.subs?.cut?.cancel?.();
+    ui.closeStory();
+    if (ui.map?.open) ui.closeMap();
+    if (ui.phone?.open) ui.phone.hide();
+    ui.menu.close();
+    // The outcome card an aborted chapter leaves behind has no hide(): it
+    // retires on its own life timer. Run the timer out rather than reaching
+    // past the retire path, so the fixture leaves by the door the game uses.
+    if (ui.bigCard?.active) ui.bigCard.t = ui.bigCard.life;
+  });
+  await pump(20);
+  const calm = await page.evaluate(() => {
+    const ui = window.__ENGINE__.ctx.peek('ui');
+    return {
+      paused: !!ui.isPaused?.(), cut: !!ui.subs?.cut?.active,
+      hard: ui._hardModal(), card: !!ui.bigCard?.active,
+    };
+  });
+  rec(label, 'the fixture is back in free roam before the falling-edge case',
+    !calm.paused && !calm.cut && !calm.hard && !calm.card,
+    `paused ${calm.paused}, cut ${calm.cut}, hard modal ${calm.hard ?? 'none'}, card ${calm.card}`);
+
+  const mapUp = await page.evaluate(async () => {
+    const ui = window.__ENGINE__.ctx.peek('ui');
+    ui.openMap();
+    await new Promise((r) => setTimeout(r, 40));
+    return { locked: !!document.pointerLockElement, grants: window.__LOCK__.grants };
+  });
+  await pump(8);
+  rec(label, 'an overlay takes the cursor back off mouse-look', !mapUp.locked,
+    `locked ${mapUp.locked}`);
+  await page.evaluate(() => window.__ENGINE__.ctx.peek('ui').closeMap());
+  await pump(20);
+  const mapDown = await snap();
+  rec(label, 'closing the last overlay hands mouse-look back with NO click',
+    mapDown.locked && mapDown.grants > mapUp.grants,
+    `locked ${mapDown.locked}, grants ${mapUp.grants} -> ${mapDown.grants}`);
+
+  // NEG CONTROL 1: with the re-request removed, the same close leaves the
+  // camera dead — the shipped behaviour this replaces.
+  const noRegrab = await page.evaluate(async () => {
+    const e = window.__ENGINE__;
+    const ui = e.ctx.peek('ui');
+    const saved = e.input.requestPointerLock;
+    e.input.requestPointerLock = () => false;          // remove the fix
+    ui.openMap();
+    await new Promise((r) => setTimeout(r, 60));
+    ui.closeMap();
+    await new Promise((r) => setTimeout(r, 60));
+    const locked = !!document.pointerLockElement;
+    e.input.requestPointerLock = saved;
+    return { locked };
+  });
+  await pump(16);
+  rec(label, 'NEG CONTROL: with the re-request removed, the map leaves mouse-look dead',
+    !noRegrab.locked, `locked-with-fix-off ${noRegrab.locked}`);
+
+  // NEG CONTROL 2: it is the LAST overlay that hands the lock back, not any
+  // overlay. With the menu still up, closing the map must leave the cursor
+  // free — otherwise the fix would re-capture the mouse over a live menu,
+  // which is bug 2 arriving from the other side.
+  const stacked = await page.evaluate(async () => {
+    const ui = window.__ENGINE__.ctx.peek('ui');
+    ui.menu.show();
+    ui.openMap();
+    await new Promise((r) => setTimeout(r, 40));
+    ui.closeMap();
+    await new Promise((r) => setTimeout(r, 60));
+    const underMenu = !!document.pointerLockElement;
+    ui.menu.close();
+    await new Promise((r) => setTimeout(r, 60));
+    return { underMenu, afterMenu: !!document.pointerLockElement };
+  });
+  await pump(16);
+  rec(label, 'closing one overlay under another keeps the cursor free',
+    !stacked.underMenu, `locked with the menu still up ${stacked.underMenu}`);
+  rec(label, 'and the last one out re-locks',
+    stacked.afterMenu, `locked after the menu closed ${stacked.afterMenu}`);
 
   // --- NEGATIVE CONTROL for the pause guard -------------------------------
   // With the guard nulled, the SAME Story transition DOES grab the lock. This

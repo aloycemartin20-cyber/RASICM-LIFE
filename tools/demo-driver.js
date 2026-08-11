@@ -479,10 +479,10 @@
       if (script.slideAt(f) && phase === 'travel') {
         codes.add('ShiftLeft');
         codes.add('KeyW');
-        if (script.slideAt(f) === 'crouch') codes.add('ControlLeft');
+        if (script.slideAt(f) === 'crouch') codes.add('KeyC');
       }
       if (script.jumpAt(f)) codes.add('Space');
-      if (script.crouchAt(f) && !bot.target) codes.add('ControlLeft');
+      if (script.crouchAt(f) && !bot.target) codes.add('KeyC');
     }
 
     /* ---- reload ------------------------------------------------------- */

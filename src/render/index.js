@@ -18,6 +18,7 @@ import { buildFallbackEnvironment } from './env.js';
 import { RenderProbeScene } from './probe.js';
 import { AerialPerspective } from './aerial.js';
 import { SceneCuller } from './cull.js';
+import { COMMON } from './glsl.js';
 
 const QUALITY_LEVEL = { low: 0, medium: 1, high: 2, ultra: 3 };
 
@@ -26,6 +27,15 @@ const QUALITY_LEVEL = { low: 0, medium: 1, high: 2, ultra: 3 };
  * PRACTICAL rather than as an effect flash. See `settings.practicalGain`.
  */
 const PRACTICAL_RANGE = 30;
+
+/**
+ * Ground pools submitted per frame through `submitGroundPool`. See the block
+ * comment on that method. Each is six vertices and a bounded screen rectangle,
+ * so the ceiling is about overdraw rather than about geometry: 32 pools with a
+ * 6 m radius fill roughly a screen and a half between them on a street-level
+ * frame, which is what the fragment cost was sized against.
+ */
+const MAX_GROUND_POOLS = 32;
 
 /**
  * Black zero-intensity point lights held in reserve to pin `numPointLights`.
@@ -38,6 +48,107 @@ const LIGHT_BALLAST_POOL = 20;
 // Full-daylight key intensity (SUN_ILLUMINANCE_TOP through a clear atmosphere).
 // Only used to normalise the viewmodel rig, never to light anything.
 const REF_DAYLIGHT = 4.6;
+
+/** Scratch for the ground-pool screen bounds. Allocated once (rule 5). */
+const _poolV = new THREE.Vector3();
+
+/**
+ * GROUND POOLS — the vertex stage is pure passthrough.
+ *
+ * `position` already holds NDC x/y: `_updateGroundPools` computes the pool's
+ * screen rectangle on the CPU, so there is nothing to transform and the quad
+ * cannot be moved by a jitter, a reversed-Z convention or a camera the pass
+ * does not own. Everything that decides what the pool LOOKS like travels in
+ * the per-vertex attributes and is resolved against the depth buffer.
+ */
+const POOL_VERT = /* glsl */ `
+in vec3 aCentre;
+in vec4 aParam;
+in vec4 aTint;
+out vec3 vCentre;
+out vec4 vParam;
+out vec4 vTint;
+
+void main() {
+  vCentre = aCentre;
+  vParam = aParam;
+  vTint = aTint;
+  gl_Position = vec4( position.xy, 0.0, 1.0 );
+}
+`;
+
+/**
+ * The pool is shaded on the surface the prepass saw, never on the proxy quad.
+ *
+ * Reconstruct the world position under this pixel, test it against the pool's
+ * ellipse and its vertical reach, and light it with the gbuffer normal. Three
+ * consequences that the additive disc it replaces could never have: the pool
+ * follows the road camber and climbs the kerb, an object in front of it
+ * occludes it exactly (its own depth is what gets reconstructed, and that
+ * lands outside the ellipse), and there is no polygon on the ground to clip,
+ * so a hard silhouette is not expressible.
+ */
+const POOL_FRAG = /* glsl */ `
+precision highp float;
+${COMMON}
+
+uniform sampler2D uDepth;
+uniform sampler2D uNormal;
+uniform vec2 uTexel;
+uniform mat4 uProjInv;
+uniform mat4 uViewInv;
+
+in vec3 vCentre;
+in vec4 vParam;
+in vec4 vTint;
+
+layout(location = 0) out vec4 outColor;
+
+void main() {
+  vec2 uv = gl_FragCoord.xy * uTexel;
+  float depth = texture( uDepth, uv ).r;
+  // Zero is the cleared value, i.e. the sky. Nothing to put light on.
+  if ( depth <= 0.0 ) discard;
+
+  vec3 viewPos = owViewPos( uv, depth, uProjInv );
+  vec3 world = ( uViewInv * vec4( viewPos, 1.0 ) ).xyz;
+  vec3 p = world - vCentre;
+
+  // Vertical reach first: it is the cheapest reject and it is what stops a
+  // street pool climbing a whole facade.
+  float h = abs( p.y ) * vTint.w;
+  if ( h >= 1.0 ) discard;
+
+  // Into the pool's own frame, then onto the unit circle. vParam.zw is
+  // (cos, sin) of the yaw, so local +z runs along the caller's heading.
+  float lx = ( p.x * vParam.z - p.z * vParam.w ) * vParam.x;
+  float lz = ( p.x * vParam.w + p.z * vParam.z ) * vParam.y;
+  float r2 = lx * lx + lz * lz;
+  if ( r2 >= 1.0 ) discard;
+
+  // smootherstep to zero at the rim, in r^2 so the core stays broad.
+  float f = 1.0 - r2;
+  float a = f * f * f * ( f * ( f * 6.0 - 15.0 ) + 10.0 );
+  float hf = 1.0 - h;
+  a *= hf * hf;
+
+  // Orientation. The source is above the centre by a third of the footprint,
+  // which is what gives a kerb face and a car flank a different value from the
+  // road — a pool with no orientation term reads as paint.
+  vec4 nrm = texture( uNormal, uv );
+  if ( nrm.z > 0.5 ) {
+    vec3 nView = owDecodeNormal( nrm.xy );
+    vec3 nWorld = mat3( uViewInv ) * nView;
+    vec3 L = normalize( vec3( -p.x, ( 1.0 / max( vParam.x, 1e-4 ) ) * 0.34 - p.y, -p.z ) );
+    a *= 0.28 + 0.72 * max( dot( nWorld, L ), 0.0 );
+  }
+
+  if ( a <= 0.002 ) discard;
+  // Premultiplied against One / One: this ADDS to the HDR buffer and can never
+  // scale what is behind it.
+  outColor = vec4( vTint.rgb * a, a );
+}
+`;
 
 /**
  * DECARLO BOYZ renderer.
@@ -95,6 +206,13 @@ const REF_DAYLIGHT = 4.6;
  *   r.registerPass(pass)      pass.render(renderer, inTex, outTarget, r);
  *                             optional .order, .enabled, .resize(w,h).
  *                             Returns an unregister function.
+ *   r.submitLight(...)        one of `q.lightSlots` REAL punctual lights, this
+ *                             frame. Scarce: the visible count is a shader
+ *                             permutation key
+ *   r.submitGroundPool(...)   a projected pool of light on whatever surface the
+ *                             prepass saw. Costs no slot and no permutation —
+ *                             this is what headlit traffic, a searchlight
+ *                             strike and facade spill are drawn with
  *   r.addLight(light, opts)   register a punctual light for distance culling
  *   r.requestEnvMap()         the PMREM environment currently in use
  *   r.setEnvMap(tex)          install a new PMREM (sky subsystem)
@@ -449,6 +567,9 @@ export class RenderSystem {
     /** Scratch for `_assignLightSlots`: per-slot winner rank, per-rank flag. */
     this._slotWin = new Int32Array(Math.max(8, this.lightSlots));
     this._winTaken = new Uint8Array(Math.max(8, this.lightSlots));
+    // The cheap half of a night city — see `submitGroundPool`. Costs no slot,
+    // no permutation and no material, so it is built unconditionally.
+    this._buildGroundPools();
     // ---- the light-count LOCK --------------------------------------------
     // The pool above makes the renderer's OWN contribution constant, but that
     // is only half the invariant: three bakes `numPointLights` — the count of
@@ -891,6 +1012,23 @@ export class RenderSystem {
       // them buys most of both, and it is applied here rather than at the
       // source because the balance is a lighting decision, not an art one.
       practicalGain: 0.55,
+      /**
+       * The same trim once the sun is DOWN, lerped over the horizon crossing.
+       *
+       * 0.55 was measured against a daylight interior seen through its own
+       * doorway, which is the case it has to lose — a lamp competing with a
+       * sunlit facade is meant to lose. After dark there is nothing for it to
+       * compete with and the trim was simply half a stop off the only light in
+       * the frame. MEASURED on the `night` shot, mean display luma of the road
+       * crown 12 m in front of a lit sodium lamp: 23.2 at 0.55 flat. The road
+       * is the darkest thing in that frame and it is the surface the player has
+       * to read at 180 km/h.
+       *
+       * Held under unity deliberately. This is a trim, not a gain: above 1 the
+       * practicals start manufacturing energy the emitter never asked for, and
+       * every emitter in the city is authored in real candela.
+       */
+      practicalNightGain: 0.95,
       // Sky the viewmodel can actually see, past the shooter's own body.
       viewFillOcclusion: 0.45,
       // Viewmodel 3-point rig. The key is scaled off the scene's own light
@@ -1274,6 +1412,268 @@ export class RenderSystem {
   }
 
   /**
+   * Ask for a PROJECTED POOL OF LIGHT on whatever surface is actually there,
+   * THIS FRAME. Like `submitLight`, there is no handle: call it every frame you
+   * want the pool.
+   *
+   *   r.submitGroundPool(x, y, z, radius, color, intensity, aspect, yaw)
+   *
+   * This is the cheap half of a night city, and it exists because the punctual
+   * slots are the expensive half. A slot is a shader permutation key and there
+   * are `q.lightSlots` of them for the whole world; a pool costs six vertices
+   * and a bounded screen rectangle, so a hundred headlit cars and a helicopter
+   * strike can all have one.
+   *
+   * WHAT IT IS NOT: geometry. The mesh drawn is only a screen-space proxy — the
+   * fragment shader reads the prepass depth and normal, reconstructs the WORLD
+   * position of the surface actually visible in that pixel, and lights that.
+   * So the pool wraps over the road crown, up a kerb face and across a car
+   * roof, is occluded by anything in front of it for free, and cannot Z-fight
+   * or show a silhouette, because there is no polygon on the ground to clip.
+   * That is the whole reason this exists rather than another additive disc:
+   * the additive disc under every street lamp in this city spent years being
+   * cut in half by the 2 % road camber.
+   *
+   * It is a FAKE light — no shadow, no albedo — so keep intensities modest and
+   * use it for spill and dressing. Anything that must read as a real source
+   * belongs in `submitLight`.
+   *
+   * @param {number} x pool centre, on the surface
+   * @param {number} y
+   * @param {number} z
+   * @param {number} radius   metres, along the pool's own +x after `yaw`
+   * @param {THREE.Color|number} color
+   * @param {number} intensity linear HDR added at the centre, BEFORE the tone
+   *                          map and before exposure. Sizing, MEASURED on the
+   *                          `night` shot, which meters ~5.7: 0.02 is a spill
+   *                          you have to look for, 0.06 reads clearly as a
+   *                          pool, and 0.4 is a searchlight strike. Anything
+   *                          near 1 clips the frame to white — the first cut of
+   *                          the facade spill shipped 0.42 and took the whole
+   *                          carriageway to 194/255
+   * @param {number} [aspect] radius along +z as a multiple of `radius`
+   * @param {number} [yaw]    radians, about +y
+   * @param {number} [height] metres of vertical reach; surfaces further above
+   *                          or below the centre than this take nothing
+   */
+  submitGroundPool(x, y, z, radius, color, intensity, aspect = 1, yaw = 0, height = 3) {
+    if (!this._pools || !(intensity > 0) || !(radius > 0)) return;
+    if (this._nPools >= MAX_GROUND_POOLS) {
+      this._poolOverflow++;
+      return;
+    }
+    // Reject before it costs a vertex: a pool whose whole footprint is behind
+    // the camera or past the draw distance contributes nothing.
+    const dx = x - this._camPos.x;
+    const dy = y - this._camPos.y;
+    const dz = z - this._camPos.z;
+    const rr = radius * Math.max(1, aspect);
+    const cut = this.q.drawDistance * 0.35 + rr;
+    if (dx * dx + dy * dy + dz * dz > cut * cut) return;
+
+    const e = this._pools[this._nPools++];
+    e.x = x;
+    e.y = y;
+    e.z = z;
+    e.rx = radius;
+    e.rz = radius * (aspect > 0.02 ? aspect : 1);
+    e.yaw = yaw;
+    e.height = Math.max(0.2, height);
+    if (typeof color === 'number') {
+      e.r = (((color >> 16) & 255) / 255) * intensity;
+      e.g = (((color >> 8) & 255) / 255) * intensity;
+      e.b = ((color & 255) / 255) * intensity;
+    } else if (color) {
+      e.r = color.r * intensity;
+      e.g = color.g * intensity;
+      e.b = color.b * intensity;
+    } else {
+      e.r = e.g = e.b = intensity;
+    }
+  }
+
+  /** Diagnostics: how the ground-pool budget was spent last frame. */
+  get poolBudget() {
+    return {
+      slots: MAX_GROUND_POOLS,
+      submitted: this._nPoolsLast ?? 0,
+      drawn: this._nPoolsDrawn ?? 0,
+      overflow: this._poolOverflow ?? 0,
+    };
+  }
+
+  /**
+   * Build the one mesh every ground pool is drawn with.
+   *
+   * One geometry, one material, one draw call, and a draw range that is set to
+   * whatever was submitted — so a frame with no pools costs a `setDrawRange(0)`
+   * and nothing else. `visible` is never toggled: the mesh has to stay in the
+   * scene walk unconditionally, or the frame it comes back it would not be in
+   * `_hide` and would write itself into the depth prepass.
+   */
+  _buildGroundPools() {
+    this._pools = [];
+    for (let i = 0; i < MAX_GROUND_POOLS; i++) {
+      this._pools.push({ x: 0, y: 0, z: 0, rx: 1, rz: 1, yaw: 0, height: 3, r: 0, g: 0, b: 0 });
+    }
+    this._nPools = 0;
+    this._nPoolsLast = 0;
+    this._nPoolsDrawn = 0;
+    this._poolOverflow = 0;
+
+    const n = MAX_GROUND_POOLS * 6;
+    this._poolPos = new Float32Array(n * 3);
+    this._poolCentre = new Float32Array(n * 3);
+    this._poolParam = new Float32Array(n * 4);
+    this._poolTint = new Float32Array(n * 4);
+    const g = new THREE.BufferGeometry();
+    this._aPoolPos = new THREE.BufferAttribute(this._poolPos, 3).setUsage(THREE.DynamicDrawUsage);
+    this._aPoolCentre = new THREE.BufferAttribute(this._poolCentre, 3).setUsage(THREE.DynamicDrawUsage);
+    this._aPoolParam = new THREE.BufferAttribute(this._poolParam, 4).setUsage(THREE.DynamicDrawUsage);
+    this._aPoolTint = new THREE.BufferAttribute(this._poolTint, 4).setUsage(THREE.DynamicDrawUsage);
+    g.setAttribute('position', this._aPoolPos);
+    g.setAttribute('aCentre', this._aPoolCentre);
+    g.setAttribute('aParam', this._aPoolParam);
+    g.setAttribute('aTint', this._aPoolTint);
+    g.setDrawRange(0, 0);
+    g.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e8);
+    this._poolGeo = g;
+
+    this._poolUniforms = {
+      uDepth: { value: null },
+      uNormal: { value: null },
+      uTexel: { value: new THREE.Vector2(1 / 1920, 1 / 1080) },
+      uProjInv: { value: new THREE.Matrix4() },
+      uViewInv: { value: new THREE.Matrix4() },
+    };
+    this._poolMat = new THREE.ShaderMaterial({
+      name: 'ow-ground-pool',
+      glslVersion: THREE.GLSL3,
+      uniforms: this._poolUniforms,
+      vertexShader: POOL_VERT,
+      fragmentShader: POOL_FRAG,
+      transparent: true,
+      // Depth is READ from the prepass texture, never from the depth buffer:
+      // the proxy quad is in screen space and has no meaningful depth of its
+      // own, and testing it would reintroduce exactly the clipping this
+      // replaces.
+      depthTest: false,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      toneMapped: false,
+      blending: THREE.CustomBlending,
+      blendSrc: THREE.OneFactor,
+      blendDst: THREE.OneFactor,
+      blendEquation: THREE.AddEquation,
+    });
+    this._poolMesh = new THREE.Mesh(g, this._poolMat);
+    this._poolMesh.name = 'ow-ground-pools';
+    this._poolMesh.frustumCulled = false;
+    this._poolMesh.matrixAutoUpdate = false;
+    this._poolMesh.renderOrder = 6;
+    this._poolMesh.userData.owNoShadow = true;
+    this._poolMesh.userData.owNoPrepass = true;
+    this._poolMesh.userData.owStatic = true;
+    this.ctx.scene.add(this._poolMesh);
+  }
+
+  /**
+   * Turn this frame's submissions into screen-space proxy quads.
+   *
+   * The quad is the pool's bounding sphere projected to NDC and padded, not a
+   * disc on the ground: the shading is done from the depth buffer, so all the
+   * geometry has to do is COVER the pixels the pool could possibly touch. A
+   * sphere that straddles the near plane covers the frame instead of being
+   * projected through a division by ~0.
+   */
+  _updateGroundPools(camera) {
+    const n = this._nPools;
+    this._nPoolsLast = n;
+    this._nPools = 0;
+    if (!this._poolMesh) return;
+    const u = this._poolUniforms;
+    u.uDepth.value = this.depthTexture;
+    u.uNormal.value = this.normalTexture;
+    u.uTexel.value.set(1 / this.screenSize.width, 1 / this.screenSize.height);
+    u.uProjInv.value.copy(camera.projectionMatrixInverse);
+    u.uViewInv.value.copy(camera.matrixWorld);
+    // Without a depth texture there is no surface to project onto; drawing the
+    // proxy would paint a rectangle of light over the whole frame.
+    if (!this.depthTexture) {
+      this._poolGeo.setDrawRange(0, 0);
+      this._nPoolsDrawn = 0;
+      return;
+    }
+
+    const P = this._poolPos;
+    const C = this._poolCentre;
+    const R = this._poolParam;
+    const T = this._poolTint;
+    const near = camera.near;
+    let w = 0;
+    for (let i = 0; i < n; i++) {
+      const e = this._pools[i];
+      const rad = Math.max(e.rx, e.rz) + e.height;
+      _poolV.set(e.x, e.y, e.z).applyMatrix4(camera.matrixWorldInverse);
+      const vz = -_poolV.z;
+      let x0 = -1;
+      let y0 = -1;
+      let x1 = 1;
+      let y1 = 1;
+      if (vz - rad > near) {
+        // Fully in front: the sphere's screen bounds, padded by a pixel row so
+        // the rim never lands mid-texel. Read off the PROJECTION MATRIX rather
+        // than fov/aspect — the TAA jitter and `_syncCameraRange` both edit the
+        // matrix, and a bound derived from stale field-of-view numbers clips
+        // the pool at the frame edge.
+        const pm = camera.projectionMatrix.elements;
+        const sx = (rad * pm[0]) / vz;
+        const sy = (rad * pm[5]) / vz;
+        const cx = (_poolV.x * pm[0]) / vz;
+        const cy = (_poolV.y * pm[5]) / vz;
+        x0 = Math.max(-1, cx - sx * 1.06);
+        x1 = Math.min(1, cx + sx * 1.06);
+        y0 = Math.max(-1, cy - sy * 1.06);
+        y1 = Math.min(1, cy + sy * 1.06);
+        if (x1 <= x0 || y1 <= y0) continue;
+      }
+      const s = Math.sin(e.yaw);
+      const c = Math.cos(e.yaw);
+      for (let k = 0; k < 6; k++) {
+        const kx = k === 0 || k === 3 || k === 5 ? x0 : x1;
+        const ky = k === 0 || k === 1 || k === 3 ? y0 : y1;
+        P[w * 3] = kx;
+        P[w * 3 + 1] = ky;
+        P[w * 3 + 2] = 0;
+        C[w * 3] = e.x;
+        C[w * 3 + 1] = e.y;
+        C[w * 3 + 2] = e.z;
+        R[w * 4] = 1 / e.rx;
+        R[w * 4 + 1] = 1 / e.rz;
+        R[w * 4 + 2] = c;
+        R[w * 4 + 3] = s;
+        T[w * 4] = e.r;
+        T[w * 4 + 1] = e.g;
+        T[w * 4 + 2] = e.b;
+        T[w * 4 + 3] = 1 / e.height;
+        w++;
+      }
+    }
+    this._nPoolsDrawn = w / 6;
+    if (w > 0) {
+      this._aPoolPos.addUpdateRange(0, w * 3);
+      this._aPoolPos.needsUpdate = true;
+      this._aPoolCentre.addUpdateRange(0, w * 3);
+      this._aPoolCentre.needsUpdate = true;
+      this._aPoolParam.addUpdateRange(0, w * 4);
+      this._aPoolParam.needsUpdate = true;
+      this._aPoolTint.addUpdateRange(0, w * 4);
+      this._aPoolTint.needsUpdate = true;
+    }
+    this._poolGeo.setDrawRange(0, w);
+  }
+
+  /**
    * Per-frame visibility statistics. `world` and the profiler both want this;
    * it is the fastest way to tell "the city is slow" from "the city is being
    * drawn twice".
@@ -1291,6 +1691,7 @@ export class RenderSystem {
       cascadeCasters: Array.from(this.csm.casterCounts),
       lightSlots: this.lightSlots,
       lightsSubmitted: this._nReqLast ?? 0,
+      groundPools: this._nPoolsDrawn ?? 0,
       pointLightCount: this._lightCountLock,
       pointLightRaises: this._lightCountRaises,
       drawDistance: this.q.drawDistance,
@@ -2452,8 +2853,24 @@ export class RenderSystem {
     );
   }
 
+  /**
+   * The room-and-street practicals trim for THIS frame.
+   *
+   * One number, computed once, consumed by both `_cullLights` (lights the
+   * caller owns) and `_assignLightSlots` (lights the pool owns) — they must
+   * agree, or a lamp changes brightness depending on which door it came in
+   * through. Ramped over the same horizon crossing the aerial night glow uses,
+   * so a practical brightens as the sun sets rather than at a threshold.
+   */
+  _practicalGain() {
+    const s = this.settings;
+    const night = THREE.MathUtils.smoothstep(-this.sunDir.y, -0.06, 0.1);
+    return s.practicalGain + ((s.practicalNightGain ?? s.practicalGain) - s.practicalGain) * night;
+  }
+
   _cullLights(camPos) {
     const s = this.settings;
+    const practical = this._practicalGain();
     for (let i = 0; i < this.lights.length; i++) {
       const e = this.lights[i];
       // If the owner animated the intensity since we last wrote it, adopt the
@@ -2482,7 +2899,7 @@ export class RenderSystem {
       // that asked to be distance-culled inside a room-or-street radius; the FX
       // flash pool deliberately registers at 90 m so the fade never bites it,
       // and a muzzle flash must not be dimmed by a room-lighting control.
-      const gain = e.range <= PRACTICAL_RANGE ? s.practicalGain : 1;
+      const gain = e.range <= PRACTICAL_RANGE ? practical : 1;
       e.applied = e.baseIntensity * fade * gain;
       e.light.intensity = e.applied;
       // `light.visible` is DELIBERATELY not touched. It used to be set to
@@ -2657,7 +3074,7 @@ export class RenderSystem {
     }
 
     const k = 1 - Math.exp(-dt * 14); // ~0.15 s to swap a slot
-    const gain = this.settings.practicalGain;
+    const gain = this._practicalGain();
     for (let i = 0; i < n; i++) {
       const slot = pool[i];
       const l = slot.light;
@@ -2781,6 +3198,11 @@ export class RenderSystem {
     // jittering its projection would just make it shimmer with nothing to
     // accumulate the offsets back out.
     if (this.taa) this._applyJitter(camera);
+
+    // Ground pools resolve against the prepass depth, so their proxy quads and
+    // their reconstruction matrix must both be built from the SAME projection
+    // the prepass is about to use — i.e. after the jitter, not before it.
+    this._updateGroundPools(camera);
 
     // ---- 4. prepass -------------------------------------------------------
     const gb = this.gbuffer;
@@ -3216,6 +3638,11 @@ export class RenderSystem {
     // everything, which is precisely what they exist to prevent.
     for (const l of this._ballast ?? []) this.ctx?.scene.remove(l);
     for (const s of this._pool ?? []) this.ctx?.scene.remove(s.light);
+    if (this._poolMesh) {
+      this.ctx?.scene.remove(this._poolMesh);
+      this._poolGeo.dispose();
+      this._poolMat.dispose();
+    }
     this.patcher.dispose();
     this.renderer.dispose();
   }

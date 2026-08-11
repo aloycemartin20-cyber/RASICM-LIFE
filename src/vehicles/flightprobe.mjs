@@ -28,6 +28,28 @@
  *     level (its negative control).
  *
  * ────────────────────────────────────────────────────────────────────────────
+ * THE ARRIVAL — what happens when it MEETS something
+ * ────────────────────────────────────────────────────────────────────────────
+ * For a long time, nothing did. An aeroplane's only contact with the world was
+ * three gear springs and a probe ring built from its bounding box — and an
+ * aircraft's `dims.W` is its WING SPAN, so every probe sat 5.4 m off the
+ * centreline and the fuselage had none at all. A Skylark could be flown into
+ * the runway at 20 m/s, or through a hangar wall at cruise, and taxi away
+ * undamaged. Three sections gate that now, all on emitted quantities:
+ *
+ *   - THE ARRIVAL: three landings differing in ONE thing, the sink rate. 2 m/s
+ *     costs nothing, 8 m/s costs health, 25 m/s is a write-off with
+ *     `vehicle:destroyed` on the wire and the same burn fuse every other wreck
+ *     in the city runs. Its negative control is the same aeroplane parked.
+ *   - THE WALL: flown into a 6 m wall at cruise it stops AT the wall and is
+ *     written off. NEGATIVE CONTROL: the same flight with the pre-fix corner
+ *     ring installed on the live vehicle, which flies the fuselage 74 m (the
+ *     Skylark) and 1532 m (the jet) past the wall without touching it.
+ *   - ON ITS BACK: an inverted aircraft reports itself GROUNDED. Its gear rays
+ *     point at the sky, so it used to report itself as flying — and the
+ *     self-righting that is meant to recover it arms off `grounded`.
+ *
+ * ────────────────────────────────────────────────────────────────────────────
  * THE VARIANTS
  * ────────────────────────────────────────────────────────────────────────────
  * Two aircraft VARIANTS ride the same two flight models with their own tuning
@@ -68,6 +90,7 @@ import * as THREE from 'three';
 import { VEHICLE_SPECS, CLASS_IDS, PAINTS, finalizeSpec, SURFACE_GRIP } from './specs.js';
 import { Vehicle } from './dynamics.js';
 import { VehicleSystem } from './index.js';
+import { DamageModel } from './damage.js';
 import { buildHeliBody } from './heli.js';
 import { buildPlaneBody } from './plane.js';
 import { buildJetBody } from './jet.js';
@@ -115,13 +138,35 @@ function makeWorld(slopeDeg = 0) {
     lodOf: () => 0,
     surfaceAt: () => 'concrete',
     waterHeightAt: () => null,
-    reportCollision: () => {},
+    /**
+     * THE REAL ONE, not a stub. `VehicleSystem.reportCollision` is what turns a
+     * reported contact into panel damage, `vehicle:collision` and
+     * `vehicle:destroyed`, and the arrival section below is a claim about all
+     * three — so it runs the shipped method against this fake system, the same
+     * way the enter section runs the shipped `nearest` and `seatAnchor`. A
+     * stub here would have made "a crash writes the aeroplane off" a statement
+     * about the harness.
+     */
+    reportCollision(...args) {
+      return VehicleSystem.prototype.reportCollision.apply(this, args);
+    },
     gripOf: (n) => grip[n] ?? grip.asphalt,
     _world: () => null,
+    ctx: CTX,
   };
 }
 const STUB = { root: null, wheels: [], panels: [], glassMeshes: [], lampMats: {} };
-const CTX = { events: { emit() {} }, peek: () => null, time: { elapsed: 0 } };
+/**
+ * A recording context. `events` is the wire every other subsystem hears a
+ * crash on, so the arrival section asserts on what came out of it rather than
+ * on a flag the vehicle set on itself.
+ */
+const EVENTS = [];
+const CTX = {
+  events: { emit(id, payload) { EVENTS.push({ id, payload }); } },
+  peek: () => null,
+  time: { elapsed: 0 },
+};
 
 function spawnSpec(spec, { driver = true, slope = 0 } = {}) {
   const v = new Vehicle(makeWorld(slope), spec, STUB, {});
@@ -388,6 +433,262 @@ function testPlane() {
     check('plane', 'NEGATIVE CONTROL — no aileron, wings stay level',
       Math.abs(bankOf(st)) < 0.09 && Math.abs(headingOf(st) - hS0) < 0.05,
       `bank ${(bankOf(st) * DEG).toFixed(1)} deg, heading drift ${((headingOf(st) - hS0) * DEG).toFixed(1)} deg`);
+  }
+}
+
+/* ================================================================== */
+/* 3b. THE ARRIVAL — a landing, a heavy landing, and a crash          */
+/* ================================================================== */
+/**
+ * Three arrivals down the SAME code path, differing in ONE emitted quantity —
+ * the sink rate the gear meets the runway at. That is what makes this an A/B
+ * and not three anecdotes: nothing else about the aircraft, the world or the
+ * inputs changes between the arms.
+ *
+ *   2 m/s   a normal approach. Not a scratch, and it must stay that way — a
+ *           model that damages every landing is worse than one that damages
+ *           none.
+ *   8 m/s   a heavy landing. Past the gear's limit, under the airframe's:
+ *           health comes off and the machine still flies home.
+ *   25 m/s  flown into the ground. A write-off, `vehicle:destroyed` on the
+ *           wire, and the SAME burn fuse every wreck in the city runs — which
+ *           is the point of routing it through `applyImpact` rather than
+ *           giving aircraft a private death.
+ *
+ * Everything asserted is either the emitted health, the emitted `destroyed`
+ * state, or an event that actually reached `ctx.events`.
+ */
+/**
+ * THE HANGAR WALL: a 6 m wide, 0.6 m thick slab across the runway at z = `at`,
+ * solid to the probe ring and to the swept capsule cast the way a real wall is
+ * solid to both.
+ *
+ * SIX METRES WIDE IS THE POINT. It is narrower than any wing in the fleet and
+ * wider than any fuselage, so it separates the two probe rings exactly: a ring
+ * built from the bounding box has its probes out at the WINGTIPS (an
+ * aeroplane's `dims.W` is its SPAN) and passes either side of this wall
+ * without touching it, while a ring on the fuselage centreline hits it
+ * nose-first. Both arms fly the same aeroplane down the same centreline.
+ */
+function makeWall(at, halfWidth = 3, thick = 0.6) {
+  const sys = makeWorld(0);
+  const contacts = {
+    depth: new Float32Array(1),
+    nx: new Float32Array(1), ny: new Float32Array(1), nz: new Float32Array(1),
+    px: new Float32Array(1), py: new Float32Array(1), pz: new Float32Array(1),
+    tri: new Int32Array(1),
+  };
+  const inSlab = (x, z, r) =>
+    Math.abs(x) <= halfWidth + r && z + r > at && z - r < at + thick;
+  sys.physics.staticWorld = {
+    contacts,
+    objectOf: () => null,
+    overlapCapsule(x0, y0, z0, x1, y1, z1, r) {
+      const z = Math.max(z0, z1);
+      if (!inSlab(x0, z, r)) return 0;
+      contacts.depth[0] = Math.min(z + r - at, thick + r);
+      contacts.nx[0] = 0; contacts.ny[0] = 0; contacts.nz[0] = -1;
+      contacts.px[0] = x0; contacts.py[0] = y0; contacts.pz[0] = at;
+      contacts.tri[0] = 0;
+      return 1;
+    },
+  };
+  sys.physics.capsuleCast = (p0, p1, radius, dir, maxDist) => {
+    const lead = Math.max(p0.z, p1.z) + radius;
+    const out = {
+      hit: false, distance: maxDist, fraction: 1,
+      point: new THREE.Vector3(), normal: new THREE.Vector3(0, 0, -1),
+      object: null, surface: 'concrete',
+    };
+    if (dir.z <= 1e-6) return out;
+    const gap = at - lead;
+    if (gap > maxDist * dir.z) return out;
+    const t = Math.max(0, gap / dir.z);
+    const x = p0.x + dir.x * t;
+    if (Math.abs(x) > halfWidth + radius) return out;
+    out.hit = true;
+    out.distance = t;
+    out.fraction = t / maxDist;
+    out.point.set(x, p0.y + dir.y * t, at);
+    return out;
+  };
+  return sys;
+}
+
+/**
+ * THE PRE-FIX PROBE RING, rebuilt from the bounding box exactly as
+ * `Vehicle`'s constructor used to build it for every kind. Installed on a LIVE
+ * aircraft so the wall section has a real negative control: the geometry is
+ * the only thing that differs between the arms.
+ */
+function cornerRing(v) {
+  const spec = v.spec;
+  const floorLocal = (spec.style?.groundY ?? 0.14) - spec.comY;
+  const roofLocal = (spec.style?.roofY ?? spec.dims.H) - spec.comY;
+  const r = Math.max(0.12, Math.min(0.32, (roofLocal - floorLocal) * 0.3,
+    spec.half.x * 0.5, spec.half.z * 0.3));
+  const px = Math.max(0.02, spec.half.x - r);
+  const pz = Math.max(0.02, spec.half.z - r);
+  const yLo = floorLocal + r;
+  const yHi = Math.max(yLo + 0.02, roofLocal - r);
+  const probes = [];
+  for (const sx of [-1, 1]) {
+    for (const sz of [-1, 0, 1]) {
+      probes.push(new THREE.Vector3(sx * px, yLo, sz * pz));
+      if (sz !== 0) probes.push(new THREE.Vector3(sx * px * 0.8, yHi, sz * pz));
+    }
+  }
+  v.probes = probes;
+  v.probeR = r;
+  // The sweep is the fuselage capsule's; a box ring never had one.
+  v._fuseA = null;
+  return v;
+}
+
+/** A deterministic rng for `DamageModel` — no `Math.random` anywhere. */
+function probeRng(seed = 12345) {
+  let s = seed >>> 0;
+  const next = () => {
+    s = (s * 1664525 + 1013904223) >>> 0;
+    return s / 4294967296;
+  };
+  return { float: next, signed: () => next() * 2 - 1, fork: () => probeRng(s) };
+}
+/** The material calls `DamageModel` makes. The stub model has no panels. */
+const MATS = {
+  paint: () => ({}),
+  glass: () => ({ clone: () => ({ color: { set() {} } }) }),
+  cracksTexture: () => null,
+};
+
+function arrive(type, sinkRate, seconds = 4) {
+  const v = spawn(type);
+  v.damage = new DamageModel(v, MATS, probeRng());
+  // Just clear of the runway, coming down at the rate under test.
+  v.position.y += 0.5;
+  v.velocity.set(0, -sinkRate, 0);
+  const from = EVENTS.length;
+  fly(v, {}, seconds);
+  const events = EVENTS.slice(from);
+  return {
+    v,
+    health: v.health,
+    frac: v.health / v.maxHealth,
+    destroyed: v.destroyed,
+    dv: v.crashDv ?? 0,
+    events,
+  };
+}
+
+function testArrival() {
+  const soft = arrive('plane', 2);
+  check('arrival', 'a normal approach costs the aeroplane nothing',
+    !soft.destroyed && soft.frac === 1 && soft.v.grounded >= 3,
+    `health ${soft.health.toFixed(0)}/${soft.v.maxHealth}, ${soft.v.grounded} wheels down`);
+
+  const heavy = arrive('plane', 8);
+  check('arrival', 'a heavy landing damages it but does not destroy it',
+    !heavy.destroyed && heavy.frac < 0.95 && heavy.frac > 0.4 && heavy.dv > 7,
+    `health ${heavy.health.toFixed(0)}/${heavy.v.maxHealth} (${(heavy.frac * 100).toFixed(0)}%) at ${heavy.dv.toFixed(1)} m/s of sink`);
+
+  const crash = arrive('plane', 25);
+  check('arrival', 'flown into the ground it is written off',
+    crash.destroyed && crash.health === 0 && crash.dv > 20,
+    `destroyed ${crash.destroyed}, health ${crash.health.toFixed(0)}, closing ${crash.dv.toFixed(1)} m/s`);
+  check('arrival', 'and `vehicle:destroyed` reaches the wire',
+    crash.events.some((e) => e.id === 'vehicle:destroyed') &&
+    crash.events.some((e) => e.id === 'vehicle:collision'),
+    `events: ${[...new Set(crash.events.map((e) => e.id))].join(', ') || 'none'}`);
+
+  // THE FUSE. The wreck burns and goes up on the same clock every other wreck
+  // in the city runs (`DamageModel.update`), and exactly once.
+  const from = EVENTS.length;
+  for (let i = 0; i < 120 * 6; i++) crash.v.damage.update(DT, CTX);
+  const blasts = EVENTS.slice(from).filter((e) => e.id === 'explosion');
+  check('arrival', 'the wreck burns and goes up once, on the shared fuse',
+    blasts.length === 1 && crash.v.burning > 0.9,
+    `${blasts.length} explosion(s), burning ${crash.v.burning.toFixed(2)}, radius ${blasts[0]?.payload.radius ?? '-'}`);
+
+  // NEGATIVE CONTROL for the whole section: the same aeroplane, the same 4 s,
+  // simply parked. If a machine that never left the ground came out damaged,
+  // every number above would be measuring the harness settling.
+  const parked = arrive('plane', 0, 4);
+  check('arrival', 'NEGATIVE CONTROL — parked, nothing is priced at all',
+    !parked.destroyed && parked.frac === 1 && parked.events.length === 0,
+    `health ${parked.health.toFixed(0)}, ${parked.events.length} events`);
+
+  /**
+   * INTO THE HANGAR WALL — the fuselage ring, at cruise.
+   *
+   * An aeroplane's `dims.W` is its WING SPAN, so the box-corner ring every
+   * vehicle used to get put all twelve probes 5.4 m off the centreline and
+   * left the fuselage — the nose, the cabin, the tail — with none. A Skylark
+   * flew its whole body through anything narrower than its own wings and only
+   * noticed if a wingtip happened to clip it.
+   *
+   * Both arms fly the same aircraft down the same centreline into the same
+   * 6 m wall at cruise; the ONLY difference is which probe ring the body
+   * carries. Asserted on the emitted position of the nose relative to the wall
+   * face, and on the emitted `destroyed` state.
+   */
+  {
+    const D = 900;
+    for (const [type, seconds] of [['plane', 30], ['jet', 26]]) {
+      const spec = finalizeSpec(VEHICLE_SPECS[type]);
+      const nose = spec.style.noseZ ?? spec.half.z;
+      const arm = (ring) => {
+        const v = new Vehicle(makeWall(D), spec, STUB, {});
+        v.damage = new DamageModel(v, MATS, probeRng());
+        v.setPose(new THREE.Vector3(0, spec.comY - spec.style.gearY, 0), 0);
+        v.driver = { isPlayer: true };
+        v.autoReverse = true;
+        if (ring === 'corner') cornerRing(v);
+        let deepest = -Infinity;
+        for (let i = 0; i < Math.round(seconds * 120); i++) {
+          v.input.boost = 1;
+          v.input.throttle = 0;
+          v.input.brake = 0;
+          v.input.steer = 0;
+          v.input.handbrake = false;
+          v.fixedStep(DT, CTX);
+          deepest = Math.max(deepest, v.position.z + nose - D);
+        }
+        return { deepest, destroyed: v.destroyed, dv: v.crashDv ?? 0 };
+      };
+      const fuse = arm('fuselage');
+      const box = arm('corner');
+      check('wall', `${type}: the fuselage ring stops it AT the wall`,
+        fuse.deepest < 1.5 && box.deepest > 40,
+        `nose reached ${fuse.deepest.toFixed(2)} m past the face; on the old corner ring it reached ${box.deepest.toFixed(0)} m past it`);
+      check('wall', `${type}: flying into it at cruise writes the airframe off`,
+        fuse.destroyed && fuse.dv > 30,
+        `destroyed ${fuse.destroyed} at ${fuse.dv.toFixed(0)} m/s of closing speed`);
+      check('wall', `${type}: NEGATIVE CONTROL — on the corner ring the wall is not there at all`,
+        !box.destroyed,
+        `corner-ring arm destroyed ${box.destroyed}, nose ${box.deepest.toFixed(0)} m past the wall`);
+    }
+  }
+
+  // ON ITS BACK: the gear points at the sky, and the aircraft must still know
+  // it is on the ground — `_rightSelf` is armed off `grounded`, so an inverted
+  // machine reporting itself airborne can never come back over.
+  {
+    const v = spawn('plane');
+    v.quaternion.setFromEuler(new THREE.Euler(0, 0, Math.PI, 'YXZ'));
+    v.prevQuaternion.copy(v.quaternion);
+    // Resting on the fuselage crown. ONE step, and read it there: the gear
+    // points are now 1.7 m up in the air and their 1.4 m rays cannot reach the
+    // ground from that pose, so a non-zero count can only have come from the
+    // inverted branch. (Left running, this harness has nothing to hold an
+    // upside-down aeroplane up — `staticWorld` is null — and it would sink
+    // through the floor until the gear rays caught it from underneath, which
+    // is exactly the artefact this one-step read avoids.)
+    v.position.y = v.spec.style.fuseR + 0.05;
+    fly(v, {}, DT);
+    basis(v);
+    check('arrival', 'inverted on the apron it reports itself GROUNDED, not flying',
+      v.grounded > 0 && v.airborne === 0 && v.position.y > 0 && _u.y < -0.9,
+      `grounded ${v.grounded}, airborne ${v.airborne.toFixed(2)} s, up.y ${_u.y.toFixed(2)}, y ${v.position.y.toFixed(2)} m`);
   }
 }
 
@@ -825,6 +1126,7 @@ function testSilhouettes() {
 testEnter();
 testHeli();
 testPlane();
+testArrival();
 testNewsHeli();
 testSportPlane();
 testJet();

@@ -296,6 +296,33 @@ const _v3 = new THREE.Vector3();
 const _n = new THREE.Vector3();
 const _cam = new THREE.Vector3();
 const _fwd = new THREE.Vector3();
+/** Camera heading, flattened to XZ. Refreshed once per frame in `update`. */
+const _fwdCam = new THREE.Vector3(0, 0, -1);
+
+/* ---- headlight arbitration (see `_updateHeadlights`) ------------------- */
+/** Cars scored for a real spot pair each frame. Sized well over the traffic
+ *  budget within `HEADLIGHT_MAX_M`, so the scoring never truncates in play. */
+const HEADLIGHT_CANDIDATES = 24;
+/** Metres. Past this a pair of spots is a couple of pixels of lit road. */
+const HEADLIGHT_MAX_M = 95;
+/** Metres. Road pools are cheap but not free; this bounds the overdraw. */
+const HEADLIGHT_POOL_M = 62;
+/** Ceiling on pools `vehicles` will take out of the renderer's 32, so a
+ *  helicopter strike and the facade spill always have somewhere to land. */
+const HEADLIGHT_POOLS = 14;
+const HEADLIGHT_POOL_R = 4.4;
+const HEADLIGHT_POOL_TINT = 0xfff0d8;
+/** A cruiser's pool takes its bar's blue, so a chase reads in the road. */
+const HEADLIGHT_POOL_COP = 0xdfe6ff;
+/**
+ * Linear HDR gain at the centre of a headlight road pool.
+ *
+ * A fake: no albedo, no shadow. Sized against the sodium pools it shares the
+ * road with (`props/kit_street.js` peak 0.62 through a 0.055 material opacity)
+ * so a passing car reads as brighter than the street lighting without erasing
+ * the lane paint under it.
+ */
+const HEADLIGHT_POOL_GAIN = 0.06;
 
 /**
  * Per-instance paint tones. Value scale plus a small warm/cool shift — the two
@@ -1720,6 +1747,11 @@ export class VehicleSystem {
 
     // `_selectLod` reads this shared temp; refreshed once per frame here.
     ctx.camera.getWorldPosition(_cam);
+    // ...and the heading, for the headlight arbitration's in-front bias.
+    ctx.camera.updateMatrixWorld();
+    const cme = ctx.camera.matrixWorld.elements;
+    _fwdCam.set(-cme[8], 0, -cme[10]);
+    if (_fwdCam.lengthSq() > 1e-6) _fwdCam.normalize();
     const alpha = ctx.time.alpha;
     const lodCount = [0, 0, 0, 0];
     this.groundShadows.begin();
@@ -1867,60 +1899,250 @@ export class VehicleSystem {
   /* ================================================================== */
 
   /**
-   * A FIXED pool of two spot lights, created once at init and never made
-   * invisible — only their intensity moves. Per ARCHITECTURE.md the number of
-   * VISIBLE lights is a shader permutation key, so a headlight that switched
-   * `visible` would recompile every lit material in the scene the moment the
-   * player got into a car at night.
+   * A FIXED pool of spot lights, created once at init and never made invisible
+   * — only their intensity moves. Per ARCHITECTURE.md the number of VISIBLE
+   * lights is a shader permutation key, so a headlight that switched `visible`
+   * would recompile every lit material in the scene the moment the player got
+   * into a car at night.
+   *
+   * The pool used to be exactly two, and `_lightHost` handed both of them to
+   * ONE car for the whole world — the player's if he was driving, otherwise
+   * literally the first vehicle in the array with a driver. So a 3-star night
+   * pursuit had five cars on screen wearing blazing emissive headlight quads
+   * over uniformly black asphalt, none of them throwing a single lumen, and a
+   * pedestrian standing between two active lightbars received no coloured light
+   * at all.
+   *
+   * Now it is `HOSTS` cars of two lights each, scored and arbitrated every
+   * frame (`_updateHeadlights`), and every OTHER headlit vehicle in range gets
+   * a projected road pool instead — which costs no permutation, no slot and no
+   * light at all. See `render.submitGroundPool`.
    */
   _buildHeadlightPool(ctx) {
     this.headlights = [];
-    if ((ctx.config.q.lightSlots ?? 4) < 4) return;
-    for (let i = 0; i < 2; i++) {
-      const l = new THREE.SpotLight(0xfff0d8, 0, 62, 0.62, 0.42, 1.3);
-      l.name = `vehicle_headlight_${i}`;
-      l.castShadow = false;
-      l.visible = true;
-      l.position.set(0, -900, 0);
-      l.target.position.set(0, -900, 1);
-      this.root.add(l);
-      this.root.add(l.target);
-      this.headlights.push(l);
+    this._hlHosts = [];
+    const slots = ctx.config.q.lightSlots ?? 4;
+    if (slots < 4) return;
+    // The count is baked into every lit material's program the moment the
+    // renderer pre-warms, so it is decided ONCE, here, off the quality tier —
+    // never from how many cars happen to be on screen.
+    //
+    // `?owHeadlightHosts=N` overrides it, and exists so the cost of this pool
+    // is measurable rather than asserted: every lit fragment in the frame
+    // iterates NUM_SPOT_LIGHTS, so going from one host to three is a real
+    // per-pixel bill and somebody has to have paid it with a clock.
+    //
+    // MEASURED, `tools/perfcheck.mjs --q=high`, p50 frame ms, one machine:
+    //   1 host  29.5 and 26.6      2 hosts  27.7      3 hosts  30.7
+    // The control arm repeated spans 2.9 ms on its own, which is wider than
+    // the gap between the arms, so the honest reading is that four extra
+    // zero-intensity spot lights are BELOW this bench's noise floor here — not
+    // that they are free. Re-measure before going past three.
+    const forced = /[?&]owHeadlightHosts=(\d+)/.exec(location.search);
+    const hosts = forced ? Math.max(0, Math.min(6, +forced[1])) : slots >= 8 ? 3 : 2;
+    if (hosts === 0) return;
+    for (let h = 0; h < hosts; h++) {
+      const pair = [];
+      for (let i = 0; i < 2; i++) {
+        const l = new THREE.SpotLight(0xfff0d8, 0, 62, 0.62, 0.42, 1.3);
+        l.name = `vehicle_headlight_${h}_${i}`;
+        l.castShadow = false;
+        l.visible = true;
+        l.position.set(0, -900, 0);
+        l.target.position.set(0, -900, 1);
+        this.root.add(l);
+        this.root.add(l.target);
+        this.headlights.push(l);
+        pair.push(l);
+      }
+      this._hlHosts.push({ lights: pair, car: null, level: 0 });
     }
+    /** Scratch for the per-frame scoring pass. Preallocated (rule 5). */
+    this._hlCand = [];
+    for (let i = 0; i < HEADLIGHT_CANDIDATES; i++) this._hlCand.push({ v: null, score: 0 });
+    this._nHlCand = 0;
   }
 
+  /**
+   * Score every headlit car in range and arbitrate the spot pairs.
+   *
+   * Three bands, and they are bands rather than a single sort because the two
+   * cars whose headlights the player is actually reading are not the two
+   * nearest ones:
+   *
+   *   PLAYER    whatever he is driving, unconditionally. You have to be able to
+   *             see the road, the kerb and a spike strip ahead of your own
+   *             bonnet; that is the whole feature.
+   *   PURSUIT   the nearest cruiser with its bar lit. `lightbarOn` is set by
+   *             `police` on the cars actually chasing, so this needs no reach
+   *             into another subsystem and it is true per frame rather than per
+   *             spawn.
+   *   TRAFFIC   everything else, nearest-first, biased toward what is in front
+   *             of the camera.
+   *
+   * HYSTERESIS, not round-robin. Rotating the pairs through the traffic would
+   * spread real light around, and it would also make an individual car's
+   * headlights fade up and down while it drove in a straight line, which reads
+   * as a fault in the car rather than as a budget. An incumbent instead gets a
+   * bonus on its contribution term (never across a band), so two near-tied cars
+   * cannot trade the pair back and forth; the fair-share job is done by the
+   * road pool below, which every headlit car in range gets whether or not it
+   * won a pair.
+   */
   _updateHeadlights(ctx) {
-    if (!this.headlights?.length) return;
+    if (!this._hlHosts?.length) return;
     const sky = ctx.peek('sky');
     const alt = sky?.sunAltitude ?? 0.6;
     const night = Math.max(0, Math.min(1, 1 - (alt + 0.02) / 0.14));
-    const v = this._lightHost(ctx);
-    if (!v || night < 0.02) {
-      for (const l of this.headlights) l.intensity = 0;
+    const dt = Math.min(0.1, Math.max(1 / 480, ctx.time.dt || 1 / 60));
+    if (night < 0.02) {
+      for (const h of this._hlHosts) {
+        h.car = null;
+        h.level = 0;
+        h.lights[0].intensity = 0;
+        h.lights[1].intensity = 0;
+      }
       return;
     }
-    const s = v.spec.style;
-    const hl = s.headlight;
-    const y = (hl?.y ?? 0.7) - v.spec.comY;
-    const z = (s.noseZ ?? v.spec.half.z) - 0.1;
-    const x = (s.hwMax ?? 1) * (s.noseHw ?? 1) - (hl?.inset ?? 0.3);
-    for (let i = 0; i < this.headlights.length; i++) {
-      const l = this.headlights[i];
-      _v.set(i === 0 ? -x : x, y, z).applyQuaternion(v.quaternion).add(v.position);
-      l.position.copy(_v);
-      _v2.set(i === 0 ? -x * 1.5 : x * 1.5, y - 3.2, z + 26).applyQuaternion(v.quaternion).add(v.position);
-      l.target.position.copy(_v2);
-      l.target.updateMatrixWorld();
-      l.intensity = v.destroyed ? 0 : 46 * night;
+
+    const player = ctx.peek('player');
+    const pv = player?.vehicle ?? player?.currentVehicle ?? null;
+    const cand = this._hlCand;
+    let n = 0;
+    let bestCop = null;
+    let bestCopD2 = Infinity;
+    const render = this.render ?? (this.render = ctx.peek('render') ?? null);
+    let pools = 0;
+    for (let i = 0; i < this.vehicles.length; i++) {
+      const v = this.vehicles[i];
+      if (v.destroyed || !v.model?.root?.visible) continue;
+      if (v !== pv && !v.driver) continue;
+      const d2 = _cam.distanceToSquared(v.position);
+      if (d2 > HEADLIGHT_MAX_M * HEADLIGHT_MAX_M) continue;
+      // The road pool: every headlit car in range gets one, including the ones
+      // that will lose the arbitration below. This is what stops a night chase
+      // being five cars with glowing lamps over black asphalt.
+      if (render?.submitGroundPool && d2 < HEADLIGHT_POOL_M * HEADLIGHT_POOL_M && pools < HEADLIGHT_POOLS) {
+        pools++;
+        this._submitHeadlightPool(render, v, night);
+      }
+      if (v.lightbarOn && d2 < bestCopD2) {
+        bestCopD2 = d2;
+        bestCop = v;
+      }
+      if (n >= HEADLIGHT_CANDIDATES) continue;
+      const e = cand[n++];
+      e.v = v;
+      // Inverse-distance within the traffic band, lifted for anything in front
+      // of the camera — a car behind you throws its light away from the shot.
+      _v.copy(v.position).sub(_cam);
+      const facing = _v.dot(_fwdCam) > 0 ? 1.6 : 1;
+      e.score = (facing * 120) / (12 + Math.sqrt(d2));
+    }
+    for (let i = 0; i < n; i++) {
+      const e = cand[i];
+      if (e.v === pv) e.score = 3e6;
+      else if (e.v === bestCop) e.score = 2e6;
+      else {
+        for (const h of this._hlHosts) {
+          if (h.car === e.v && h.level > 0.3) {
+            e.score *= 1.35;
+            break;
+          }
+        }
+      }
+    }
+
+    // ---- assignment: incumbents keep their pair, then best-first ----------
+    for (const h of this._hlHosts) {
+      if (h.car) {
+        let live = false;
+        for (let i = 0; i < n; i++) if (cand[i].v === h.car) { live = true; cand[i].score = -1; break; }
+        if (!live) h.car = null;
+      }
+    }
+    for (const h of this._hlHosts) {
+      if (h.car) continue;
+      let best = -1;
+      let bestS = 0;
+      for (let i = 0; i < n; i++) {
+        if (cand[i].score > bestS) {
+          bestS = cand[i].score;
+          best = i;
+        }
+      }
+      if (best < 0) break;
+      h.car = cand[best].v;
+      h.level = 0;
+      cand[best].score = -1;
+    }
+
+    // ---- pose + crossfade -------------------------------------------------
+    const k = 1 - Math.exp(-dt * 9); // ~0.2 s, slower than a slot handover
+    for (const h of this._hlHosts) {
+      const v = h.car;
+      if (!v) {
+        h.level = Math.max(0, h.level - k);
+        h.lights[0].intensity = 0;
+        h.lights[1].intensity = 0;
+        continue;
+      }
+      h.level += (1 - h.level) * k;
+      const s = v.spec.style;
+      const hl = s.headlight;
+      const y = (hl?.y ?? 0.7) - v.spec.comY;
+      const z = (s.noseZ ?? v.spec.half.z) - 0.1;
+      const x = (s.hwMax ?? 1) * (s.noseHw ?? 1) - (hl?.inset ?? 0.3);
+      for (let i = 0; i < 2; i++) {
+        const l = h.lights[i];
+        _v.set(i === 0 ? -x : x, y, z).applyQuaternion(v.quaternion).add(v.position);
+        l.position.copy(_v);
+        _v2.set(i === 0 ? -x * 1.5 : x * 1.5, y - 3.2, z + 26).applyQuaternion(v.quaternion).add(v.position);
+        l.target.position.copy(_v2);
+        l.target.updateMatrixWorld();
+        l.intensity = 46 * night * h.level;
+      }
     }
   }
 
-  _lightHost(ctx) {
-    const player = ctx.peek('player');
-    const pv = player?.vehicle ?? player?.currentVehicle ?? null;
-    if (pv && !pv.destroyed) return pv;
-    for (const v of this.vehicles) if (v.driver) return v;
-    return null;
+  /**
+   * The projected road pool under one headlit car.
+   *
+   * Placed on the ground ahead of the nose and oriented with the car, so it
+   * sweeps as the car turns: longer along the heading than across it, which is
+   * the near field of a dipped beam. It is deliberately SHORT compared to what
+   * the spot pair throws — a pool this fake has no shadow and no albedo, so
+   * anything more than the first few car lengths reads as a painted stripe
+   * rather than as light. The throw down the road is the pair's job, and the
+   * pair is what the arbitration above is spending.
+   */
+  _submitHeadlightPool(render, v, night) {
+    // Off the wheels' own contacts, and off the FLAG rather than the vector:
+    // `w.contact` is preallocated and therefore always truthy (rule 12).
+    let gy = 0;
+    let grounded = 0;
+    for (const w of v.wheels ?? []) {
+      if (w.grounded !== true) continue;
+      gy += w.contact.y;
+      grounded++;
+    }
+    const y = grounded
+      ? gy / grounded
+      : v.position.y - (v.spec.comY ?? 0.5) + (v.spec.style?.groundY ?? 0.1);
+    _fwd.set(0, 0, 1).applyQuaternion(v.quaternion);
+    const yaw = Math.atan2(_fwd.x, _fwd.z);
+    const ahead = HEADLIGHT_POOL_R * 0.62;
+    render.submitGroundPool(
+      v.position.x + _fwd.x * ahead,
+      y + 0.02,
+      v.position.z + _fwd.z * ahead,
+      HEADLIGHT_POOL_R,
+      v.lightbarOn ? HEADLIGHT_POOL_COP : HEADLIGHT_POOL_TINT,
+      HEADLIGHT_POOL_GAIN * night,
+      1.55,
+      yaw,
+      2.2
+    );
   }
 
   /** Brake / tail / indicator / reverse / lightbar emissives. */

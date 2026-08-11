@@ -166,6 +166,109 @@ const ASSIST_MAX_CLIMB = 1.15;
 
 /**
  * ────────────────────────────────────────────────────────────────────────────
+ * ROLL STABILITY — what stops a corner becoming a rollover, and why the
+ * suspension cannot do it on its own.
+ * ────────────────────────────────────────────────────────────────────────────
+ * A car tips when the lateral force at the contact patches, acting a CoM height
+ * below the mass it is turning, out-moments the weight acting a half-track
+ * outboard of the tyre it is leaning on. Every term of that is real here and
+ * the model produces it faithfully — which is the problem, because the model
+ * also runs tyres that peak at mu ~1.35 and bodies whose CoM sits high enough
+ * that 1.0 g at the patch is already past the tipping point once the suspension
+ * has rolled and carried the CoM outboard with it.
+ *
+ * MEASURED before this existed, `rollprobe.mjs`, peak absolute bank over a 6 s
+ * corner entered at 110 km/h under throttle and full lock on FLAT asphalt:
+ * van 97, truck 96, pickup 105, suv 108 degrees — every one of them past 90,
+ * i.e. on its roof, with nothing but the steering held. A SEDAN needed only a
+ * 1 rad/s roll disturbance (a kerb strike mid-corner) to reach 111.
+ *
+ * Once the inside pair lifts there is nothing left to stop it: an unloaded
+ * spring pushes with zero force, so the whole restoring moment is gravity's,
+ * and gravity's arm SHRINKS as the bank grows. The divergence is one-way.
+ *
+ * So the assist is the roll axis's exact analogue of the yaw spin recovery a
+ * few lines below it — past the angle at which the car has stopped cornering
+ * and started tipping, a bounded restoring torque plus rate damping, and
+ * nothing at all below that angle. Ordinary body roll (measured 5-12 deg at the
+ * limit across the fleet) is under the onset and is untouched, which matters:
+ * visible body roll is a quality requirement, not a defect.
+ *
+ * THE REFERENCE IS THE GROUND, NOT THE WORLD. Measured against world up, this
+ * would fight every cambered road and every Mt Washington incline in the city —
+ * a car parked across a 20 degree slope is banked 20 degrees and is not tipping
+ * over. The angle is taken against the mean CONTACT NORMAL of the wheels that
+ * are actually touching, so a car on a slope is level as far as this is
+ * concerned and only a car leaning off its own tyres is not.
+ */
+/** Bank past which a car is tipping rather than cornering, radians (13 deg). */
+const ROLL_ONSET = 0.23;
+/** Band over which the assist ramps to full authority, radians. */
+const ROLL_BAND = 0.20;
+/** Peak restoring roll acceleration, rad/s^2, and the rate damping with it. */
+const ROLL_GAIN = 13;
+const ROLL_DAMP = 3.4;
+
+/**
+ * ────────────────────────────────────────────────────────────────────────────
+ * SELF-RIGHTING — a car on its roof is a session-ending bug, not a punishment.
+ * ────────────────────────────────────────────────────────────────────────────
+ * Nothing in the model can turn an upside-down car back over: the wheels cast
+ * their rays along the body's own -up, which points at the sky, so `grounded`
+ * is 0, no pedal does anything, and the chassis probes simply hold it there.
+ * A player who ends up inverted away from a road is stranded exactly as surely
+ * as the high-centred car `_unstick` exists for.
+ *
+ * The recovery is the same shape as everything else here: a FORCE, never a
+ * teleport, ramped rather than popped, armed only at rest and only while the
+ * body is genuinely over. It rocks — the torque builds against the roof edge
+ * until the CoM crosses it — so what the player sees is the car heaving over
+ * onto its side and dropping back onto its wheels, not a snap to upright.
+ *
+ * A WRECK IS LEFT WHERE IT LIES: a burnt-out shell rolling itself back over is
+ * a physics engine showing its workings.
+ */
+/**
+ * ────────────────────────────────────────────────────────────────────────────
+ * WHAT AN AIRCRAFT IMPACT COSTS — see `applyImpact`.
+ * ────────────────────────────────────────────────────────────────────────────
+ * A car has a crumple structure and a single hit may never take more than 45%
+ * of it (`damage.js CRASH_MAX_FRAC`), which is exactly right for a car: a
+ * write-off should be a pile-up, not one unlucky nudge. An AIRFRAME is not a
+ * car. It is thin metal wrapped round a tank of fuel, and flying it into a
+ * hillside at cruise is not a dent — the one thing every player expects from
+ * that is a fireball. So past a closing speed the airframe cannot absorb, the
+ * aircraft is written off outright and the existing burn fuse in
+ * `DamageModel.update` takes it from there.
+ *
+ * 14 m/s is 50 km/h at the skin. Below it the ordinary crash pricing applies
+ * and the machine is damaged rather than lost, so a heavy landing costs a
+ * repair bill and a botched approach costs the aeroplane.
+ */
+const AIR_CRASH_DV = 14;
+/** Below this closing speed an aircraft contact is taxi noise, not an impact. */
+const AIR_IMPACT_MIN = 2.5;
+
+/**
+ * Body up under which a vehicle counts as OVER — cos(72 deg).
+ *
+ * Deliberately this side of 90: a car lying on its FLANK is as stranded as one
+ * on its roof (the wheel rays are cast along the body's own -up, so they point
+ * at a wall rather than at the ground either way), and a player who has been
+ * tipped onto the driver's door is not going to accept "it is not quite upside
+ * down" as an answer. Everything above it is a car on a slope — Pittsburgh has
+ * 30 degree streets — and is left alone.
+ */
+const RIGHT_UP = 0.30;
+/** Seconds inverted and at rest before the recovery arms, and its ramp. */
+const RIGHT_DELAY = 1.2;
+const RIGHT_IN = 1.6;
+/** Peak righting roll acceleration, rad/s^2, and the lift that goes with it. */
+const RIGHT_ACC = 15;
+const RIGHT_LIFT = 0.35;
+
+/**
+ * ────────────────────────────────────────────────────────────────────────────
  * HOW FAR PAST THE GRIP LIMIT THE STEERING IS ALLOWED TO ASK. See
  * `_updateSteering`.
  * ────────────────────────────────────────────────────────────────────────────
@@ -205,6 +308,8 @@ const _v5 = new THREE.Vector3();
 const _fwd = new THREE.Vector3();
 const _right = new THREE.Vector3();
 const _up = new THREE.Vector3();
+/** The axis the yaw stabiliser works about. See the yaw-stability block. */
+const _axis = new THREE.Vector3();
 const _n = new THREE.Vector3();
 const _r = new THREE.Vector3();
 const _k0 = new THREE.Vector3();
@@ -376,6 +481,16 @@ export class Vehicle {
     this.kerbAssist = 0;
     this._feelPhase = 0;
 
+    /**
+     * Roll stability and self-righting state. See `_rollAssist` / `_rightSelf`.
+     * `rollAssist` is the engaged fraction, published for `rollprobe.mjs` and
+     * the drive benches; `_rightFor` is seconds spent inverted and `_rightDir`
+     * the direction the recovery committed to.
+     */
+    this.rollAssist = 0;
+    this._rightFor = 0;
+    this._rightDir = 0;
+
     // Boat
     this.inWater = false;
     this.waterY = -Infinity;
@@ -440,19 +555,65 @@ export class Vehicle {
      */
     const floorLocal = (spec.style?.groundY ?? 0.14) - spec.comY;
     const roofLocal = (spec.style?.roofY ?? spec.dims.H) - spec.comY;
-    this.probeR = Math.max(
-      0.12,
-      Math.min(0.32, (roofLocal - floorLocal) * 0.3, spec.half.x * 0.5, spec.half.z * 0.3)
-    );
     this.probes = [];
-    const px = Math.max(0.02, spec.half.x - this.probeR);
-    const pz = Math.max(0.02, spec.half.z - this.probeR);
-    const yLo = floorLocal + this.probeR;
-    const yHi = Math.max(yLo + 0.02, roofLocal - this.probeR);
-    for (const sx of [-1, 1]) {
-      for (const sz of [-1, 0, 1]) {
-        this.probes.push(new THREE.Vector3(sx * px, yLo, sz * pz));
-        if (sz !== 0) this.probes.push(new THREE.Vector3(sx * px * 0.8, yHi, sz * pz));
+    if (spec.kind === 'plane') {
+      /**
+       * AN AEROPLANE IS A TUBE, NOT A BOX, and the box was in the wrong place.
+       *
+       * `spec.dims.W` for a fixed-wing is the WING SPAN, so the corner ring
+       * above put every probe 5.4 m outboard of the centreline — at the
+       * WINGTIPS — and left the fuselage with none at all. A Skylark could fly
+       * its nose, its cabin and its tail straight through a hangar wall and
+       * only notice if a wingtip happened to clip it.
+       *
+       * So the ring follows the fuselage CENTRELINE from the tail cone to the
+       * spinner at the fuselage radius, which is the shape the airframe
+       * actually is, plus one sphere at each wingtip so the span still exists
+       * as far as the solver is concerned. The spheres overlap along the tube,
+       * so there is no gap between them for a wall to pass through, and the
+       * sweep in `_airSweep` closes the one thing a static ring cannot: a
+       * 100 m/s aircraft covers 0.83 m per step and would tunnel through
+       * anything thinner than that between two of them.
+       */
+      const st = spec.style;
+      const r = Math.min(st.fuseR ?? 0.6, 0.85);
+      this.probeR = r;
+      const z0 = st.fuseZ0 ?? -spec.half.z;
+      const z1 = st.noseZ ?? spec.half.z;
+      const y = (st.fuseY ?? spec.comY) - spec.comY;
+      const n = Math.max(3, Math.min(9, Math.round((z1 - z0) / (r * 1.4)) + 1));
+      for (let i = 0; i < n; i++) {
+        this.probes.push(new THREE.Vector3(0, y, z0 + ((z1 - z0) * i) / (n - 1)));
+      }
+      // The wingtips, on the SAME radius the ring uses — one sphere is all a
+      // 0.2 m thick panel can be given when the solver has a single radius, so
+      // it is raised until its underside sits on the wing's underside. A wing
+      // that is too thick UPWARDS costs nothing; one that is too thick
+      // downwards puts a parked low-wing aeroplane on its wingtips (measured:
+      // the Meridian's tip clears the apron by 0.16 m on a naive placement).
+      const halfSpan = Math.max(0, (st.wingSpan ?? spec.dims.W) * 0.5 - r);
+      const wy = (st.wingY ?? st.fuseY ?? spec.comY) - spec.comY
+        + r - (st.wingThick ?? 0.2) * 0.5;
+      for (const sx of [-1, 1]) {
+        this.probes.push(new THREE.Vector3(sx * halfSpan, wy, st.wingZ ?? 0));
+      }
+      /** The fuselage capsule `_airSweep` sweeps, in body-local metres. */
+      this._fuseA = new THREE.Vector3(0, y, z0);
+      this._fuseB = new THREE.Vector3(0, y, z1);
+    } else {
+      this.probeR = Math.max(
+        0.12,
+        Math.min(0.32, (roofLocal - floorLocal) * 0.3, spec.half.x * 0.5, spec.half.z * 0.3)
+      );
+      const px = Math.max(0.02, spec.half.x - this.probeR);
+      const pz = Math.max(0.02, spec.half.z - this.probeR);
+      const yLo = floorLocal + this.probeR;
+      const yHi = Math.max(yLo + 0.02, roofLocal - this.probeR);
+      for (const sx of [-1, 1]) {
+        for (const sz of [-1, 0, 1]) {
+          this.probes.push(new THREE.Vector3(sx * px, yLo, sz * pz));
+          if (sz !== 0) this.probes.push(new THREE.Vector3(sx * px * 0.8, yHi, sz * pz));
+        }
       }
     }
 
@@ -507,6 +668,9 @@ export class Vehicle {
     this._stuckFrom.copy(this.position);
     this.stuckFor = 0;
     this.kerbAssist = 0;
+    this.rollAssist = 0;
+    this._rightFor = 0;
+    this._rightDir = 0;
     this.drivetrain.reset();
   }
 
@@ -626,10 +790,17 @@ export class Vehicle {
       // reading as a teleport.
       this._rideKerbs(dt);
       this._unstick(dt);
+      // Roll stability reads the contact normals `_stepWheels` just wrote, so
+      // it has to run after it and before the integrator.
+      this._rollAssist();
       // A car in a river. Buoyancy, drag, damage and a drowned engine — the
       // three water rules, in this model's units.
       this._stepWater(dt, ctx);
     }
+
+    // Every kind that can end up on its back gets the recovery. A boat is
+    // hulled and rights itself hydrostatically — see `stepBoat`.
+    if (kind !== 'boat') this._rightSelf(dt);
 
     this._aero(dt);
     this._integrate(dt);
@@ -1225,9 +1396,61 @@ export class Vehicle {
      * With the clamp this is the understeer limiter every arcade-accessible
      * driving game runs: it will not turn faster than grip allows, and it bleeds
      * off yaw when the car is already rotating faster than that.
+     *
+     * ────────────────────────────────────────────────────────────────────────
+     * THE AXIS IS THE GROUND'S, NOT THE BODY'S
+     * ────────────────────────────────────────────────────────────────────────
+     * Both torques below used to be built about the BODY's up axis, and that is
+     * only the axis the tyres work about while the body is sitting square on
+     * the surface. A tyre's yaw moment is made at the contact patch, so it acts
+     * about the CONTACT NORMAL; once the body is leaning off its own tyres the
+     * body axis is not that axis any more, and the difference is a torque about
+     * the car's lateral axis that nobody asked for and that grows with the
+     * lean. A damper sized to swing a two-tonne car's heading is not a small
+     * thing to leak into another axis.
+     *
+     * So: the axis is the mean contact normal of the wheels that are touching,
+     * and the magnitude carries `up . n` — the literal projection of the old
+     * body-axis torque onto it. Both halves matter and both are exactly 1 on
+     * level ground under a level car, so ordinary driving is unchanged to the
+     * last bit. `up . n` is also the right physics for the case this is about:
+     * the yaw moment a pair of tyres can make falls away as the car comes up
+     * onto them.
+     *
+     * WORLD UP WOULD BE WRONG, and it is the obvious first answer. Pittsburgh
+     * is hills: on a 20 degree incline a torque about world up has a component
+     * about the body's own NOSE axis — it leaks into ROLL, on the terrain where
+     * a roll is least recoverable. The contact normal degenerates to world up
+     * on the flat and to the hillside's normal on the hill, and leaks into
+     * neither.
+     *
+     * BE CLEAR ABOUT WHAT THIS AXIS IS AND IS NOT WORTH, because it was
+     * reported as the whole rollover fix and it is not. MEASURED on the emitted
+     * attitude (`rollprobe.mjs`), peak absolute bank over a 6 s corner entered
+     * at 110 km/h under W and full lock, body axis vs this one, on the flat and
+     * on 8 / 14 / 20 degree slopes, with and without a 1.5 rad/s kerb strike
+     * mid-corner: the two arms agree to within 1 degree in every one of those
+     * 16 runs. The rollovers this file is really about — van 97, truck 96,
+     * pickup 105, suv 108 degrees of bank on FLAT asphalt — are a roll-axis
+     * problem and are fixed on the roll axis, in `_rollAssist`. This is the
+     * correct axis for a torque that is about yaw; it is not the fix.
+     *
+     * `debugBodyYaw` restores the old axis on a LIVE vehicle with no edit, for
+     * anyone re-running that A/B. Off on every shipped path.
      */
     if (grounded > 0 && this.speed > 3) {
-      const yawRate = this.angularVelocity.dot(_up);
+      const bodyAxis = this.debugBodyYaw === true;
+      if (bodyAxis) {
+        _axis.copy(_up);
+      } else {
+        _axis.set(0, 0, 0);
+        for (let i = 0; i < wheels.length; i++) {
+          if (wheels[i].grounded) _axis.add(wheels[i].normal);
+        }
+        if (_axis.lengthSq() < 1e-6) _axis.set(0, 1, 0); else _axis.normalize();
+      }
+      const lever = bodyAxis ? 1 : Math.max(0, _up.dot(_axis));
+      const yawRate = this.angularVelocity.dot(_axis);
       const ackermann = (this.forwardSpeed * Math.tan(this.steerAngle)) / this.spec.wheelbase;
       let mu = 0;
       for (let i = 0; i < wheels.length; i++) mu += wheels[i].mu || 0;
@@ -1237,7 +1460,7 @@ export class Vehicle {
       const err = target - yawRate;
       const grip = grounded / wheels.length;
       const k = this.spec.inertia.y * 0.7 * Math.min(1, this.speed / 12) * grip;
-      this.addTorque(_v0.copy(_up).multiplyScalar(err * k));
+      this.addTorque(_v0.copy(_axis).multiplyScalar(err * k * lever));
 
       /**
        * Spin recovery: past ~35 degrees of body slip the car is no longer
@@ -1258,7 +1481,7 @@ export class Vehicle {
         const strength = Math.min(1, (beta - onset) / 0.7);
         const gain = bike ? 4.2 : 1.5;
         this.addTorque(
-          _v0.copy(_up).multiplyScalar(-yawRate * this.spec.inertia.y * gain * strength * grip)
+          _v0.copy(_axis).multiplyScalar(-yawRate * this.spec.inertia.y * gain * strength * grip * lever)
         );
       }
     }
@@ -1460,6 +1683,104 @@ export class Vehicle {
     this._force.addScaledVector(_k0, this.mass * ASSIST_PUSH * a);
     if (this.velocity.y < ASSIST_MAX_CLIMB) {
       this._force.y += this.mass * -GRAVITY * ASSIST_LIFT * a;
+    }
+  }
+
+  /**
+   * Roll stability. See the `ROLL_ONSET` block for why it exists and why the
+   * reference is the ground rather than the world.
+   *
+   * `rollAssist` is the engaged fraction, published for the bench. The torque
+   * is bounded by construction (a fixed angular acceleration, not a spring on
+   * an unbounded error) and it can only ever act to REDUCE the bank, so it
+   * cannot push a car past level and start an oscillation of its own.
+   *
+   * `debugNoRollAssist` disarms it on a LIVE vehicle with no edit — the
+   * negative control `rollprobe.mjs` runs, in the shape ARCHITECTURE rule 12
+   * asks for. Off on every shipped path.
+   */
+  _rollAssist() {
+    const wheels = this.wheels;
+    // A BIKE is deliberately exempt: it has no roll stiffness by design and
+    // `_bikeLean` owns its roll axis outright. A bike that could not lean is
+    // not a bike.
+    if (
+      this.grounded === 0 || this.destroyed || this.debugNoRollAssist === true ||
+      this.spec.kind === 'bike' || wheels.length < 3
+    ) {
+      this.rollAssist = 0;
+      return;
+    }
+    // The surface the car is standing on, from the contacts it actually has.
+    _n.set(0, 0, 0);
+    for (let i = 0; i < wheels.length; i++) {
+      if (wheels[i].grounded) _n.add(wheels[i].normal);
+    }
+    if (_n.lengthSq() < 1e-6) { this.rollAssist = 0; return; }
+    _n.normalize();
+
+    _fwd.set(0, 0, 1).applyQuaternion(this.quaternion);
+    _right.set(1, 0, 0).applyQuaternion(this.quaternion);
+    _up.set(0, 1, 0).applyQuaternion(this.quaternion);
+    // Bank about the car's own nose axis, relative to that surface. Positive
+    // is the same sense as `atan2(right.y, up.y)` on level ground.
+    const bank = Math.atan2(_n.dot(_right), _n.dot(_up));
+    const over = Math.abs(bank) - ROLL_ONSET;
+    if (over <= 0) { this.rollAssist = 0; return; }
+
+    const strength = Math.min(1, over / ROLL_BAND);
+    this.rollAssist = strength;
+    const rollRate = this.angularVelocity.dot(_fwd);
+    // A positive torque about +Z raises `right.y`, i.e. increases the bank, so
+    // the restoring term carries the opposite sign to the bank itself.
+    const acc = -Math.sign(bank) * ROLL_GAIN * strength - ROLL_DAMP * rollRate * strength;
+    this.addTorque(_v0.copy(_fwd).multiplyScalar(this.spec.inertia.z * acc));
+  }
+
+  /**
+   * Rock an inverted vehicle back onto its wheels. See the `RIGHT_UP` block.
+   *
+   * Arming is deliberately narrow — over, at rest, resting on SOMETHING, and
+   * not a write-off — and the direction is committed to ONCE per attempt. That
+   * last part is not tidiness: a car sitting at exactly 180 degrees is a
+   * hair's breadth either side of the sign, and re-deciding every step at
+   * 120 Hz makes the torque chatter instead of building.
+   */
+  _rightSelf(dt) {
+    _up.set(0, 1, 0).applyQuaternion(this.quaternion);
+    const supported = this.grounded > 0 || this.diag.contacts > 0;
+    if (
+      this.destroyed || this.debugNoRight === true || _up.y > RIGHT_UP ||
+      !supported || this.speed > 2.5
+    ) {
+      this._rightFor = 0;
+      this._rightDir = 0;
+      return;
+    }
+
+    this._rightFor += dt;
+    if (this._rightFor < RIGHT_DELAY) return;
+
+    _fwd.set(0, 0, 1).applyQuaternion(this.quaternion);
+    _right.set(1, 0, 0).applyQuaternion(this.quaternion);
+    if (this._rightDir === 0) {
+      // The SHORT way round — back down the way it went over, which for a car
+      // on its flank is a quarter turn rather than three. A torque about +Z
+      // raises `right.y`, i.e. increases the bank, so unwinding it is the
+      // opposite sign. At exactly 180 the two are the same distance and the
+      // sign is arbitrary; committing to one is what stops it dithering there.
+      const bank = Math.atan2(_right.y, _up.y);
+      this._rightDir = bank >= 0 ? -1 : 1;
+    }
+    const ramp = Math.min(1, (this._rightFor - RIGHT_DELAY) / RIGHT_IN);
+    this.addTorque(
+      _v0.copy(_fwd).multiplyScalar(this.spec.inertia.z * RIGHT_ACC * ramp * this._rightDir)
+    );
+    // Just enough lift to take weight off the roof so the shell can pivot on
+    // its edge instead of grinding on it. Under a g, and capped on climb rate
+    // for the same reason `_unstick`'s is: this may not throw a car into the air.
+    if (this.velocity.y < ASSIST_MAX_CLIMB) {
+      this._force.y += this.mass * -GRAVITY * RIGHT_LIFT * ramp;
     }
   }
 
@@ -1731,6 +2052,101 @@ export class Vehicle {
   }
 
   /**
+   * PRICE AN IMPACT BY ITS CLOSING SPEED. See the `AIR_CRASH_DV` block.
+   *
+   * The one thing this adds over `VehicleSystem.reportCollision` is the
+   * WRITE-OFF: an aircraft past the closing speed its airframe can absorb is
+   * destroyed on the spot rather than dented, and the burn fuse that already
+   * exists for every wreck does the rest. Everything else — the panel damage,
+   * `vehicle:collision`, `vehicle:destroyed` — goes down the paths it always
+   * did, so nothing downstream has a second case to learn.
+   *
+   * Takes the contact as scalars, in `reportCollision`'s own argument order, so
+   * a caller inside the step does not have to allocate a vector to report a
+   * hit (hard rule 5).
+   *
+   * @returns the closing speed it priced, or 0 if it declined the hit.
+   */
+  applyImpact(closing, px, py, pz, nx, ny, nz, other, ctx) {
+    if (this.destroyed || !(closing > AIR_IMPACT_MIN)) return 0;
+    this.wake();
+    this._lastImpulse = this.mass * closing;
+    /** The closing speed of the last impact, m/s. Published for the benches. */
+    this.crashDv = closing;
+    this.sys.reportCollision?.(
+      this, other ?? null, px, py, pz, nx, ny, nz, this.mass * closing
+    );
+    if (closing >= AIR_CRASH_DV && !this.destroyed) {
+      this.health = 0;
+      this.damage?.destroy?.(ctx);
+      this.destroyed = true;
+      this.engineOn = false;
+      if (!this._deathEmitted) {
+        this._deathEmitted = true;
+        ctx?.events?.emit('vehicle:destroyed', {
+          vehicle: this, point: new THREE.Vector3(px, py, pz),
+        });
+      }
+    }
+    return closing;
+  }
+
+  /**
+   * THE ONE THING A RING OF SPHERES CANNOT DO: catch something moving faster
+   * than the spheres are wide.
+   *
+   * The probe ring is a set of point-in-space overlap tests, so it can only
+   * find geometry that is inside a probe at the END of a step. A sphere of
+   * radius `r` therefore catches anything it passes within `2r` of, and misses
+   * everything else: the guarantee holds only while the step's travel is under
+   * that window. The fuselage capsule is SWEPT from the previous pose along
+   * the step's travel instead, which has no such limit. On a hit the body is
+   * put back at first contact, the impact is priced by its CLOSING SPEED — the
+   * physical quantity a crash is made of — and the aircraft keeps a fraction
+   * of its momentum, because an airframe hitting a hillside at cruise does not
+   * ricochet off it.
+   *
+   * BE HONEST ABOUT THE MARGIN THIS IS BUYING. MEASURED against the shipped
+   * fleet: the jet's 0.78 m fuselage radius gives a 1.56 m window against
+   * 1.17 m of travel per 120 Hz step at its 140 m/s top speed, and the
+   * Skylark's 0.6 m radius gives 1.2 m against 0.42 m. So NOTHING IN THE FLEET
+   * CAN TUNNEL TODAY — it would take about 190 m/s — and `flightprobe`'s wall
+   * section cannot make one do it. What the sweep is, is the guarantee that
+   * this stays true if anyone tightens a fuselage radius, raises a top speed
+   * or adds a thinner aircraft, and it is the only path that prices a contact
+   * from the closing speed at FIRST TOUCH rather than from whatever the ring's
+   * impulse solver resolved a step later.
+   *
+   * Armed only above the speed at which a step covers half a probe radius, so
+   * a taxiing aeroplane pays nothing for it and no ground-handling bench moves.
+   */
+  _airSweep(ctx) {
+    const phys = this.sys.physics;
+    if (!phys?.capsuleCast || !this._fuseA) return;
+    _v0.copy(this.position).sub(this.prevPosition);
+    const travel = _v0.length();
+    if (travel <= this.probeR * 0.5) return;
+    _v0.multiplyScalar(1 / travel);
+
+    _k0.copy(this._fuseA).applyQuaternion(this.prevQuaternion).add(this.prevPosition);
+    _k1.copy(this._fuseB).applyQuaternion(this.prevQuaternion).add(this.prevPosition);
+    const hit = phys.capsuleCast(_k0, _k1, this.probeR, _v0, travel, phys.MASK.WORLD);
+    if (!hit.hit) return;
+
+    // Back to first contact, a hair short of the surface so the probe ring
+    // resolves the rest of it the way it resolves every other contact.
+    this.position.copy(this.prevPosition).addScaledVector(_v0, Math.max(0, hit.distance - 0.02));
+    const closing = -this.velocity.dot(hit.normal);
+    if (closing <= AIR_IMPACT_MIN) return;
+    this.applyImpact(
+      closing, hit.point.x, hit.point.y, hit.point.z,
+      hit.normal.x, hit.normal.y, hit.normal.z, hit.object ?? null, ctx
+    );
+    this.velocity.multiplyScalar(0.2);
+    this.angularVelocity.multiplyScalar(0.4);
+  }
+
+  /**
    * Chassis vs the static world. Sphere probes at the body corners against the
    * BVH; the deepest contact per probe is resolved with a positional push and
    * an impulse, so hitting a wall costs speed and spins the car rather than
@@ -1738,6 +2154,10 @@ export class Vehicle {
    */
   _collide(dt, ctx) {
     const phys = this.sys.physics;
+    // The anti-tunnelling sweep runs FIRST and on its own terms: it works off
+    // the step's travel, so it has to see the position before the ring has
+    // pushed it anywhere.
+    if (this.spec.kind === 'plane') this._airSweep(ctx);
     if (!phys?.staticWorld) return;
     const cts = phys.staticWorld.contacts;
     const r = this.probeR;
@@ -1818,7 +2238,16 @@ export class Vehicle {
     if (biggest > this.mass * 0.55 && this._impactCool <= 0) {
       this._impactCool = 0.1;
       this._lastImpulse = biggest;
-      this.sys.reportCollision(this, hitObj, hitPointX, hitPointY, hitPointZ, hitNX, hitNY, hitNZ, biggest);
+      // An aircraft's contacts are priced by closing speed, because past the
+      // speed an airframe can absorb the answer is a write-off rather than a
+      // dent. See `applyImpact`.
+      if (this.spec.kind === 'plane') {
+        this.applyImpact(
+          biggest / this.mass, hitPointX, hitPointY, hitPointZ, hitNX, hitNY, hitNZ, hitObj, ctx
+        );
+      } else {
+        this.sys.reportCollision(this, hitObj, hitPointX, hitPointY, hitPointZ, hitNX, hitNY, hitNZ, biggest);
+      }
     }
   }
 

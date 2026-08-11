@@ -401,11 +401,17 @@ async function runBoot() {
   // (SKIP ALL) and let the clock be handed back, so the pause-menu assertions
   // below test the running game, not the cutscene. If the save has no pending
   // chapter (story done) there is no cutscene and this is a no-op.
-  const skippedIntro = await page.evaluate(() => {
+  //
+  // The lock is sampled BEFORE the skip, because "the cursor is free" is a
+  // claim about the moment SKIP is on screen — see the pair of assertions
+  // below.
+  const intro = await page.evaluate(() => {
     const c = window.__ENGINE__.ctx.peek('ui')?.subs?.cut;
-    if (c?.active) { c.skipAll?.(); return true; }
-    return false;
+    const locked = !!document.pointerLockElement;
+    if (c?.active) { c.skipAll?.(); return { played: true, locked }; }
+    return { played: false, locked };
   });
+  const skippedIntro = intro.played;
   if (skippedIntro) {
     await page.waitForFunction(() => window.__ENGINE__.time.scale === 1, null, { timeout: 8000 })
       .catch(() => {});
@@ -433,17 +439,26 @@ async function runBoot() {
   rec(label, 'the game runs with control once the intro is skipped',
     playing.scale === 1 && playing.control,
     `time.scale ${playing.scale}, control ${playing.control}`);
-  // START lands in the intro CUTSCENE, which deliberately frees the cursor so
-  // SKIP is clickable — so the lock is NOT held at this point, by design. The
-  // real player journey is: skip the intro, click the world, and mouse-look
-  // works. Assert that journey: a canvas click after the skip takes the lock.
-  rec(label, 'the cutscene left the cursor free (SKIP was clickable)',
-    !playing.locked, `locked ${playing.locked}`);
-  await page.evaluate(() => window.__CLICK__(innerWidth / 2, innerHeight / 2));
-  await page.waitForTimeout(300);
-  const relocked = await page.evaluate(() => !!document.pointerLockElement);
-  rec(label, 'clicking the world after the intro takes pointer lock',
-    relocked, `locked ${relocked}`);
+  /**
+   * THE TWO MOMENTS EITHER SIDE OF THE INTERSTITIAL, AND THEY ASSERT OPPOSITE
+   * THINGS ON PURPOSE. START takes pointer lock inside its own click
+   * (`src/ui/boot.js`), the cutscene coming up releases it so SKIP is
+   * clickable, and the cutscene ENDING has to hand it back — otherwise
+   * mouse-look is dead until the player clicks the world, and that click used
+   * to fire a round.
+   *
+   * This file used to sample the lock AFTER the skip and assert it was free,
+   * with a comment about SKIP being clickable — i.e. it read the running
+   * game's state to make a claim about the cutscene's. It passed only because
+   * nothing re-locked. That is not rule 13: the sample point was wrong for the
+   * question, and the requirement on the second moment has since inverted.
+   * `src/ui/lockuxprobe.mjs` owns the same falling edge through the map and
+   * the menu, with the negative controls.
+   */
+  rec(label, 'the cutscene leaves the cursor free while SKIP is on screen',
+    !intro.locked, `locked during the cut ${intro.locked}`);
+  rec(label, 'the intro hands mouse-look back the moment it ends, with no click',
+    playing.locked, `locked after the skip ${playing.locked}`);
 
   // And the pause menu still behaves after arriving through the boot flow.
   const esc = async () => {

@@ -22,11 +22,17 @@ const SFX_BUSES = ['weapons', 'foley', 'ambience', 'sirens', 'vehicles', 'voice'
  * `CONTROLS.md`. The doc is out of date in at least three places that matter —
  * it gives the mouse wheel a chase-camera zoom (`input.wheel` has no reader in
  * the whole tree), and it does not know about Alt-walk, the middle-mouse
- * shoulder swap, or the number row. Two keys are BOUND in `ACTIONS` and read by
- * nobody — `grenade` (G) and `flashlight` (T) — so they are deliberately not
- * here: a hint naming a key that does nothing is worse than no hint, which is
- * what `src/ui/controlsprobe.mjs` gates. Add a row here only after you have
- * found the line that reads it.
+ * shoulder swap, or the number row. `grenade` (G) and `flashlight` (T) were
+ * bound in `ACTIONS` and read by nobody and are deliberately not here; both
+ * bindings are now deleted outright. A hint naming a key that does nothing is
+ * worse than no hint, which is what `src/ui/controlsprobe.mjs` gates. Add a row
+ * here only after you have found the line that reads it.
+ *
+ * CROUCH IS `C`, NOT `CTRL`. `ACTIONS.crouch` dropped `ControlLeft` because
+ * holding it made every other key a browser shortcut and Ctrl+W closed the tab
+ * mid-run — see the header of `src/core/input.js`. A row naming CTRL would now
+ * be a key the game does not read, which is the exact failure the gate exists
+ * for.
  *
  * J and K come from `GameSystem._input` (`src/game/index.js:775`), which is in
  * no document at all and which the gate found by pressing every letter: J
@@ -60,7 +66,7 @@ const CONTROL_GROUPS = [
     [['SHIFT'], '', 'Sprint'],
     [['ALT'], '', 'Walk'],
     [['SPACE'], '', 'Jump'],
-    [['CTRL', 'C'], '/', 'Crouch'],
+    [['C'], '', 'Crouch'],
     [['MOUSE'], '', 'Look'],
     [['V'], '', 'Camera view'],
     [['F'], '', 'Action · see the prompt'],
@@ -117,10 +123,10 @@ const CONTROL_GROUPS = [
     [['P'], '', 'Phone'],
     [['O'], '', 'Story'],
     [['J'], '', 'Start the next job'],
-    [['K'], '', 'Drop the job'],
+    [['K'], '', 'Drop the job (press twice, or Shift+K)'],
     [['N'], '', 'Radio station'],
     [['X'], '', 'Switch brother (hold)'],
-    [['B'], '', 'Minimap mode'],
+    [['SHIFT', 'B'], '+', 'Minimap north up / heading up'],
     [['↑', '↓', '←', '→'], '', 'Move in a list'],
     [['ENTER'], '', 'Choose'],
   ]],

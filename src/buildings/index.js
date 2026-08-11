@@ -144,6 +144,34 @@ const KERB_MARGIN = 0.30;
 const GUARD_UNDER = 0.05;
 const GUARD_OVER = 1.9;
 
+/* ---- night windows + facade spill (see `_driveLights`) ----------------- */
+/**
+ * Night multiplier on a LIT ROOM's authored emissive, replacing the 5.2 every
+ * emitter in the city used to share.
+ *
+ * MEASURED on `searchlight_side`, which is the frame the review cited: at 5.2
+ * the lit rectangles metered 246-252/255 across their whole area with a
+ * standard deviation under 3, i.e. clipped white with no shape in them at all.
+ * A room is a 3 x 4 m emitter and bloom has that whole area to smear, which is
+ * the argument `palette.js` already makes about sign boxes; the thin emitters
+ * (`neon_*`) keep the old ramp because a 22 mm tube has nothing to blow out.
+ * Per-window variance then spreads what is left over roughly 0.26x to 1.28x,
+ * so the brightest windows still land near the top of the range and the
+ * curtained ones sit two and a half stops under them.
+ */
+const WINDOW_NIGHT = 2.4;
+/** Lot kinds whose ground floor is lit and faces a street. */
+const SPILL_KINDS = new Set(['shop', 'block', 'tower']);
+/** Metres from the camera within which a frontage earns a pool. */
+const SPILL_M = 70;
+/** Metres a shopfront's light reaches across the pavement. */
+const SPILL_REACH = 5.0;
+/** Pools `buildings` will take out of the renderer's 32. */
+const SPILL_MAX = 8;
+/** Linear HDR gain. Half the headlight pool: this is spill, not a source. */
+const SPILL_GAIN = 0.016;
+const SPILL_TINT = 0xffd2a0;
+
 /**
  * Half the ground a carriageway occupies.
  *
@@ -1318,6 +1346,7 @@ export class BuildingSystem {
     // reaches 288 m would punch a hole in the city.
     this.skyline?.update(cam, this.synthetic ? 3 * SYNTH_TILE : this.midRadius);
     this._driveLights(ctx);
+    this._submitFacadeSpill(dt, ctx);
 
     // The BVH rebuild is O(tris); doing it per tile would cost more than the
     // whole build. Coalesce.
@@ -1333,12 +1362,40 @@ export class BuildingSystem {
    * Lit windows are emissive materials, not point lights — a night skyline
    * needs tens of thousands of them and `q.lightSlots` is eight. One uniform
    * write per material per change drives the whole city.
+   *
+   * TWO THINGS CHANGED HERE AND THEY ARE THE SAME DEFECT SEEN TWICE.
+   *
+   * The night ramp was `base * (0.22 + 5.2 * mix)` for every material in the
+   * list, which took a lit room to 5.42x its authored intensity after dark, and
+   * a room is a BROAD emitter. `palette.js` says this in its own comment and
+   * then the ramp ignored it: "a 22 mm neon tube can sit five stops over white
+   * and still read as a tube, because bloom has almost no area to smear; a 4 m
+   * lit sign box at the same intensity is a blown white slab with no shape in
+   * it". A tower full of 3 m x 4 m rooms at 5.42x is that slab, tiled — which
+   * is what a critic photographed: uniform near-100 % white rectangles that
+   * spill nothing onto the plaza below them. Rooms and tubes now ramp
+   * separately, because area is what decides the ceiling.
+   *
+   * And every lit room in the city held the SAME value, because one uniform
+   * drives all of them. That is the right cost model and the wrong picture: a
+   * real block is a scatter of bright offices, dim rooms, drawn curtains and
+   * empty floors. `_patchWindowVariance` puts that back per fragment, off the
+   * window's own world position, so it costs no extra material, no extra draw
+   * call and no per-window CPU work.
    */
   _driveLights(ctx) {
     if (!this._litMats.length) {
+      // `?owLegacyWindows=1` restores the shipped behaviour — one 5.42x ramp
+      // for every emitter and no per-window variance — as the negative control
+      // for both halves of this (rule 12). MEASURED on `searchlight_side`, over
+      // the lit facade of the tower the review photographed.
+      this._legacyWindows = /[?&]owLegacyWindows=1/.test(location.search);
       for (const k of ['room_lit_warm', 'room_lit_cool', 'neon_amber', 'neon_teal', 'neon_red']) {
         const m = this.lib._mats.get(k);
-        if (m) this._litMats.push({ m, base: SURFACES[k]?.opts?.three?.emissiveIntensity ?? 1 });
+        if (!m) continue;
+        const room = k.startsWith('room_') && !this._legacyWindows;
+        if (room) this._patchWindowVariance(m);
+        this._litMats.push({ m, room, base: SURFACES[k]?.opts?.three?.emissiveIntensity ?? 1 });
       }
       if (!this._litMats.length) return;
     }
@@ -1347,7 +1404,185 @@ export class BuildingSystem {
     const mix = 1 - Math.min(1, Math.max(0, (alt + 0.06) / 0.2));
     if (Math.abs(mix - this._litMix) < 0.02) return;
     this._litMix = mix;
-    for (const e of this._litMats) e.m.emissiveIntensity = e.base * (0.22 + 5.2 * mix);
+    for (const e of this._litMats) {
+      e.m.emissiveIntensity = e.base * (e.room ? 0.22 + WINDOW_NIGHT * mix : 0.22 + 5.2 * mix);
+    }
+  }
+
+  /**
+   * PER-WINDOW VARIANCE, resolved in the fragment shader.
+   *
+   * The value is a hash of the window's own WORLD position, so it is stable
+   * under any camera motion, identical between two runs, and free of the
+   * per-window CPU state that a real "which rooms are lit" simulation would
+   * need at city scale. Two terms, and the split is deliberate:
+   *
+   *   PER FLOOR   a hard step quantised to the floor pitch. Steps are safe on
+   *               this axis and only on this axis — the generators lay each
+   *               glazing band strictly INSIDE one floor, so a step at the
+   *               floor boundary can never cut a window in half. It is also the
+   *               axis that reads: a tower with two bright floors, a dark one
+   *               and a curtained one above is instantly a building with people
+   *               in it.
+   *   ACROSS      a smooth ripple, never a step, at roughly one and a half bays
+   *               of period. The horizontal quantisation that would give a
+   *               crisper scatter has no safe grid: bays run 3.4-11 m depending
+   *               on the archetype, so any fixed cell size draws a hard line
+   *               down the middle of some window somewhere in the city.
+   *
+   * The dimmest band is CURTAINED rather than off — pulled down and warmed,
+   * because a drawn curtain is a diffuser, not a switch. Windows that are
+   * properly unlit are already unlit: the generators pick a different material
+   * for those (`facade.js` and `archetypes.js` both branch on `litRate`), and
+   * this modulates only the ones that came out lit.
+   */
+  _patchWindowVariance(m) {
+    if (m.userData.owWindowVariance) return;
+    m.userData.owWindowVariance = true;
+    const prev = m.onBeforeCompile;
+    m.onBeforeCompile = (shader, renderer) => {
+      prev?.call(m, shader, renderer);
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', '#include <common>\nvarying vec3 owWinPos;')
+        .replace(
+          '#include <begin_vertex>',
+          [
+            '#include <begin_vertex>',
+            'vec4 owWp = vec4( transformed, 1.0 );',
+            '#ifdef USE_BATCHING',
+            '  owWp = batchingMatrix * owWp;',
+            '#endif',
+            '#ifdef USE_INSTANCING',
+            '  owWp = instanceMatrix * owWp;',
+            '#endif',
+            'owWinPos = ( modelMatrix * owWp ).xyz;',
+          ].join('\n')
+        );
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', '#include <common>\nvarying vec3 owWinPos;')
+        .replace(
+          '#include <emissivemap_fragment>',
+          [
+            '#include <emissivemap_fragment>',
+            '{',
+            '  float owBay = floor( owWinPos.x * 0.021 + owWinPos.z * 0.017 );',
+            '  float owYf = owWinPos.y * 0.3279;',
+            '  float owFl = floor( owYf );',
+            '  // The floor step is RAMPED over the top 15 % of the storey, not',
+            '  // cut. A hard floor() draws a line straight through every window',
+            '  // whose glazing band happens to straddle the boundary — visible',
+            '  // in the first cut of this as a white top half over a grey bottom',
+            '  // half, repeated across a whole row. The ramp is 0.46 m, which is',
+            '  // shorter than the spandrel between two glazing bands, so it lands',
+            '  // in the masonry on most facades and reads as falloff on the rest.',
+            '  float owN0 = fract( sin( dot( vec2( owFl, owBay ), vec2( 12.9898, 78.233 ) ) ) * 43758.5453 );',
+            '  float owN1 = fract( sin( dot( vec2( owFl + 1.0, owBay ), vec2( 12.9898, 78.233 ) ) ) * 43758.5453 );',
+            '  float owN = mix( owN0, owN1, smoothstep( 0.85, 1.0, fract( owYf ) ) );',
+            '  float owS = 0.5 + 0.5 * sin( owWinPos.x * 0.86 + owWinPos.z * 0.63 + owN * 6.283 );',
+            '  float owK = mix( 0.62, 1.28, owN * 0.68 + owS * 0.32 );',
+            '  // curtained: a diffuser, so it loses value and gains warmth. Also',
+            '  // a ramp rather than a branch, for the same reason.',
+            '  float owC = 1.0 - smoothstep( 0.20, 0.32, owN );',
+            '  owK *= mix( 1.0, 0.42, owC );',
+            '  vec3 owTint = mix( vec3( 1.0 ), vec3( 1.14, 0.94, 0.72 ), owC );',
+            '  totalEmissiveRadiance *= owK * owTint;',
+            '}',
+          ].join('\n')
+        );
+    };
+    // A distinct key so the patched variant never shares a program with the
+    // unpatched material of the same type.
+    const key = m.customProgramCacheKey;
+    m.customProgramCacheKey = () => `${key ? key.call(m) : ''}|ow-winvar`;
+    m.needsUpdate = true;
+  }
+
+  /**
+   * STREET-LEVEL SPILL: a lit facade puts light on the pavement in front of it.
+   *
+   * A projected pool per near frontage rather than a punctual light per
+   * building — `render.submitGroundPool` costs no light slot and no shader
+   * permutation, which is the only reason this is affordable at all. `world`
+   * already publishes the one thing needed to place it: `lot.frontage` is the
+   * street-facing edge, so the pool lies ALONG the shopfront and reaches out
+   * into the road rather than being a circle centred on a building.
+   *
+   * The candidate list is rebuilt at 4 Hz and resubmitted every frame: the
+   * lots do not move, and rebuilding it per frame would walk every lot in the
+   * near ring sixty times a second for an answer that changes when the player
+   * walks ten metres.
+   */
+  _submitFacadeSpill(dt, ctx) {
+    const r = this.render ?? (this.render = ctx.peek('render') ?? null);
+    if (!r?.submitGroundPool) return;
+    if (!(this._litMix > 0.12)) return;
+    const cam = this._camXZ;
+    const list = this._spill ?? (this._spill = []);
+    this._spillTimer = (this._spillTimer ?? 0) - dt;
+    if (this._spillTimer <= 0) {
+      this._spillTimer = 0.25;
+      list.length = 0;
+      for (const rec of this.tiles.values()) {
+        if (!rec.near || !rec.lots) continue;
+        if (list.length >= SPILL_MAX * 3) break;
+        for (const lot of rec.lots) {
+          const f = lot.frontage;
+          if (!f || !SPILL_KINDS.has(lot.kind)) continue;
+          const ax = f[0][0];
+          const az = f[0][1];
+          const bx = f[1][0];
+          const bz = f[1][1];
+          const mx = (ax + bx) * 0.5;
+          const mz = (az + bz) * 0.5;
+          const d2 = (mx - cam.x) * (mx - cam.x) + (mz - cam.z) * (mz - cam.z);
+          if (d2 > SPILL_M * SPILL_M) continue;
+          const len = Math.hypot(bx - ax, bz - az);
+          if (len < 3) continue;
+          // Outward is away from the lot's own centroid, so the pool lands on
+          // the pavement and not inside the building.
+          const fp = lot.footprint;
+          if (!fp || fp.length < 3) continue;
+          let gx = 0;
+          let gz = 0;
+          for (const p of fp) {
+            gx += p[0];
+            gz += p[1];
+          }
+          gx /= fp.length;
+          gz /= fp.length;
+          let ox = mx - gx;
+          let oz = mz - gz;
+          const ex = (bx - ax) / len;
+          const ez = (bz - az) / len;
+          // strip the along-frontage component, leaving the normal
+          const along = ox * ex + oz * ez;
+          ox -= ex * along;
+          oz -= ez * along;
+          const ol = Math.hypot(ox, oz) || 1;
+          ox /= ol;
+          oz /= ol;
+          const reach = Math.min(SPILL_REACH, len * 0.5);
+          const px = mx + ox * reach * 0.55;
+          const pz = mz + oz * reach * 0.55;
+          list.push({
+            x: px,
+            y: this._groundAt(px, pz) + 0.02,
+            z: pz,
+            r: reach,
+            aspect: Math.max(1, (len * 0.5) / reach),
+            yaw: Math.atan2(ex, ez),
+            d2,
+          });
+          if (list.length >= SPILL_MAX * 3) break;
+        }
+      }
+      list.sort((a, b) => a.d2 - b.d2);
+      list.length = Math.min(list.length, SPILL_MAX);
+    }
+    const gain = SPILL_GAIN * this._litMix;
+    for (const s of list) {
+      r.submitGroundPool(s.x, s.y, s.z, s.r, SPILL_TINT, gain, s.aspect, s.yaw, 2.6);
+    }
   }
 
   // ------------------------------------------------- synthetic development --

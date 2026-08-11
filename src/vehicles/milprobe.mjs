@@ -303,6 +303,9 @@ function testDrive() {
     const corner = (type, launch, thr, steer, mutate) => {
       const sys = makeSys();
       const v = spawn(sys, type, 0, 0, 0, mutate);
+      // The assist hook lives on the vehicle, not the spec (dynamics reads
+      // `this.debugNoRollAssist`) — carry a mutate-set flag across.
+      if (v.spec.debugNoRollAssist) v.debugNoRollAssist = true;
       run(sys, 2);
       run(sys, launch, () => { v.input.throttle = 1; });
       run(sys, 2.5, () => { v.input.throttle = thr; v.input.steer = steer; });
@@ -328,7 +331,7 @@ function testDrive() {
     check('drive', 'leans under half a sedan per unit of cornering at matched g',
       t.acc > s.acc - 2.5 && tPer < sPer / 2,
       `${tPer.toFixed(3)} vs sedan ${sPer.toFixed(3)} deg per m/s^2`);
-    const neg = corner('tank', 8, 0.6, 1, (b) => { b.comY = 1.5; });
+    const neg = corner('tank', 8, 0.6, 1, (b) => { b.comY = 1.5; b.debugNoRollAssist = true; });
     check('drive', 'NEGATIVE CONTROL — at a car\'s comY the same corner rolls it over',
       neg.minUp < 0.5,
       `min emitted up.y ${neg.minUp.toFixed(2)} (tuned tank held ${t.minUp.toFixed(2)})`);

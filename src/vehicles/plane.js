@@ -768,6 +768,14 @@ export function stepPlane(v, dt, ctx) {
   // longitudinal friction would exactly cancel the gentle pushback — so the
   // brake is suppressed there; SPACE at any real forward speed still brakes.
   const braking = dnT > 0 && !reverseActive;
+  // Touchdown bookkeeping for the hard-landing check below. `v.grounded` is
+  // still LAST step's count here — it is written at the end of this function —
+  // which is exactly the edge a landing is: airborne, then not.
+  const wasAirborne = v.grounded === 0;
+  let sink = 0;
+  let tdX = 0;
+  let tdY = 0;
+  let tdZ = 0;
   for (let i = 0; i < pts.length; i++) {
     _p.copy(pts[i]).applyQuaternion(q).add(v.position);
     const hit = phys.raycast(_p, _dir, maxRay, phys.MASK?.WORLD ?? 0);
@@ -779,6 +787,13 @@ export function stepPlane(v, dt, ctx) {
     if (pen > MAX_SPRING) deepest = Math.max(deepest, pen - MAX_SPRING);
     _r.copy(pts[i]).applyQuaternion(q);
     _vel.copy(v.angularVelocity).cross(_r).add(v.velocity);
+    // The sink rate AT THE WHEEL, which is what the leg has to absorb — not
+    // the CoM's, which is a different number on a nose-first or wing-low
+    // arrival, i.e. exactly the arrivals that break aeroplanes.
+    if (-_vel.y > sink) {
+      sink = -_vel.y;
+      tdX = _p.x; tdY = hitY; tdZ = _p.z;
+    }
     let fy = F.gearK * Math.min(Math.max(0, pen), MAX_SPRING) - F.gearC * _vel.y;
     fy = clamp(fy, 0, weight * 2.2);
     _f.set(0, fy, 0);
@@ -813,6 +828,52 @@ export function stepPlane(v, dt, ctx) {
     v.position.y += Math.min(deepest, 0.25) * 0.5;
     if (v.velocity.y < 0) v.velocity.y *= 0.4;
   }
+
+  /**
+   * THE HARD LANDING.
+   *
+   * The gear spring absorbs an ordinary arrival and always has. What it used to
+   * do at any sink rate at all was absorb it SILENTLY: a Skylark flown into the
+   * runway at 20 m/s bounced, rolled to a stop and taxied away undamaged,
+   * because nothing on the aircraft path ever priced a contact. The wheeled
+   * fleet has had `_collide` reporting its impacts since the beginning; an
+   * aeroplane's only contact with the world was three springs.
+   *
+   * So a touchdown past `gearSink` hands the airframe the sink rate it arrived
+   * at as a closing speed, and `Vehicle.applyImpact` prices it — a repair bill
+   * up to `AIR_CRASH_DV` and a write-off past it, with the wreck's own burn
+   * fuse taking over from there. Fired on the AIRBORNE -> DOWN edge, so a
+   * rollout over a bump is not a second landing.
+   *
+   * `gearSink` defaults to 4.5 m/s, about 900 ft/min: comfortably above the
+   * ~2 m/s a normal approach arrives at and well under the 6 m/s a light
+   * aircraft's legs are certified to.
+   */
+  if (wasAirborne && contacts > 0 && sink > (F.gearSink ?? 4.5)) {
+    v.applyImpact(sink, tdX, tdY, tdZ, 0, 1, 0, null, ctx);
+  }
+
+  /**
+   * ON ITS BACK, THE GEAR IS POINTING AT THE SKY.
+   *
+   * Every ray above is cast straight down FROM A GEAR POINT, so an inverted
+   * aircraft casts them from above its own fuselage into nothing within reach:
+   * `contacts` is 0, `grounded` is 0, and a machine lying on its canopy on the
+   * apron reports itself as FLYING. Everything gated on `v.grounded` then
+   * reads the wrong state — including `Vehicle._rightSelf`, which is what is
+   * supposed to get it back over, so the one state that most needs the
+   * recovery was the one state that could not arm it.
+   *
+   * The test is the fuselage's own: inverted, and the belly is within a
+   * fuselage radius of the ground under it, means it is resting ON that
+   * ground. It cannot fire on anything upright — the gear holds the fuselage a
+   * full leg above the surface.
+   */
+  if (contacts === 0 && _up.y < 0.35) {
+    const hull = (spec.style.fuseR ?? 0.6) + 0.3;
+    if (v.position.y - ground <= hull) contacts = 1;
+  }
+
   v.grounded = contacts;
   v.airborne = contacts === 0 ? v.airborne + dt : 0;
   v.inWater = false;

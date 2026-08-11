@@ -55,6 +55,13 @@ const _qs = typeof location !== 'undefined' ? new URLSearchParams(location.searc
 /** Force the wall-clock budget even under `deterministic`. Negative control. */
 const WALL_CLOCK_BUILD = _qs?.get('owWallClockBuild') === '1';
 const DET_JOBS_OVERRIDE = Number(_qs?.get('owBuildJobs')) || 0;
+/**
+ * Fire queued `world:tile:load` events for tiles that have already been
+ * unloaded — i.e. restore the orphan leak `_streamTiles` guards against.
+ * The negative control for `src/world/tileleakprobe.mjs`; a gate that has never
+ * failed is not evidence of anything (ARCHITECTURE rule 12).
+ */
+const STALE_TILE_LOADS = _qs?.get('owStaleTileLoads') === '1';
 
 /**
  * Run `fn` with a render target bound, so every program compiled inside it gets
@@ -602,7 +609,35 @@ export class WorldSystem {
         new THREE.Vector3((tx + 1) * TILE, 400, (tz + 1) * TILE)
       );
       const pri = d2 < TILE * TILE * 4 ? 1 : d2 < TILE * TILE * 25 ? 3 : 5;
-      this.queue.push(() => events.emit('world:tile:load', { tx, tz, lots, bounds }), pri);
+      /**
+       * THE STALE-LOAD GUARD, and it is not defensive padding.
+       *
+       * `world:tile:unload` is emitted SYNCHRONOUSLY above; `world:tile:load` is
+       * QUEUED. So any camera jump larger than the stream radius — a brother
+       * switch, mission staging, a respawn, a capture shot — drops a tile whose
+       * load job is still sitting in the queue, and firing that job hands
+       * `buildings` and `props` a tile `world` has already stopped streaming.
+       * They build it; no unload can ever follow, because the record it would
+       * name is gone; and `skyline.restore()` for that cell is never called.
+       *
+       * MEASURED at q=medium after one far teleport: 31 live tiles in `world`
+       * against 75 in `buildings` — 44 orphans, every one of them beyond 600 m,
+       * four of them over the Golden Triangle. Downtown then photographs as a
+       * bare plain for the rest of the session, because the skyline impostors
+       * those four cells suppressed are never restored.
+       *
+       * IDENTITY, not `live.has(key)`. A tile dropped and re-added before its
+       * job runs has a BRAND NEW record under the same key, and it is the new
+       * record's own job that must fire — the same distinction `buildings._live`
+       * and the sector pump below already make, for the same reason.
+       *
+       * `?owStaleTileLoads=1` puts the leak back. That is the negative control
+       * for `src/world/tileleakprobe.mjs`.
+       */
+      this.queue.push(() => {
+        if (!STALE_TILE_LOADS && this._tiles.live.get(this._tiles.key(tx, tz)) !== rec) return;
+        events.emit('world:tile:load', { tx, tz, lots, bounds });
+      }, pri);
     }
     this._stats.tiles = this._tiles.live.size;
   }

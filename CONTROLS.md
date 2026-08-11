@@ -23,7 +23,7 @@ arsenal unreachable from the keyboard.
 | `W A S D` / arrows | move · drive · **helicopter: `W`/`S` tilt the disc fore/aft, `A`/`D` are the tail pedals** |
 | `Shift` | sprint on foot · nitro in a car · **helicopter: DESCEND** |
 | `Space` | jump on foot · handbrake in a car · **helicopter: CLIMB** |
-| `Ctrl` / `C` | crouch |
+| `C` | crouch — **not `Ctrl`**: see the note below the table |
 | **`F`** | **the contextual action** — enter / exit / carjack / swap vehicle / sleep at a safehouse / interact |
 | `E` / `Q` | next / previous weapon |
 | `R` | reload |
@@ -31,11 +31,31 @@ arsenal unreachable from the keyboard.
 | `H` | horn |
 | `LMB` | fire (a melee weapon swings — melee is a WEAPON, not a separate key) |
 | `RMB` | aim |
+| `B` | fire mode · **`Shift`+`B`** flips the minimap north-up / heading-up |
 | `M` | map · `Tab` weapon wheel · `X` character switch · `P` phone · `N` radio station |
 | `Esc` | pause |
 
 Mouse drag rotates the camera; wheel zooms the chase distance (radius clamped
 8–30, pitch 0.35–1.42 rad).
+
+**Mouse-look comes back on its own.** Every overlay that needs the cursor —
+menu, map, phone, story, cheat panel, cutscene, result card — releases pointer
+lock on the way up and takes it back on the way down (`ui._syncPause`), so the
+camera is live again on the frame the last one closes. Where the browser refuses
+a lock it was not asked for by a gesture, a click on the world still buys it —
+and **that click does not fire**: `Input._onMouseDown` swallows the trigger edge
+of the click that restores the lock, but only in a browser that has granted one
+before, or a build where pointer lock is unavailable would have no fire button
+at all.
+
+**No modifier key is a held game control, and no key means two things.** Crouch
+was `Ctrl` as well as `C`, and `Input._onKeyDown` exempts `e.ctrlKey` from
+`preventDefault` so devtools and refresh survive — which meant that while crouch
+was held, `R` reloaded the page, `S` opened Save Page As, and `Ctrl`+`W`/`T`/`N`
+are reserved by the user agent and cannot be cancelled at all. Crouching and
+walking forward closed the tab. Separately, `B` was flipping the fire mode and
+the minimap at once. Anything that has to share a key takes `Shift`, and both
+readers test the modifier — `src/weapons/index.js` declines a `B` carrying it.
 
 ## Flying the Riverhop
 

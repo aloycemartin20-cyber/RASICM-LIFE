@@ -208,6 +208,15 @@ export class MissionRunner {
       /** The boss's post-death escape phase (raise heat, win at zero stars). */
       escapeOn: false,
       escapeGrace: 0,
+      /**
+       * The boss's health-keyed phase counter, 0..B.phases-1. Declared here
+       * with the rest of the scratch so its name is visible next to `phase`,
+       * which is the runner's own lifecycle field and is not a track's to
+       * write. `boss` wrote `phase` for three finales — see `_begin`.
+       */
+      bossPhase: 0,
+      /** Set once if a track overwrote `phase`, so the error prints once. */
+      phaseFault: false,
       /** How long the result card waits for the `done` dialogue beats. */
       doneHold: 1.2,
       /**
@@ -379,8 +388,19 @@ export class MissionRunner {
       return;
     }
     // `survive` overrides the timer inside init; everything else uses baseTimer.
+    const phase = M.phase;
     t.init(M, M.def, this);
     if (M.state !== 'run') return; // init already failed the mission
+    // A TRACK MAY NOT WRITE `M.phase`. It is the runner's lifecycle field, and
+    // an `init` that reaches for it as a generic name — `boss` used it as an
+    // integer counter — leaves `running` false for the whole chapter, so five
+    // subsystems (body shop, race prompt, safehouse, carjack heat, kill drops)
+    // treat a live finale as free roam. Nothing throws and nothing logs, which
+    // is why this restores AND says so.
+    if (M.phase !== phase) {
+      console.error(`[game] track "${M.track}" overwrote M.phase (${phase} -> ${String(M.phase)}) in init — that field belongs to the runner; use a track-specific name`);
+      M.phase = phase;
+    }
     this.objective(M, defaultObjective(M.def), M.hasTimer ? M.timer : null, '', -1);
   }
 
@@ -388,9 +408,36 @@ export class MissionRunner {
   /* frame                                                                */
   /* ==================================================================== */
 
+  /**
+   * THE LIFECYCLE FIELD IS THE RUNNER'S. A track may write its own scratch and
+   * nothing else, and `phase` is the most natural generic name there is — the
+   * boss track used it as an integer counter for three finales, which made
+   * `missions.running` false for the whole fight and turned five subsystems
+   * into free-roam behaviour with nothing thrown and nothing logged.
+   *
+   * `_begin` can restore the exact value it knows a track was handed. Here only
+   * the TYPE can be asserted, because `win` and `fail` legitimately move the
+   * phase from inside a track's own update. Unconditional rather than dev-only
+   * on purpose: the damage is invisible in a shipped build, so a check that
+   * runs only on a dev build is a check that never runs where it is needed.
+   *
+   * @returns {boolean} true if it had to repair one.
+   */
+  _checkPhase(M) {
+    if (typeof M.phase === 'string') return false;
+    if (!M.phaseFault) {
+      M.phaseFault = true;
+      console.error(`[game] track "${M.track}" overwrote M.phase with ${JSON.stringify(M.phase)} — that field belongs to the runner; use a track-specific name`);
+    }
+    // Only the 'run' phase calls a track's `update`, so 'run' is where it was.
+    M.phase = 'run';
+    return true;
+  }
+
   update(dt) {
     const M = this.M;
     if (!M || M.phase === 'over') return;
+    this._checkPhase(M);
     const focus = this.wq.focusPos(this._v);
     this.px = focus.x;
     this.pz = focus.z;
@@ -464,6 +511,11 @@ export class MissionRunner {
 
     const t = TRACKS[M.track];
     t?.update?.(M, dt, this);
+    // BEFORE the readers, not on the next frame. `game._update` calls this and
+    // then hands the same frame to `freeroam`, `hostiles` and the heat, every
+    // one of which asks `missions.running` — so a clobber repaired at the top
+    // of the NEXT update is still a whole frame of free-roam behaviour.
+    this._checkPhase(M);
 
     if (M.state === 'run') {
       this._publishMarkers();

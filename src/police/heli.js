@@ -134,6 +134,31 @@ const BEAM = {
   /** Beats street practicals, loses to a muzzle flash. */
   lightPriority: 6,
   lightColor: 0xffe8c4,
+
+  /**
+   * THE STRIKE.
+   *
+   * The punctual light above makes the surfaces under the beam LIT, and it is
+   * an omni: it has no idea a cone is pointing at it, so the pool it throws is
+   * a soft circle that fades with the inverse square and nothing else. What a
+   * Nightsun actually puts on the road is a hard-cored ELLIPSE — round when the
+   * beam is straight down, stretched along the beam's own bearing as it slants
+   * — and that ellipse is the single most legible thing about a searchlight
+   * from outside the beam. Without it the shaft simply ends where the geometry
+   * ends.
+   *
+   * Drawn with `render.submitGroundPool`, which resolves against the prepass
+   * depth: it lands on the actual road, kerb and car roofs under the beam
+   * rather than on a disc, and costs no light slot.
+   *
+   * `strikeR` is the half-width across the bearing; the ellipse stretches by
+   * 1/cos(incidence) along it, capped, so a beam raking down a street draws the
+   * long smear it should.
+   */
+  strikeR: 7.0,
+  strikeStretchMax: 3.2,
+  strikeGain: 0.42,
+  strikeColor: 0xfff2d8,
 };
 
 const BEAM_VERT = /* glsl */ `
@@ -183,6 +208,13 @@ void main() {
   float ref2 = uBeam.y * uBeam.y;
   float fall = ref2 / ( ref2 + d * d );
   fall *= smoothstep( 0.0, 0.08, vAxial );
+  // ...and a taper into the last stretch before the strike. The cone is an
+  // OPEN mesh, so without this its base is a hard ring the moment the ground
+  // under it is not exactly where the apex arithmetic put it — on a kerb, a
+  // car roof, a slope. The strike ellipse (see BEAM.strikeR) carries the
+  // energy from here down, which is also the physically right split: the last
+  // few metres of a searchlight are surface, not air.
+  fall *= 1.0 - 0.62 * smoothstep( 0.84, 1.0, vAxial );
   float a = uBeam.w * soft * fall * smoothstep( uNear.x, uNear.y, dist );
   if ( a <= 0.0015 ) discard;
   // Premultiplied: the material blends One / One, so this adds exactly
@@ -595,6 +627,44 @@ export class Helicopter {
       BEAM.lightRange,
       BEAM.lightPriority,
       HELI_LIGHT_KEY
+    );
+    this._submitStrike(r);
+  }
+
+  /**
+   * The ellipse the beam burns onto whatever it is pointing at.
+   *
+   * Its shape is the beam's own incidence, not a constant: a lens 200 m up and
+   * nearly overhead draws a circle, and the same lens raking down a street at
+   * 20 degrees draws a smear three times as long. Both are the same two lines
+   * of arithmetic — the incidence cosine off the beam vector — and getting them
+   * from the beam rather than authoring them is what makes the strike track the
+   * shaft instead of sliding out of it as the helicopter orbits.
+   */
+  _submitStrike(r) {
+    if (!r.submitGroundPool) return;
+    _v.subVectors(this._spot, this.position);
+    const len = _v.length();
+    if (!(len > 1)) return;
+    _v.multiplyScalar(1 / len);
+    // Straight down is |dir.y| = 1. Guarded so a near-horizontal beam cannot
+    // stretch the ellipse to the horizon.
+    const cosI = Math.max(1 / BEAM.strikeStretchMax, Math.abs(_v.y));
+    const bearing = Math.atan2(_v.x, _v.z);
+    // Inverse square from the lens, referenced to the same distance the shaft
+    // is: the strike and the shaft have to dim together or the pool detaches.
+    const ref2 = BEAM.refM * BEAM.refM;
+    const fall = ref2 / (ref2 + len * len);
+    r.submitGroundPool(
+      this._spot.x,
+      this._spot.y,
+      this._spot.z,
+      BEAM.strikeR,
+      BEAM.strikeColor,
+      BEAM.strikeGain * this.beamOn * fall,
+      1 / cosI,
+      bearing,
+      3.0
     );
   }
 

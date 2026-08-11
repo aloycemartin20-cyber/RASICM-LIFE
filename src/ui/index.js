@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { installStyles, removeStyles } from './style.js';
-import { el, clamp, clamp01, damp, lerp, setClass, setStyle } from './util.js';
+import { el, clamp, clamp01, damp, lerp, setClass, setStyle, setText } from './util.js';
 import { Crosshair } from './crosshair.js';
 import { Hitmarkers } from './hitmarkers.js';
 import { DamageArcs } from './damage.js';
@@ -27,6 +27,9 @@ import {
 } from './data.js';
 
 const MAX_BLIPS = 64;
+
+/** Seconds the radar tag reads NORTH UP / HEADING UP after a mode change. */
+const RADAR_FLASH = 1.8;
 
 /**
  * ===========================================================================
@@ -560,7 +563,7 @@ export class UiSystem {
     // than hunt for a button that opens it.
     this.touch.tapTarget(this.radar.root, () => this.toggleMap());
     this.touch.tapTarget(this.weapon.root, () => this.touch.bridge.tap('KeyE'));
-    this.touch.tapTarget(this.stars.root, () => this.radar.setMode(!this.radar.headingUp));
+    this.touch.tapTarget(this.stars.root, () => this._toggleRadarMode());
 
     this.health.onBeat = (i) => this.sfx('heartbeat', 0.35 + i * 0.5);
 
@@ -598,6 +601,7 @@ export class UiSystem {
     this._lastKillAt = -10;
     this._regenTimer = 0;
     this._hadPointerLock = false;
+    this._radarFlash = 0;
     this._zone = '';
     this._debug = null;
     this._foundPackages = this.map.found;
@@ -1346,6 +1350,21 @@ export class UiSystem {
     this._syncPause();
   }
 
+  /**
+   * SHIFT+B, or a tap on the stars. The mode change is invisible on a stopped
+   * player — a north-up map and a heading-up map are the same picture until he
+   * turns — so the tag says which it is for `RADAR_FLASH` seconds. The text is
+   * borrowed, not owned: see the restore beside `radar.draw`.
+   */
+  _toggleRadarMode() {
+    const headingUp = !this.radar.headingUp;
+    this.radar.setMode(headingUp);
+    setText(this.radar.zoneEl, headingUp ? 'HEADING UP' : 'NORTH UP');
+    setStyle(this.radar.zoneEl, 'color', 'var(--gold)');
+    this._radarFlash = RADAR_FLASH;
+    this.sfx('ui_confirm', 0.45);
+  }
+
   /** M on the keyboard, the MAP nav button on touch, a tap on the radar. */
   toggleMap() {
     this.map.toggle({ x: this.state.x, z: this.state.z });
@@ -1766,6 +1785,17 @@ export class UiSystem {
     r.colour = s.colour;
     r.street = s.street;
     this.radar.draw(r, rawDt);
+    // The mode flash runs AFTER the draw, so the tag it wrote this frame is the
+    // one being overwritten. Handing the zone name back is `radar`'s job and
+    // stays `radar`'s job: clearing its cached district is what makes it
+    // repaint, so the steady-state text keeps exactly one writer.
+    if (this._radarFlash > 0) {
+      this._radarFlash -= rawDt;
+      if (this._radarFlash <= 0) {
+        this.radar._zone = '';
+        setStyle(this.radar.zoneEl, 'color', '');
+      }
+    }
 
     // ---- full-screen states ----------------------------------------------
     this.weaponWheel.update(rawDt);
@@ -1835,11 +1865,26 @@ export class UiSystem {
     // that IS how the first Escape arrives), so a deliberate release here would
     // otherwise arm a pause menu that springs open over the very interstitial
     // the release was freeing the cursor for.
+    //
+    // AND THE FALLING EDGE, which is the other half of the same door. Releasing
+    // the lock was the only half that existed, so every route back into the
+    // game — a cutscene ending, a result card fading, ESC out of the menu, M
+    // out of the map — left mouse-look dead until the player clicked the world,
+    // and that click discharged a round (`src/core/input.js:_onMouseDown` now
+    // swallows it). Re-requesting here gives the camera back on the frame the
+    // last overlay closes, with no click at all. Three conditions, all of them
+    // load-bearing: the LAST overlay (any still up and the cursor stays free),
+    // not a screenshot fiction (`off` covers debug states, the boot flow and
+    // the sandbox, none of which is a player asking for mouse-look), and not a
+    // touch build, where there is no mouse to capture and look is a drag.
+    // `input.requestPointerLock` re-checks `pointerLockGuard` on top of that.
     const needsCursor =
       w.menu || w.story || w.map || w.phone || w.cheats || w.ending || w.card || w.cut;
     if (needsCursor && !this._needsCursorPrev) {
       this._hadPointerLock = false;               // ours, not an Escape
       this.ctx?.input?.exitPointerLock?.();
+    } else if (!needsCursor && this._needsCursorPrev && !off && !this.touch?.active) {
+      this.ctx?.input?.requestPointerLock?.();
     }
     this._needsCursorPrev = needsCursor;
     return frozen;
@@ -2157,10 +2202,19 @@ export class UiSystem {
     if (input.pressed('KeyO') && (this.story.open || !this._hardModal())) this.toggleStory();
     if (!this._hardModal()) {
       if (input.pressed('KeyN')) this.cycleStation(1);
-      // The radar's north-up / heading-up toggle used to live on H, which
-      // `CONTROLS.md` and `ACTIONS.horn` both give to the HORN. Sounding the
-      // horn flipped the minimap. It moves to B, and to a tap on the ring.
-      if (input.pressed('KeyB')) this.radar.setMode(!this.radar.headingUp);
+      /**
+       * The radar's north-up / heading-up toggle. It lived on H, which
+       * `ACTIONS.horn` also owns, so sounding the horn flipped the minimap; it
+       * then moved to a bare B, which `weapons` reads for the fire mode
+       * (`src/weapons/index.js`) — so changing fire mode silently rotated the
+       * radar out of heading-up, with both advertised on the pause panel as
+       * separate bindings. SHIFT is the modifier because it is already held for
+       * half the game and is not itself an edge, and `weapons` declines a B
+       * carrying it. One key, one meaning.
+       */
+      if (input.pressed('KeyB') && (input.held('ShiftLeft') || input.held('ShiftRight'))) {
+        this._toggleRadarMode();
+      }
     }
     if (this.story.open) {
       if (input.pressed('ArrowDown')) this.story.move(1);

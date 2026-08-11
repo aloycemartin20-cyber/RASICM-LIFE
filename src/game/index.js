@@ -22,8 +22,10 @@
  *
  * KEYS this system owns (nothing else in the repo binds them):
  *   J  start the next chapter / accept the job
- *   K  abandon the current chapter
- *   U  cycle brother (the wheel is `ui`'s; this is the keyboard shortcut)
+ *   K  abandon the current chapter — ASKS FIRST. Press twice inside
+ *      `ABORT_CONFIRM`, or Shift+K to skip the question (`_abortRequest`)
+ *   U  cycle brother (the wheel is `ui`'s; this is the keyboard shortcut).
+ *      Refused while a chapter is live — `Characters.switchTo` owns that
  *
  * EVERY ONE OF THEM IS GATED ON `ui.isPaused()`. `time.scale` going to zero
  * does NOT stop this system reading input: the engine calls `update(t.dt)` on
@@ -85,6 +87,10 @@ export class GameSystem {
     /** Death mid-chapter: the chapter restarts itself after the WASTED card. */
     this._restartIdx = -1;
     this._restartT = 0;
+    /** Unscaled stamp of the K press that armed "abandon the job?". */
+    this._abortArmedRaw = 0;
+    /** The `M.seq` it was armed on; `-1` is idle, and `M.seq` counts from 1. */
+    this._abortArmedSeq = -1;
   }
 
   /* ---- the world's content, readable without importing `data.js` -------- */
@@ -207,6 +213,9 @@ export class GameSystem {
       heat: this.heat,
       director: this.director,
       save: this.save,
+      // So the live-chapter refusal sits where every switch path passes,
+      // rather than only on `GameSystem.switchTo`. See `Characters.switchTo`.
+      missions: this.missions,
     }).init();
 
     this.freeroam.boy = this.characters.boy;
@@ -558,15 +567,65 @@ export class GameSystem {
     return this.save.difficulty ?? 'normal';
   }
 
+  /**
+   * Abandon the live chapter, NOW. The programmatic door — the cheat panel,
+   * `restartCurrentMission` and the harnesses come in here and mean it.
+   *
+   * A chapter still in play ends through `missions.fail`, which is the ordinary
+   * fail path: `mission:fail`, the FAILED result card carrying the reason, and
+   * `_onMissionEnd`'s retry line. Walking away has to LOOK like the outcome it
+   * is; the silent `abort()` is only for a chapter whose outcome card is
+   * already up (a won outro), where there is nothing left to tell the player.
+   *
+   * The KEY path is `_abortRequest` — one press of K does not reach this.
+   */
   abortMission() {
     if (!this.missions.active) return false;
+    this._abortArmedSeq = -1;
     const M = this.missions.M;
     if (M.state === 'run') this.missions.fail(M, 'You walked away from the job');
     else this.missions.abort();
     return true;
   }
 
+  /**
+   * `K`, from the keyboard. It ASKS FIRST.
+   *
+   * K sits one key from the J the pause panel tells the player to press, and it
+   * threw a live chapter away on a single press with a FAILED card as the only
+   * warning it had happened. The first press arms and toasts; a second press
+   * inside `ABORT_CONFIRM` commits; Shift+K commits outright for anyone who
+   * knows what the key does.
+   *
+   * The window is `ctx.time.raw` — UNSCALED — because a chapter runs at
+   * whatever the clock is doing (0.22 under the weapon wheel, 0.12 in a
+   * hitstop) and a confirmation measured in simulated seconds would be a
+   * different length every time it was offered. It also cannot survive a pause:
+   * `_input` is gated on `ui.isPaused()`, and raw time keeps running behind a
+   * menu, so a window armed before the menu has expired by the time it comes
+   * down.
+   *
+   * @param {boolean} force Shift is held — skip the question.
+   */
+  _abortRequest(force = false) {
+    if (!this.missions.active) return false;
+    const raw = this.ctx.time.raw;
+    // Keyed to the chapter it was armed on, not just to the clock: a WASTED
+    // restart can hand the player a NEW chapter inside the window, and a
+    // question asked about the old one must not answer for that one.
+    const seq = this.missions.M.seq;
+    // The seq IS the idle flag (`-1`, and `M.seq` counts from 1). A `raw > 0`
+    // test would have read as idle on the frame the clock itself is at zero.
+    const armed = this._abortArmedSeq === seq && raw - this._abortArmedRaw <= ABORT_CONFIRM;
+    if (force || armed) return this.abortMission();
+    this._abortArmedRaw = raw;
+    this._abortArmedSeq = seq;
+    this.wq.ui?.notify?.('Abandon the job?', 'PRESS K AGAIN', 'bad');
+    return false;
+  }
+
   _onMissionEnd(M, won) {
+    this._abortArmedSeq = -1;
     this._syncHud();
     this.writer.now(this.save);
     if (won) this._announceNext();
@@ -580,12 +639,15 @@ export class GameSystem {
   /* characters                                                           */
   /* ==================================================================== */
 
-  /** Switch active DeCarlo brother. */
+  /**
+   * Switch active DeCarlo brother.
+   *
+   * The mid-chapter refusal is NOT here any more. It lives in
+   * `Characters.switchTo`, which is the one place this method, the `U` key
+   * (`characters.cycle`) and the X wheel's `ui:character` event all pass
+   * through — two of those three used to bypass a guard written only here.
+   */
   switchTo(id) {
-    if (this.missions.running) {
-      this.wq.ui?.notify?.('Not during a job', null, 'bad');
-      return false;
-    }
     return this.characters.switchTo(id);
   }
 
@@ -710,7 +772,10 @@ export class GameSystem {
       if (!this._simErr) {
         this._simErr = true;
         console.error('[game] sim error — the loop keeps running, fix this:', e);
-        this.wq.ui?.notify?.('Something broke', 'PRESS K THEN J TO RESTART', 'bad');
+        // K twice, because K asks first now (`_abortRequest`). "PRESS K" is
+        // load-bearing text: `ui._touchify` rewrites that exact phrase for a
+        // build with no keyboard.
+        this.wq.ui?.notify?.('Something broke', 'PRESS K TWICE THEN J', 'bad');
       }
     }
   }
@@ -841,7 +906,13 @@ export class GameSystem {
       if (this.missions.active && this.missions.M.phase === 'intro') this.missions.skipIntro();
       else if (!this.missions.active) this.startMission();
     }
-    if (input.pressed?.('KeyK')) this.abortMission();
+    // Two presses, or one with Shift. `src/ui/pausearbiterprobe.mjs`'s live
+    // control still taps K once and expects the chapter gone — it encodes the
+    // old one-press contract and wants a second tap.
+    if (input.pressed?.('KeyK')) {
+      this._abortRequest(!!(input.held?.('ShiftLeft') || input.held?.('ShiftRight')));
+    }
+    // Refused mid-chapter inside `Characters.switchTo`, with the toast.
     if (input.pressed?.('KeyU')) this.characters.cycle(1);
   }
 
@@ -1042,6 +1113,10 @@ export class GameSystem {
   debugStage(name = 'chapter', opts = {}) {
     const ui = this.wq.ui;
     if (BOY_ORDER.includes(name)) {
+      // Clean slate first, like every stage below: a live chapter REFUSES the
+      // switch now (`Characters.switchTo`), so staging a brother after staging
+      // a boss would otherwise photograph the wrong man.
+      this.missions.abort();
       this.characters.switchTo(name);
       return { stage: name, character: name };
     }
@@ -1246,6 +1321,13 @@ const PICKUP_DRIVE_BOOST = 1.6;
 
 /** Seconds the WASTED/BUSTED card breathes before the chapter restarts. */
 const RESTART_DELAY = 2.6;
+
+/**
+ * How long K's "abandon the job?" stays armed, in UNSCALED seconds. Long
+ * enough to read the toast and mean it, short enough that a K pressed a minute
+ * later is a fresh question rather than a confirmation of a forgotten one.
+ */
+const ABORT_CONFIRM = 4;
 
 const STAGES = [
   'clean', 'chapter', 'race', 'firefight', 'boss', 'ending', 'packages',

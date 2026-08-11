@@ -44,7 +44,11 @@ export const bossTrack = {
     const B = BOSSES[c.bossId];
     if (!B) return g.fail(M, 'No such rival');
     M.B = B;
-    M.phase = 0;
+    // `bossPhase`, NOT `phase`. `M.phase` is the RUNNER's lifecycle field
+    // ('intro'|'travel'|'run'|'outro'|'over'), and a track that writes an
+    // integer over it takes `missions.running` false for the whole chapter —
+    // silently, in five other subsystems at once. See `MissionRunner._begin`.
+    M.bossPhase = 0;
     M.minionT = 5;
     M.tell = '';
     M.tellT = 0;
@@ -113,8 +117,8 @@ export const bossTrack = {
 
     // ---- phases ---------------------------------------------------------
     const phase = Math.min(B.phases - 1, Math.floor((1 - hpFrac) * B.phases));
-    if (phase !== M.phase) {
-      M.phase = phase;
+    if (phase !== M.bossPhase) {
+      M.bossPhase = phase;
       g.notify(`Phase ${phase + 1}`, B.weak, 'bad');
       g.wq.uiSfx('kill', 1);
       const n = B.minions[Math.min(phase, B.minions.length - 1)];
