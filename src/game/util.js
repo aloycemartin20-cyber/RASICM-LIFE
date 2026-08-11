@@ -50,6 +50,7 @@ export function clockText(sec) {
 
 const _q = new THREE.Quaternion();
 const _e = new THREE.Euler(0, 0, 0, 'YXZ');
+const _up = new THREE.Vector3();
 
 /** Heading of a vehicle handle, radians, +Z forward to match `Math.atan2(dx,dz)`. */
 export function yawOf(v) {
@@ -57,6 +58,17 @@ export function yawOf(v) {
   _q.copy(v.quaternion);
   _e.setFromQuaternion(_q, 'YXZ');
   return _e.y;
+}
+
+/**
+ * How upright a vehicle handle is: +1 on its wheels, 0 on its side, -1 on its
+ * roof. Read off the EMITTED orientation rather than any roll state the
+ * dynamics keep, because a wedged car is exactly the case where the two stop
+ * agreeing (rule 12).
+ */
+export function upDot(v) {
+  if (!v?.quaternion) return 1;
+  return _up.set(0, 1, 0).applyQuaternion(v.quaternion).y;
 }
 
 /**
@@ -87,6 +99,130 @@ export function driveToward(veh, v, inp, tx, tz, opts = {}) {
   return d;
 }
 
+/* ===================================================================== */
+/* driveRoute — the same wheel, but the road graph picks where to point it */
+/* ===================================================================== */
+
+/**
+ * Seconds between route solves for ONE vehicle.
+ *
+ * MEASURED on the emitted city (3141 nodes, 4399 edges): 400 random
+ * node-to-node solves averaged 0.111 ms, worst 1.05 ms. The mission layer and
+ * the pursuit fleet together never hold more than ~14 AI cars, so 1 Hz is
+ * 1.6 ms of CPU per second of play. The leg-arrival test below is what keeps
+ * the car on the road BETWEEN solves; the period only bounds how stale a plan
+ * may get, and the solve always restarts from where the car actually is.
+ */
+const ROUTE_PERIOD = 1.0;
+/** Aim at the first waypoint at least this far ahead — closer ones wobble. */
+const LEG_MIN = 22;
+/** Within this of the aimed waypoint, the leg is done: re-solve now. */
+const LEG_ARRIVE = 12;
+/**
+ * Inside this range of the destination, drive straight at it. The last two
+ * waypoints of any route are off-graph stubs anyway, and a `routeTo` call per
+ * second for a boss circling the player 20 m away buys nothing.
+ */
+const ROUTE_MIN = 40;
+/** The destination moving this far re-solves immediately rather than at 1 Hz. */
+const DEST_MOVE = 40;
+/**
+ * A held leg waypoint further than this from the car cannot be ours. Vehicle
+ * handles are POOLED (`vehicles.despawn` recycles them), so a cruiser can be
+ * handed back to `heat` still carrying the route state of its previous life.
+ * Nothing else notices, because a stale waypoint steers exactly like a live
+ * one — it just points at a road on the other side of the city.
+ */
+const LEG_STALE = 220;
+
+/** Reused steer options — `driveToward` reads them and returns. Rule 5. */
+const _ropts = { throttle: 1, gain: 1.6, slow: 0, boost: false };
+/** Reused `routeTo` options. `fromY` is what keeps a bridge deck off its quay. */
+const _routeOpts = { fromY: 0, toY: NaN };
+/** Solve-phase counter, so fourteen AI cars never all re-plan on one frame. */
+let _routeSeq = 0;
+
+/**
+ * Steer an AI vehicle toward a distant point BY ROAD.
+ *
+ * `driveToward` is pure pursuit against a raw (x, z): correct for the last
+ * forty metres and catastrophic over a kilometre, because Steel City is three
+ * rivers and a hill and the straight line between two safehouses goes through
+ * the Monongahela. This asks `world.routeTo` — the same graph `traffic` and
+ * `police` drive on — for draw-ordered waypoints and feeds `driveToward` the
+ * next one instead of the destination.
+ *
+ * THE RETURN VALUE IS THE DISTANCE TO THE FINAL DESTINATION, not to the leg.
+ * Every caller uses it as a trigger radius (ram range, tracer range, "the
+ * target got away"), and handing back the leg distance would fire all of them
+ * at the wrong moment.
+ *
+ * NO ROAD GRAPH, NO ROUTE. A bench with no `world`, an endpoint in open water,
+ * two ends on different islands: `routeTo` returns null and this falls through
+ * to `driveToward` unchanged, which is what every headless probe of this file
+ * exercises.
+ *
+ * @param {object} wq  the `WorldQuery` — `.vehicles` and `.world`
+ * @param {object} v   the vehicle handle; route state is cached on it
+ * @param {object} inp a PREALLOCATED input record, reused by the caller
+ * @param {number} dt  seconds since the caller's last call for THIS vehicle
+ */
+export function driveRoute(wq, v, inp, tx, tz, dt, opts = EMPTY_OPTS) {
+  const veh = wq?.vehicles;
+  if (!veh?.setInput || !v || v.destroyed) return 0;
+  const d = dist(v.position.x, v.position.z, tx, tz);
+  const world = wq.world;
+  let r = v._route;
+  if (!r) {
+    r = v._route = {
+      t: (_routeSeq++ % 8) * (ROUTE_PERIOD / 8),
+      have: false, final: false, x: 0, z: 0, tx, tz,
+    };
+  }
+  r.t -= dt;
+
+  if (!world?.routeTo || d < ROUTE_MIN) {
+    r.have = false;
+    return driveToward(veh, v, inp, tx, tz, opts);
+  }
+  if (r.have) {
+    const leg = dist(v.position.x, v.position.z, r.x, r.z);
+    if (leg < LEG_ARRIVE || leg > LEG_STALE) r.t = 0;
+  }
+  if (dist2(r.tx, r.tz, tx, tz) > DEST_MOVE * DEST_MOVE) r.t = 0;
+
+  if (r.t <= 0 || !r.have) {
+    r.t = ROUTE_PERIOD;
+    r.tx = tx;
+    r.tz = tz;
+    r.have = false;
+    _routeOpts.fromY = v.position.y;
+    const path = world.routeTo(v.position.x, v.position.z, tx, tz, _routeOpts);
+    if (path && path.length > 1) {
+      let k = path.length - 1;
+      for (let i = 1; i < path.length; i++) {
+        if (dist2(path[i].x, path[i].z, v.position.x, v.position.z) >= LEG_MIN * LEG_MIN) { k = i; break; }
+      }
+      // COPY. `routeTo` hands back a REUSED array of reused records
+      // (src/world/route.js) and the next caller this frame overwrites it.
+      r.x = path[k].x;
+      r.z = path[k].z;
+      r.final = k === path.length - 1;
+      r.have = true;
+    }
+  }
+  if (!r.have) return driveToward(veh, v, inp, tx, tz, opts);
+
+  _ropts.throttle = opts.throttle ?? 1;
+  _ropts.gain = opts.gain ?? 1.6;
+  _ropts.boost = !!opts.boost;
+  // The slow radius is about ARRIVING. Applied to an intermediate junction
+  // waypoint it brakes the car to a crawl at every corner of a 2 km route.
+  _ropts.slow = r.final ? (opts.slow ?? 0) : 0;
+  driveToward(veh, v, inp, r.x, r.z, _ropts);
+  return d;
+}
+
 export class WorldQuery {
   constructor(ctx) {
     this.ctx = ctx;
@@ -96,6 +232,7 @@ export class WorldQuery {
     this._v2 = new THREE.Vector3();
     this._spot = { x: 0, y: 0, z: 0, yaw: 0, ok: false };
     this._spot2 = { x: 0, y: 0, z: 0, yaw: 0, ok: false };
+    this._lane = { x: 0, y: 0, z: 0, yaw: 0, ok: false };
     this._playerPos = new THREE.Vector3();
     this._half = 1400; // resolved from world.CITY_SIZE at init
   }
@@ -452,6 +589,55 @@ export class WorldQuery {
     return this.findRoadSpot(14, 70, x, z, out);
   }
 
+  /**
+   * The nearest drivable LANE CENTRE to a point, or null.
+   *
+   * `findRoadSpot` is the annulus version — "put a car somewhere near here".
+   * This is the unwedge version: "where I stand is not a road, name the road".
+   * Same `_drivableTo` filter, so it never answers with mill trackage or a
+   * stranded fragment, and never with a lane centre that is under water.
+   *
+   * The record is REUSED. Read it before the next call.
+   */
+  nearestLane(x, z, out = this._lane) {
+    out.ok = false;
+    const roads = this.world?.roads;
+    if (!roads?.nearestEdge || !roads.laneCenter) return null;
+    const hit = roads.nearestEdge(x, z, LANE_REACH);
+    if (!this._drivableTo(hit)) return null;
+    const id = hit.edge.id ?? hit.edge;
+    const lane = hit.lane ?? 0;
+    const t = clamp01(typeof hit.t === 'number' ? hit.t : 0.5);
+    roads.laneCenter(id, lane, t, this._v);
+    if (this.isWater(this._v.x, this._v.z)) return null;
+    out.x = this._v.x;
+    out.z = this._v.z;
+    out.y = this.groundY(out.x, out.z);
+    out.yaw = roads.laneYaw ? roads.laneYaw(id, lane) : 0;
+    out.ok = true;
+    return out;
+  }
+
+  /**
+   * Put a wedged AI vehicle back on the nearest lane, upright and stopped.
+   *
+   * `setPose` is the ONE published way to relocate a `Vehicle`: it clears the
+   * velocity, the angular velocity, every wheel's suspension state and the
+   * drivetrain, so the car does not arrive still carrying the spin that put it
+   * on its roof. Writing `position` alone leaves all of that intact and the
+   * car re-wedges within a second.
+   *
+   * @returns {boolean} true if it was moved.
+   */
+  unwedgeVehicle(v, ride = 0.6) {
+    if (typeof v?.setPose !== 'function') return false;
+    const lane = this.nearestLane(v.position.x, v.position.z);
+    if (!lane) return false;
+    this._v2.set(lane.x, lane.y + ride, lane.z);
+    v.setPose(this._v2, lane.yaw);
+    return true;
+  }
+
   /* ------------------------------------------------------------ vehicles -- */
 
   /**
@@ -506,3 +692,11 @@ const SHORE_REACH = 22;
  * (`dock_point`), so 400 m is slack, not a target.
  */
 const ANCHOR_ROAD_REACH = 400;
+
+/**
+ * How far `nearestLane` will search. A wedged car is by definition somewhere it
+ * should not be — a forecourt, a verge, the back of a lot — but it got there by
+ * driving, so the road it left is close. 80 m covers the widest reservation in
+ * the plan without reaching across a river.
+ */
+const LANE_REACH = 80;

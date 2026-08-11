@@ -375,7 +375,14 @@ export const SERVICES = [
   { id: 'gas_north', name: 'Shore Service', x: -184, z: -544, kind: 'gas' },
   { id: 'gas_row', name: 'Steel Row Fuel', x: 760, z: 328, kind: 'gas' },
   { id: 'gas_law', name: 'Butler St Gas', x: 696, z: -512, kind: 'gas' },
-  { id: 'shop_spray', name: 'Rustbelt Respray', x: -336, z: 176, kind: 'respray' },
+  // MOVED OFF THE MONONGAHELA. (-336, 176) — DESIGN.md's legacy (-84, 44) at
+  // K = 4 — is 10.9 m under the river; the surveyed replacement is dry, 1.0%
+  // slope over a 12 m ring and 13.5-13.6 m off a two-lane arterial on all six
+  // seeds, which clears `corridorHalfWidth('arterial', 2) + 3` = 10.4 m, so
+  // `resolvePoi` keeps it (moved 0 m on every seed) rather than walking the
+  // forecourt somewhere else. The reasoning and the measurements are in
+  // `src/game/data.js` SHOPS, which MUST agree with this line.
+  { id: 'shop_spray', name: 'Rustbelt Respray', x: -136, z: 96, kind: 'respray' },
   { id: 'shop_ammo', name: 'Foundry Supply', x: 384, z: -280, kind: 'ammo' },
   { id: 'shop_food', name: "Primo's Sandwich", x: -120, z: 24, kind: 'food' },
   { id: 'shop_ammo2', name: 'Row Hardware', x: 816, z: 464, kind: 'ammo' },

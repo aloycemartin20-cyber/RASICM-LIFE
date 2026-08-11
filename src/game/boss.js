@@ -46,7 +46,7 @@
  */
 
 import { BOSSES, R, BOY_ORDER } from './data.js';
-import { clamp01, dist, driveToward, wrapAngle, yawOf } from './util.js';
+import { clamp01, dist, driveRoute, wrapAngle, yawOf } from './util.js';
 
 /**
  * Beats after the boss drops, the fight is not over — the kill flips to an
@@ -83,6 +83,9 @@ const TELL_NAME = {
 const FRONT_ARC = 1.22;   // rad, ~70 deg either side of his nose
 const REAR_ARC = 1.92;    // rad, ~110 deg — past the shoulder, you are behind
 const FRONT_TAKE = 0.45;
+
+/** Reused steer options for the driver boss. Rule 5: one record, rewritten. */
+const DRIVER_OPTS = { throttle: 1, gain: 1.7, boost: false };
 
 /**
  * What the boss bar is drawn from, published on `mission:boss`.
@@ -435,9 +438,11 @@ export const bossTrack = {
     const pv = g.wq.playerVehicle();
     const tx = pv ? pv.position.x : g.px;
     const tz = pv ? pv.position.z : g.pz;
-    const d = driveToward(g.wq.vehicles, v, g._input, tx, tz, {
-      throttle: 1, gain: 1.7, boost: phase >= 1,
-    });
+    // By road while she is closing across the district, pure pursuit inside
+    // `driveRoute`'s own close range — which is where a car fight happens and
+    // where a route would only steer her at the junction behind you.
+    DRIVER_OPTS.boost = phase >= 1;
+    const d = driveRoute(g.wq, v, g._input, tx, tz, dt, DRIVER_OPTS);
     // Ram damage — this is her whole game, and it is why the brothers tell you
     // to go for the rear wheels rather than meet her head on.
     if (d < 6 && Math.abs(v.forwardSpeed ?? 0) > 11) {

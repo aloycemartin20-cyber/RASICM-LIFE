@@ -835,19 +835,30 @@ const CSS = `
   display:flex; flex-direction:column; align-items:center;
   will-change: transform, opacity;
 }
-.ow-mk-glyph { position:relative; width:calc(16px * var(--k)); height:calc(16px * var(--k)); }
+/* 22px, not 16, and the 8-way outline rather than a drop shadow on the type.
+   At 1920x1080 the old marker was a 16px diamond over 9-10px lettering, and a
+   soft shadow behind light type over a light building facade is no separation
+   at all — the distance readout disappeared against pavement. The 8-way outline
+   is the same ring the objective panel and the weapon chip already wear, so this
+   is the HUD's existing legibility answer applied to the one widget that was
+   drawing without it. GLYPH in markers.js mirrors this box. */
+.ow-mk-glyph { position:relative; width:calc(22px * var(--k)); height:calc(22px * var(--k)); }
 .ow-mk-glyph svg { position:absolute; inset:0; width:100%; height:100%; display:block; overflow:visible;
-  filter: drop-shadow(0 1px 2px rgba(0,0,0,.85)); }
+  filter: drop-shadow(0 calc(1.5px * var(--k)) calc(3px * var(--k)) rgba(0,0,0,.9)); }
 .ow-mk-letter {
   position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
-  font-size: calc(9.5px * var(--k)); color:#08161c; font-weight:700;
+  font-size: calc(13px * var(--k)); color:#08161c; font-weight:800;
 }
 .ow-mk-dist {
-  margin-top: calc(var(--u) * .6);
-  font-size: calc(10px * var(--k)); letter-spacing:.12em; color: var(--ink);
-  text-shadow: var(--sh);
+  margin-top: calc(var(--u) * .7);
+  font-family: var(--fd);
+  font-size: calc(13px * var(--k)); font-weight:700; letter-spacing:.1em; color: var(--paper);
+  text-shadow: var(--sh-o1);
 }
-.ow-mk-name { font-size: calc(9px * var(--k)); letter-spacing:.18em; color: var(--ink-2); text-shadow:var(--sh); }
+.ow-mk-name {
+  font-size: calc(11px * var(--k)); font-weight:700; letter-spacing:.2em; color: var(--ink);
+  text-shadow: var(--sh-o1);
+}
 .ow-mk.threat .ow-mk-dist { color: var(--red); }
 
 .ow-nade { position:absolute; left:0; top:0; will-change: transform, opacity; }

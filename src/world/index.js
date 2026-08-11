@@ -1520,7 +1520,13 @@ export class WorldSystem {
     out.z = p.z;
     out.district = d?.name ?? '';
     out.districtId = d?.id ?? '';
-    out.street = ne.edge?.name ?? '';
+    // `nearestEdge().name` is the AUTHORED name and most edges do not have one
+    // — a grid street defers to the corridor table, which only `streetAt`
+    // consults. So this line published '' for the large majority of the city
+    // and the HUD's street readout was blank almost everywhere it mattered.
+    // It also answered from an edge up to 90 m away, i.e. named a street the
+    // player was nowhere near; `streetAt` refuses past the kerb.
+    out.street = this.streetAt(p.x, p.z, p.y) ?? '';
     out.onBridge = !!ne.edge?.bridge;
     out.bridge = ne.edge?.bridge ? ne.edge.bridgeId : '';
     out.water = this.isWater(p.x, p.z);

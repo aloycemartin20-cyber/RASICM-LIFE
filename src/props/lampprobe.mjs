@@ -39,11 +39,22 @@
  * tracked region is near-linear across any three consecutive frames. The
  * metric is therefore the SECOND difference — how far a frame lands from
  * where the previous two were heading — normalised by the lamp's own full
- * swing over the traverse (`maxPopNorm`), over lamps whose swing clears a
- * noise floor. Motion cancels out of it; a crossfade contributes only the
- * kink where its ~0.15 s fade starts; a teleport contributes its whole
- * height. (The plain first difference was measured first and does NOT
- * separate the arms — 0.33 vs 0.34 — because the motion term dominates both.)
+ * swing over the traverse AND by the square of the camera step (`maxPopNorm`,
+ * units 1/m^2), over lamps whose swing clears a noise floor and whose track is
+ * long enough to establish one. Motion cancels out of it; a crossfade
+ * contributes only the kink where its ~0.15 s fade starts; a teleport
+ * contributes its whole height. (The plain first difference was measured first
+ * and does NOT separate the arms — 0.33 vs 0.34 — because the motion term
+ * dominates both.)
+ *
+ * THREE THINGS STAND BETWEEN THAT IDEA AND A NUMBER THAT MEANS ANYTHING, and
+ * all three were found by this gate going decorative: it scored fixed 0.196 and
+ * control 0.196 — the same headline, from the same 29-frame lamp, in the arm
+ * with the light path WORKING and the arm with it BROKEN. See `MIN_TRACK` (a
+ * short track is a lamp sweeping the frame edge, where the profile is steepest
+ * and mostly foreground), `despike` (a one-frame occlusion is not a light
+ * changing hands) and the `STEP_M^2` note beside the normaliser (a limit that
+ * silently means something different at another `--step` is not a limit).
  *
  * Internal pool state IS logged per frame — how far each pool key's position
  * moved — but only as a diagnostic so a failure says "key 9001 jumped 27.4 m
@@ -96,8 +107,52 @@ const MARGIN = { x0: 0.05, x1: 0.95, y0: 0.28, y1: 0.88 };
  * camera-motion noise — judging those measures nothing but the noise itself.
  */
 const AMP_FLOOR = 15;
+/**
+ * A lamp must be tracked this many CONSECUTIVE-CAPABLE frames to be judged.
+ *
+ * A region is only sampled while its lamp is 4-38 m ahead and the whole box
+ * sits inside `MARGIN`. A lamp that satisfies both for only a few dozen frames
+ * is one sweeping past the edge of the frame or close under the camera, where
+ * the pool's luminance profile is steepest and most of what crosses the box is
+ * foreground — a bollard, a kerb line, a parked wing. MEASURED on the fixed
+ * arm: the two shortest tracks (29 and 43 frames of 184) carried popNorm 0.196
+ * and 0.057 while the four long ones sat at 0.025-0.034, and the 29-frame one
+ * set the headline. It also set the CONTROL's headline, to three significant
+ * figures — which is the proof that what it measures is not the light path at
+ * all, because the control is the arm where the light path is broken.
+ *
+ * 60 frames is 18 m of travel at the default step, most of a lamp pitch.
+ */
+const MIN_TRACK = Number(args.track ?? 60);
 
 const lum = (r, g, b) => 0.2126 * r + 0.7152 * g + 0.0722 * b;
+
+/**
+ * Median-of-three over the tracked series, which is the whole de-spiking of
+ * this probe and is not a smoothing pass.
+ *
+ * A median filter has exactly the property this measurement needs: it deletes
+ * an ISOLATED one-frame outlier and preserves a STEP. So a glint, or a pole
+ * sweeping through the 96x59 px box for a frame, stops contributing its whole
+ * height to the second difference, while a light that changes hands between
+ * two frames still contributes all of its. MEASURED on the worst offender
+ * (`lamp:-2,0:2`, a 5.79 spike-and-return over frames 64-68 present IDENTICALLY
+ * in both arms): 5.79 -> 2.48.
+ *
+ * Only applied across samples that are consecutive in `t`; a tracking gap
+ * leaves the sample alone rather than mixing two different moments.
+ */
+function despike(s) {
+  const out = new Array(s.length);
+  for (let i = 0; i < s.length; i++) {
+    const a = s[i - 1];
+    const b = s[i];
+    const c = s[i + 1];
+    if (!a || !c || a.t !== b.t - 1 || c.t !== b.t + 1) { out[i] = b.L; continue; }
+    out[i] = Math.max(Math.min(a.L, b.L), Math.min(Math.max(a.L, b.L), c.L));
+  }
+  return out;
+}
 
 /** Mean luminance of a box inside a decoded PNG. */
 function boxLum(png, x, y, w, h) {
@@ -281,11 +336,12 @@ async function run(extra) {
     const perLamp = [];
     for (const [id, s] of series) {
       if (s.length < 12) continue;
+      const f = despike(s);
       let lo = Infinity;
       let hi = -Infinity;
-      for (const p of s) {
-        if (p.L < lo) lo = p.L;
-        if (p.L > hi) hi = p.L;
+      for (const v of f) {
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
       }
       const amp = hi - lo;
       let maxStep = 0;
@@ -301,19 +357,37 @@ async function run(extra) {
       let popAt = -1;
       for (let i = 1; i < s.length; i++) {
         if (s[i].t !== s[i - 1].t + 1) continue; // tracking gap — no pair
-        const d = Math.abs(s[i].L - s[i - 1].L);
+        const d = Math.abs(f[i] - f[i - 1]);
         if (d > maxStep) {
           maxStep = d;
           maxAt = s[i].t;
         }
         if (i >= 2 && s[i - 1].t === s[i - 2].t + 1) {
-          const p = Math.abs(s[i].L - 2 * s[i - 1].L + s[i - 2].L);
+          const p = Math.abs(f[i] - 2 * f[i - 1] + f[i - 2]);
           if (p > maxPop) {
             maxPop = p;
             popAt = s[i].t;
           }
         }
       }
+      /**
+       * `popNorm` is a CURVATURE PER METRE OF CAMERA TRAVEL SQUARED, not a bare
+       * ratio, and dividing by `STEP_M^2` is what makes the thresholds below
+       * mean the same thing at any `--step`.
+       *
+       * A smooth pool profile contributes a second difference of about
+       * `step^2 * d2L/ds2`, so dividing it out leaves a property of the SCENE
+       * that does not move when the sampling does. A teleport contributes its
+       * whole height whatever the step, so its normalised value only grows as
+       * the step shrinks. That asymmetry is the direction a gate wants:
+       * sampling the traverse more finely can sharpen the failure and can never
+       * soften it. Before this the limits were silently quoted at one step and
+       * a `--step=0.15` run would have halved the fixed arm's number and left
+       * the control's alone.
+       */
+      const norm = amp >= AMP_FLOOR && s.length >= MIN_TRACK
+        ? +(maxPop / (amp * STEP_M * STEP_M)).toFixed(3)
+        : null;
       perLamp.push({
         id,
         frames: s.length,
@@ -322,12 +396,18 @@ async function run(extra) {
         maxAt,
         maxPop: +maxPop.toFixed(2),
         popAt,
-        popNorm: amp >= AMP_FLOOR ? +(maxPop / amp).toFixed(3) : null,
+        popNorm: norm,
+        why: norm !== null ? '' : (amp < AMP_FLOOR ? 'under amp floor' : `track ${s.length} < ${MIN_TRACK}`),
         series: s.map((p) => [p.t, +p.L.toFixed(2)]),
       });
     }
     const judged = perLamp.filter((p) => p.popNorm !== null);
-    if (!judged.length) throw new Error('no lamp cleared the amplitude floor — nothing measured');
+    if (judged.length < 3) {
+      throw new Error(
+        `only ${judged.length} lamp(s) cleared the amplitude floor and the ${MIN_TRACK}-frame ` +
+        'track guard — too few to judge, so this run measured nothing'
+      );
+    }
     const worst = judged.reduce((a, b) => (b.popNorm > a.popNorm ? b : a));
 
     return {
@@ -362,7 +442,7 @@ function report(name, r) {
     console.log(
       `${''.padEnd(14)} ${p.id.padEnd(14)} frames=${String(p.frames).padStart(3)} ` +
         `amp=${String(p.amp).padStart(7)} maxStep=${String(p.maxStep).padStart(7)} ` +
-        `maxPop=${String(p.maxPop).padStart(7)} popNorm=${p.popNorm ?? '(under floor)'}`
+        `maxPop=${String(p.maxPop).padStart(7)} popNorm=${p.popNorm ?? `(${p.why})`}`
     );
   }
   const jumps = r.poolJump.filter((j) => j.jump > 5);
@@ -379,19 +459,44 @@ function report(name, r) {
  * RATCHETS (rule 13) — measured values beside each limit; move them DOWN
  * (tighter) when the behaviour improves, never up.
  *
- *   maxPopNorm <= 0.20   measured 0.159 fixed / 0.332 legacy, repeat runs
- *                        within 0.01. A handover spreads over the ~0.15 s
- *                        crossfade; nothing lands a third of a lamp's swing
- *                        away from where the last two frames were heading.
+ * BOTH LIMITS WERE RE-DERIVED. The previous pair (0.20 / 0.25) were quoted
+ * against a bare `maxPop / amp` on an unfiltered series with no track guard,
+ * and on this tree they had stopped separating the arms AT ALL: fixed 0.196
+ * and control 0.196, to three significant figures, because BOTH headlines were
+ * set by the same 29-frame lamp whose pop is path curvature and a foreground
+ * sweep. The control could not fail, so the gate was decorative — a passing
+ * `maxPopNorm <= 0.20` said nothing about lamp handover. Everything that
+ * changed is in `MIN_TRACK`, `despike` and the `STEP_M^2` normaliser above.
+ *
+ * MEASURED with those in place, one run, all values 1/m^2 of camera travel:
+ *
+ *   arm      judged lamps (popNorm)                 headline   pool jumps >5 m
+ *   fixed    0.275 0.329 0.380 [0.902]              0.902      0
+ *   control  0.275 0.923 1.445 [0.910]              1.445      40
+ *
+ *   maxPopNorm <= 1.10   fixed measured 0.902, and that headline is ONE lamp
+ *                        (`lamp:-2,0:2`) whose 5.79 spike-and-return over five
+ *                        frames the median filter reduces to 2.48 but cannot
+ *                        remove, and which reads 0.910 in the CONTROL — i.e.
+ *                        it is provably not the light path, because the arm
+ *                        with the light path broken measures the same thing.
+ *                        Every other judged lamp is 0.275-0.380. The honest
+ *                        goal is that headline coming down to ~0.4, which
+ *                        needs a region statistic robust to a foreground
+ *                        object crossing the box (a percentile rather than a
+ *                        mean), not a different light path.
+ *   control >= 1.25      control measured 1.445, on the lamp the pool actually
+ *                        hands over (`lamp:-2,0:15`, an 8.57 single-frame step
+ *                        against 3.27 in the fixed arm).
  *
  * Negative control: `owLampRankKey=1` restores the rank-derived keys. Its
- * maxPopNorm must sit ABOVE the fail limit or the metric no longer measures
- * the teleport and cannot be trusted. Its internal confirmation: the legacy
- * arm logs ~21 pool-key position jumps over 5 m in one 55 m traverse; the
- * fixed arm logs zero.
+ * maxPopNorm must sit ABOVE `CTL_POP_MIN` or the metric no longer measures the
+ * teleport and cannot be trusted. Its internal confirmation: the legacy arm
+ * logs 40 pool-key position jumps over 5 m in one 55 m traverse; the fixed arm
+ * logs zero.
  */
-const POP_MAX = 0.2;
-const CTL_POP_MIN = 0.25;
+const POP_MAX = 1.1;
+const CTL_POP_MIN = 1.25;
 
 if (args.gate) {
   const fixed = await run(args.params || '');

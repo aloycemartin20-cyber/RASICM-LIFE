@@ -1858,6 +1858,7 @@ export class UiSystem {
     // The full map draws the SAME live contacts the ring does — one source,
     // two projections, no way for them to disagree.
     this.map.blips = this._blipView;
+    this.map.route = s.route;
     this.map.update(rawDt, {
       x: s.x, z: s.z, heading: s.heading, colour: s.colour, inVehicle: s.inVehicle,
     });
@@ -1937,8 +1938,18 @@ export class UiSystem {
       w.menu || w.story || w.map || w.phone || w.cheats || w.ending || w.card || w.cut;
     if (needsCursor && !this._needsCursorPrev) {
       this._hadPointerLock = false;               // ours, not an Escape
+      this._relockPending = false;                // a new overlay voids the IOU
       this.ctx?.input?.exitPointerLock?.();
-    } else if (!needsCursor && this._needsCursorPrev && !off && !this.touch?.active) {
+    } else if (!needsCursor && this._needsCursorPrev) {
+      // LATCHED, not fired: the edge can land on the very frame the boot
+      // overlay (or another `off` state) is still tearing down — the intro
+      // cutscene ends while `__BOOT__.active` fades — and an edge-only
+      // re-request suppressed once is suppressed forever. The IOU survives
+      // until the suppressors clear, then pays out exactly once below.
+      this._relockPending = true;
+    }
+    if (this._relockPending && !needsCursor && !off && !this.touch?.active) {
+      this._relockPending = false;
       this.ctx?.input?.requestPointerLock?.();
     }
     this._needsCursorPrev = needsCursor;
@@ -2073,7 +2084,12 @@ export class UiSystem {
         this.setRespect(gs.respect, delta);
       }
       if (gs.respect !== undefined) this._respectSeen = true;
+      // A live chapter owns the panel; with none running it says what is NEXT.
+      // Two fields rather than one fallback in `game`, because `objective`
+      // being null in free roam is load-bearing three files away — see
+      // `GameSystem._syncHud` and `hud.js`'s boss-bar backstop.
       if (gs.objective) this.objective.set(gs.objective);
+      else if (gs.nextObjective) this.objective.set(gs.nextObjective);
     }
 
     // ---- health regeneration when nobody else owns health -----------------
@@ -2086,6 +2102,16 @@ export class UiSystem {
         }
         s.health = Math.min(s.maxHealth, s.health + dt * 24);
       }
+    }
+
+    // ---- the street under the player --------------------------------------
+    // `world.getHudState().street` is the only producer, and until now nothing
+    // read it: `state.street` was initialised to '' and never assigned, so the
+    // readout beside the Slag Ring has been empty for its entire existence.
+    // A debug state keeps its scripted line.
+    if (!this._debug) {
+      const wh = this._sub('world');
+      if (wh) s.street = typeof wh.street === 'string' ? wh.street : '';
     }
 
     // ---- district crossing -> the zone flourish ---------------------------
@@ -2154,6 +2180,13 @@ export class UiSystem {
     for (const o of this._objectives) {
       if (o.position) push(o.position, 'mission', 0);
     }
+    // THE NEXT CHAPTER'S PIN. `game` publishes `{x,z,name}` on its HUD state
+    // while a brother has a chapter waiting and nothing is running — the one
+    // place on the map he is meant to go. Its own ink (see `styleFor` in
+    // `citymap.js`), because a job you have not accepted must never look like
+    // a job already under way.
+    const gsn = this._sub('game')?.next;
+    if (gsn && Number.isFinite(gsn.x) && Number.isFinite(gsn.z)) push(gsn, 'chapter', 0);
     this._blipCount = n;
   }
 
@@ -2365,13 +2398,35 @@ export class UiSystem {
     }
   }
 
+  /**
+   * THE WHEEL ASKS BEFORE IT COMMITS.
+   *
+   * It used to repaint the HUD and toast "Switched to X" and only then emit
+   * `ui:character` — so a switch `Characters.switchTo` REFUSES (a story chapter
+   * is live) flashed the other brother's name, colour, vitals maxima and
+   * loadout over the man still on screen, and was undone a frame later by the
+   * corrective `setCharacter` that class pushes back. Two contradictory
+   * notifications, and the wrong one arrived first.
+   *
+   * `game.switchTo` returns the answer. Only a literal `true` repaints; the
+   * refusal path has already put its own 'Not during a job' toast up. With no
+   * `game` at all — the model-preview page, every headless bench — the wheel is
+   * the only authority there is, and commits as before.
+   */
   _closeCharWheel() {
     this.charWheel.hide();
     const id = this.charWheel.selected;
-    if (id && id !== this.state.character) {
+    if (!id || id === this.state.character) return;
+    const game = this.ctx.peek?.('game');
+    if (typeof game?.switchTo === 'function') {
+      if (game.switchTo(id) !== true) return;
+      // `Characters.restore` calls `setCharacter` itself on the way through;
+      // this only covers a `game` that answered true without doing so.
+      if (this.state.character !== id) this.setCharacter(id);
+    } else {
       this.setCharacter(id);
-      this.notify('Switched to ' + (BOY_BY_ID[id]?.name ?? id), '', 'slag');
     }
+    this.notify('Switched to ' + (BOY_BY_ID[id]?.name ?? id), '', 'slag');
   }
 
   _selectWeapon(id) {

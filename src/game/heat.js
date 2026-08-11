@@ -30,7 +30,7 @@
  */
 
 import * as THREE from 'three';
-import { clamp, clamp01, dist, wrapAngle, yawOf } from './util.js';
+import { clamp, clamp01, dist, driveRoute } from './util.js';
 
 /** Seconds out of sight, per star, before the level drops one. */
 const COOLDOWN = [0, 14, 20, 27, 36, 48];
@@ -42,6 +42,13 @@ const SIGHT = 110;
 const BUST_TIME = 2.6;
 const BUST_RADIUS = 14;
 const EMPTY_OPTS = Object.freeze({});
+/**
+ * Reused pursuit steer options — one record, rewritten per cruiser (rule 5).
+ * `slow` 12 replaces the old explicit `brake = d < 9 ? 0.6 : 0`: it eases on
+ * over the same distance instead of stamping, which stops a cruiser arriving
+ * at 30 m/s and bouncing off the player's boot.
+ */
+const PURSUIT_OPTS = { throttle: 1, gain: 1.5, slow: 12, boost: false };
 
 export class Heat {
   constructor(ctx, q) {
@@ -330,25 +337,22 @@ export class Heat {
   }
 
   /**
-   * Deliberately dumb pursuit: point at the player, floor it, handbrake if the
-   * angle is hopeless. This is a placeholder for `police`'s pursuit driving —
-   * it exists so `escape` is a real objective, not so it is good AI.
+   * Pursuit driving, on the road graph.
+   *
+   * Still deliberately simple — this is a placeholder for `police`'s own
+   * pursuit AI and exists so `escape` is a real objective — but it is no
+   * longer pure pursuit against a raw (x, z). A cruiser dispatched 150-320 m
+   * away with a river between it and the player used to drive into the river;
+   * `driveRoute` gives it the same graph `traffic` drives on and falls back to
+   * the old straight-line steer where there is no route.
    */
   _drivePursuit(dt, px, pz, wq) {
     const veh = wq.vehicles;
     if (!veh?.setInput) return;
-    const inp = this._input;
     for (const c of this.cops) {
-      const want = Math.atan2(px - c.position.x, pz - c.position.z);
-      const yaw = yawOf(c);
-      const err = wrapAngle(want - yaw);
-      const d = dist(c.position.x, c.position.z, px, pz);
-      inp.steer = clamp(err * 1.5, -1, 1);
-      inp.throttle = d > 14 ? 1 : 0.2;
-      inp.brake = d < 9 ? 0.6 : 0;
-      inp.handbrake = Math.abs(err) > 1.7 && Math.abs(c.forwardSpeed ?? 0) > 16;
-      inp.boost = d > 90 && this.level >= 3;
-      veh.setInput(c, inp);
+      const far = dist(c.position.x, c.position.z, px, pz) > 90;
+      PURSUIT_OPTS.boost = far && this.level >= 3;
+      const d = driveRoute(wq, c, this._input, px, pz, dt, PURSUIT_OPTS);
       // 5 stars: they will ram you. DESIGN.md wanted table.
       if (this.level >= 5 && d < 7) veh.damage?.(c, 2 * dt, null);
     }

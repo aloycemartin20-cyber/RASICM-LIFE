@@ -195,7 +195,7 @@ export const SAFEHOUSES = [
 ];
 
 export const SHOPS = [
-  { id: 'shop_spray', name: 'RUSTBELT RESPRAY', x: -336, z: 176, kind: 'spray' },
+  { id: 'shop_spray', name: 'RUSTBELT RESPRAY', x: -136, z: 96, kind: 'spray' },
   { id: 'shop_ammo', name: 'FOUNDRY SUPPLY', x: 384, z: -280, kind: 'ammo' },
   { id: 'shop_ammo2', name: 'ROW HARDWARE', x: 816, z: 464, kind: 'ammo' },
   { id: 'shop_food', name: "PRIMO'S SANDWICH", x: -120, z: 24, kind: 'food' },

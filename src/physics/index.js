@@ -293,6 +293,16 @@ export class PhysicsSystem {
     }
     this._impactCursor = 0;
     this._impactResult = [];
+    /** Whose round is in flight — see `fireBullet`. Null outside a trace. */
+    this._bulletSource = null;
+    /**
+     * NEGATIVE CONTROL for `src/physics/attribprobe.mjs`, never set in play:
+     * drops the attribution back off the `damage:dealt` payload, which is the
+     * build where `ui` and `audio` could only guess the shooter from an absent
+     * field. Same live-hatch pattern as `debugIgnorePause` / `debugTracerNoCars`
+     * — the control runs against this code, not against a copy of it.
+     */
+    this.debugNoBulletSource = false;
 
     this._raw = makeHitRecord();
     this._raw2 = makeHitRecord();
@@ -993,16 +1003,41 @@ export class PhysicsSystem {
    * Trace a round through the world, penetrating what it can.
    * Emits `bullet:impact` for every entry and every exit.
    * Returns an array of impact records (reused; copy what you keep).
+   *
+   * `opts.source` is the ACTOR that fired, and it rides through to the
+   * `damage:dealt` payload `emitImpact` raises so a listener can tell WHOSE
+   * round connected. It is parked on `_bulletSource` for the duration of the
+   * trace rather than handed down through `Ballistics.fire`: one trace emits
+   * from several places inside the penetration solver — entry, exit, layer
+   * two — and none of those frames belongs to the caller.
+   *
+   * Saved and restored rather than cleared, because `hit.collider.onHit` runs
+   * inside the trace and is free to fire a round of its own; a bare clear
+   * would leave the nested shooter's attribution on the outer round's exit
+   * impact.
    */
   fireBullet(opts) {
-    const n = this.ballistics.fire({ rng: this.rng, ...opts });
-    const res = this._impactResult;
-    res.length = 0;
-    for (let i = 0; i < n; i++) res.push(this.ballistics.impacts[i]);
-    return res;
+    const prevSource = this._bulletSource;
+    this._bulletSource = opts.source ?? null;
+    try {
+      const n = this.ballistics.fire({ rng: this.rng, ...opts });
+      const res = this._impactResult;
+      res.length = 0;
+      for (let i = 0; i < n; i++) res.push(this.ballistics.impacts[i]);
+      return res;
+    } finally {
+      this._bulletSource = prevSource;
+    }
   }
 
-  emitImpact(px, py, pz, nx, ny, nz, dx, dy, dz, si, damage, exit, hit) {
+  /**
+   * `source` (14th) names the actor that dealt it for callers that reach this
+   * directly; a round traced through `fireBullet` carries its own and needs no
+   * argument. Null stays null — ARCHITECTURE.md's `damage:dealt` contract makes
+   * the field optional, and `ui`/`audio` still read an unnamed source as the
+   * local player.
+   */
+  emitImpact(px, py, pz, nx, ny, nz, dx, dy, dz, si, damage, exit, hit, source) {
     const p = this._impactPool[this._impactCursor];
     this._impactCursor = (this._impactCursor + 1) % IMPACT_POOL;
     p.point.set(px, py, pz);
@@ -1025,6 +1060,7 @@ export class PhysicsSystem {
         headshot: hit?.part === 'head',
         killed: false,
         point: p.point,
+        source: this.debugNoBulletSource ? null : (source ?? this._bulletSource),
       });
     }
   }

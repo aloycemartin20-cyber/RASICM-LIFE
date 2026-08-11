@@ -226,6 +226,16 @@ export class PedSystem {
      */
     this.debugIgnoreAirfields = false;
 
+    /**
+     * Live negative-control hatch for the pavement rejoin, same pattern and
+     * same rule: never set in play. When true, `Ped._rejoinPavement` declines,
+     * so a walker with no pavement link goes on wandering across whatever is in
+     * the disc round his anchor — which is the build where a third of the crowd
+     * was standing in the carriageway. `src/peds/streetprobe.mjs --gate` flips
+     * it to prove its sidewalk fraction is measuring the fix and not the shot.
+     */
+    this.debugNoRejoin = false;
+
     /* ---- the crew: two brothers, their own pool, never streamed ---- */
     this.crew = new Crew(this);
     this.crewAuto = true;          // spawn them as soon as there is a player

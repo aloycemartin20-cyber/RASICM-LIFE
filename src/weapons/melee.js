@@ -324,13 +324,11 @@ export class MeleeSolver {
      *
      * The impulse is the knockback.
      *
-     * IT ALSO CARRIES THE PLAYER'S CLAIM TO THE HITMARKER, IMPLICITLY.
-     * `physics.emitImpact` raises the `damage:dealt` for this swing with no
-     * `source` on it, and `ui._isPlayerSource` / `audio._isPlayerSource` read an
-     * absent source as the player — which is true only because this call and
-     * `src/weapons/ballistics.js` are `fireBullet`'s only callers, and both are
-     * his. Give an AI a `fireBullet` and it must carry a `source` through to
-     * that payload, or every enemy round starts drawing the player a hitmarker.
+     * IT ALSO CARRIES THE PLAYER'S CLAIM TO THE HITMARKER, EXPLICITLY:
+     * `source: 'player'` rides through `physics.emitImpact` into the
+     * `damage:dealt` payload, same convention as the round path. The
+     * absent-source inference in `ui`/`audio._isPlayerSource` remains only as
+     * a legacy backstop for emitters that predate the stamp.
      */
     phys.fireBullet({
       origin: this._origin,
@@ -342,6 +340,9 @@ export class MeleeSolver {
       impulse: (def.knockback ?? 3) * 9 * model.knockbackScale,
       mask,
       rng,
+      /* The swing names its actor like the round does — the absent-source
+       * inference is a legacy backstop, not a contract. */
+      source: 'player',
     });
     if (best.hit) {
       this.stats.hits++;

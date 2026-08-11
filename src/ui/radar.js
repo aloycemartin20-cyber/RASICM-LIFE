@@ -26,11 +26,23 @@
 
 import * as THREE from 'three';
 import { el, clamp, clamp01, damp, lerp, setStyle, setText, FONT_STACK, FONT_MONO } from './util.js';
-import { CityMap, drawIcon, drawPlayerArrow, MAP_INK } from './citymap.js';
+import { CityMap, drawIcon, drawPlayerArrow, styleFor } from './citymap.js';
 import { POI_STYLE, buildPoiList, districtAt } from './data.js';
 
 const SPAN_IDLE = 190;
 const SPAN_FAST = 440;
+/**
+ * Metres across the disc below which it carries street names.
+ *
+ * The gate is the SPAN and not pixels-per-metre, because ppm on this disc is a
+ * function of `devicePixelRatio` — the same 190 m view is 0.94 ppm at dpr 1 and
+ * 1.87 at dpr 2, so a ppm threshold would put street names on a retina screen
+ * and not on anyone else's. 360 m covers the standstill span (190 m) and the
+ * whole town-driving range up to about 100 km/h; only the motorway pull-out
+ * (`SPAN_FAST`, 440 m) drops the names, and at that speed the street under the
+ * wheels is what the readout beside the bezel is for.
+ */
+const LABEL_SPAN = 360;
 
 /**
  * Negative-control hatch for the AFB findability gate (src/ui/afbprobe.mjs):
@@ -85,7 +97,8 @@ export class SlagRing {
     this._pos = new THREE.Vector3();
     this._view = {
       cx: 0, cz: 0, ppm: 1, rot: 0, w: 0, h: 0,
-      alleys: true, tint: true, labels: false, labelScale: 1, px: 1, font: FONT_STACK,
+      alleys: true, tint: true, labels: false, streets: false, streetMax: 3,
+      labelScale: 1, px: 1, font: FONT_STACK,
     };
     this._pt = [0, 0];
 
@@ -176,6 +189,12 @@ export class SlagRing {
     v.h = S;
     v.alleys = ppm > 0.55;
     v.labels = false;
+    // Names on the disc only when the disc is a street map rather than a
+    // district map — see LABEL_SPAN.
+    v.streets = this.viewSpan < LABEL_SPAN;
+    // Three names is what fits on a 178 px disc without the map disappearing
+    // under its own captions.
+    v.streetMax = 3;
     v.px = this.dpr * this.k;
     this.map.draw(g, v);
 
@@ -195,14 +214,18 @@ export class SlagRing {
     if (wanted > 0 && s.hunting !== false) this._cordon(g, half, S, wanted, u);
 
     // ---- route ------------------------------------------------------------
+    // The GPS line is the single most useful thing on the disc and it was the
+    // faintest: a 3.6 px magenta at 0.92 over a #8d9bab arterial is barely a
+    // stroke apart from the road under it. Wider, opaque, on a darker and
+    // wider casing so it reads as something laid OVER the network.
     const route = s.route;
     if (route && route.length >= 4) {
       const p = this._pt;
       g.lineJoin = 'round';
       g.lineCap = 'round';
       for (let pass = 0; pass < 2; pass++) {
-        g.strokeStyle = pass === 0 ? 'rgba(4,8,12,.8)' : 'rgba(255,59,138,.92)';
-        g.lineWidth = (pass === 0 ? 6.4 : 3.6) * u;
+        g.strokeStyle = pass === 0 ? 'rgba(3,6,10,.92)' : '#ff4f96';
+        g.lineWidth = (pass === 0 ? 8 : 4.6) * u;
         g.beginPath();
         for (let i = 0; i < route.length; i += 2) {
           proj(route[i], route[i + 1], p);
@@ -235,14 +258,14 @@ export class SlagRing {
       const p = this._pt;
       for (let i = 0; i < blips.length; i++) {
         const b = blips[i];
-        const st = POI_STYLE[b.kind] ?? POI_STYLE.enemy;
+        const st = styleFor(b.kind) ?? POI_STYLE.enemy;
         // A per-contact colour wins over the kind's generic one. This is what
         // makes each brother draw in his own DESIGN.md colour instead of all
         // three sharing the ALLY green — `ui._collectBlips` carries it off
         // `peds.getHudActors()`. Absent (the normal case) falls back to `st.c`.
         const ink = b.colour ?? st.c;
         proj(b.x, b.z, p);
-        const objective = b.kind === 'mission' || b.kind === 'waypoint';
+        const objective = b.kind === 'mission' || b.kind === 'waypoint' || b.kind === 'chapter';
         // Only objectives get pinned to the rim. Clamping every contact turns
         // a busy chase into a string of beads round the edge that tells you
         // nothing about where anyone actually is.
@@ -252,8 +275,8 @@ export class SlagRing {
         if (b.kind === 'cop') {
           // Police flash blue/white on the radar, in step with the lightbar.
           const t = (this.time * 2.6 + i * 0.31) % 1;
-          const c = t < 0.5 ? '#3f8dff' : '#a8cfff';
-          this._dotBlip(g, p[0], p[1], 3.5 * u, c, b.heading, false);
+          const c = t < 0.5 ? '#5aa0ff' : '#dcebff';
+          this._dotBlip(g, p[0], p[1], 4.3 * u, c, b.heading, false);
         } else if (objective) {
           drawIcon(g, st.g, p[0], p[1], 6.6 * u, ink, 1);
         } else {
@@ -340,26 +363,30 @@ export class SlagRing {
     const grd = g.createConicGradient
       ? g.createConicGradient(a0 - tail, half, half)
       : null;
+    // Every alpha here is roughly doubled against the original. At 0.018 the
+    // sweep was below the disc's own vignette and the "they are looking for
+    // you HERE" read did not survive being photographed, let alone being
+    // glanced at from a moving car.
     if (grd) {
       grd.addColorStop(0, 'rgba(255,106,18,0)');
-      grd.addColorStop(tail / (Math.PI * 2) * 0.55, `rgba(255,110,20,${0.018 + 0.006 * wanted})`);
-      grd.addColorStop(tail / (Math.PI * 2), `rgba(255,150,40,${0.075 + 0.016 * wanted})`);
+      grd.addColorStop(tail / (Math.PI * 2) * 0.55, `rgba(255,110,20,${0.04 + 0.012 * wanted})`);
+      grd.addColorStop(tail / (Math.PI * 2), `rgba(255,150,40,${0.15 + 0.03 * wanted})`);
       grd.addColorStop(Math.min(0.999, tail / (Math.PI * 2) + 0.004), 'rgba(255,106,18,0)');
       grd.addColorStop(1, 'rgba(255,106,18,0)');
       g.fillStyle = grd;
       g.fillRect(half - r, half - r, r * 2, r * 2);
     }
     // hard leading edge
-    g.strokeStyle = `rgba(255,214,140,${(0.3 + 0.08 * wanted).toFixed(2)})`;
-    g.lineWidth = 1.3 * u;
+    g.strokeStyle = `rgba(255,222,164,${(0.5 + 0.09 * wanted).toFixed(2)})`;
+    g.lineWidth = 1.7 * u;
     g.beginPath();
     g.moveTo(half, half);
     g.lineTo(half + Math.cos(a0) * r, half + Math.sin(a0) * r);
     g.stroke();
     g.restore();
 
-    g.strokeStyle = `rgba(255,148,46,${(0.24 + 0.09 * wanted).toFixed(2)})`;
-    g.lineWidth = 1.3 * u;
+    g.strokeStyle = `rgba(255,158,58,${(0.44 + 0.1 * wanted).toFixed(2)})`;
+    g.lineWidth = 1.7 * u;
     g.setLineDash([4.5 * u, 5.5 * u]);
     g.beginPath();
     g.arc(half, half, r, 0, Math.PI * 2);

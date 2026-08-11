@@ -26,7 +26,7 @@
  */
 
 import { RACE_TRACKS, R, TIMED_STORY, MARK_GREEN, MARK_AMBER, REPAIR_TIME } from './data.js';
-import { clamp01, dist, driveToward } from './util.js';
+import { clamp01, dist, driveRoute, upDot } from './util.js';
 
 /* ===================================================================== */
 /* helpers shared by several tracks                                       */
@@ -69,6 +69,99 @@ function enemyDmg(c, g, base = 10) {
   return Math.round((base + c.difficulty * 2) * g.diff.dmgIn);
 }
 
+/* ------------------------------------------------------------------- */
+/* the wedge watchdog on a track's own vehicle                          */
+/* ------------------------------------------------------------------- */
+
+/**
+ * Seconds a track vehicle may lie inverted and still before the chapter is
+ * declared wedged. Long enough that a roll the player drives out of — the roll
+ * assist rights a car in about two — is never scored as one.
+ */
+const VEH_FAULT_T = 8;
+/** Under this ground speed the car is not driving out of it. */
+const VEH_STATIC = 0.8;
+/** `upDot` below this is on its side or its roof. cos 80 deg. */
+const VEH_UPRIGHT = 0.17;
+
+/**
+ * Has the vehicle this chapter depends on stopped being a vehicle?
+ *
+ * TWO faults, and the second is the one that used to hang a chapter forever.
+ * `destroyed` is loud and every track already tested it — and it now also
+ * covers an aircraft, because `vehicles` raises `vehicle:destroyed` on a
+ * terrain impact. On its ROOF is silent: the car is at full health, the
+ * objective is intact, nothing fails and nothing can ever complete. A chapter
+ * that cannot be won must end with the ordinary retry card rather than leaving
+ * the player to reach for the pause menu.
+ *
+ * `key` is a FIXED property name on `M` — a literal, never built per frame
+ * (rule 5) — so two vehicles in one chapter cannot share a clock.
+ *
+ * @returns {'destroyed'|'inverted'|'gone'|null}
+ */
+function vehFault(M, dt, v, key) {
+  if (!v) return 'gone';
+  if (v.destroyed) return 'destroyed';
+  const stuck = upDot(v) < VEH_UPRIGHT && Math.abs(v.forwardSpeed ?? 0) < VEH_STATIC;
+  const t = stuck ? (M[key] ?? 0) + dt : 0;
+  M[key] = t;
+  return t >= VEH_FAULT_T ? 'inverted' : null;
+}
+
+/**
+ * The same watchdog for a COURTESY RIDE — the car a track spawns into `M.veh`
+ * only because the player walked to the start line.
+ *
+ * TWO GUARDS, and both stop this ending a chapter that was still winnable.
+ * Losing the courtesy car is not a fail while he has something else to drive:
+ * he may have stolen better two streets ago, and failing him for the car he
+ * abandoned would be a worse bug than the hang. And it is only applied by the
+ * tracks that cannot be finished without a car at all — `race` (a lap timer
+ * against 26 m gates a kilometre apart) and `chase` (a muscle car at full
+ * throttle). `escape` cools down on foot, `escort`'s truck now drives itself
+ * to the drop, and VIPER LANE can be shot off her wheels by a man standing
+ * still; all three stay winnable, so none of them calls this.
+ */
+function rideFault(M, dt, g) {
+  if (!M.veh) return null;
+  const fault = vehFault(M, dt, M.veh, '_faultRide');
+  if (!fault) return null;
+  const pv = g.wq.playerVehicle();
+  return pv && pv !== M.veh && !pv.destroyed ? null : fault;
+}
+
+/** Fail text for a fault, so all seven tracks word it the same way. */
+function faultReason(fault, what = 'The vehicle') {
+  if (fault === 'inverted') return `${what} ended up on its roof`;
+  if (fault === 'gone') return `${what} never arrived`;
+  return `${what} was wrecked`;
+}
+
+/* ------------------------------------------------------------------- */
+/* collect                                                              */
+/* ------------------------------------------------------------------- */
+
+/** Nearest a crate may be scattered from the anchor — else they land underfoot. */
+const COLLECT_MIN = 60;
+/**
+ * Where the courtesy boat is moored, relative to the chapter's anchor. Both
+ * radii are walking distances off a bank the anchor is already on: MEASURED
+ * over six seeds at The Point, the worst mooring is 87 m out with dry land
+ * 20 m from the hull (`src/game/dockprobe.mjs`).
+ */
+const BOAT_MIN = 20;
+const BOAT_MAX = 90;
+
+/**
+ * Can this hull cross a river? The `boat` class and nothing else in the fleet:
+ * a car in water loses 6% of max health a second, and an aircraft that puts
+ * down on the Ohio is a wreck, not a ride.
+ */
+function waterCapable(v) {
+  return !!v && !v.destroyed && (v.type === 'boat' || v.spec?.kind === 'boat' || v.spec?.id === 'boat');
+}
+
 /* ===================================================================== */
 
 export const TRACKS = {
@@ -100,8 +193,8 @@ export const TRACKS = {
       M.aboard = false;
     },
     update(M, dt, g) {
-      if (!M.veh) return g.fail(M, 'The vehicle never arrived');
-      if (M.veh.destroyed) return g.fail(M, 'The vehicle was wrecked');
+      const fault = vehFault(M, dt, M.veh, '_faultDeliver');
+      if (fault) return g.fail(M, faultReason(fault));
       const pv = g.wq.playerVehicle();
       if (pv === M.veh) {
         if (!M.aboard) {
@@ -292,11 +385,12 @@ export const TRACKS = {
       );
 
       if (M.hasTimer && M.timer <= 0) return g.fail(M, 'Out of time');
+      const fault = rideFault(M, dt, g);
+      if (fault) return g.fail(M, faultReason(fault, 'Your car'));
       this.driveRivals(M, dt, g);
     },
 
     driveRivals(M, dt, g) {
-      const veh = g.wq.vehicles;
       const cps = M.points;
       for (const r of M.rivals) {
         if (!r || r.destroyed) continue;
@@ -309,7 +403,11 @@ export const TRACKS = {
         const nxt = cps[(r.raceCp + 1) % cps.length];
         const aimX = t.x + (nxt.x - t.x) * 0.18;
         const aimZ = t.z + (nxt.z - t.z) * 0.18;
-        driveToward(veh, r, g._input, aimX, aimZ, { throttle: r.racePace, gain: 1.5 });
+        // By road, so the standings line means something: a rival that cut the
+        // straight line between two gates drove into the Allegheny and the
+        // player was P1 by default.
+        RIVAL_OPTS.throttle = r.racePace;
+        driveRoute(g.wq, r, g._input, aimX, aimZ, dt, RIVAL_OPTS);
       }
     },
   },
@@ -351,8 +449,11 @@ export const TRACKS = {
         M.fleeX = s.x;
         M.fleeZ = s.z;
       }
-      driveToward(g.wq.vehicles, t, g._input, M.fleeX, M.fleeZ, { throttle: 1, boost: d < 60 });
+      FLEE_OPTS.boost = d < 60;
+      driveRoute(g.wq, t, g._input, M.fleeX, M.fleeZ, dt, FLEE_OPTS);
       if (d > R.chaseLose) return g.fail(M, 'The target got away');
+      const fault = rideFault(M, dt, g);
+      if (fault) return g.fail(M, faultReason(fault, 'Your car'));
     },
   },
 
@@ -382,7 +483,8 @@ export const TRACKS = {
         1 - w / Math.max(1, M.needStars)
       );
       // The respray itself lives in `freeroam.js` so it works outside a
-      // mission too; the track only has to notice the result.
+      // mission too; the track only has to notice the result. No `rideFault`
+      // here on purpose — see its header: the heat cools on foot.
       if (w === 0 && M.graceT <= 0) g.win(M);
     },
   },
@@ -396,10 +498,24 @@ export const TRACKS = {
       const water = !!c.water;
       const spread = c.spread ?? 380;
       for (let i = 0; i < M.goal; i++) {
+        // `nearShore` on a crate is the same rule as on a hull: a crate in the
+        // middle of the Ohio is one the player can only reach by abandoning the
+        // boat and swimming the last stretch at 2.1 m/s.
         const s = water
-          ? g.wq.findWaterSpot(60, spread, a.x, a.z)
-          : g.wq.findGroundSpot(60, spread, a.x, a.z);
+          ? g.wq.findWaterSpot(COLLECT_MIN, spread, a.x, a.z, undefined, true)
+          : g.wq.findGroundSpot(COLLECT_MIN, spread, a.x, a.z);
         g.spawnPickup(M, s.x, s.z, 'crate', { mission: true, y: water ? 1.1 : undefined });
+      }
+      // A WATER OBJECTIVE GUARANTEES A HULL — the contract deliver, chase,
+      // escort, escape, race and boss-driver already keep with `if
+      // (!g.wq.playerVehicle()) g.spawnVehicle(...)`. Swim speed is 2.1 m/s
+      // (3.4 sprinting), so a clocked salvage run with no boat is a chapter
+      // that cannot be finished rather than one that is hard.
+      if (water && !waterCapable(g.wq.playerVehicle())) {
+        const p = g.wq.findWaterSpot(BOAT_MIN, BOAT_MAX, a.x, a.z, undefined, true);
+        M.veh = g.spawnVehicle(M, 'boat', p.x, p.z, p.yaw);
+        // Green: fetch it. The clock is on the crates, not on reaching the boat.
+        if (M.veh) g.markVehicle(M, M.veh, MARK_GREEN);
       }
     },
     update(M, dt, g) {
@@ -480,6 +596,15 @@ export const TRACKS = {
       M.dest = g.wq.poi(c.dest) ?? g.wq.nearestSafehouse(s.x, s.z).poi;
       M.attackT = 8;
       M.warnT = 0;
+      // Stuck watchdog: where the truck was when the window opened, and how
+      // long it has been failing to leave.
+      M.stuckX = s.x;
+      M.stuckZ = s.z;
+      M.stuckT = 0;
+      M.unwedged = 0;
+      // THE HARD TIMER. Without one, a truck jammed against a wall neither
+      // wins nor fails and the chapter runs until the player quits.
+      if (!M.hasTimer) g.armTimer(M, ESCORT_TIMER);
       if (!g.wq.playerVehicle()) {
         const p = g.wq.findRoadSpot(10, 36, s.x, s.z);
         M.veh = g.spawnVehicle(M, g.boy.car ?? 'sports', p.x, p.z, p.yaw);
@@ -487,8 +612,13 @@ export const TRACKS = {
     },
     update(M, dt, g) {
       const a = M.ally;
-      if (!a) return g.fail(M, 'The truck never made it out');
-      if (a.destroyed) return g.fail(M, 'The truck was destroyed');
+      const fault = vehFault(M, dt, a, '_faultAlly');
+      if (fault === 'gone') return g.fail(M, 'The truck never made it out');
+      if (fault === 'destroyed') return g.fail(M, 'The truck was destroyed');
+      if (fault === 'inverted' && !g.wq.unwedgeVehicle(a, 1.1)) {
+        return g.fail(M, 'The truck ended up on its roof');
+      }
+      if (M.timer <= 0 && M.hasTimer) return g.fail(M, 'Out of time');
       g.marker(M, 0, M.dest.x, M.dest.z, M.dest.name, 'D', R.dropoff);
       g.marker(M, 1, a.position.x, a.position.z, 'The truck', 'T');
       const hull = Math.round(clamp01(a.health / a.maxHealth) * 100);
@@ -497,9 +627,13 @@ export const TRACKS = {
         clamp01(1 - d / Math.max(1, M.escortStart ?? d)));
       if (M.escortStart === undefined) M.escortStart = d;
 
-      // Dylan is driving it and he is, per the chapter, slow and complaining.
-      driveToward(g.wq.vehicles, a, g._input, M.dest.x, M.dest.z, { throttle: 0.62, gain: 1.4, slow: 26 });
+      // Dylan is driving it and he is, per the chapter, slow and complaining —
+      // but he is driving it ON THE ROADS AND OVER THE BRIDGES. The straight
+      // line from sh_aidan to sh_dylan crosses the Monongahela channel, and a
+      // land vehicle in water loses 6% of max health a second.
+      driveRoute(g.wq, a, g._input, M.dest.x, M.dest.z, dt, TRUCK_OPTS);
       if (d < R.dropoff) return g.win(M);
+      this.watchStuck(M, dt, g, a);
 
       if (hull < 45 && M.warnT <= 0) {
         M.warnT = 12;
@@ -507,19 +641,76 @@ export const TRACKS = {
       }
       M.warnT -= dt;
 
-      // Ambushers, in cars, aimed at the truck rather than at the player.
+      this.ambush(M, dt, g, a);
+    },
+
+    /**
+     * The truck moved less than `STUCK_MOVE` in `STUCK_T` — put it back on the
+     * nearest lane rather than letting the chapter run out its clock against a
+     * bollard. It is the same recovery `unwedgeVehicle` gives an inverted one,
+     * and it is deliberately cheap to trigger and cheap to survive: the timer
+     * is still running, so a truck that keeps re-wedging still fails.
+     */
+    watchStuck(M, dt, g, a) {
+      M.stuckT += dt;
+      if (dist(a.position.x, a.position.z, M.stuckX, M.stuckZ) > STUCK_MOVE) {
+        M.stuckX = a.position.x;
+        M.stuckZ = a.position.z;
+        M.stuckT = 0;
+        return;
+      }
+      if (M.stuckT < STUCK_T) return;
+      M.stuckT = 0;
+      M.stuckX = a.position.x;
+      M.stuckZ = a.position.z;
+      if (g.wq.unwedgeVehicle(a, 1.1)) {
+        M.unwedged++;
+        g.say('dylan', 'Had to back it out. Give me a second.');
+      }
+    },
+
+    /**
+     * Ambushers, in cars, aimed at the truck rather than at the player.
+     *
+     * THREE CAPS, all of them missing before and all of them the same bug: a
+     * spawner with no accounting. One car every 11 s for a run that has no
+     * clock, never despawned (mission vehicles are exempt from the streaming
+     * cull), each ramming for 34 HP/s against a 520 HP truck — four converging
+     * was 136 HP/s and the chapter was over in four seconds.
+     */
+    ambush(M, dt, g, a) {
+      const list = g.vehiclesOf(M);
+      let live = 0;
+      // Backwards: retiring one splices it out of the array being walked.
+      for (let i = list.length - 1; i >= 0; i--) {
+        const v = list[i];
+        if (!v.isAmbush) continue;
+        // The distance test comes FIRST so a wreck is retired too — it burns
+        // where the player left it and is cleared once the convoy is 250 m up
+        // the road, rather than being held for the whole chapter because it
+        // failed the `destroyed` guard on the way past.
+        if (dist(v.position.x, v.position.z, a.position.x, a.position.z) > AMBUSH_DROP) {
+          list.splice(i, 1);
+          g.wq.despawnVehicle(v, FORCE);
+          continue;
+        }
+        if (v.destroyed) continue;
+        live++;
+        const dd = driveRoute(g.wq, v, g._input, a.position.x, a.position.z, dt, RAM_OPTS);
+        if (dd < 6.5) g.wq.damageVehicle(a, AMBUSH_RAM * dt, v.position);
+      }
       M.attackT -= dt;
-      if (M.attackT <= 0) {
-        M.attackT = 11;
-        const s = g.wq.findRoadSpot(180, 300, a.position.x, a.position.z);
-        const at = g.spawnVehicle(M, 'muscle', s.x, s.z, s.yaw, { tag: 'ambush' });
-        if (at) { at.isAmbush = true; at.chaseTarget = a; }
+      if (live >= AMBUSH_MAX) {
+        // Capped. Hold the cadence at a short refill so a slot that frees is
+        // filled a beat later rather than on the very next frame.
+        if (M.attackT < AMBUSH_REFILL) M.attackT = AMBUSH_REFILL;
+        return;
       }
-      for (const v of g.vehiclesOf(M)) {
-        if (!v.isAmbush || v.destroyed) continue;
-        const dd = driveToward(g.wq.vehicles, v, g._input, a.position.x, a.position.z, { throttle: 1, boost: true });
-        if (dd < 6.5) g.wq.damageVehicle(a, 34 * dt, v.position);
-      }
+      if (M.attackT > 0) return;
+      M.attackT = 11;
+      const s = g.wq.findRoadSpot(180, 300, a.position.x, a.position.z);
+      const at = g.spawnVehicle(M, 'muscle', s.x, s.z, s.yaw, { tag: 'ambush' });
+      if (at) { at.isAmbush = true; at.chaseTarget = a; }
     },
   },
 
@@ -729,6 +920,9 @@ export const TRACKS = {
         }
       } else {
         const v = M.veh;
+        // NOT the inverted arm of `vehFault`: this car is a repair target, not
+        // a ride, and the repair runs on foot beside it — a sedan on its roof
+        // is ugly, not unwinnable, and failing it would end a winnable chapter.
         if (!v) return g.fail(M, 'The car is gone');
         if (v.destroyed) return g.fail(M, 'You wrecked the car. Date night is off');
         g.marker(M, 0, v.position.x, v.position.z, 'The car', 'R', R.repair);
@@ -774,6 +968,55 @@ export const TRACKS = {
 
 /** A protect ward's health pool. Flat: he is family, not a difficulty knob. */
 const WARD_HP = 320;
+
+/* ------------------------------------------------------------------- */
+/* escort tuning                                                        */
+/* ------------------------------------------------------------------- */
+
+/**
+ * The hard chapter clock, seconds at `timerMul` 1.
+ *
+ * MEASURED on the only escort in the story — Aidan CH 5, sh_aidan (632,-464)
+ * to sh_dylan (-504,432) over the Monongahela: the routed truck covers the
+ * 2.2 km road distance in ~210 s of headless sim at throttle 0.62. 360 s is
+ * 1.7x that, which is slack for the ambushers, the stuck recoveries and a
+ * player who stops to fight, and is still a bound rather than a wait.
+ */
+const ESCORT_TIMER = 360;
+/** Metres the truck must make in `STUCK_T` or it is wedged. */
+const STUCK_MOVE = 3;
+const STUCK_T = 8;
+/** Ambush cars alive at once. Four converging was the second CH 5 blocker. */
+const AMBUSH_MAX = 3;
+/** Metres from the truck past which an ambusher is retired, not chased. */
+const AMBUSH_DROP = 250;
+/**
+ * Ram damage per second, per car. Was 34 with no cap, so four of them took a
+ * 520 HP truck down in under four seconds; at 18 the capped three take 29 s of
+ * uninterrupted contact, which is a threat the player can answer.
+ */
+const AMBUSH_RAM = 18;
+/** Seconds before a freed ambush slot is refilled. */
+const AMBUSH_REFILL = 4;
+/**
+ * Past `vehicles.despawn`'s `isMission` cull-guard — the same door
+ * `MissionRunner.cleanup` uses, and the only other caller authorised to open
+ * it. Frozen and shared so the retirement path allocates nothing.
+ */
+const FORCE = Object.freeze({ force: true });
+
+/* ------------------------------------------------------------------- */
+/* reused steer options — rule 5: no `update` allocates a literal       */
+/* ------------------------------------------------------------------- */
+
+/** A rival's pace is per-car, so this one is written before every call. */
+const RIVAL_OPTS = { throttle: 1, gain: 1.5 };
+/** The chase target boosts only once the player is on its bumper. */
+const FLEE_OPTS = { throttle: 1, boost: false };
+/** Dylan, slow and complaining, easing off for the drop. */
+const TRUCK_OPTS = Object.freeze({ throttle: 0.62, gain: 1.4, slow: 26 });
+/** An ambusher has one setting. */
+const RAM_OPTS = Object.freeze({ throttle: 1, boost: true });
 
 /* ===================================================================== */
 /* the objective eyebrow, shared                                          */

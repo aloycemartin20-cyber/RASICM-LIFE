@@ -62,6 +62,16 @@ export const STATE = {
 };
 
 /**
+ * How far PAST a street's own pavement a wandering walker may be and still be
+ * treated as belonging to it. See `Ped._rejoinPavement`.
+ *
+ * Sized on the two things it has to separate: a man who has drifted a couple of
+ * metres off the kerb (rejoin) and a man on a plaza or in a park on the far
+ * side of a lot (leave him wandering). 4 m is one pavement width plus a stride.
+ */
+const REJOIN_MARGIN = 4;
+
+/**
  * Hit capsules: [part, headBone, tailBone, radius, damageScale]. `part` is what
  * `physics` reports back on the impact, and `damage:dealt` turns a `head` hit
  * into a headshot.
@@ -196,6 +206,9 @@ export class Ped {
     this._crossK = 0;
     this._groundTimer = 0;
     this._decision = 0;
+    /** Countdown to the next "am I standing in a road?" poll — `_updateWalk`. */
+    this._rejoinT = 0;
+    this._rejoinLink = null;
     this._animAccum = 0;
     this._animSkip = 0;
     this._deadTime = 0;
@@ -297,6 +310,7 @@ export class Ped {
     this.__ragdoll = null;
     this.velocity.set(0, 0, 0);
     this._decision = rng.range(0, 3);
+    this._rejoinT = rng.range(0, 2.4);
     this._waterTime = 0;
     this.baseSpeed = outfit.speed[0] * (outfit.gait.speedK ?? 1);
     this.runSpeed = outfit.speed[1] * (outfit.gait.speedK ?? 1);
@@ -623,12 +637,67 @@ export class Ped {
     this._move(dt);
   }
 
+  /**
+   * A WANDERER STANDING NEXT TO A STREET IS A WANDERER IN THE STREET.
+   *
+   * `Wander` picks a destination in a disc around its anchor — 22 m staged,
+   * 30 m ambient — and knows nothing about roads. A downtown block is ~78 m
+   * across, so that disc reaches clean over both kerbs, and a walker with no
+   * pavement link strolls down the middle of the carriageway on the way to a
+   * perfectly reasonable point on the far pavement. MEASURED in the `crowd`
+   * shot before this: 43 of 74 live pedestrians were in wander mode and 20 of
+   * those were standing on `asphalt` — the single largest contributor to
+   * `streetprobe`'s sidewalk fraction.
+   *
+   * The wander is not the bug and is not being replaced: it is what a person
+   * does in a park, on a plaza and inside a lot, and it stays exactly that.
+   * What is fixed is that a wanderer who is standing NEXT TO A PAVEMENT is
+   * handed back to the pavement network instead of being left to cross it.
+   * `SidewalkNet.nearestLink` has existed for this since the file was written
+   * and nothing had ever called it.
+   *
+   * Deliberately a BIAS, not a snap: adopting a link only changes where he is
+   * AIMING. He walks onto the pavement over the next second or two under the
+   * same steering, avoidance and collision as everyone else, so nothing
+   * teleports and the crowd does not visibly rank itself up on a kerb.
+   *
+   * The range is derived from the road, not authored: `offsetOf(edge)` is that
+   * street's own pavement offset, so a man in the middle of a two-lane street
+   * (5.5 m out) and a man in the middle of a four-lane arterial (9.9 m out)
+   * are both inside it, while a man in a park a block away is not and goes on
+   * wandering. `REJOIN_MARGIN` is the slack past the pavement itself.
+   */
+  _rejoinPavement() {
+    const net = this.sys?.net;
+    if (!net?.ready || this.sys.debugNoRejoin) return false;
+    const link = net.nearestLink(
+      this.position.x, this.position.z,
+      this._rejoinLink ?? (this._rejoinLink = {}),
+      this.yaw
+    );
+    if (!link) return false;
+    const p = net.pointOn(link.edge, link.side, link.t, this._v);
+    const dx = p.x - this.position.x;
+    const dz = p.z - this.position.z;
+    const reach = net.offsetOf(link.edge) + REJOIN_MARGIN;
+    if (dx * dx + dz * dz > reach * reach) return false;
+    this.setLink(link);
+    return true;
+  }
+
   _updateWalk(dt) {
     this.desiredSpeed = this.jogger ? this.runSpeed * 0.74 : this.baseSpeed;
     if (this.navMode === 'wander') {
       const go = this.wander.step(this.rng, this.position, dt);
       this.wanderTarget = this.wander.target;
       if (!go) this.desiredSpeed = 0;
+      // Polled rather than tested every frame: `nearestEdge` is a spatial
+      // query and the answer cannot change fast at walking pace.
+      this._rejoinT -= dt;
+      if (this._rejoinT <= 0) {
+        this._rejoinT = this.rng.range(1.6, 3.4);
+        this._rejoinPavement();
+      }
     }
     // occasionally stop and do something
     if (this._decision <= 0) {

@@ -42,6 +42,26 @@ function project(pos, camera, w, h, margin) {
   return _proj;
 }
 
+/**
+ * Marker geometry, CSS px before `k`. `GLYPH` MIRRORS `.ow-mk-glyph`'s box in
+ * `style.js` — the two are one measurement in two languages, and the transform
+ * below centres the glyph on the projected point, so they must not drift.
+ */
+const GLYPH = 22;
+/**
+ * Opacity floors. The distance curve exists so a busy map is not a wall of
+ * icons, but it used to reach ZERO at 300 m and an objective marker is the one
+ * thing on screen the player is actively hunting for. MEASURED on the 1920x1080
+ * hud capture before the floor: the far marker drew at alpha 0.00 — invisible,
+ * with its distance readout invisible with it.
+ *
+ * The off-screen chevron gets the HIGHER floor, not the lower one it used to
+ * get from a flat 0.72 multiplier: a chevron is by definition pointing at
+ * something you cannot see, so dimming it is dimming the only thing left.
+ */
+const FADE_FLOOR = 0.55;
+const CHEVRON_FLOOR = 0.8;
+
 function diamond(parent) {
   const s = svg('svg', { viewBox: '0 0 16 16' }, parent);
   svg(
@@ -150,8 +170,9 @@ export class WorldMarkers {
           setStyle(it.node, 'display', '');
         }
         const node = it.node;
-        setStyle(node, 'transform', `translate(${(p.x - 20 * k).toFixed(1)}px,${(p.y - 12 * k).toFixed(1)}px)`);
-        setStyle(node, 'width', `${(40 * k).toFixed(1)}px`);
+        const gh = GLYPH * k * 0.5;
+        setStyle(node, 'transform', `translate(${(p.x - GLYPH * k).toFixed(1)}px,${(p.y - gh).toFixed(1)}px)`);
+        setStyle(node, 'width', `${(GLYPH * 2 * k).toFixed(1)}px`);
         setText(node._letter, o.label ?? '');
         setText(node._dist, metres(p.dist));
         setText(node._name, o.name ?? '');
@@ -160,8 +181,9 @@ export class WorldMarkers {
         setStyle(node._chev, 'display', edge ? '' : 'none');
         setStyle(node._letter, 'opacity', edge ? '0' : '1');
         if (edge) setStyle(node._chev, 'transform', `rotate(${p.angle.toFixed(1)}deg)`);
-        // distant markers dim so a busy map doesn't turn into a wall of icons
-        const fade = clamp01(1.15 - p.dist / 260) * (edge ? 0.72 : 1);
+        // Distant markers dim, but never out — see the floors above.
+        const curve = clamp01(1.15 - p.dist / 260);
+        const fade = Math.max(edge ? CHEVRON_FLOOR : FADE_FLOOR, curve);
         setStyle(node, 'opacity', fade.toFixed(3));
       }
     }

@@ -3,7 +3,7 @@ import {
   RIVERS, DISTRICTS, BRIDGES, BLUFF, ROAD_KIND,
   SAFEHOUSES, SERVICES, DOCKS, LANDMARKS, POI_PAD, LANDMARK_RESERVE,
   corridorHalfWidth, roadHalfWidth, clamp01, smoothstep, smootherstep, lerp, segDist2,
-  nearestSiteDist,
+  nearestSiteDist, corridorStreetName,
 } from './plan.js';
 import {
   gradeAirfields, airfieldAt, levelAirfieldRoads,
@@ -2267,11 +2267,17 @@ function closeNetwork(graph, terrain) {
         }
       }
       if (!best) continue;
+      // A LINK IS THE MISSING END OF A STREET, so it takes that street's
+      // identity — see `linkIdentity`. 'Connector' was a literal that reached
+      // the player: it is what `streetAt` returns under the car and therefore
+      // what the HUD prints beside the minimap, and CONNECTOR is not a place
+      // in Pittsburgh or anywhere else.
+      const ident = linkIdentity(graph, best.a, best.b);
       graph.addEdge(best.a.id, best.b.id, {
         kind: 'street',
         lanes: 2,
-        corridor: 'island_link',
-        name: 'Connector',
+        corridor: ident.corridor,
+        name: ident.name,
       });
       parent[find(comp[best.b.id])] = root;
       bridged++;
@@ -2307,6 +2313,49 @@ function closeNetwork(graph, terrain) {
     `${bridged} link(s) laid (${(bridgedM / 1000).toFixed(2)} km), ` +
     `${dropped} unreachable edge(s) dropped (${(droppedM / 1000).toFixed(2)} km)`
   );
+}
+
+const _linkIdent = { corridor: 'island_link', name: null };
+
+/**
+ * The identity a closing link inherits: the street it continues.
+ *
+ * TWO FIELDS carry a street name in this graph, and the link has to inherit
+ * the SAME one its source used rather than copy the resolved string across:
+ *
+ *   - a LITERAL `name` (a quay, a bridge deck, a landmark approach) is copied
+ *     as-is. The string is already in the emitted vocabulary, so re-using it
+ *     for the stub that continues that very road adds nothing new;
+ *   - a name that comes from the CORRIDOR TABLE is inherited as the corridor
+ *     ID instead. Copying that string would put an authored name into the
+ *     emitted-literal vocabulary and one name would then have two sources —
+ *     which is exactly the separation `src/world/routeprobe.mjs` gates.
+ *
+ * Preference is the stranded end first: the link leaves the fragment and
+ * arrives at the network, so the street it continues is the fragment's.
+ * Nothing named on either end leaves `island_link`, which the corridor table
+ * has no entry for and which therefore resolves to no name at all — the
+ * honest answer, and the one `route.js` already documents callers must handle.
+ */
+function linkIdentity(graph, a, b) {
+  const out = _linkIdent;
+  out.corridor = 'island_link';
+  out.name = null;
+  const src = namedEdgeAt(graph, a) ?? namedEdgeAt(graph, b);
+  if (!src) return out;
+  if (src.name) out.name = src.name;
+  else out.corridor = src.corridor;
+  return out;
+}
+
+/** The first drivable edge on this node that resolves to a street name. */
+function namedEdgeAt(graph, n) {
+  for (let i = 0; i < n.links.length; i++) {
+    const e = graph.edges[n.links[i]];
+    if (!e || e.rail) continue;
+    if (e.name ?? corridorStreetName(e.corridor)) return e;
+  }
+  return null;
 }
 
 /**

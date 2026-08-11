@@ -29,8 +29,25 @@
 
 import { clamp, clamp01, lerp } from './util.js';
 import {
-  RIVERS, DISTRICTS, BRIDGES, LANDMARKS, HALF_CITY, districtAt,
+  RIVERS, DISTRICTS, BRIDGES, LANDMARKS, HALF_CITY, districtAt, POI_STYLE,
 } from './data.js';
+
+/**
+ * Blip kinds the authored POI table does not carry, and the one lookup both
+ * projections use. `chapter` is the NEXT story chapter's staging pin: a job
+ * the player has NOT accepted, so it must not wear the live-mission amber or
+ * the two become indistinguishable the moment a chapter is running. One owner,
+ * two consumers (`radar.js`, `pausemap.js`) — the same rule the blip array
+ * itself follows.
+ */
+const EXTRA_STYLE = {
+  chapter: { c: '#7bc8ff', g: 'flag', p: 9, label: 'NEXT CHAPTER' },
+};
+
+/** POI/blip style for a kind, or null. Never invents a colour. */
+export function styleFor(kind) {
+  return POI_STYLE[kind] ?? EXTRA_STYLE[kind] ?? null;
+}
 
 /* ------------------------------------------------------------- palette --- */
 
@@ -46,8 +63,12 @@ import {
 export const MAP_INK = {
   land: '#161b21',
   landLo: '#10151a',
-  water: '#082a36',
-  waterEdge: 'rgba(70,196,190,.40)',
+  // The rivers ARE the city — three of them meeting at The Point is the whole
+  // silhouette — and at #082a36 they were L*≈14 against land at L*≈13, i.e. a
+  // black shape on a black shape. Nothing about the map's read depends on the
+  // water being dark; it depends on the water being UNAMBIGUOUSLY not land.
+  water: '#12455a',
+  waterEdge: 'rgba(86,214,206,.50)',
   park: '#18271e',
   casing: '#070a0e',
   street: '#606d7a',
@@ -55,8 +76,14 @@ export const MAP_INK = {
   highway: '#c6d3e0',
   alley: '#525d69',
   rail: '#2e3640',
-  bridge: '#cfdae6',
+  // Bridges are the only way across, so they get the one warm ink on the map —
+  // sodium against everything else's cold steel (DESIGN.md's palette), which is
+  // what lets the player pick the next crossing out of a grid of grey at a
+  // glance. Cold white read as "a slightly brighter street".
+  bridge: '#ffca7a',
+  bridgeCasing: '#1a0f06',
   label: 'rgba(203,216,229,.78)',
+  streetLabel: 'rgba(178,196,216,.86)',
 };
 
 const KIND_ID = { highway: 3, arterial: 2, street: 1, alley: 0 };
@@ -80,6 +107,8 @@ const KIND_MAX = [1.7, 3.1, 4.6, 6.8];
 const KIND_LOD = [0.34, 0.11, 0.0, 0.0];
 
 const CELL = 128; // metres per spatial-index cell
+/** New street-name lookups a single labelled frame may pay for. See below. */
+const NAME_BUDGET = 24;
 
 /* --------------------------------------------------------------- water --- */
 
@@ -130,6 +159,17 @@ export class CityMap {
     this.kind = new Uint8Array(0);
     this.width = new Float32Array(0);
     this.bridge = new Uint8Array(0);
+    this.y = new Float32Array(0);
+    /**
+     * Resolved street names, filled LAZILY and only for edges something asked
+     * to label. A `world` edge usually carries `name: null` and defers to the
+     * corridor table `route.js` reads, so the only honest source is
+     * `world.streetAt` — which `ui` may not import (rule 2) and cannot afford
+     * to call 3 000 times at adopt. Six visible arterials a frame, cached
+     * for good, is the whole cost.
+     */
+    this.names = [];
+    this.nameAt = null;
 
     this.cells = new Map();
     this._visit = null;
@@ -172,13 +212,31 @@ export class CityMap {
       this.kind[n] = KIND_ID[e.kind] ?? 1;
       this.width[n] = e.width ?? 8;
       this.bridge[n] = e.bridge ? 1 : 0;
+      // Mid-deck height, so `streetAt` can tell a bridge from the quay it
+      // flies over — eighteen metres apart and two metres apart in plan.
+      this.y[n] = ((a.y ?? 0) + (b.y ?? 0)) * 0.5;
       n++;
     }
     if (n < 8) return false;
     this.n = n;
     this.live = true;
+    this.names.length = 0;
+    this.nameAt = typeof world.streetAt === 'function'
+      ? (x, z, y) => world.streetAt(x, z, y)
+      : null;
     this._index();
     return true;
+  }
+
+  /** The street name on edge `i`, resolved once and remembered. */
+  edgeName(i) {
+    const cached = this.names[i];
+    if (cached !== undefined) return cached;
+    const n = this.nameAt
+      ? this.nameAt((this.x0[i] + this.x1[i]) * 0.5, (this.z0[i] + this.z1[i]) * 0.5, this.y[i])
+      : null;
+    this.names[i] = n || null;
+    return this.names[i];
   }
 
   _alloc(cap) {
@@ -190,6 +248,7 @@ export class CityMap {
     this.kind = new Uint8Array(cap);
     this.width = new Float32Array(cap);
     this.bridge = new Uint8Array(cap);
+    this.y = new Float32Array(cap);
   }
 
   _index() {
@@ -512,22 +571,29 @@ export class CityMap {
     // ---- bridge decks: brighter than the road they carry, because on this
     // map the bridges are the only way across and the player is always
     // looking for the next one -------------------------------------------
+    // Two passes, casing first and WIDER than the road's own casing: a warm
+    // deck laid straight onto a cold grid needs its own dark gap or the two
+    // inks meet and the crossing reads as a colour artefact rather than as a
+    // separate structure. Casing is +2.6 px against the road's +1.6.
     if (ppm > 0.12) {
-      g.strokeStyle = MAP_INK.bridge;
       g.lineCap = 'butt';
-      for (let i = 0; i < ids.length; i++) {
-        const id = ids[i];
-        if (!this.bridge[id]) continue;
-        const kk = this.kind[id];
-        g.lineWidth = clamp(
-          this._classWidth(kk) * 0.72,
-          KIND_MIN[kk] * px * mpp,
-          KIND_MAX[kk] * px * mpp
-        );
-        g.beginPath();
-        g.moveTo(this.x0[id], this.z0[id]);
-        g.lineTo(this.x1[id], this.z1[id]);
-        g.stroke();
+      for (let pass = 0; pass < 2; pass++) {
+        g.strokeStyle = pass === 0 ? MAP_INK.bridgeCasing : MAP_INK.bridge;
+        for (let i = 0; i < ids.length; i++) {
+          const id = ids[i];
+          if (!this.bridge[id]) continue;
+          const kk = this.kind[id];
+          const fill = clamp(
+            this._classWidth(kk) * 0.72,
+            KIND_MIN[kk] * px * mpp,
+            KIND_MAX[kk] * px * mpp
+          );
+          g.lineWidth = pass === 0 ? fill + Math.max(2.6 * px * mpp, fill * 0.5) : fill;
+          g.beginPath();
+          g.moveTo(this.x0[id], this.z0[id]);
+          g.lineTo(this.x1[id], this.z1[id]);
+          g.stroke();
+        }
       }
       g.lineCap = 'round';
     }
@@ -536,10 +602,165 @@ export class CityMap {
 
     // ---- labels are drawn in screen space so they never rotate ------------
     if (v.labels) this._labels(g, v, cos, sin);
+    // ...except street names, which run ALONG their street: a name floating
+    // free of the line it belongs to labels nothing on a map this dense.
+    if (v.streets) this._streetLabels(g, v, cos, sin, ids);
   }
 
   _classWidth(k) {
     return k === 3 ? 26 : k === 2 ? 15 : k === 1 ? 10 : 7;
+  }
+
+  /**
+   * Street names, written ALONG the arterials and highways on screen.
+   *
+   * Four rules, each of which is why a naive version draws nothing or draws
+   * mush:
+   *
+   *   - only ARTERIAL and HIGHWAY (`kind >= 2`). Naming every residential
+   *     street at radar zoom writes four labels into a 190 m disc;
+   *   - the length gate is on the RUN — every visible edge sharing the name,
+   *     summed — not on one edge. MEASURED on the emitted graph: a named
+   *     arterial is chopped into ~30 m graph edges, which is 19 device px at
+   *     the radar's closest zoom, so a per-edge gate at any useful threshold
+   *     labels NOTHING. The first version of this method did exactly that and
+   *     drew zero labels on a disc with 674 arterial edges behind it;
+   *   - the gate is in SCREEN PIXELS. "Is there room to write this here" is a
+   *     screen question, not a metres one;
+   *   - one label per NAME, placed on the run's edge nearest the view centre.
+   *     Otherwise "LIBERTY AVENUE" is written a dozen times down one road.
+   *
+   * Text runs along the edge and is flipped through 180 degrees when that would
+   * put it upside down, which is what every paper map does and what makes the
+   * name readable without the player tilting his head.
+   */
+  _streetLabels(g, v, cos, sin, ids) {
+    const { w, h, ppm } = v;
+    if (!this.live || !this.nameAt) return;
+    const px = v.px ?? 1;
+    const rot = v.rot ?? 0;
+    const minRun = 84 * px; // device px of road under the name
+    const fs = clamp(9.2 * px, 8, 22);
+    // Preallocated candidate records, linear-scanned (rule 5). A dozen names
+    // fit on the widest view this ever draws, so a Map would cost more in
+    // per-frame entry churn than the scan costs in comparisons.
+    const pool = (this._namePool ??= []);
+    let np = 0;
+    /**
+     * NEW name resolutions this frame. A name costs one `world.streetAt` the
+     * first time it is wanted and nothing ever after, but the pause map's
+     * widest labelled view has ~830 arterial edges on screen at once — so an
+     * unbudgeted first frame does 830 spatial queries in one go and the map
+     * opens with a hitch. Bounded here and converged over the next half second;
+     * an unresolved edge is simply skipped this frame, never guessed at.
+     */
+    let budget = NAME_BUDGET;
+
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i];
+      if (this.kind[id] < 2) continue;
+      const ax = (this.x0[id] - v.cx) * ppm;
+      const az = (this.z0[id] - v.cz) * ppm;
+      const bx = (this.x1[id] - v.cx) * ppm;
+      const bz = (this.z1[id] - v.cz) * ppm;
+      const run = Math.hypot(bx - ax, bz - az);
+      const mx = (ax + bx) * 0.5;
+      const mz = (az + bz) * 0.5;
+      const sx = w * 0.5 + mx * cos - mz * sin;
+      const sy = h * 0.5 + mx * sin + mz * cos;
+      if (sx < 0 || sy < 0 || sx > w || sy > h) continue;
+      let name = this.names[id];
+      if (name === undefined) {
+        if (budget <= 0) continue;
+        budget--;
+        name = this.edgeName(id);
+      }
+      if (!name) continue;
+      let slot = -1;
+      for (let j = 0; j < np; j++) if (pool[j].name === name) { slot = j; break; }
+      if (slot < 0) {
+        slot = np++;
+        pool[slot] ??= { name: '', d2: 0, run: 0, x: 0, y: 0, a: 0, used: false };
+        const r0 = pool[slot];
+        r0.name = name;
+        r0.run = 0;
+        r0.d2 = Infinity;
+        r0.used = false;
+      }
+      const r = pool[slot];
+      r.run += run;
+      // The label goes on the segment closest to the middle of the view, which
+      // is the one least likely to be clipped and the one the player is
+      // actually looking at.
+      const d2 = (sx - w * 0.5) ** 2 + (sy - h * 0.5) ** 2;
+      if (d2 >= r.d2) continue;
+      let a = Math.atan2(bz - az, bx - ax) + rot;
+      if (a > Math.PI * 0.5 || a < -Math.PI * 0.5) a += Math.PI;
+      r.d2 = d2;
+      r.x = sx;
+      r.y = sy;
+      r.a = a;
+    }
+    if (!np) return;
+
+    g.save();
+    g.textAlign = 'center';
+    g.textBaseline = 'middle';
+    g.font = `700 ${fs.toFixed(1)}px ${v.font}`;
+    g.lineJoin = 'round';
+    g.lineWidth = Math.max(2.4, fs * 0.32);
+    g.strokeStyle = 'rgba(4,7,10,.92)';
+    g.fillStyle = MAP_INK.streetLabel;
+
+    /**
+     * LONGEST RUN FIRST, and no two labels on top of each other. Without both,
+     * a 178 px disc over downtown draws eight names into the space of three and
+     * the result is less legible than no names at all — MEASURED on the hud
+     * capture, where Fifth Avenue, Grant Street and two bridge decks landed in
+     * one 40 px square. Selection is a scan rather than a sort because the
+     * candidate list is a dozen entries and a sort allocates.
+     */
+    const max = v.streetMax ?? 4;
+    const taken = (this._nameTaken ??= new Float32Array(64));
+    let nt = 0;
+    for (let k = 0; k < max; k++) {
+      let pick = -1;
+      let best = minRun;
+      for (let j = 0; j < np; j++) {
+        const m = pool[j];
+        if (m.used || m.run < best) continue;
+        best = m.run;
+        pick = j;
+      }
+      if (pick < 0) break;
+      const m = pool[pick];
+      m.used = true;
+      const half = Math.max(g.measureText(m.name).width * 0.5, fs * 2) + fs * 0.5;
+      let clash = false;
+      for (let t = 0; t < nt && !clash; t++) {
+        const dx = m.x - taken[t * 3];
+        const dy = m.y - taken[t * 3 + 1];
+        if (Math.hypot(dx, dy) < half + taken[t * 3 + 2]) clash = true;
+      }
+      if (clash) {
+        k--; // a rejected candidate does not spend one of the label slots
+        continue;
+      }
+      if (nt * 3 + 2 < taken.length) {
+        taken[nt * 3] = m.x;
+        taken[nt * 3 + 1] = m.y;
+        taken[nt * 3 + 2] = half;
+        nt++;
+      }
+      g.save();
+      g.translate(m.x, m.y);
+      g.rotate(m.a);
+      g.strokeText(m.name, 0, -fs * 0.95);
+      g.fillText(m.name, 0, -fs * 0.95);
+      g.restore();
+    }
+    for (let j = 0; j < np; j++) pool[j].used = false;
+    g.restore();
   }
 
   _labels(g, v, cos, sin) {

@@ -100,8 +100,10 @@ import { Helicopter } from './heli.js';
 import { Dispatch } from './dispatch.js';
 import { TUNE, POLICE_DIFF, clamp, clamp01 } from './tune.js';
 
-/** Rustbelt Respray — DESIGN.md shop list. */
-const RESPRAY = { x: -336, z: 176, r: 11 };
+/** Rustbelt Respray — MUST match `plan.js` SERVICES / `game/data.js` SHOPS.
+ * The shop moved off the riverbed 2026-08-11; a stale copy here puts the
+ * lose-the-cops ring in the Monongahela. */
+const RESPRAY = { x: -136, z: 96, r: 11 };
 
 /** Control rate: every Nth 120 Hz fixed step. 120 / 2 = 60 Hz, as traffic. */
 const DECIMATE = 2;

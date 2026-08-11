@@ -131,8 +131,15 @@ export class SidewalkNet {
     return null;
   }
 
-  /** The nearest pavement to a world point, or null. */
-  nearestLink(x, z, out = {}) {
+  /**
+   * The nearest pavement to a world point, or null.
+   *
+   * `heading` (radians, optional) picks the direction of travel that keeps a
+   * walker facing the way he already is. Without it a walker adopting this
+   * link would about-face on the spot half the time, which reads as a glitch
+   * rather than as somebody stepping back onto the pavement.
+   */
+  nearestLink(x, z, out = {}, heading = null) {
     if (!this.ready || typeof this.roads.nearestEdge !== 'function') return null;
     const near = this.roads.nearestEdge(x, z, 160);
     if (!near || !near.edge) return null;
@@ -144,7 +151,7 @@ export class SidewalkNet {
     const lat = -e.dz * px + e.dx * pz;
     out.edge = e;
     out.side = lat >= 0 ? 1 : -1;
-    out.dir = 1;
+    out.dir = heading === null || Math.sin(heading) * e.dx + Math.cos(heading) * e.dz >= 0 ? 1 : -1;
     out.t = near.t;
     return out;
   }
@@ -194,9 +201,27 @@ export class SidewalkNet {
       out.t = link.dir > 0 ? 1 : 0;
       return out;
     }
-    // stay on the corner we are standing on: take the nearer of the two
-    // pavements of the chosen edge
-    const tNear = best.dir > 0 ? 0 : 1;
+    /**
+     * TURN THE CORNER — DO NOT AIM AT THE MIDDLE OF THE JUNCTION.
+     *
+     * The new link used to start at t = 0 (or 1), i.e. exactly AT the node,
+     * offset sideways onto the new edge's pavement. At a crossroads those two
+     * facts fight: the sideways offset is along the OLD street, which at a
+     * right-angle junction points straight down the NEW street's centreline —
+     * so the aim point for the first stride round every corner is the middle
+     * of the carriageway the walker has just decided not to cross. MEASURED in
+     * the `crowd` shot: nine of the twenty-six link-mode pedestrians were
+     * standing on `asphalt`, every one of them within a few metres of a node,
+     * and their nearest edge was never the edge they were walking.
+     *
+     * Starting the link one pavement-offset INTO the new edge puts the aim
+     * point past the far kerb of the street being left, which is where the
+     * corner of a real pavement is. Capped at 0.45 so a very short edge cannot
+     * have its parameter run past its own midpoint.
+     */
+    const corner = this.offsetOf(link.edge) / Math.max(8, best.edge.len ?? 8);
+    const tIn = Math.min(0.45, corner);
+    const tNear = best.dir > 0 ? tIn : 1 - tIn;
     const pA = this.pointOn(best.edge, 1, tNear, this._out);
     const dA = (pA.x - here.x) ** 2 + (pA.z - here.z) ** 2;
     const pB = this.pointOn(best.edge, -1, tNear, this._out);

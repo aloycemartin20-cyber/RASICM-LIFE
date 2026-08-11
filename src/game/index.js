@@ -75,9 +75,32 @@ export class GameSystem {
 
   constructor() {
     /** Mutated in place — `ui` polls this every frame, so it must not allocate. */
-    this._hud = { money: 0, objective: null, respect: 0, character: 'carson', chapter: 0, wanted: 0, ward: null, storyDone: false };
+    this._hud = { money: 0, objective: null, nextObjective: null, respect: 0, character: 'carson', chapter: 0, wanted: 0, ward: null, storyDone: false, next: null };
     this._roster = [];
     this._mapPoints = [];
+    /**
+     * THE PERSISTENT "WHAT NOW" PANEL, preallocated. `hudObjective()` is null
+     * whenever no chapter is running, which was every second of free roam — so
+     * the one readout that tells the player what this game is asking of him was
+     * blank for most of the playtime, and the 4 s toast that used to be the
+     * only carrier of that information fires underneath the result card. See
+     * `_nextObjective`.
+     */
+    this._nextObj = { eyebrow: 'NEXT', text: '', timer: null, warn: false, count: 'PRESS J', progress: -1 };
+    /** Where the next chapter stages, published on the HUD state as `.next`. */
+    this._nextPin = { x: 0, z: 0, name: '' };
+    /** Cached "CH n · NAME", rebuilt only when the chapter def changes. */
+    this._nextKey = null;
+    this._nextTitle = '';
+    /** The delayed "press J" toast — see `_announceNext` / `_announceTick`. */
+    this._announceArmed = false;
+    this._announceRaw = 0;
+    /**
+     * GPS. `flat` is a REUSED array of x,z pairs handed to `ui.setRoute`; `ui`
+     * only ever reads it, so refilling it in place is safe and is the only way
+     * to poll a route without allocating every second (rule 5).
+     */
+    this._gps = { flat: [], next: 0, wpX: NaN, wpZ: NaN, on: false };
     this._pendingChapter = -1;
     this._deathCd = 0;
     this._playtime = 0;
@@ -358,8 +381,25 @@ export class GameSystem {
     h.chapter = this.economy.char().chapter;
     h.wanted = this.heat.wanted;
     h.objective = this.missions.hudObjective();
+    /**
+     * THE PERSISTENT "WHAT NOW" LINE IS A SEPARATE FIELD, and it has to be.
+     *
+     * The obvious version of this — fall `objective` back to the NEXT state —
+     * silently kills a backstop three files away: `src/ui/hud.js`'s boss bar
+     * hides itself on `this._bossOn && hud?.objective`, precisely because
+     * `objective` is null the instant no chapter is live and that is the one
+     * condition an event which never fired cannot miss. Making `objective`
+     * always truthy left the boss bar on screen in free roam after an abort —
+     * MEASURED at 39.9 px of a dead rival's health bar over an empty street,
+     * caught by `src/ui/wardprobe.mjs`.
+     *
+     * So `objective` keeps its meaning — THE RUNNING CHAPTER'S objective, null
+     * when there is none — and `ui` falls back to this one for the panel.
+     */
+    h.nextObjective = h.objective ? null : this._nextObjective();
     /** `{ name, health 0..1 }` while a protect chapter is live, else null. */
     h.ward = this.missions.hudWard();
+    h.next = this.missions.active ? null : this._nextPinPoint();
     h.storyDone = this.economy.char().chapter >= this.characters.boy.story.length;
     if (prev !== h.money) {
       this.wq.ui?.setMoney?.(h.money, h.money - prev);
@@ -385,22 +425,191 @@ export class GameSystem {
     return { index: c.chapter, def: boy.story[c.chapter] };
   }
 
+  /**
+   * Where the next chapter puts the player, for the map pin.
+   *
+   * `at` / `from` first, which is the same pair `mission.js` resolves into the
+   * travel leg — so the pin and the mission's own staging marker agree. `dest`
+   * is a deliberate third fallback and NOT what the runner uses: a `deliver`
+   * chapter that names only a destination has no staging point at all, and a
+   * pin at the drop is a truer answer than no pin. A race names no POI and
+   * stages on its own grid, exactly as the runner does.
+   */
+  _chapterSite(def) {
+    const p = this.wq.poi(def.at ?? def.from ?? def.dest ?? '');
+    if (p) return p.stage ?? p;
+    if (def.track === 'race') return RACE_TRACKS[def.trackId]?.points?.[0] ?? null;
+    return null;
+  }
+
+  /**
+   * THE PANEL WHEN NOTHING IS RUNNING. Preallocated and mutated in place —
+   * `ui` polls it every frame off `getHudState().objective`.
+   *
+   * It survives the result card by construction: the card is an overlay, the
+   * panel is derived state, and the frame after `cleanup()` clears the live
+   * objective this one takes the slot back. That is the difference between a
+   * toast (a 4 s event, easily missed, and fired underneath a full-screen card)
+   * and a readout.
+   */
+  _nextObjective() {
+    const o = this._nextObj;
+    const n = this.nextChapter();
+    if (n) {
+      // `_syncHud` runs every frame, so the title string is built only when the
+      // chapter actually changes (rule 5) — the key is the def itself.
+      if (this._nextKey !== n.def) {
+        this._nextKey = n.def;
+        this._nextTitle = `${n.def.no} · ${n.def.name}`;
+      }
+      o.eyebrow = 'NEXT CHAPTER';
+      o.text = this._nextTitle;
+      o.count = 'PRESS J';
+      return o;
+    }
+    // The arc is over; the city is not.
+    const j = this.jobs.best();
+    if (!j) return null;
+    this._nextKey = null;
+    o.eyebrow = 'SIDE JOB';
+    o.text = j.name;
+    o.count = 'PRESS J';
+    return o;
+  }
+
+  /** `{x,z,name}` for the next chapter's pin, or null. Reused record. */
+  _nextPinPoint() {
+    const n = this.nextChapter();
+    const site = n ? this._chapterSite(n.def) : null;
+    if (!site || !Number.isFinite(site.x) || !Number.isFinite(site.z)) return null;
+    const p = this._nextPin;
+    p.x = site.x;
+    p.z = site.z;
+    // Shares `_nextObjective`'s cached title — same fact, one allocation.
+    if (this._nextKey !== n.def) {
+      this._nextKey = n.def;
+      this._nextTitle = `${n.def.no} · ${n.def.name}`;
+    }
+    p.name = this._nextTitle;
+    return p;
+  }
+
+  /**
+   * Arm the "what now" toast. The ARMING is immediate — `_pendingChapter` is
+   * what `J` honours and it must be right this frame — but the NOTIFICATION
+   * waits.
+   *
+   * `_onMissionEnd` calls this on the same frame the PASSED card goes up, and a
+   * notification fired into the top-left corner behind a full-screen result
+   * card is one nobody has ever read: the toast lives about four seconds, the
+   * card outlives it, and the single line naming the key that starts the next
+   * chapter expired underneath it. `_announceTick` emits it once the world is
+   * running again.
+   */
   _announceNext() {
     const n = this.nextChapter();
-    const ui = this.wq.ui;
-    if (!n) {
-      // The arc is over; the city is not. Point him at the job board rather
-      // than at nothing — an empty map after the credits is the thing
-      // GAMEPLAY.md calls out as the difference between our build and one with
-      // a game in it.
-      ui?.notify?.(`${this.characters.boy.name.toUpperCase()}'S STORY`, 'COMPLETE', 'gold');
-      const j = this.jobs.best();
-      if (j) ui?.notify?.(j.name.toUpperCase(), `SIDE JOB · PRESS J · ${money(j.pay)}`, 'slag');
-      this._pendingChapter = -1;
+    this._pendingChapter = n ? n.index : -1;
+    this._announceArmed = true;
+    this._announceRaw = this.ctx?.time?.raw ?? 0;
+  }
+
+  /**
+   * Emit the armed toast once the screen is the player's again.
+   *
+   * The clock is UNSCALED (`time.raw`) deliberately: a result card holds
+   * `time.scale` at zero, so a countdown in simulated seconds behind one would
+   * never reach the toast at all. While anything is holding the world the
+   * stamp is pushed forward, so the beat is measured from the moment the
+   * player gets the screen back rather than from the moment he lost it.
+   */
+  _announceTick(ctx, paused) {
+    if (!this._announceArmed) return;
+    // A chapter started before the toast could fire (the boot handover does
+    // exactly this) makes it stale — the objective panel already says it.
+    if (this.missions.active) {
+      this._announceArmed = false;
       return;
     }
-    ui?.notify?.(`${n.def.no} · ${n.def.name.toUpperCase()}`, 'PRESS J', 'slag');
-    this._pendingChapter = n.index;
+    const raw = ctx.time.raw;
+    if (paused) {
+      this._announceRaw = raw;
+      return;
+    }
+    if (raw - this._announceRaw < ANNOUNCE_HOLD) return;
+    this._announceArmed = false;
+    const ui = this.wq.ui;
+    const n = this.nextChapter();
+    if (n) {
+      ui?.notify?.(`${n.def.no} · ${n.def.name.toUpperCase()}`, 'PRESS J', 'slag');
+      return;
+    }
+    ui?.notify?.(`${this.characters.boy.name.toUpperCase()}'S STORY`, 'COMPLETE', 'gold');
+    const j = this.jobs.best();
+    if (j) ui?.notify?.(j.name.toUpperCase(), `SIDE JOB · PRESS J · ${money(j.pay)}`, 'slag');
+  }
+
+  /**
+   * THE GPS. One solve, two projections: `ui.setRoute` feeds the Slag Ring and
+   * the pause map from the same flat array.
+   *
+   * Polled at 1 Hz because the FROM end moves — the route is only useful if it
+   * starts where the car is — and re-solved IMMEDIATELY when the destination
+   * changes, which is the event the player just caused and expects an answer
+   * to. `world.routeTo` hands back a REUSED array (`src/world/route.js`), so
+   * everything retained here is copied out of it before the next call.
+   *
+   * `null` means "not by road" for three different reasons, all of which mean
+   * the same thing to a driver: there is no line to draw. The waypoint flag
+   * still marks the spot.
+   */
+  _gpsTick(ctx, pos) {
+    const g = this._gps;
+    const ui = this.wq.ui;
+    if (!ui?.setRoute) return;
+    const w = this._navTarget();
+    if (!w) {
+      // Idle: nothing to poll, and nothing to clear twice.
+      if (!g.on && !Number.isFinite(g.wpX)) return;
+      g.wpX = NaN;
+      g.wpZ = NaN;
+      g.on = false;
+      g.flat.length = 0;
+      ui.setRoute(null);
+      return;
+    }
+    const moved = !(Number.isFinite(g.wpX) &&
+      (w.x - g.wpX) ** 2 + (w.z - g.wpZ) ** 2 < GPS_SAME2);
+    const raw = ctx.time.raw;
+    if (!moved && raw < g.next) return;
+    g.next = raw + GPS_PERIOD;
+    g.wpX = w.x;
+    g.wpZ = w.z;
+    const path = this.wq.world?.routeTo?.(pos.x, pos.z, w.x, w.z, { fromY: pos.y });
+    if (!path || path.length < 2) {
+      if (g.on) {
+        g.on = false;
+        g.flat.length = 0;
+        ui.setRoute(null);
+      }
+      return;
+    }
+    const flat = g.flat;
+    flat.length = path.length * 2;
+    for (let i = 0; i < path.length; i++) {
+      flat[i * 2] = path[i].x;
+      flat[i * 2 + 1] = path[i].z;
+    }
+    g.on = true;
+    ui.setRoute(flat);
+  }
+
+  /**
+   * Where the GPS is pointing: the pin a live mission has borrowed, else the
+   * one the player dropped on the map himself. Same precedence `ui` draws the
+   * flag with, so the line always ends at the flag.
+   */
+  _navTarget() {
+    return this.missions.waypoint ?? this.missions.userWaypoint ?? null;
   }
 
   /**
@@ -449,6 +658,8 @@ export class GameSystem {
   mapPoints(out = this._mapPoints) {
     this.freeroam.mapPoints(out);
     this.jobs.mapPoints(out);
+    const n = this.missions.active ? null : this._nextPinPoint();
+    if (n) out.push({ x: n.x, z: n.z, kind: 'chapter', name: n.name });
     return out;
   }
 
@@ -839,6 +1050,11 @@ export class GameSystem {
     this.airbase.update(dt);
     if (!paused) this._input(ctx);
     this._syncHud();
+    // Both are driven off `time.raw` and both must run while the world is
+    // stopped: the GPS so a route asked for on the pause map is drawn on the
+    // pause map, the toast so it can measure how long the card has been up.
+    this._gpsTick(ctx, pos);
+    this._announceTick(ctx, paused);
     this.writer.update(dt, this.save);
 
     // Track how far the family has driven — a stat the result cards and the
@@ -1328,6 +1544,27 @@ const RESTART_DELAY = 2.6;
  * later is a fresh question rather than a confirmation of a forgotten one.
  */
 const ABORT_CONFIRM = 4;
+
+/**
+ * UNSCALED seconds the "PRESS J" toast waits after the world comes back before
+ * it appears. Long enough that it is not competing with the result card's own
+ * exit animation, short enough that it is still an answer to what just
+ * happened. See `_announceTick`.
+ */
+const ANNOUNCE_HOLD = 1.1;
+
+/**
+ * GPS poll period, UNSCALED seconds, and the squared metres inside which two
+ * destinations are the same destination.
+ *
+ * 1 Hz is `route.js`'s own sizing note — its 8 m result cache is quantised
+ * against exactly this caller — and it is a quarter of a second of travel at
+ * 108 km/h, so the line cannot go visibly stale between solves. A destination
+ * change re-solves on the spot regardless; 4 m² is a metre of jitter on a
+ * mission marker tracking a moving car, not a new destination.
+ */
+const GPS_PERIOD = 1;
+const GPS_SAME2 = 4;
 
 const STAGES = [
   'clean', 'chapter', 'race', 'firefight', 'boss', 'ending', 'packages',

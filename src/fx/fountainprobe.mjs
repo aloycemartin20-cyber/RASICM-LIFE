@@ -61,6 +61,36 @@ const args = Object.fromEntries(
 const JSON_OUT = !!args.json;
 const log = (...a) => { if (!JSON_OUT) console.log(...a); };
 
+/**
+ * HOW FULL THE BASIN HAS TO BE, as a fraction of the fountain's OWN cap.
+ *
+ * This used to be a flat `>= 500 live records`, and that number contradicted
+ * the budget it sits next to in the same run: `fountain.cap` is
+ * `clamp(particleBudget * 0.045, 60, 900)`, which is 360 at the `high` tier the
+ * probe boots. So the two population checks asked for `500 <= region <= 360`
+ * — unsatisfiable by construction, and the only reason the gate was ever green
+ * is that it was measured on a tier whose budget happened to clear it. A gate
+ * that cannot pass at the quality it runs at is not measuring the fountain, it
+ * is measuring which preset the harness picked.
+ *
+ * Derived instead, so the expectation FOLLOWS the budget: `fountain.js` sizes
+ * every per-stream rate as `share * cap / life`, so the steady-state population
+ * sums to cap by construction and lands a little under it because a stream's
+ * last spawn of a frame has not aged out yet. 0.8 leaves room for that and for
+ * the records that drift past the 20 m attribution radius, and is still far
+ * above anything a broken emitter can reach. MEASURED at the `high` tier
+ * (budget 8000, cap 360): 312 live in the region on the main sample and 309
+ * after the control is released — 0.87 and 0.86 of cap, against a 0.80 bar.
+ *
+ * FLOOR: a low tier caps at 60, and 0.8 of that is 48 records — few enough
+ * that a fountain reduced to a trickle would still pass. The floor is what
+ * catches a dead one whatever the preset, and it is deliberately below the
+ * lowest legal cap so the two never fight.
+ */
+const FULL_FRAC = 0.8;
+const FULL_FLOOR = 40;
+const wantRegion = (cap) => Math.max(FULL_FLOOR, Math.round(cap * FULL_FRAC));
+
 /** Where the camera stands: ~85 m from lm_point, inside NEAR_FULL (180 m) and
  *  ANCHOR_RANGE (300 m), so every stream runs at full rate and the anchor is
  *  the MEASURED one, not the far-vista provisional. `ground: true` keeps the
@@ -289,8 +319,9 @@ try {
     `fountain.waterY ${raw.f?.waterY?.toFixed(3)} vs probe ray ${raw.basinTop?.toFixed(3)}`);
   add('live water stands above the basin (>= 40 records over basin+1.5)',
     main.above >= 40, `${main.above} live above basin+1.5 m`);
-  add('the fountain is actually flowing (>= 500 live in its region)',
-    main.region >= 500, `${main.region} live within 20 m of lm_point`);
+  add(`the fountain is actually flowing (>= ${wantRegion(cap)} live in its region)`,
+    main.region >= wantRegion(cap),
+    `${main.region} live within 20 m of lm_point, want >= ${wantRegion(cap)} (${FULL_FRAC} of cap ${cap}, floor ${FULL_FLOOR})`);
   add('the emitted population respects the cap', main.region <= cap,
     `${main.region} live <= cap ${cap}`);
   add('cap respects the tier budget (<= 4.5% of q.particleBudget, 60..900)',
@@ -318,7 +349,8 @@ try {
   await pump(400);
   const back = analyse(await page.evaluate(extractInPage));
   add('the water comes back when the control is released',
-    back.above >= 40 && back.region >= 500, `${back.region} live, ${back.above} above basin`);
+    back.above >= 40 && back.region >= wantRegion(cap),
+    `${back.region} live (want >= ${wantRegion(cap)}), ${back.above} above basin`);
 
   raw._main = main; raw._nc = nc; raw._back = back;
   raw.recs = raw.recs.length; // don't dump 800 records into the report

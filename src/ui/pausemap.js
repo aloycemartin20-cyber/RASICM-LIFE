@@ -15,13 +15,21 @@
  */
 
 import { el, setText, setStyle, clamp, clamp01, damp, ease, FONT_STACK } from './util.js';
-import { CityMap, drawIcon, drawPlayerArrow } from './citymap.js';
+import { CityMap, drawIcon, drawPlayerArrow, styleFor } from './citymap.js';
 import {
   POI_STYLE, buildPoiList, PACKAGES, RACES, DISTRICTS, HALF_CITY, districtAt,
 } from './data.js';
 
 const MIN_PPM = 0.13;
 const MAX_PPM = 2.4;
+/**
+ * A POI at or above this priority is ALWAYS named, at every zoom the pin is
+ * drawn at. Safehouses, resprays and packages are places the player is trying
+ * to FIND — an unlabelled icon on a full-screen map is a puzzle, and the
+ * `nameAt` zoom gate meant the only view that showed you the whole city was
+ * also the only view that told you nothing about it.
+ */
+const ALWAYS_NAMED = 6;
 
 /**
  * Negative-control hatch for the AFB findability gate (src/ui/afbprobe.mjs):
@@ -60,10 +68,10 @@ export class PauseMap {
     // The restricted military base and the civilian airfields draw pins too, so
     // their kinds need a legend key — without one the olive "RESTRICTED" plate
     // near the north rim is an icon with nothing to explain it.
-    for (const k of ['mission', 'cop', 'enemy', 'friend', 'safehouse', 'ammo',
+    for (const k of ['mission', 'chapter', 'cop', 'enemy', 'friend', 'safehouse', 'ammo',
       'spray', 'food', 'gas', 'dock', 'airport', 'military', 'landmark',
       'race', 'package', 'waypoint']) {
-      const st = POI_STYLE[k];
+      const st = styleFor(k);
       const row = el('div', 'lg', legend);
       const sw = el('i', null, row);
       setStyle(sw, 'background', st.c);
@@ -96,16 +104,31 @@ export class PauseMap {
     this.w = 0;
     this.h = 0;
     this.dpr = Math.min(2, window.devicePixelRatio || 1);
+    /**
+     * TYPE AND STROKE SCALE, device px per authored px.
+     *
+     * `dpr` alone is not it. The full map is authored against a 1080-tall
+     * window, and on anything taller every label, pin and rule stays the size
+     * it was while the map under it gets bigger — so a 1440p player reads
+     * 8.6 px type across a metre-wide picture. Geometry still uses `dpr`
+     * (a metre must project the same however big the words are); everything
+     * that is TYPOGRAPHY uses this. At 1920x1080 dpr 1 it is exactly 1, so the
+     * reference capture is unchanged.
+     */
+    this.u = this.dpr;
     this.found = new Set();
     this.waypoint = null;
     /** Live contacts, same array the Slag Ring draws — set by ui each frame. */
     this.blips = null;
+    /** Flat x,z pairs — the SAME GPS line the Slag Ring draws. Set by ui. */
+    this.route = null;
     this.player = { x: 0, z: 0, heading: 0, colour: '#ff6a12', inVehicle: false };
     this._drag = null;
     this._pt = [0, 0];
     this._view = {
       cx: 0, cz: 0, ppm: 1, rot: 0, w: 0, h: 0,
-      alleys: true, tint: true, labels: true, labelScale: 1, px: 1, font: FONT_STACK,
+      alleys: true, tint: true, labels: true, streets: true, streetMax: 18,
+      labelScale: 1, px: 1, font: FONT_STACK,
     };
 
     setStyle(this.root, 'display', 'none');
@@ -203,6 +226,7 @@ export class PauseMap {
   resize(w, h) {
     this.w = w;
     this.h = h;
+    this.u = this.dpr * clamp(Math.min(w, h) / 1080, 0.8, 2.0);
     const pw = Math.round(w * this.dpr);
     const ph = Math.round(h * this.dpr);
     if (this.canvas.width !== pw || this.canvas.height !== ph) {
@@ -247,8 +271,11 @@ export class PauseMap {
     v.h = H;
     v.alleys = ppm > 0.6;
     v.labels = true;
-    v.px = this.dpr;
-    v.labelScale = this.dpr * clamp(0.7 + ppm * 0.7, 0.9, 1.9);
+    // CSS ppm, not the device one: a dpr-2 screen must not label a view a
+    // dpr-1 screen leaves bare. Same reasoning as `radar.js`'s LABEL_SPAN.
+    v.streets = this.ppm > 0.5;
+    v.px = this.u;
+    v.labelScale = this.u * clamp(0.7 + ppm * 0.7, 0.9, 1.9);
     this.map.draw(g, v);
 
     const proj = (x, z, out) => {
@@ -257,7 +284,7 @@ export class PauseMap {
       return out;
     };
     const p = this._pt;
-    const u = this.dpr;
+    const u = this.u;
 
     // ---- graticule: 250 m, so distances are readable off the map ---------
     g.strokeStyle = 'rgba(125,140,163,.07)';
@@ -299,12 +326,33 @@ export class PauseMap {
       g.setLineDash([]);
     }
 
+    // ---- the GPS route ----------------------------------------------------
+    // THE SAME FLAT ARRAY the Slag Ring strokes. One solve in `game`, two
+    // projections — the map and the disc cannot disagree about the way there,
+    // and the full map is where a player actually plans the drive.
+    const route = this.route;
+    if (route && route.length >= 4) {
+      g.lineJoin = 'round';
+      g.lineCap = 'round';
+      for (let pass = 0; pass < 2; pass++) {
+        g.strokeStyle = pass === 0 ? 'rgba(3,6,10,.9)' : '#ff4f96';
+        g.lineWidth = (pass === 0 ? 9 : 5) * u;
+        g.beginPath();
+        for (let i = 0; i < route.length; i += 2) {
+          proj(route[i], route[i + 1], p);
+          if (i === 0) g.moveTo(p[0], p[1]);
+          else g.lineTo(p[0], p[1]);
+        }
+        g.stroke();
+      }
+    }
+
     // ---- POIs -------------------------------------------------------------
     const r = clamp(7 * u * clamp(ppm * 1.6, 0.7, 1.5), 6 * u, 13 * u);
     const nameAt = ppm > 0.62;
     g.textAlign = 'center';
     g.textBaseline = 'top';
-    g.font = `600 ${(8.6 * u).toFixed(1)}px ${FONT_STACK}`;
+    g.font = `600 ${(9.4 * u).toFixed(1)}px ${FONT_STACK}`;
     for (let i = 0; i < this.pois.length; i++) {
       const poi = this.pois[i];
       const st = POI_STYLE[poi.kind];
@@ -313,7 +361,7 @@ export class PauseMap {
       proj(poi.x, poi.z, p);
       if (p[0] < -40 || p[1] < -40 || p[0] > W + 40 || p[1] > H + 40) continue;
       drawIcon(g, st.g, p[0], p[1], r, st.c, 1);
-      if (nameAt && st.p >= 3) {
+      if ((nameAt || st.p >= ALWAYS_NAMED) && st.p >= 3) {
         g.strokeStyle = 'rgba(4,7,10,.9)';
         g.lineWidth = 3 * u;
         g.lineJoin = 'round';
@@ -339,14 +387,14 @@ export class PauseMap {
       for (let i = 0; i < bl.length; i++) {
         const b = bl[i];
         if (!b || !Number.isFinite(b.x) || !Number.isFinite(b.z)) continue;
-        const st = POI_STYLE[b.kind] ?? POI_STYLE.enemy;
+        const st = styleFor(b.kind) ?? POI_STYLE.enemy;
         // Per-contact colour first — same rule as the ring, so the two views
         // cannot disagree about which brother is which.
         const ink = b.colour ?? st.c;
         proj(b.x, b.z, p);
         if (p[0] < -20 || p[1] < -20 || p[0] > W + 20 || p[1] > H + 20) continue;
-        if (b.kind === 'mission') {
-          drawIcon(g, 'mission', p[0], p[1], r * 1.05, ink, 1);
+        if (b.kind === 'mission' || b.kind === 'chapter') {
+          drawIcon(g, st.g, p[0], p[1], r * 1.05, ink, 1);
         } else {
           drawIcon(g, 'dot', p[0], p[1], r * 0.6, ink, 0.95);
         }

@@ -70,6 +70,8 @@ class Projectile {
     this.weapon = null;
     this.mask = undefined;
     this.kind = 'bullet';
+    /** Who fired it. Rides to `damage:dealt` — see `ProjectileSim.shooter`. */
+    this.source = null;
     this.gravityScale = 1;
     /* explosive */
     this.explodes = false;
@@ -364,8 +366,26 @@ export class ProjectileSim {
   }
 
   /**
+   * WHOSE ROUNDS THESE ARE. Every projectile in this sim is spawned by
+   * `WeaponSystem._fireOnce`, which is the local player's trigger, so an
+   * unstamped round is his — and it now SAYS so on the `damage:dealt` payload
+   * instead of leaving `ui._isPlayerSource` / `audio._isPlayerSource` to infer
+   * it from an ABSENT field. That inference is only true while `fireBullet`
+   * has exactly two callers, and `spawn({ source })` is the door an AI shooter
+   * walks through; a payload that names the shooter keeps working when it does.
+   *
+   * Re-peeked until it resolves rather than cached on the first miss: a bench
+   * boots `weapons` without `player`, and caching the fallback there would
+   * hand every later round the wrong owner.
+   */
+  get shooter() {
+    return this._shooter ?? (this._shooter = this.ctx.peek('player')) ?? 'player';
+  }
+
+  /**
    * @param {object} o origin, dir (unit), speed, damage, penetration, dragK,
-   *                   maxRange, dropoff, weapon (the finalised def), tracer
+   *                   maxRange, dropoff, weapon (the finalised def), tracer,
+   *                   source (the actor that fired; defaults to `shooter`)
    */
   spawn(o) {
     let p = null;
@@ -394,6 +414,7 @@ export class ProjectileSim {
     p.bounced = 0;
     p.weapon = d;
     p.mask = o.mask;
+    p.source = o.source ?? null;
     p.kind = d?.projectile ?? 'bullet';
     p.gravityScale = d?.gravityScale ?? 1;
     p.explodes = d?.explodes === true;
@@ -662,6 +683,9 @@ export class ProjectileSim {
       dropoff: 1,
       impulse: p.pins ? 26 : 6,
       mask: p.mask,
+      /* The round names its shooter here rather than four subsystems away.
+       * See `ProjectileSim.shooter` and `physics.fireBullet`. */
+      source: p.source ?? this.shooter,
     });
     this.stats.impacts++;
 

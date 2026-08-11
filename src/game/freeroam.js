@@ -49,7 +49,7 @@
  */
 
 import {
-  HIDDEN_PACKAGES, SAFEHOUSES, SHOPS, GAS_STATIONS, RACE_TRACKS, R, DIFFS,
+  HIDDEN_PACKAGES, SAFEHOUSES, SHOPS, GAS_STATIONS, DOCKS, RACE_TRACKS, R, DIFFS,
   PACKAGE_CASH, PACKAGE_RESPECT, PACKAGE_REWARD_WEAPON, WEAPON_LIB, BOY_ORDER,
 } from './data.js';
 import { dist } from './util.js';
@@ -139,6 +139,17 @@ const SERVICE_TOAST = 2.2;
  */
 const CREW_REACH = 12;
 
+/**
+ * Where a moored boat sits relative to the PIER HEAD a `DOCKS` record names.
+ *
+ * The annulus is measured from the pier x/z, never from `stage`: the stage is
+ * the dry apron behind the slip and a boat put there is a boat in a car park.
+ * The outer radius is what keeps the hull in sight of the map's BOAT DOCK blip
+ * and inside `dockprobe`'s 40 m reach; the inner one keeps it off the piles.
+ */
+const DOCK_MOOR_MIN = 10;
+const DOCK_MOOR_MAX = 30;
+
 export class FreeRoam {
   constructor(ctx, deps) {
     this.ctx = ctx;
@@ -210,10 +221,19 @@ export class FreeRoam {
     this._airportSeeded = false;
     this._airportVehicles = [];
 
-    // See `_respray`: `police` owns the same shop at the same coordinates and
-    // updates first, so the stars can already be gone by the time this system
-    // looks. A clear TO zero is therefore also evidence that the player drove
-    // in hot, and it arms the free respray that `game` owns the other half of.
+    /** The moored boats at the three slips, spawned once. See below. */
+    this._dockSeeded = false;
+    this._dockVehicles = [];
+    /**
+     * NEGATIVE-CONTROL SWITCH. Holds the dock fleet back so a bench can measure
+     * a world with no boat in it. `dockprobe.mjs` sets it; nothing else reads it.
+     */
+    this.debugNoDockBoats = false;
+
+    // See `_respray`: `police` runs a respray ring of its own and updates
+    // first, so the stars can already be gone by the time this system looks. A
+    // clear TO zero is therefore also evidence that the player drove in hot,
+    // and it arms the free respray that `game` owns the other half of.
     this._offWanted = ctx.events.on('wanted:change', (e) => {
       if (e && e.level === 0 && (e.prev ?? 0) > 0) this._sprayHot = 2;
     });
@@ -327,6 +347,43 @@ export class FreeRoam {
       const heli = this.wq.spawnVehicle('heli', hx, hz, af.yaw);
       if (plane) this._airportVehicles.push(plane);
       if (heli) this._airportVehicles.push(heli);
+    }
+  }
+
+  /* ==================================================================== */
+  /* the dock fleet                                                       */
+  /* ==================================================================== */
+
+  /**
+   * Moor one RIVERJACK at each of the three slips, once, as soon as the world
+   * is up — the same contract as the airfield fleet above, for the same reason.
+   *
+   * Carson's whole arc is on the water and the only boat the game ever spawned
+   * was his CH 1 delivery, which `MissionRunner.cleanup` force-despawns at the
+   * end of the chapter. From CH 2 on there was no hull anywhere on three rivers
+   * and `src/ui/data.js` was drawing a BOAT DOCK blip over an empty slip.
+   *
+   * `nearShore` is not optional here: `findWaterSpot` will otherwise answer
+   * with a point mid-channel, and a boat you have to swim 2.1 m/s to is not a
+   * boat you can take. The flag makes the spot have dry land within reach, so
+   * the pier walk-up and the `TAKE THE RIVERJACK` prompt are the ordinary
+   * `_vehicleNear` scan a parked car gets.
+   *
+   * UNTAGGED, like the aircraft: no mission tag means `MissionRunner.cleanup`
+   * never sees it, and `traffic` / `props` only ever despawn handles of their
+   * own, so nothing in the game removes these.
+   */
+  _seedDockVehicles() {
+    if (this._dockSeeded || this.debugNoDockBoats) return;
+    // `world` answers `isWater` — with no world every sample is dry, every
+    // search fails and all three boats moor on the fallback pier head.
+    if (typeof this.wq.world?.isWater !== 'function') return;
+    if (typeof this.wq.vehicles?.spawn !== 'function') return;
+    this._dockSeeded = true;
+    for (const d of DOCKS) {
+      const s = this.wq.findWaterSpot(DOCK_MOOR_MIN, DOCK_MOOR_MAX, d.x, d.z, undefined, true);
+      const boat = this.wq.spawnVehicle('boat', s.x, s.z, s.yaw);
+      if (boat) this._dockVehicles.push(boat);
     }
   }
 
@@ -575,6 +632,7 @@ export class FreeRoam {
     this._sinceFire += dt;
     this._ambient(dt);
     this._seedAirportVehicles();
+    this._seedDockVehicles();
     this._restoreRadio();
     this._publishDifficulty();
 
@@ -1038,20 +1096,28 @@ export class FreeRoam {
    * Rustbelt Respray. Free while you are hot — that is the whole point of the
    * shop, and charging a man with four stars is a joke he cannot stop for.
    *
-   * `police` implements the same rule at the same coordinates and owns the
-   * notification, so when it is the authority this only changes the paint and
-   * lets the star clear come from there. Two RESPRAYED toasts for one drive-in
-   * is the bug that comes from both systems being polite.
+   * THE STAR CLEAR IS ASKED FOR HERE, not left to `police`. `police` keeps its
+   * own copy of the shop coordinate (`RESPRAY`, src/police/index.js) and runs
+   * its ring from its own update; while the two copies agreed, deferring to it
+   * worked. The shop has since MOVED off the Monongahela (see `SHOPS` in
+   * data.js) and a private duplicate of a moved coordinate is a shop that
+   * repaints the car and leaves the stars on — measured in `interactprobe`,
+   * 3* in and 3* out. `Heat.clear` forwards to `police.clearWanted` whoever
+   * owns the meter, so asking is correct in both worlds and idempotent in
+   * either. The TOAST is still gated, on whether the stars were still up when
+   * this looked: `police` clears from an earlier update and posts its own
+   * RESPRAYED, and two toasts for one drive-in is the bug that comes from both
+   * systems being polite.
    */
   _respray(x, z, veh, dt) {
     // "Was he hot when he drove in?", not "is he hot on the frame I looked".
     //
-    // `police` implements the same shop at the same coordinates and clears the
-    // stars from its own update, which runs BEFORE this one. So on the frame
-    // the car crosses onto the forecourt the level can already be zero by the
-    // time this reads it — and then the free respray never fires and the car
-    // keeps its old paint and plate, which is the half of the deal `game`
-    // owns. Measured: the star clear passed and the repaint silently did not.
+    // `police` clears the stars from its own update, which runs BEFORE this
+    // one. So on the frame the car crosses onto the forecourt the level can
+    // already be zero by the time this reads it — and then the free respray
+    // never fires and the car keeps its old paint and plate, which is the half
+    // of the deal `game` owns. Measured: the star clear passed and the repaint
+    // silently did not.
     if (this.heat.wanted > 0) this._sprayHot = 2;
     else this._sprayHot = Math.max(0, this._sprayHot - dt);
 
@@ -1063,14 +1129,15 @@ export class FreeRoam {
 
     if (this._sprayHot > 0) {
       if (this._sprayCd <= 0) {
+        // Read the meter BEFORE clearing it: still up means nobody else has
+        // announced this respray, so the toast is ours to post.
+        const announced = this.heat.wanted === 0;
         this._sprayCd = 4;
         this._sprayHot = 0;
         this._repaint(veh);
         this.wq.sfx('reload', veh.position, { gain: 0.7 });
-        if (this.heat.authoritative) {
-          this.heat.clear('respray');
-          this.wq.ui?.notify?.('Resprayed', 'HEAT OFF', 'char');
-        }
+        this.heat.clear('respray');
+        if (!announced) this.wq.ui?.notify?.('Resprayed', 'HEAT OFF', 'char');
         this.onSave?.();
       }
       return this._setStatus('RESPRAYING', `${shop.name} · HEAT OFF`);

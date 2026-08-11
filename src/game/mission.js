@@ -127,6 +127,20 @@ export class MissionRunner {
     return DIFFS[this.difficulty] ?? DIFFS.normal;
   }
 
+  /**
+   * The map pin this mission has BORROWED, or null.
+   *
+   * `_publishMarkers` writes it and `cleanup` hands it back by poisoning the
+   * record with NaN, which is the existing "not borrowed" sentinel — so this
+   * is a read of the state that is already there, not a second copy of it. The
+   * GPS routes to whatever this returns, falling through to `userWaypoint`,
+   * which is exactly the precedence `setWaypoint` publishes.
+   */
+  get waypoint() {
+    const w = this._wp;
+    return w && Number.isFinite(w.x) && Number.isFinite(w.z) ? w : null;
+  }
+
   get active() {
     return !!this.M && this.M.phase !== 'over';
   }

@@ -78,6 +78,21 @@
  * noise, and the run aborts rather than reporting them.
  *
  * ────────────────────────────────────────────────────────────────────────────
+ * THE SAME FORTY PLACES EVERY RUN
+ * ────────────────────────────────────────────────────────────────────────────
+ * This file used to grade a DIFFERENT CITY on every run — see `?capture=1` at
+ * the `page.goto` below for why, and for the three-run measurement either side
+ * of it. It matters more here than anywhere else in the tree because this is
+ * 357 s of `npm run handoff`, and a probe nobody can attribute a failure to is
+ * a probe everybody learns to re-run instead of read.
+ *
+ * MEASURED, three consecutive runs of one unchanged build: runs 1 and 3 are
+ * BYTE-IDENTICAL over all 40 site lines and all four assertions; run 2 differs
+ * on one line, in the third decimal of the peak speed at a 28% grade site that
+ * the STEEP exclusion drops anyway (-0.78 vs -0.84 m/s). Before it: 36 / 37 /
+ * 38 upright sites and 3 / 4 / 8 sites that ran into something.
+ *
+ * ────────────────────────────────────────────────────────────────────────────
  * NEGATIVE CONTROL — a gate that has never failed is not evidence
  * ────────────────────────────────────────────────────────────────────────────
  * Revert the fix in `src/vehicles/dynamics.js` — one line, both halves of the
@@ -182,9 +197,18 @@ const DENY_TOL = Number(opts.deny ?? 0.06);
  * 60 sites. This threshold sits two orders of magnitude below the broken arm
  * and five times above the healthy one.
  *
+ * LOWERED 0.001 -> 0.0001 now the run is deterministic (see `?capture=1` at the
+ * goto below). The rate is turned into a budget as
+ * `max(1, round(samples * rate))`, so at the default 40 sites this is a budget
+ * of ONE denied wheel-frame rather than five. MEASURED on three consecutive
+ * runs of the seeded city: 0 of 5088 upright frames, every time, with the whole
+ * report byte-identical between runs bar one third-decimal on a 28% grade. A
+ * budget of five was slack that only existed to absorb a different city every
+ * run, and that is gone.
+ *
  * LOWER IT when the sampling is tightened; never raise it to make a run green.
  */
-const DENY_RATE = Number(opts.denyrate ?? 0.001);
+const DENY_RATE = Number(opts.denyrate ?? 0.0001);
 /** A body this level lets a vertical ray stand in for one along the body -up. */
 const UPRIGHT_DOT = Number(opts.upright ?? 0.97);
 /**
@@ -388,7 +412,33 @@ const RUN_SITE = async ({ s, TYPE, SETTLE, DRIVE, UPRIGHT_DOT, DENY_TOL }) => {
 };
 
 try {
-  await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'domcontentloaded', timeout: 90000 });
+  /*
+   * `?capture=1` IS THE SITE SEED, and it is why two runs of this file now
+   * grade the same forty places.
+   *
+   * The sites below are read off `world.roads`, and `world.rng` is
+   * `ctx.rng.fork()` — which `engine.js:106` seeds from `Math.random()` unless
+   * `config.deterministic` is set. So without this the ROAD GRAPH ITSELF was
+   * regenerated every run: a different city, a different edge list, and
+   * therefore forty different lane sites. MEASURED before the flag, three runs
+   * of one unchanged build: 36 / 37 / 38 upright sites and 3 / 4 / 8 sites that
+   * ran into something. Nobody could attribute a change to their own work
+   * against that, and 357 s is far too expensive a probe to be unattributable.
+   *
+   * Capture mode buys two more things this file wants and nothing it does not:
+   * the streaming and build budgets go WORK-denominated (ARCHITECTURE.md rule
+   * 8's deliberate exception), so how much collision exists around a site stops
+   * depending on machine load; and `sky` freezes the clock, so a run cannot
+   * drift into dusk. It does NOT hide the HUD (only a shot with `hud:false`
+   * does that) and it does not touch spawning, input or the vehicle path.
+   *
+   * What it does NOT fix, stated because the next person will look for it:
+   * `engine.step` still takes its dt from the wall clock, so the number of
+   * 120 Hz substeps inside a frame is still machine-paced. The sites are
+   * identical; the launch speeds still wobble a few per cent. The assertions
+   * below are sized for that and the run-to-run spread is quoted next to them.
+   */
+  await page.goto(`http://127.0.0.1:${port}/?capture=1`, { waitUntil: 'domcontentloaded', timeout: 90000 });
   await page.waitForFunction('window.__READY__===true', null, { timeout: 180000 });
   await pump(120);
 
@@ -518,7 +568,7 @@ try {
   check('no wheel is denied a contact it has',
     deniedFrames <= denyBudget,
     `${deniedFrames} wheel-frames airborne with the road inside ${DENY_TOL} m, of ${deniedSamples} upright frames ` +
-    `on ${dry.length} sites (${(100 * deniedFrames / Math.max(1, deniedSamples)).toFixed(3)}%, RATCHET <= ${(DENY_RATE * 100).toFixed(1)}% = ${denyBudget})` +
+    `on ${dry.length} sites (${(100 * deniedFrames / Math.max(1, deniedSamples)).toFixed(3)}%, RATCHET <= ${(DENY_RATE * 100).toFixed(2)}% = ${denyBudget})` +
     (denied.length ? ` — ${denied.slice(0, 6).join('; ')}` : ''));
 
   check(`a settled car has >= ${MIN_DOWN} wheels down`,

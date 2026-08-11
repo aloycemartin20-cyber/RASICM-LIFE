@@ -130,8 +130,39 @@ export const SAFEHOUSES = [
   { id: 'sh_north', name: 'Shore Loft', x: -192, z: -672, owner: null, worldId: 'sh_loft', respect: 600 },
 ];
 
+/**
+ * The counters and the one respray.
+ *
+ * RUSTBELT RESPRAY MOVED, and it had to. DESIGN.md authors it at (-84, 44) on
+ * the legacy 700 m map, which is (-336, 176) at K = 4 — and that is 10.9 m
+ * under the Monongahela, 60 m out from the nearest bank. `R.service` is 11 m and
+ * `_respray` needs a CAR stopped inside it, so the one hard heat reset in the
+ * game, the thing every `escape` chapter is about reaching, could not be
+ * reached at all: `police._respray` and `freeroam._respray` both measure
+ * against this coordinate. It reads as reachable to anything that only asks
+ * which road is nearest — the Fort Pitt deck passes 3.2 m away, twenty metres
+ * overhead — which is the same trap `groundtruthprobe`'s `onDeck` test exists
+ * for, and why the check below is "is the point dry", not "is a road near it".
+ *
+ * The new point is SURVEYED, not eyeballed, by the method
+ * `groundtruthprobe.mjs` uses — the analytic terrain plus the road graph
+ * `generateCity` emits, over the same six seeds — and it is the nearest point
+ * to the authored one that satisfies what a drive-in forecourt has to BE:
+ * dry (h +7.0 m, 103 m to the waterline), flat (0.3% at r = 7 m, 1.0% worst
+ * over a 12 m ring, against the 26% `netgen.resolvePoi` rejects at), and
+ * road-adjacent on EVERY seed (13.5-13.6 m from a two-lane arterial centreline,
+ * always on the main drivable component, never a bridge deck). 13.5 m clears
+ * `corridorHalfWidth('arterial', 2) + 3` = 10.4 m, so `resolvePoi` keeps the
+ * authored point rather than walking the shop off it, and the whole 17 m pad is
+ * stamped where this table says the shop is. It stays downtown, which is where
+ * the legacy coordinate was aiming.
+ *
+ * `src/world/plan.js` SERVICES carries the same coordinate and must be edited
+ * with this one — `world` owns whether you can drive onto it, `game` owns what
+ * happens when you do.
+ */
 export const SHOPS = [
-  { id: 'shop_spray', name: 'Rustbelt Respray', x: -336, z: 176, kind: 'spray', price: 200 },
+  { id: 'shop_spray', name: 'Rustbelt Respray', x: -136, z: 96, kind: 'spray', price: 200 },
   { id: 'shop_ammo', name: 'Foundry Supply', x: 384, z: -280, kind: 'ammo', price: 8 },
   { id: 'shop_food', name: "Primo's Sandwich", x: -120, z: 24, kind: 'food', price: 45 },
   { id: 'shop_ammo2', name: 'Row Hardware', x: 816, z: 464, kind: 'ammo', price: 8 },
@@ -379,8 +410,17 @@ export const BOYZ = {
         intro: [['dylan', "Harbormaster's crew runs the bridge circuit for pinks."],
                 ['carson', "Then I'll take theirs."]],
         done: [['dylan', 'Told you the old man could drive.']] },
+      // SPREAD IS A CLOCK, NOT A MOOD. `collect` scatters `goal` crates in a
+      // 60-`spread` annulus and the player has to visit every one of them, so
+      // the honest cost of the chapter is the TOUR, not the radius. MEASURED on
+      // the emitted rivers, six seeds x four scatters, nearest-neighbour tour
+      // from the anchor at 60% of the Riverjack's 21.7 m/s top speed: the
+      // authored 520 m gave a 1209 m median / 1825 m worst tour — 93 s / 140 s,
+      // i.e. past the 128 s hard and 108 s steel clocks, and that is WITH the
+      // boat `collect.init` now spawns. At 220 it is 782 m / 1062 m = 60 s /
+      // 82 s, inside the steel clock on the worst scatter measured.
       { no: 'CH 4', name: 'Salvage Rights', zone: 'OHIO CHANNEL', teaser: 'Pull six crates out of the water before they do.',
-        track: 'collect', goal: 6, spread: 520, water: true, at: 'lm_point', baseTimer: 150, cash: 2200, respect: 65, difficulty: 2,
+        track: 'collect', goal: 6, spread: 220, water: true, at: 'lm_point', baseTimer: 150, cash: 2200, respect: 65, difficulty: 2,
         intro: [['carson', "Barge went down at the Point. Cargo's still floating."],
                 ['aidan', "Half the city's out there fishing for it."],
                 ['carson', "Then I'd better be quick."]],
@@ -554,8 +594,17 @@ export const BOYZ = {
                 ['aidan', 'There are brakes, Dylan.'],
                 ['dylan', 'There are. I said no brakes.']],
         done: [['dylan', 'Beat it by nine seconds.'], ['aidan', 'Beat what by nine seconds?']] },
+      // The same tour arithmetic as Carson CH 4, on the ground. MEASURED at the
+      // authored 380 m, six seeds x four scatters: a 724 m median / 1049 m
+      // worst tour, which is 66 s / 95 s at a downtown 11 m/s (drive between
+      // drops, run the last few metres) and 92 s / 133 s at Dylan's own 7.9 m/s
+      // sprint — past the 89 s hard and 76 s steel clocks either way, and only
+      // 10% inside the normal one on the worst scatter. At 260 m the tour is
+      // 529 m / 789 m: 48 s / 72 s driving, 67 s median on foot. The clock goes
+      // to 120 s with it, so the worst scatter keeps ~17% spare at steel rather
+      // than finishing on the buzzer.
       { no: 'CH 2', name: 'Package Run', zone: 'GOLDEN TRIANGLE', teaser: 'Four drops, one clock.',
-        track: 'collect', goal: 4, spread: 380, at: 'lm_tower', baseTimer: 105, cash: 1300, respect: 42, difficulty: 1,
+        track: 'collect', goal: 4, spread: 260, at: 'lm_tower', baseTimer: 120, cash: 1300, respect: 42, difficulty: 1,
         intro: [['carson', 'Four parcels, downtown, before the bridges back up.'],
                 ['dylan', "Bridges don't back up if you don't stop."]],
         done: [['dylan', 'All four. Tip?'], ['carson', 'No.']] },
