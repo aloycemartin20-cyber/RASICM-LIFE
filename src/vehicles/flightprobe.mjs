@@ -80,6 +80,18 @@
  *     seat anchor (the thing the boarding animation aims at) is finite and
  *     inside its own cabin.
  *
+ * ────────────────────────────────────────────────────────────────────────────
+ * THE ENVELOPE
+ * ────────────────────────────────────────────────────────────────────────────
+ * Everything above gates that a machine flies AT ALL. None of it moves if a
+ * helicopter's transit speed halves, which is the one thing a player feels
+ * first — so section 6 floors the emitted transit: top speed along the nose and
+ * time to gain 100 m, for both rotorcraft high and nap-of-the-earth, and top
+ * speed and best climb for all three fixed-wings. With it, the A/B that says
+ * `dynamics.js`'s shared roll stability and self-righting cannot reach a flight
+ * model at all, and the assertion that no rotorcraft carries the fixed-wing
+ * fuselage probe ring.
+ *
  * Every threshold below is a MEASURED emitted quantity with a margin, and the
  * negative controls are run so the positive assertions mean something.
  *
@@ -187,15 +199,24 @@ function spawnSpec(spec, { driver = true, slope = 0 } = {}) {
 function spawn(type, opts = {}) {
   return spawnSpec(finalizeSpec(VEHICLE_SPECS[type]), opts);
 }
-function fly(v, input, seconds) {
+/**
+ * `input` may be an object, or a FUNCTION of the vehicle evaluated per step —
+ * the envelope section flies closed-loop profiles (hold this height, then push
+ * the cyclic) that a fixed input cannot express. `onStep` samples the emitted
+ * state after each step, which is the only place a peak can be read.
+ */
+function fly(v, input, seconds, onStep) {
   const n = Math.round(120 * seconds);
+  const fn = typeof input === 'function';
   for (let i = 0; i < n; i++) {
-    v.input.throttle = input.throttle ?? 0;
-    v.input.brake = input.brake ?? 0;
-    v.input.steer = input.steer ?? 0;
-    v.input.handbrake = !!input.handbrake;
-    v.input.boost = input.boost ?? 0;
+    const inp = fn ? input(v) : input;
+    v.input.throttle = inp.throttle ?? 0;
+    v.input.brake = inp.brake ?? 0;
+    v.input.steer = inp.steer ?? 0;
+    v.input.handbrake = !!inp.handbrake;
+    v.input.boost = inp.boost ?? 0;
     v.fixedStep(DT, CTX);
+    if (onStep) onStep(v, i);
   }
   return v;
 }
@@ -1123,6 +1144,217 @@ function testSilhouettes() {
 }
 
 /* ================================================================== */
+/* 6. THE ENVELOPE — the speed the player actually feels              */
+/* ================================================================== */
+/**
+ * ────────────────────────────────────────────────────────────────────────────
+ * WHY A FLOOR ON A NUMBER NOBODY WAS ASSERTING
+ * ────────────────────────────────────────────────────────────────────────────
+ * Everything above this point gates that a machine flies AT ALL — it climbs,
+ * it unsticks, it banks, it breaks when it arrives too fast. Not one assertion
+ * in it would move if a helicopter's transit speed halved, and a player does
+ * not experience "it climbs" — he experiences how long the Ohio takes to
+ * cross. That is the shape of the report this section exists for: the
+ * helicopter reported as "not moving forward as fast, making it hard to fly",
+ * against a suite that was green through the whole of it.
+ *
+ * So the transit is measured and floored, on the emitted speed along the nose
+ * and the emitted time to gain 100 m, at the values MEASURED on the flight
+ * models as they stand:
+ *
+ *      dash, 30 s of full collective + full forward cyclic from the pad
+ *        Riverhop        40.52 m/s top,  13.15 s to +100 m
+ *        Skywatch 6      38.43 m/s top,  10.79 s to +100 m
+ *      nap of the earth, levelled off low, then 20 s of full cyclic
+ *        Riverhop        36.31 m/s top, undamaged
+ *        Skywatch 6      34.88 m/s top, undamaged
+ *      fixed-wing, 40 s of throttle with the elevator in once rolling
+ *        Skylark         44.55 m/s top,   7.64 m/s best climb
+ *        Slipstream      69.20 m/s top,  15.48 m/s best climb
+ *        jet            115.26 m/s top,  82.93 m/s best climb
+ *
+ * The bands are 3%, which is wider than this model's run-to-run spread (it has
+ * none — the integrator is deterministic and every figure above reproduces to
+ * the last digit) and narrow enough that no loss a player could feel fits
+ * inside one.
+ *
+ * ────────────────────────────────────────────────────────────────────────────
+ * AND THE A/B THAT SAYS THE ROLLOVER WORK CANNOT REACH A FLIGHT MODEL
+ * ────────────────────────────────────────────────────────────────────────────
+ * `_rollAssist`, `_rightSelf` and the contact-normal yaw axis all landed in
+ * `dynamics.js`, which every kind shares, and all three are the natural
+ * suspects for a rotorcraft that lost speed. Reading the guards is not
+ * evidence; flying the identical profile with all three DISARMED on the live
+ * vehicle is. `debugNoRollAssist` / `debugNoRight` / `debugBodyYaw` exist for
+ * exactly that (ARCHITECTURE rule 12), and the claim asserted here is the
+ * strong one — not "close enough" but the SAME EMITTED TRAJECTORY, to 1e-9 —
+ * because anything less would leave room for a small bleed to hide in.
+ *
+ * A rotorcraft must also never take the fixed-wing probe ring: the fuselage
+ * capsule and the swept `_airSweep` belong to `kind: 'plane'`, and a helicopter
+ * that grew a 0.6 m sphere on its centreline would drag it through the deck in
+ * exactly this profile. Asserted on the RING THE VEHICLE BUILT, not on the kind
+ * string that chose it.
+ */
+/** All three roll/righting hooks off, for the inertness A/B. */
+const NO_ASSIST = { debugNoRollAssist: true, debugNoRight: true, debugBodyYaw: true };
+/** Scratch input for the closed-loop profiles below (hard rule 5). */
+const _in = { throttle: 0, brake: 0, steer: 0, handbrake: false, boost: 0 };
+
+/** 30 s of full collective and full forward cyclic, from rest on the pad. */
+function dash(v, seconds = 30) {
+  const y0 = v.position.y;
+  let top = 0;
+  let t100 = Infinity;
+  _in.throttle = 1; _in.brake = 0; _in.steer = 0; _in.handbrake = true; _in.boost = 0;
+  fly(v, _in, seconds, (m, i) => {
+    const s = fwdSpeed(m);
+    if (s > top) top = s;
+    if (t100 === Infinity && m.position.y - y0 >= 100) t100 = (i + 1) / 120;
+  });
+  return { top, t100 };
+}
+
+/**
+ * Level off low, then push the cyclic and hold it — the profile a player flies
+ * down a river, and the one where a ground contact priced as an impact, or a
+ * probe sphere dragging through the deck, would show up as lost speed. The
+ * collective is closed-loop on the EMITTED altitude, so both machines settle at
+ * their own hover height rather than at a number written here.
+ */
+function nap(v, seconds = 20, hold = 3) {
+  const health0 = v.health;
+  fly(v, { }, 6);                                    // spool, skids on the deck
+  fly(v, (m) => {
+    _in.throttle = 0; _in.brake = 0; _in.steer = 0; _in.boost = 0;
+    _in.handbrake = m.altitude < hold;
+    return _in;
+  }, 6);
+  let top = 0;
+  let minAlt = Infinity;
+  fly(v, (m) => {
+    _in.throttle = 1; _in.brake = 0; _in.steer = 0; _in.boost = 0;
+    _in.handbrake = m.altitude < hold;
+    return _in;
+  }, seconds, (m) => {
+    const s = fwdSpeed(m);
+    if (s > top) top = s;
+    if (m.altitude < minAlt) minAlt = m.altitude;
+  });
+  return { top, minAlt, lost: health0 - v.health, destroyed: v.destroyed };
+}
+
+/** Full throttle down the runway and away, elevator in once it is rolling. */
+function climbOut(v, seconds = 40) {
+  let top = 0;
+  let climb = 0;
+  fly(v, (m) => {
+    _in.throttle = 0; _in.steer = 0; _in.handbrake = false; _in.boost = 1;
+    _in.brake = fwdSpeed(m) > 32 ? 0.45 : 0;
+    return _in;
+  }, seconds, (m) => {
+    const s = fwdSpeed(m);
+    if (s > top) top = s;
+    if (m.velocity.y > climb) climb = m.velocity.y;
+  });
+  return { top, climb };
+}
+
+function testEnvelope() {
+  /* ---- the transit: a floor on speed and a ceiling on time ----------- */
+  for (const [id, name, topMin, t100Max] of [
+    ['heli', 'Riverhop', 39.31, 13.54],
+    ['newsheli', 'Skywatch 6', 37.28, 11.12],
+  ]) {
+    const r = dash(spawn(id));
+    check('envelope', `${name} holds its transit speed under full cyclic`,
+      r.top >= topMin,
+      `${r.top.toFixed(2)} m/s top, floor ${topMin} (measured ${id === 'heli' ? 40.52 : 38.43})`);
+    check('envelope', `${name} still reaches 100 m in the time it always did`,
+      r.t100 <= t100Max,
+      `${r.t100.toFixed(2)} s to +100 m, ceiling ${t100Max}`);
+  }
+
+  /* ---- low and fast: no contact of a rotorcraft's may cost it ------- */
+  for (const [id, name, topMin] of [
+    ['heli', 'Riverhop', 35.22],
+    ['newsheli', 'Skywatch 6', 33.83],
+  ]) {
+    const r = nap(spawn(id));
+    check('envelope', `${name} holds its speed nap-of-the-earth`,
+      r.top >= topMin,
+      `${r.top.toFixed(2)} m/s top at ${r.minAlt.toFixed(2)} m AGL, floor ${topMin}`);
+    check('envelope', `${name} takes no damage from twenty seconds down there`,
+      r.lost === 0 && r.destroyed === false,
+      `lost ${r.lost} health, destroyed ${r.destroyed}`);
+  }
+
+  /* ---- the fixed-wing fleet did not go with it ---------------------- */
+  for (const [id, name, topMin, climbMin] of [
+    ['plane', 'Skylark', 43.22, 7.41],
+    ['sportplane', 'Slipstream', 67.12, 15.01],
+    ['jet', 'the jet', 111.81, 80.44],
+  ]) {
+    const r = climbOut(spawn(id));
+    check('envelope', `${name} holds its top speed`, r.top >= topMin,
+      `${r.top.toFixed(2)} m/s, floor ${topMin}`);
+    check('envelope', `${name} holds its climb rate`, r.climb >= climbMin,
+      `${r.climb.toFixed(2)} m/s best climb, floor ${climbMin}`);
+  }
+
+  /* ---- A/B: the roll/righting work is inert on an aircraft ---------- */
+  for (const id of AIRCRAFT) {
+    const heli = VEHICLE_SPECS[id].kind === 'heli';
+    const run = (hooks) => {
+      const v = spawn(id);
+      if (hooks) Object.assign(v, hooks);
+      const r = heli ? dash(v, 20) : climbOut(v, 20);
+      return { ...r, x: v.position.x, y: v.position.y, z: v.position.z };
+    };
+    const a = run(null);
+    const b = run(NO_ASSIST);
+    const d = Math.max(
+      Math.abs(a.top - b.top), Math.abs(a.x - b.x), Math.abs(a.y - b.y), Math.abs(a.z - b.z)
+    );
+    check('envelope', `${id} flies identically with the roll assists disarmed`,
+      d < 1e-9,
+      `top ${a.top.toFixed(4)} vs ${b.top.toFixed(4)} m/s, worst delta ${d.toExponential(2)}`);
+  }
+
+  /* ---- no rotorcraft may take the fixed-wing probe ring -------------- */
+  for (const id of AIRCRAFT) {
+    const v = spawn(id);
+    const plane = v.spec.kind === 'plane';
+    // The generic corner ring is what the constructor builds for everything
+    // that is not `kind: 'plane'`, and it is bounded at 0.32 m — a fuselage
+    // capsule on a helicopter's centreline would be twice that.
+    const ok = plane
+      ? !!v._fuseA && v.probeR > 0.4
+      : v._fuseA === undefined && v.probeR <= 0.32;
+    check('envelope', `${id} carries the ${plane ? 'fuselage' : 'corner'} probe ring`, ok,
+      `kind ${v.spec.kind}, ${v.probes.length} probes at r ${v.probeR.toFixed(3)}, fuselage capsule ${v._fuseA ? 'yes' : 'no'}`);
+  }
+
+  /* ---- NEGATIVE CONTROLS: the floors above are load-bearing ---------- */
+  /**
+   * Three ways a shared-code change could plausibly cost the machine its
+   * transit — more drag on the disc, less cyclic authority, less collective —
+   * each applied to the spec and each required to drive the assertion RED. A
+   * floor that nothing can fail is a comment.
+   */
+  for (const [label, mutate, red] of [
+    ['three times the disc drag', (b) => { b.rotor.discDrag *= 3; }, 'top'],
+    ['a third of the cyclic authority', (b) => { b.rotor.pitchMax /= 3; }, 'top'],
+    ['half the commanded climb', (b) => { b.rotor.climbUp /= 2; }, 't100'],
+  ]) {
+    const r = dash(spawnSpec(variantSpec('heli', mutate)));
+    const fell = red === 'top' ? r.top < 39.31 : r.t100 > 13.54;
+    check('envelope', `NEGATIVE CONTROL — with ${label} the floor fails`, fell,
+      `${r.top.toFixed(2)} m/s top, ${r.t100.toFixed(2)} s to +100 m`);
+  }
+}
+
+/* ================================================================== */
 testEnter();
 testHeli();
 testPlane();
@@ -1131,6 +1363,7 @@ testNewsHeli();
 testSportPlane();
 testJet();
 testSilhouettes();
+testEnvelope();
 
 console.log(`\nflightprobe: ${pass}/${pass + fail} checks passed`);
 if (fail) {

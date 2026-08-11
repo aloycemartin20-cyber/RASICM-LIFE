@@ -77,10 +77,23 @@ export const UNITS = {
  *                         POOL you look at light ON (headlit traffic, a
  *                         searchlight strike, spill off a lit shopfront). It
  *                         resolves against the prepass depth, so it costs six
- *                         vertices and some fill, and no permutation at all.
- *                     `vehicles` also owns a small FIXED pool of spot lights
- *                     for the cars whose beams the player is actually reading,
- *                     sized off this number at boot for the same reason.
+ *                         vertices and some fill, and no permutation at all —
+ *                         but fill is not free either, so `render` spends it
+ *                         nearest-first under a screen-area budget.
+ *                     `vehicles` also owns a small FIXED pool of SPOT lights
+ *                     for the cars whose beams the player is actually reading.
+ *                     Two of them, and the number lives in `src/vehicles/`
+ *                     rather than here on purpose — it is not a slot and it is
+ *                     not scaled by the tier.
+ *
+ *                     `numSpotLights` IS A SECOND PERMUTATION KEY and it is not
+ *                     covered by this budget at all. It was raised from 2 to 6
+ *                     once, by a wave that reasonably assumed extra lights at
+ *                     intensity 0 were free; MEASURED, they are ~1.5 ms each on
+ *                     a 17.6 ms night frame, because three unrolls the spot
+ *                     loop over EVERY lit fragment in the frame whatever the
+ *                     intensities are. `render.stats.spotLightCount` publishes
+ *                     it and `render` warns when it moves.
  * `drawDistance`      camera far plane, metres — the skyline has to be visible
  * `shadowDistance`    far edge of the last cascade
  * `trafficBudget`     CEILING on live moving cars near the camera. `traffic`

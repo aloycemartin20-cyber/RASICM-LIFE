@@ -300,7 +300,44 @@ const _fwd = new THREE.Vector3();
 const _fwdCam = new THREE.Vector3(0, 0, -1);
 
 /* ---- headlight arbitration (see `_updateHeadlights`) ------------------- */
-/** Cars scored for a real spot pair each frame. Sized well over the traffic
+/**
+ * REAL SPOT LIGHTS THIS SUBSYSTEM EVER MAKES VISIBLE. Two, for ever.
+ *
+ * `NUM_SPOT_LIGHTS` is a shader permutation key exactly like `numPointLights`,
+ * and it is charged a second time on every lit fragment in the frame: three
+ * unrolls the spot loop, so this number multiplies the whole screen, not just
+ * the lit part of it. Nothing in the renderer was watching it — only the POINT
+ * count was pinned — so raising this from two to six went unreported and was
+ * simply slower everywhere.
+ *
+ * MEASURED, `night` shot, q=high, 1600x900, governor off, seven interleaved
+ * 90-frame windows with four of the six lights hidden between them:
+ *
+ *   6 visible spot lights   p50 45.6 ms
+ *   2 visible spot lights   p50 33.5 ms      delta 12.1 ms, 6/7 pairs positive
+ *
+ * and a cleaner earlier run of the same page, 6 -> 0: 23.9 -> 15.2 ms, i.e.
+ * about 1.5 ms per visible spot light on this machine at this resolution. On a
+ * `main` night frame of 17.6 ms that is 8 % PER LIGHT, so there is no budget
+ * anywhere for a third.
+ *
+ * The multi-host feature survives all of it, because hosts and lights are no
+ * longer the same thing: `HEADLIGHT_HOSTS` cars are scored and arbitrated, the
+ * two lights are DISTRIBUTED over whichever of them won, and every other
+ * headlit car in range gets a projected road pool — which costs no permutation
+ * and no slot. See `_updateHeadlights`.
+ */
+const HEADLIGHT_LIGHTS = 2;
+/**
+ * Cars that may hold one of those two lights at once.
+ *
+ * Two, so a night street has real light from two different sources rather than
+ * from the one car `_lightHost` used to pick. The player's car is the exception
+ * and takes BOTH lights as a proper pair, because his own beams are the ones he
+ * reads the road with and a single centreline cone is visibly not a car.
+ */
+const HEADLIGHT_HOSTS = 2;
+/** Cars scored for a real light each frame. Sized well over the traffic
  *  budget within `HEADLIGHT_MAX_M`, so the scoring never truncates in play. */
 const HEADLIGHT_CANDIDATES = 24;
 /** Metres. Past this a pair of spots is a couple of pixels of lit road. */
@@ -1905,58 +1942,69 @@ export class VehicleSystem {
    * would recompile every lit material in the scene the moment the player got
    * into a car at night.
    *
-   * The pool used to be exactly two, and `_lightHost` handed both of them to
-   * ONE car for the whole world — the player's if he was driving, otherwise
-   * literally the first vehicle in the array with a driver. So a 3-star night
-   * pursuit had five cars on screen wearing blazing emissive headlight quads
-   * over uniformly black asphalt, none of them throwing a single lumen, and a
-   * pedestrian standing between two active lightbars received no coloured light
-   * at all.
+   * `_lightHost` used to hand both of them to ONE car for the whole world —
+   * the player's if he was driving, otherwise literally the first vehicle in
+   * the array with a driver. So a 3-star night pursuit had five cars on screen
+   * wearing blazing emissive headlight quads over uniformly black asphalt, none
+   * of them throwing a single lumen, and a pedestrian standing between two
+   * active lightbars received no coloured light at all.
    *
-   * Now it is `HOSTS` cars of two lights each, scored and arbitrated every
-   * frame (`_updateHeadlights`), and every OTHER headlit vehicle in range gets
-   * a projected road pool instead — which costs no permutation, no slot and no
-   * light at all. See `render.submitGroundPool`.
+   * Now `HEADLIGHT_HOSTS` cars are scored and arbitrated every frame
+   * (`_updateHeadlights`) and the FIXED two lights are distributed over the
+   * winners; every other headlit vehicle in range gets a projected road pool
+   * instead, which costs no permutation, no slot and no light at all. See
+   * `render.submitGroundPool`.
+   *
+   * THE COUNT IS DECIDED HERE AND NEVER AGAIN. It is baked into every lit
+   * material's program the moment the renderer pre-warms, so it comes off the
+   * quality tier and never off how many cars happen to be on screen. It is
+   * also the number `main` shipped, deliberately — see `HEADLIGHT_LIGHTS` for
+   * what a third one costs.
    */
   _buildHeadlightPool(ctx) {
     this.headlights = [];
     this._hlHosts = [];
     const slots = ctx.config.q.lightSlots ?? 4;
     if (slots < 4) return;
-    // The count is baked into every lit material's program the moment the
-    // renderer pre-warms, so it is decided ONCE, here, off the quality tier —
-    // never from how many cars happen to be on screen.
-    //
-    // `?owHeadlightHosts=N` overrides it, and exists so the cost of this pool
-    // is measurable rather than asserted: every lit fragment in the frame
-    // iterates NUM_SPOT_LIGHTS, so going from one host to three is a real
-    // per-pixel bill and somebody has to have paid it with a clock.
-    //
-    // MEASURED, `tools/perfcheck.mjs --q=high`, p50 frame ms, one machine:
-    //   1 host  29.5 and 26.6      2 hosts  27.7      3 hosts  30.7
-    // The control arm repeated spans 2.9 ms on its own, which is wider than
-    // the gap between the arms, so the honest reading is that four extra
-    // zero-intensity spot lights are BELOW this bench's noise floor here — not
-    // that they are free. Re-measure before going past three.
-    const forced = /[?&]owHeadlightHosts=(\d+)/.exec(location.search);
-    const hosts = forced ? Math.max(0, Math.min(6, +forced[1])) : slots >= 8 ? 3 : 2;
-    if (hosts === 0) return;
-    for (let h = 0; h < hosts; h++) {
-      const pair = [];
-      for (let i = 0; i < 2; i++) {
-        const l = new THREE.SpotLight(0xfff0d8, 0, 62, 0.62, 0.42, 1.3);
-        l.name = `vehicle_headlight_${h}_${i}`;
-        l.castShadow = false;
-        l.visible = true;
-        l.position.set(0, -900, 0);
-        l.target.position.set(0, -900, 1);
-        this.root.add(l);
-        this.root.add(l.target);
-        this.headlights.push(l);
-        pair.push(l);
-      }
-      this._hlHosts.push({ lights: pair, car: null, level: 0 });
+    for (let i = 0; i < HEADLIGHT_LIGHTS; i++) {
+      const l = new THREE.SpotLight(0xfff0d8, 0, 62, 0.62, 0.42, 1.3);
+      l.name = `vehicle_headlight_${i}`;
+      l.castShadow = false;
+      l.visible = true;
+      l.position.set(0, -900, 0);
+      l.target.position.set(0, -900, 1);
+      this.root.add(l);
+      this.root.add(l.target);
+      this.headlights.push(l);
     }
+    // `?owHeadlightHosts=N` clamps how many CARS may hold a light, 0..HOSTS. It
+    // deliberately does NOT change how many lights exist: an A/B arm that moved
+    // the permutation key would recompile every lit material at the moment it
+    // was switched and then measure the recompile as well as the arm, which is
+    // exactly what the first cut of this hook did.
+    const forced = /[?&]owHeadlightHosts=(\d+)/.exec(location.search);
+    const hosts = forced ? Math.max(0, Math.min(HEADLIGHT_HOSTS, +forced[1])) : HEADLIGHT_HOSTS;
+    for (let h = 0; h < hosts; h++) this._hlHosts.push({ car: null, level: 0, n: 0 });
+    /**
+     * `?owHeadlightUnstable=1` — THE NEGATIVE CONTROL, and the only reason it
+     * is here (rule 12).
+     *
+     * It restores the obvious implementation in both halves: a light with
+     * nobody to shine for is switched off with `visible = false` rather than
+     * driven to intensity 0, and the player's car stops taking the pair, so the
+     * number of lights in use follows how many cars are in range instead of
+     * being fixed. That is what every author reaches for, it looks correct, and
+     * it moves `numSpotLights` — so the whole city recompiles the moment
+     * traffic thins out, mid-drive, at speed.
+     *
+     * BOTH HALVES ARE LOAD-BEARING for the control, which is worth knowing
+     * because the first cut had only the first: with the player always pairing,
+     * both lights are always posed and the count cannot move however it parks
+     * the unused ones. A control that cannot fail is the same defect as a gate
+     * that cannot fail. `slotprobe --gate` requires this arm to move the spot
+     * count or compile a program mid-drive.
+     */
+    this.debugHeadlightUnstable = /[?&]owHeadlightUnstable=1/.test(location.search);
     /** Scratch for the per-frame scoring pass. Preallocated (rule 5). */
     this._hlCand = [];
     for (let i = 0; i < HEADLIGHT_CANDIDATES; i++) this._hlCand.push({ v: null, score: 0 });
@@ -1964,7 +2012,7 @@ export class VehicleSystem {
   }
 
   /**
-   * Score every headlit car in range and arbitrate the spot pairs.
+   * Score every headlit car in range and arbitrate the two spot lights.
    *
    * Three bands, and they are bands rather than a single sort because the two
    * cars whose headlights the player is actually reading are not the two
@@ -1980,17 +2028,25 @@ export class VehicleSystem {
    *   TRAFFIC   everything else, nearest-first, biased toward what is in front
    *             of the camera.
    *
-   * HYSTERESIS, not round-robin. Rotating the pairs through the traffic would
+   * HYSTERESIS, not round-robin. Rotating the lights through the traffic would
    * spread real light around, and it would also make an individual car's
    * headlights fade up and down while it drove in a straight line, which reads
    * as a fault in the car rather than as a budget. An incumbent instead gets a
    * bonus on its contribution term (never across a band), so two near-tied cars
-   * cannot trade the pair back and forth; the fair-share job is done by the
+   * cannot trade a light back and forth; the fair-share job is done by the
    * road pool below, which every headlit car in range gets whether or not it
-   * won a pair.
+   * won one.
+   *
+   * WHAT A WINNER ACTUALLY GETS is one light, not two — except the player's
+   * car, which gets the pair. The two are a FIXED resource (`HEADLIGHT_LIGHTS`)
+   * because their number is a shader permutation key charged on every lit
+   * fragment in the frame, so "more hosts" can never mean "more lights"; it
+   * means the same two lights land on more interesting cars. Empty lights are
+   * driven to intensity 0 and left visible, never hidden — hiding one is the
+   * recompile this whole arrangement exists to avoid.
    */
   _updateHeadlights(ctx) {
-    if (!this._hlHosts?.length) return;
+    if (!this.headlights?.length) return;
     const sky = ctx.peek('sky');
     const alt = sky?.sunAltitude ?? 0.6;
     const night = Math.max(0, Math.min(1, 1 - (alt + 0.02) / 0.14));
@@ -1999,9 +2055,9 @@ export class VehicleSystem {
       for (const h of this._hlHosts) {
         h.car = null;
         h.level = 0;
-        h.lights[0].intensity = 0;
-        h.lights[1].intensity = 0;
+        h.n = 0;
       }
+      for (const l of this.headlights) this._parkHeadlight(l);
       return;
     }
 
@@ -2053,7 +2109,7 @@ export class VehicleSystem {
       }
     }
 
-    // ---- assignment: incumbents keep their pair, then best-first ----------
+    // ---- assignment: incumbents keep their host slot, then best-first -----
     for (const h of this._hlHosts) {
       if (h.car) {
         let live = false;
@@ -2077,32 +2133,73 @@ export class VehicleSystem {
       cand[best].score = -1;
     }
 
+    // ---- distribute the two lights over the winners -----------------------
+    // The player pairs; anyone else takes a single centreline cone. Decided
+    // before the pose loop so a light is written exactly once per frame and the
+    // leftovers can be zeroed without a second pass over the hosts.
+    let assigned = 0;
+    for (const h of this._hlHosts) h.n = 0;
+    for (const h of this._hlHosts) {
+      if (!h.car || assigned >= HEADLIGHT_LIGHTS) continue;
+      const pair =
+        h.car === pv && assigned + 2 <= HEADLIGHT_LIGHTS && this.debugHeadlightUnstable !== true;
+      h.n = pair ? 2 : 1;
+      assigned += h.n;
+    }
+
     // ---- pose + crossfade -------------------------------------------------
     const k = 1 - Math.exp(-dt * 9); // ~0.2 s, slower than a slot handover
+    let li = 0;
     for (const h of this._hlHosts) {
-      const v = h.car;
-      if (!v) {
+      if (!h.car || h.n === 0) {
         h.level = Math.max(0, h.level - k);
-        h.lights[0].intensity = 0;
-        h.lights[1].intensity = 0;
         continue;
       }
       h.level += (1 - h.level) * k;
-      const s = v.spec.style;
-      const hl = s.headlight;
-      const y = (hl?.y ?? 0.7) - v.spec.comY;
-      const z = (s.noseZ ?? v.spec.half.z) - 0.1;
-      const x = (s.hwMax ?? 1) * (s.noseHw ?? 1) - (hl?.inset ?? 0.3);
-      for (let i = 0; i < 2; i++) {
-        const l = h.lights[i];
-        _v.set(i === 0 ? -x : x, y, z).applyQuaternion(v.quaternion).add(v.position);
-        l.position.copy(_v);
-        _v2.set(i === 0 ? -x * 1.5 : x * 1.5, y - 3.2, z + 26).applyQuaternion(v.quaternion).add(v.position);
-        l.target.position.copy(_v2);
-        l.target.updateMatrixWorld();
-        l.intensity = 46 * night * h.level;
+      // side 0 is the centreline: one cone from the middle of the nose, which
+      // is what a car that is not the player's gets. The pair keeps the
+      // authored lamp inset so the player's own beams separate on the road.
+      if (h.n === 2) {
+        this._poseHeadlight(this.headlights[li++], h.car, -1, h.level, night);
+        this._poseHeadlight(this.headlights[li++], h.car, 1, h.level, night);
+      } else {
+        this._poseHeadlight(this.headlights[li++], h.car, 0, h.level, night);
       }
     }
+    for (; li < this.headlights.length; li++) this._parkHeadlight(this.headlights[li]);
+  }
+
+  /**
+   * A light with nobody to shine for. Intensity 0, `visible` untouched — the
+   * count is the permutation key, not the brightness.
+   */
+  _parkHeadlight(l) {
+    l.intensity = 0;
+    if (this.debugHeadlightUnstable === true) l.visible = false;
+  }
+
+  /**
+   * Aim one spot light out of one car's nose.
+   *
+   * `side` is -1 / +1 for the left and right lamp of a pair, or 0 for the
+   * single centreline cone a non-player host gets. The target is 26 m down the
+   * car's own +Z and 3.2 m below the lamp, which is the dip a real low beam
+   * has; splaying the pair's targets by 1.5x the lamp inset is what makes two
+   * beams read as two rather than as one wide one.
+   */
+  _poseHeadlight(l, v, side, level, night) {
+    if (l.visible !== true) l.visible = true;
+    const s = v.spec.style;
+    const hl = s.headlight;
+    const y = (hl?.y ?? 0.7) - v.spec.comY;
+    const z = (s.noseZ ?? v.spec.half.z) - 0.1;
+    const x = ((s.hwMax ?? 1) * (s.noseHw ?? 1) - (hl?.inset ?? 0.3)) * side;
+    _v.set(x, y, z).applyQuaternion(v.quaternion).add(v.position);
+    l.position.copy(_v);
+    _v2.set(x * 1.5, y - 3.2, z + 26).applyQuaternion(v.quaternion).add(v.position);
+    l.target.position.copy(_v2);
+    l.target.updateMatrixWorld();
+    l.intensity = 46 * night * level;
   }
 
   /**

@@ -1384,21 +1384,7 @@ export class BuildingSystem {
    * call and no per-window CPU work.
    */
   _driveLights(ctx) {
-    if (!this._litMats.length) {
-      // `?owLegacyWindows=1` restores the shipped behaviour — one 5.42x ramp
-      // for every emitter and no per-window variance — as the negative control
-      // for both halves of this (rule 12). MEASURED on `searchlight_side`, over
-      // the lit facade of the tower the review photographed.
-      this._legacyWindows = /[?&]owLegacyWindows=1/.test(location.search);
-      for (const k of ['room_lit_warm', 'room_lit_cool', 'neon_amber', 'neon_teal', 'neon_red']) {
-        const m = this.lib._mats.get(k);
-        if (!m) continue;
-        const room = k.startsWith('room_') && !this._legacyWindows;
-        if (room) this._patchWindowVariance(m);
-        this._litMats.push({ m, room, base: SURFACES[k]?.opts?.three?.emissiveIntensity ?? 1 });
-      }
-      if (!this._litMats.length) return;
-    }
+    if (!this._collectLitMats()) return;
     const sky = this._sky ?? (this._sky = ctx.peek('sky'));
     const alt = sky?.sunAltitude ?? 0.5;
     const mix = 1 - Math.min(1, Math.max(0, (alt + 0.06) / 0.2));
@@ -1407,6 +1393,40 @@ export class BuildingSystem {
     for (const e of this._litMats) {
       e.m.emissiveIntensity = e.base * (e.room ? 0.22 + WINDOW_NIGHT * mix : 0.22 + 5.2 * mix);
     }
+  }
+
+  /**
+   * Find the emissive materials the night ramp drives, and install the
+   * per-window variance patch on the room ones.
+   *
+   * SPLIT OUT OF `_driveLights` SO THE PRE-WARM CAN CALL IT FIRST.
+   * `_patchWindowVariance` adds a `customProgramCacheKey`, so a material
+   * patched after `prewarmMaterials` has run has had the WRONG variant
+   * compiled: the pre-warm's 400-odd programs are for the unpatched key, and
+   * the patched ones then compile lazily, in play, as each geometry path first
+   * appears. That is precisely the mid-drive stall ARCHITECTURE.md's pre-warm
+   * section exists to prevent, arriving through a door it did not cover.
+   * Patched before the pre-warm builds its scratch city, the compiled variant
+   * is the one the game uses.
+   *
+   * `?owLegacyWindows=1` restores the shipped behaviour — one 5.42x ramp for
+   * every emitter and no per-window variance — as the negative control for both
+   * halves of this (rule 12). MEASURED on `searchlight_side`, over the lit
+   * facade of the tower the review photographed.
+   *
+   * @returns {boolean} whether there is anything to drive
+   */
+  _collectLitMats() {
+    if (this._litMats.length) return true;
+    this._legacyWindows = /[?&]owLegacyWindows=1/.test(location.search);
+    for (const k of ['room_lit_warm', 'room_lit_cool', 'neon_amber', 'neon_teal', 'neon_red']) {
+      const m = this.lib._mats.get(k);
+      if (!m) continue;
+      const room = k.startsWith('room_') && !this._legacyWindows;
+      if (room) this._patchWindowVariance(m);
+      this._litMats.push({ m, room, base: SURFACES[k]?.opts?.three?.emissiveIntensity ?? 1 });
+    }
+    return this._litMats.length > 0;
   }
 
   /**
@@ -1631,6 +1651,10 @@ export class BuildingSystem {
     if (!renderer) return { ok: false, reason: 'no renderer' };
     const t0 = performance.now();
     const before = renderer.info.programs?.length ?? 0;
+    // BEFORE anything is built: the window-variance patch changes the program
+    // cache key, so compiling the scratch city first would warm the variant the
+    // game never uses. See `_collectLitMats`.
+    this._collectLitMats();
 
     const scene = new THREE.Scene();
     const built = [];

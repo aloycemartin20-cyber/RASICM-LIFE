@@ -197,9 +197,16 @@ const ASSIST_MAX_CLIMB = 1.15;
  * THE REFERENCE IS THE GROUND, NOT THE WORLD. Measured against world up, this
  * would fight every cambered road and every Mt Washington incline in the city —
  * a car parked across a 20 degree slope is banked 20 degrees and is not tipping
- * over. The angle is taken against the mean CONTACT NORMAL of the wheels that
- * are actually touching, so a car on a slope is level as far as this is
- * concerned and only a car leaning off its own tyres is not.
+ * over. The angle is taken against the CONTACT NORMAL of the wheels that are
+ * actually touching, so a car on a slope is level as far as this is concerned
+ * and only a car leaning off its own tyres is not.
+ *
+ * That reference is not simply their mean — see the `REF_TAU` block, and read
+ * it before touching anything here. A mean is a measurement only while enough
+ * wheels are down and they agree about the surface, and a 13 rad/s^2 torque
+ * taken off a reading that was neither is the "it spun out on the hill"
+ * report. `_groundRef` is what scores it and `_rollAssist` spends no more
+ * authority than the score allows.
  */
 /** Bank past which a car is tipping rather than cornering, radians (13 deg). */
 const ROLL_ONSET = 0.23;
@@ -208,6 +215,77 @@ const ROLL_BAND = 0.20;
 /** Peak restoring roll acceleration, rad/s^2, and the rate damping with it. */
 const ROLL_GAIN = 13;
 const ROLL_DAMP = 3.4;
+
+/**
+ * ────────────────────────────────────────────────────────────────────────────
+ * THE GROUND REFERENCE — filtered, and SCORED, because a mean of contact
+ * normals is not always a measurement of anything.
+ * ────────────────────────────────────────────────────────────────────────────
+ * `_rollAssist` has to know what surface the car is standing on, because a car
+ * banked 20 degrees on a 20 degree hill is not banked at all. The raw answer,
+ * the mean of the grounded wheels' normals, is trustworthy in exactly one
+ * situation: when enough wheels are down and they agree about it. Two ways it
+ * is not:
+ *
+ *   TOO FEW VOTES     three points define a plane and one defines nothing. A
+ *                     car with a single wheel touching gets that wheel's own
+ *                     normal, and nothing in that number can tell a car
+ *                     leaning off its tyres from a car sitting square on a
+ *                     hill. MEASURED, an Ironside taking the 30 degree hill
+ *                     onset in the connected-roads bench: over the 0.55 s
+ *                     after it came back down on ONE wheel the reference read
+ *                     65 degrees of bank on a body only 36 degrees off
+ *                     vertical, and the assist held full authority — 13 rad/s^2
+ *                     — through all of it. That is the "it spun out on the
+ *                     hill" report, and it is a car being corrected for a lean
+ *                     it did not have.
+ *   DISAGREEMENT      at a camber or crown transition — an intersection
+ *                     gutter, a slope onset, the joins the report calls
+ *                     "connected roads" — the wheels genuinely stand on
+ *                     different surfaces, and their mean is a surface NO wheel
+ *                     is on. MEASURED across the same onset: 22.8 degrees of
+ *                     spread between grounded wheels.
+ *
+ * So the reference is low-passed (a surface is a property of the road, and the
+ * road does not change in a step) and it carries a confidence that goes to
+ * zero as the votes thin out or the wheels stop agreeing. `_rollAssist` scales
+ * its authority by that confidence, so it cannot fire on a reading it has no
+ * grounds for.
+ *
+ * NOTHING ELSE READS IT on the shipped path. The yaw stabiliser works about
+ * the body's own up axis and always did — see the axis block in `_stepWheels`
+ * for why the version of it that read this reference was reverted.
+ *
+ * Untouched, to the last bit, is the case every one of these numbers was tuned
+ * on: four wheels down on one surface scores 1 and filters to itself.
+ */
+/** Time constant of the reference normal's low-pass, seconds. */
+const REF_TAU = 0.25;
+/** Wheel-normal disagreement the reference survives, and where it is worthless. */
+const REF_SPREAD_OK = 0.14;
+const REF_SPREAD_MAX = 0.28;
+/**
+ * Contacts the reference needs before it is a measurement rather than a guess.
+ *
+ * TWO, not three, and the difference is the whole roll assist. Three points
+ * define a plane, so three is what a reference "should" want — but the car
+ * this exists for is a car with its INSIDE PAIR IN THE AIR, and demanding
+ * three contacts takes the assist away at the exact moment it is the only
+ * thing left. MEASURED with a three-vote floor: suv 64, pickup 69 degrees of
+ * bank on the flat-ground corner, i.e. straight back to the rollover the
+ * assist was written for. A single tyre, by contrast, defines nothing at all —
+ * a car balanced on one wheel and a car sitting square on a hillside report
+ * the same normal — and it is where the bad reading came from.
+ */
+const REF_VOTES = 2;
+/**
+ * Seconds of unbroken contact before the reference counts as a ROAD rather
+ * than a bounce. A car coming down off a crest touches one wheel, and the
+ * surface under that wheel is not yet the surface it is about to be standing
+ * on; the assist may not commit 13 rad/s^2 to a pose that is still landing.
+ */
+const REF_ARM = 0.25;
+
 
 /**
  * ────────────────────────────────────────────────────────────────────────────
@@ -308,7 +386,7 @@ const _v5 = new THREE.Vector3();
 const _fwd = new THREE.Vector3();
 const _right = new THREE.Vector3();
 const _up = new THREE.Vector3();
-/** The axis the yaw stabiliser works about. See the yaw-stability block. */
+/** The yaw stabiliser's axis, and `_groundRef`'s scratch mean normal. */
 const _axis = new THREE.Vector3();
 const _n = new THREE.Vector3();
 const _r = new THREE.Vector3();
@@ -491,6 +569,16 @@ export class Vehicle {
     this._rightFor = 0;
     this._rightDir = 0;
 
+    /**
+     * The ground reference `_rollAssist` works against. See the `REF_TAU`
+     * block: `groundNormal` is the low-passed mean contact normal and
+     * `groundRef` is how much of a measurement it currently is, 0 to 1. Both
+     * are published for the benches.
+     */
+    this.groundNormal = new THREE.Vector3(0, 1, 0);
+    this.groundRef = 0;
+    this._refFor = 0;
+
     // Boat
     this.inWater = false;
     this.waterY = -Infinity;
@@ -671,6 +759,9 @@ export class Vehicle {
     this.rollAssist = 0;
     this._rightFor = 0;
     this._rightDir = 0;
+    this.groundNormal.set(0, 1, 0);
+    this.groundRef = 0;
+    this._refFor = 0;
     this.drivetrain.reset();
   }
 
@@ -1154,6 +1245,10 @@ export class Vehicle {
       w.vel = Math.max(-7, Math.min(7, (w.prevLen - w.len) / dt));
     }
 
+    // The contact normals are final; score and filter the surface they imply
+    // before anything downstream builds a torque about it.
+    this._groundRef(dt);
+
     // ---- spring + damper + anti-roll -------------------------------------
     const arb = [0, 0, 0, 0];
     if (wheels.length === 4) {
@@ -1398,58 +1493,65 @@ export class Vehicle {
      * off yaw when the car is already rotating faster than that.
      *
      * ────────────────────────────────────────────────────────────────────────
-     * THE AXIS IS THE GROUND'S, NOT THE BODY'S
+     * THE AXIS IS THE BODY'S, AND THE ARGUMENT FOR THE GROUND'S DID NOT SURVIVE
+     * BEING MEASURED. Read this before moving it again.
      * ────────────────────────────────────────────────────────────────────────
-     * Both torques below used to be built about the BODY's up axis, and that is
-     * only the axis the tyres work about while the body is sitting square on
-     * the surface. A tyre's yaw moment is made at the contact patch, so it acts
-     * about the CONTACT NORMAL; once the body is leaning off its own tyres the
-     * body axis is not that axis any more, and the difference is a torque about
-     * the car's lateral axis that nobody asked for and that grows with the
-     * lean. A damper sized to swing a two-tonne car's heading is not a small
-     * thing to leak into another axis.
+     * The case for building both torques about the CONTACT NORMAL instead is a
+     * good one on paper: a tyre's yaw moment is made at the contact patch, so
+     * once the body is leaning off its own tyres the body axis is not quite the
+     * axis the tyres work about, and the difference leaks into roll. It was
+     * tried, with the magnitude carrying `up . n` as the projection of this
+     * torque onto it. Both are exactly 1 under a level car on level ground, so
+     * it looked free.
      *
-     * So: the axis is the mean contact normal of the wheels that are touching,
-     * and the magnitude carries `up . n` — the literal projection of the old
-     * body-axis torque onto it. Both halves matter and both are exactly 1 on
-     * level ground under a level car, so ordinary driving is unchanged to the
-     * last bit. `up . n` is also the right physics for the case this is about:
-     * the yaw moment a pair of tyres can make falls away as the car comes up
-     * onto them.
+     * IT IS NOT FREE AT THE FRICTION LIMIT. `yawRate` is read as
+     * `angularVelocity . axis`, so moving the axis off the body mixes the
+     * car's ROLL RATE into the number the limiter is regulating — and on dirt,
+     * grass and gravel the limiter is the only thing holding a car's tail,
+     * because `maxYaw` is `mu g / v` and mu is small. MEASURED over 576 steady
+     * corners (8 classes x 3 speeds x 3 locks x flat and a 6 degree camber x
+     * asphalt, dirt, grass, gravel), each arm against main, counting BOTH
+     * directions — and count both, because a one-sided count of this reads as
+     * a landslide and is how this paragraph was first written wrong:
      *
-     * WORLD UP WOULD BE WRONG, and it is the obvious first answer. Pittsburgh
+     *     body axis        0 corners worse than main,  0 better
+     *     contact normal   7 corners worse than main, 28 better
+     *
+     * So the contact normal is NOT a systematic regression. It is a chaotic
+     * reshuffle of which limit corners a car survives: 35 of 534 comparable
+     * corners land somewhere else, in both directions, and none of it is
+     * predictable from the axis. What the body axis is, is main's behaviour to
+     * the last bit — 0 and 0 — and main is the build the report says was fine.
+     *
+     * AND THE AXIS BOUGHT NOTHING TO SET AGAINST THAT. It was reported as the
+     * rollover fix and it is not: MEASURED on the emitted attitude, peak bank
+     * over a 6 s corner entered at 110 km/h under full lock, both axes, flat
+     * and on 8 / 14 / 20 degree slopes, with and without a 1.5 rad/s kerb
+     * strike — the two arms agree to within 1 degree in all 16 runs. The
+     * rollovers this file is about are a roll-axis problem and are fixed on the
+     * roll axis, in `_rollAssist`, which DOES take its reference from the
+     * ground and needs to.
+     *
+     * A change that costs a known-good baseline and returns nothing measurable
+     * is not worth its risk, so the axis is the body's.
+     *
+     * WORLD UP WOULD BE WRONG, and it is the obvious third answer. Pittsburgh
      * is hills: on a 20 degree incline a torque about world up has a component
      * about the body's own NOSE axis — it leaks into ROLL, on the terrain where
-     * a roll is least recoverable. The contact normal degenerates to world up
-     * on the flat and to the hillside's normal on the hill, and leaks into
-     * neither.
+     * a roll is least recoverable. The body axis has no such component by
+     * construction, on any slope.
      *
-     * BE CLEAR ABOUT WHAT THIS AXIS IS AND IS NOT WORTH, because it was
-     * reported as the whole rollover fix and it is not. MEASURED on the emitted
-     * attitude (`rollprobe.mjs`), peak absolute bank over a 6 s corner entered
-     * at 110 km/h under W and full lock, body axis vs this one, on the flat and
-     * on 8 / 14 / 20 degree slopes, with and without a 1.5 rad/s kerb strike
-     * mid-corner: the two arms agree to within 1 degree in every one of those
-     * 16 runs. The rollovers this file is really about — van 97, truck 96,
-     * pickup 105, suv 108 degrees of bank on FLAT asphalt — are a roll-axis
-     * problem and are fixed on the roll axis, in `_rollAssist`. This is the
-     * correct axis for a torque that is about yaw; it is not the fix.
-     *
-     * `debugBodyYaw` restores the old axis on a LIVE vehicle with no edit, for
-     * anyone re-running that A/B. Off on every shipped path.
+     * `debugGroundYaw` restores the contact-normal axis and its lever on a LIVE
+     * vehicle with no edit, for anyone re-running that A/B. Off on every
+     * shipped path.
      */
     if (grounded > 0 && this.speed > 3) {
-      const bodyAxis = this.debugBodyYaw === true;
-      if (bodyAxis) {
-        _axis.copy(_up);
-      } else {
-        _axis.set(0, 0, 0);
-        for (let i = 0; i < wheels.length; i++) {
-          if (wheels[i].grounded) _axis.add(wheels[i].normal);
-        }
-        if (_axis.lengthSq() < 1e-6) _axis.set(0, 1, 0); else _axis.normalize();
-      }
-      const lever = bodyAxis ? 1 : Math.max(0, _up.dot(_axis));
+      // `debugBodyYaw` asks for what every shipped vehicle already does, so it
+      // wins: a probe that sets it means "no assists", and it must not be able
+      // to turn one on.
+      const ground = this.debugGroundYaw === true && this.debugBodyYaw !== true;
+      if (ground) _axis.copy(this.groundNormal); else _axis.copy(_up);
+      const lever = ground ? Math.max(0, _up.dot(_axis)) : 1;
       const yawRate = this.angularVelocity.dot(_axis);
       const ackermann = (this.forwardSpeed * Math.tan(this.steerAngle)) / this.spec.wheelbase;
       let mu = 0;
@@ -1481,7 +1583,9 @@ export class Vehicle {
         const strength = Math.min(1, (beta - onset) / 0.7);
         const gain = bike ? 4.2 : 1.5;
         this.addTorque(
-          _v0.copy(_axis).multiplyScalar(-yawRate * this.spec.inertia.y * gain * strength * grip * lever)
+          _v0.copy(_axis).multiplyScalar(
+            -yawRate * this.spec.inertia.y * gain * strength * grip * lever
+          )
         );
       }
     }
@@ -1687,6 +1791,58 @@ export class Vehicle {
   }
 
   /**
+   * The surface the car is standing on, filtered and scored. See the `REF_TAU`
+   * block for why a mean of contact normals needs both.
+   *
+   * `groundNormal` is held through an airborne moment rather than snapped back
+   * to world up: a car that has just left a crest is about to land on the
+   * surface it left, not on a level one. `groundRef` goes to zero for the
+   * whole of that, so nothing acts on the held value in the meantime.
+   *
+   * `debugRawRef` restores the raw reference — the instantaneous mean, trusted
+   * outright — on a LIVE vehicle with no edit. That is what `_rollAssist` used
+   * to be handed, so it is the negative control `rollprobe.mjs`'s connected-
+   * roads section runs. Off on every shipped path.
+   */
+  _groundRef(dt) {
+    const wheels = this.wheels;
+    _axis.set(0, 0, 0);
+    let down = 0;
+    for (let i = 0; i < wheels.length; i++) {
+      if (wheels[i].grounded) { _axis.add(wheels[i].normal); down++; }
+    }
+    if (down === 0 || _axis.lengthSq() < 1e-6) {
+      this._refFor = 0;
+      this.groundRef = 0;
+      return;
+    }
+    _axis.normalize();
+    this._refFor += dt;
+    if (this.debugRawRef === true) {
+      this.groundNormal.copy(_axis);
+      this.groundRef = 1;
+      return;
+    }
+
+    // How far the worst-placed wheel disagrees with the mean.
+    let spread = 0;
+    for (let i = 0; i < wheels.length; i++) {
+      const w = wheels[i];
+      if (!w.grounded) continue;
+      const d = w.normal.dot(_axis);
+      const a = Math.acos(d > 1 ? 1 : d < -1 ? -1 : d);
+      if (a > spread) spread = a;
+    }
+    const agree = 1 - Math.min(1, Math.max(0,
+      (spread - REF_SPREAD_OK) / (REF_SPREAD_MAX - REF_SPREAD_OK)));
+    const need = Math.min(REF_VOTES, wheels.length);
+    const votes = need > 1 ? Math.min(1, (down - 1) / (need - 1)) : 1;
+    this.groundRef = agree * votes * Math.min(1, this._refFor / REF_ARM);
+
+    this.groundNormal.lerp(_axis, 1 - Math.exp(-dt / REF_TAU)).normalize();
+  }
+
+  /**
    * Roll stability. See the `ROLL_ONSET` block for why it exists and why the
    * reference is the ground rather than the world.
    *
@@ -1694,6 +1850,11 @@ export class Vehicle {
    * is bounded by construction (a fixed angular acceleration, not a spring on
    * an unbounded error) and it can only ever act to REDUCE the bank, so it
    * cannot push a car past level and start an oscillation of its own.
+   *
+   * The engagement carries `groundRef` as well as the bank, so the authority
+   * it spends is capped by how much of a measurement the reference is. That is
+   * what keeps it off a car that is mid-landing or straddling a camber change
+   * — see `_groundRef`.
    *
    * `debugNoRollAssist` disarms it on a LIVE vehicle with no edit — the
    * negative control `rollprobe.mjs` runs, in the shape ARCHITECTURE rule 12
@@ -1711,13 +1872,11 @@ export class Vehicle {
       this.rollAssist = 0;
       return;
     }
-    // The surface the car is standing on, from the contacts it actually has.
-    _n.set(0, 0, 0);
-    for (let i = 0; i < wheels.length; i++) {
-      if (wheels[i].grounded) _n.add(wheels[i].normal);
-    }
-    if (_n.lengthSq() < 1e-6) { this.rollAssist = 0; return; }
-    _n.normalize();
+    // The surface the car is standing on — filtered, and only as far as the
+    // wheels actually agree there is one. See `_groundRef`.
+    const conf = this.groundRef;
+    if (conf <= 0) { this.rollAssist = 0; return; }
+    _n.copy(this.groundNormal);
 
     _fwd.set(0, 0, 1).applyQuaternion(this.quaternion);
     _right.set(1, 0, 0).applyQuaternion(this.quaternion);
@@ -1728,7 +1887,7 @@ export class Vehicle {
     const over = Math.abs(bank) - ROLL_ONSET;
     if (over <= 0) { this.rollAssist = 0; return; }
 
-    const strength = Math.min(1, over / ROLL_BAND);
+    const strength = Math.min(1, over / ROLL_BAND) * conf;
     this.rollAssist = strength;
     const rollRate = this.angularVelocity.dot(_fwd);
     // A positive torque about +Z raises `right.y`, i.e. increases the bank, so

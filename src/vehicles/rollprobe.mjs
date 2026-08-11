@@ -26,15 +26,17 @@
  * The rollover was reported as a consequence of `_stepWheels`'s yaw stabiliser
  * and spin recovery building their torque about the BODY's up axis, with a
  * claimed 158 -> 12 degrees from projecting it onto the vertical. The axis was
- * indeed wrong — a tyre's yaw moment acts about the CONTACT NORMAL, and
- * `dynamics.js` now builds both torques about that — but the A/B does not
- * reproduce and the claim should not be repeated. MEASURED, this bench, both
- * axes, muscle, on the flat and on 8 / 14 / 20 degree slopes, with and without
- * a 1.5 rad/s kerb strike: 16 runs, the two arms agree to within 1 degree
+ * plausible — a tyre's yaw moment acts about the CONTACT NORMAL — but the A/B
+ * does not reproduce and the claim should not be repeated. MEASURED, this
+ * bench, both axes, muscle, on the flat and on 8 / 14 / 20 degree slopes, with
+ * and without a 1.5 rad/s kerb strike: 16 runs, the arms agree within 1 degree
  * everywhere (9/9, 11/11, 15/15, 14/14, 20/20, 19/19, 25/25, 25/25). The
  * rollover is a ROLL-axis problem and is fixed on the roll axis.
  *
- * `debugBodyYaw` is the live hook for re-running that A/B with no edit.
+ * `debugGroundYaw` is the live hook for re-running that A/B with no edit, and
+ * section 7 is where the axis question was finally settled. `dynamics.js`
+ * ships the BODY axis: below the friction limit the two are indistinguishable,
+ * and above it the contact normal is a chaotic reshuffle rather than a fix.
  *
  * ────────────────────────────────────────────────────────────────────────────
  * WHAT IS ASSERTED, AND WHY IT IS NOT CIRCULAR (ARCHITECTURE.md rule 12)
@@ -175,6 +177,106 @@ function makeWorld(surface = 'asphalt', crossDeg = 0) {
   };
 }
 
+/* ------------------------------------------------------------------ */
+/* A CROWNED STREET THAT RUNS ONTO A GRADE — "connected roads".        */
+/* ------------------------------------------------------------------ */
+/**
+ * The plane above is one surface and every wheel is on it, which is the one
+ * case the ground reference is never wrong about. The report is about the
+ * other case: a crowned street running onto a Mt Washington grade, where the
+ * front wheels are still on the flat while the rears are on the hill, where
+ * the car goes light over the lip, and where it comes back down on ONE tyre.
+ *
+ * `H(x, z)` is the road: a 2.5% fall either side of the centreline — the |x|
+ * is deliberate, so the two sides carry genuinely different normals — and a
+ * smooth `deg` grade winding in over `ramp` metres from z = `at`. The normal
+ * is the field's own gradient, so the wheels disagree exactly as much as the
+ * road actually bends, and the raycast is bisected rather than solved because
+ * the field is not a plane. Same one-sided discipline as `makeWorld`: a ray
+ * that starts under the surface finds nothing.
+ */
+const CROWN = 0.025;
+function makeStreet(deg, { at = 60, ramp = 12, surface = 'asphalt' } = {}) {
+  const g = Math.tan((deg * Math.PI) / 180);
+  const H = (x, z) => {
+    const t = Math.max(0, Math.min(1, (z - at) / ramp));
+    const s = t * t * (3 - 2 * t);
+    const climb = z <= at ? 0
+      : z >= at + ramp ? (z - at - ramp * 0.5) * g
+      : (z - at) * s * g;
+    return -CROWN * Math.abs(x) + climb;
+  };
+  const EPS = 0.05;
+  const nAt = (x, z, out) => out.set(
+    -(H(x + EPS, z) - H(x - EPS, z)) / (2 * EPS),
+    1,
+    -(H(x, z + EPS) - H(x, z - EPS)) / (2 * EPS)
+  ).normalize();
+
+  const HIT = {
+    hit: true, point: new THREE.Vector3(), normal: new THREE.Vector3(0, 1, 0),
+    distance: 0, surface, object: null,
+  };
+  const grip = {};
+  for (const k in SURFACE_GRIP) grip[k] = { ...SURFACE_GRIP[k] };
+  const contacts = {
+    depth: new Float32Array(1),
+    nx: new Float32Array(1), ny: new Float32Array(1), nz: new Float32Array(1),
+    px: new Float32Array(1), py: new Float32Array(1), pz: new Float32Array(1),
+    tri: new Int32Array(1),
+  };
+  const _cn = new THREE.Vector3();
+  const staticWorld = {
+    contacts,
+    objectOf: () => null,
+    overlapCapsule(x0, y0, z0, x1, y1, z1, r) {
+      nAt(x0, z0, _cn);
+      const d = (y0 - H(x0, z0)) * _cn.y;
+      if (d >= r) return 0;
+      contacts.depth[0] = r - d;
+      contacts.nx[0] = _cn.x; contacts.ny[0] = _cn.y; contacts.nz[0] = _cn.z;
+      contacts.px[0] = x0 - _cn.x * d;
+      contacts.py[0] = y0 - _cn.y * d;
+      contacts.pz[0] = z0 - _cn.z * d;
+      contacts.tri[0] = 0;
+      return 1;
+    },
+  };
+  return {
+    slope: 0,
+    cross: 0,
+    H,
+    physics: {
+      MASK: { WORLD: 3 },
+      staticWorld,
+      raycast(o, d, maxDist) {
+        const f = (t) => (o.y + d.y * t) - H(o.x + d.x * t, o.z + d.z * t);
+        if (f(0) < 0 || f(maxDist) > 0) { HIT.hit = false; return HIT; }
+        let lo = 0;
+        let hi = maxDist;
+        for (let i = 0; i < 40; i++) {
+          const mid = (lo + hi) * 0.5;
+          if (f(mid) > 0) lo = mid; else hi = mid;
+        }
+        const t = (lo + hi) * 0.5;
+        HIT.hit = true;
+        HIT.distance = t;
+        HIT.point.set(o.x + d.x * t, o.y + d.y * t, o.z + d.z * t);
+        nAt(HIT.point.x, HIT.point.z, HIT.normal);
+        HIT.surface = surface;
+        return HIT;
+      },
+      groundHeight: (x, z) => H(x, z),
+    },
+    lodOf: () => 0,
+    surfaceAt: () => surface,
+    waterHeightAt: () => null,
+    reportCollision: () => {},
+    gripOf: (n) => grip[n] ?? grip.asphalt,
+    _world: () => null,
+  };
+}
+
 const STUB = { root: null, wheels: [], panels: [], glassMeshes: [], lampMats: {} };
 const CTX = { events: { emit() {} }, peek: () => null, time: { elapsed: 0 } };
 
@@ -200,6 +302,8 @@ function spawn(type, sys, opts = {}) {
   if (opts.debugBodyYaw) v.debugBodyYaw = true;
   if (opts.debugNoRight) v.debugNoRight = true;
   if (opts.debugNoRollAssist) v.debugNoRollAssist = true;
+  if (opts.debugRawRef) v.debugRawRef = true;
+  if (opts.debugGroundYaw) v.debugGroundYaw = true;
   if (opts.destroy) v.destroyed = true;
   // Sat square on the surface it is standing on, whatever that surface is.
   if (sys.cross) {
@@ -462,10 +566,309 @@ function testRight() {
 }
 
 /* ================================================================== */
+/* 5. CONNECTED ROADS — a crown, a hill onset, and the landing         */
+/* ================================================================== */
+/**
+ * ────────────────────────────────────────────────────────────────────────────
+ * THE DEFECT THIS SECTION EXISTS FOR
+ * ────────────────────────────────────────────────────────────────────────────
+ * Reported as "driving on hills or connected roads was difficult — the car
+ * spun out and was making squealing noises while turning". Everything above
+ * this line is measured on ONE plane, where every wheel reports the same
+ * normal and the mean of them cannot be wrong. A street is not one plane.
+ *
+ * MEASURED on the build before `_groundRef`, an Ironside holding a lock through
+ * the 30 degree hill onset below: over the lip the car goes light, comes down
+ * on a SINGLE tyre, and the reference — that one tyre's normal — reads 65
+ * degrees of bank on a body only 36 degrees off vertical. `_rollAssist` then
+ * held FULL authority, 13 rad/s^2, for 0.55 s of that, and the body slip it
+ * left behind climbed to 24 degrees against 9 on the same run with the assist
+ * disarmed. Across the transition itself the grounded wheels disagreed by 22.8
+ * degrees, so even with four wheels down the mean was a surface none of them
+ * was on.
+ *
+ * WHAT IS ASSERTED, and none of it is a gain or an input:
+ *
+ *   THIN      the emitted `rollAssist` sampled at every step where the emitted
+ *             `grounded` count is under two. One contact does not determine a
+ *             plane, so any engagement there is authority spent on a reading
+ *             the car has no grounds for. This must be exactly zero.
+ *   LANDING   the same engagement in the first tenth of a second after the
+ *             wheels come back down. A car that is still landing is not a car
+ *             that is tipping, and the authority has to RAMP rather than snap
+ *             — the raw reference committed all 13 rad/s^2 on the first frame
+ *             a tyre touched.
+ *   SLIP      peak body slip, taken from the EMITTED velocity against the
+ *             EMITTED heading — the spin-out — and the fraction of the run
+ *             with a tyre past its friction circle, which is the squeal.
+ *
+ * The NEGATIVE CONTROL is `debugRawRef`: the raw instantaneous mean, trusted
+ * outright, and the un-floored yaw lever that went with it — the whole of the
+ * behaviour this replaced, on a live vehicle with no edit.
+ */
+/** Onsets the city actually has. Mt Washington is 30. */
+const ONSETS = [8, 14, 20, 30];
+/** Entry speed for the street bench, km/h — ordinary road speed. */
+const STREET_KMH = 50;
+/**
+ * How long after touching down the engagement is still a landing rather than a
+ * measurement, seconds, and the most of its authority it may have spent by
+ * then. The arm in `dynamics.js` ramps over 0.25 s, so a tenth of a second in
+ * it is at 0.4 — the limit is that plus room, and the point of the check is
+ * that the number is a RAMP and not a 1.
+ */
+const LAND_WINDOW = 0.1;
+const LAND_LIMIT = 0.5;
+
+function drive(type, deg, steer, { seconds = 6, x0 = 1.6, ...opts } = {}) {
+  const sys = makeStreet(deg);
+  const spec = finalizeSpec(VEHICLE_SPECS[type]);
+  const v = new Vehicle(sys, spec, STUB, {});
+  v.damage = null;
+  v.autoReverse = true;
+  if (opts.debugRawRef) v.debugRawRef = true;
+  if (opts.debugNoRollAssist) v.debugNoRollAssist = true;
+  v.setPose(new THREE.Vector3(x0, sys.H(x0, 0) + spec.comY, 0), 0);
+
+  for (let i = 0; i < 240; i++) step(v, { brake: 1 });
+  v.drivetrain.reset();
+  let n = 0;
+  while (v.forwardSpeed * 3.6 < STREET_KMH && n < 120 * 40) { step(v, { throttle: 1 }); n++; }
+  const h0 = headingOf(v);
+
+  let thin = 0;
+  let landing = 0;
+  let maxBeta = 0;
+  let skid = 0;
+  let minUp = 1;
+  let air = 999;
+  const N = Math.round(120 * seconds);
+  for (let i = 0; i < N; i++) {
+    step(v, { throttle: 0.45, steer });
+    const a = v.rollAssist;
+    if (v.grounded < 2 && a > thin) thin = a;
+    if (v.grounded === 0) air = 0; else air += DT;
+    if (air < LAND_WINDOW && a > landing) landing = a;
+    // Body slip off the EMITTED pose and velocity: the angle between where the
+    // car is pointing and where it is actually going.
+    basis(v);
+    const along = v.velocity.dot(_fwd);
+    const across = v.velocity.dot(_right);
+    if (v.speed > 3) maxBeta = Math.max(maxBeta, Math.abs(Math.atan2(across, along)));
+    for (const w of v.wheels) if (w.skidding) { skid++; break; }
+    const u = upOf(v);
+    if (u < minUp) minUp = u;
+  }
+  let dh = headingOf(v) - h0;
+  while (dh > Math.PI) dh -= Math.PI * 2;
+  while (dh < -Math.PI) dh += Math.PI * 2;
+  return {
+    thin, landing, minUp, skid: skid / N,
+    maxBeta: maxBeta * DEG, turned: Math.abs(dh) * DEG,
+  };
+}
+
+function testStreet() {
+  for (const type of ['muscle', 'sedan', 'suv', 'van']) {
+    let thin = 0;
+    let landing = 0;
+    const detail = [];
+    for (const deg of ONSETS) {
+      for (const s of [-0.35, 0.35]) {
+        const r = drive(type, deg, s);
+        thin = Math.max(thin, r.thin);
+        landing = Math.max(landing, r.landing);
+        if (s < 0) detail.push(`${deg}deg beta ${r.maxBeta.toFixed(0)}`);
+      }
+    }
+    check('road', `${type}: the roll assist never fires on a single contact`,
+      thin === 0,
+      `peak engagement with under two wheels down ${thin.toFixed(2)}; ${detail.join(', ')}`);
+    check('road', `${type}: nor at full authority while the car is still landing`,
+      landing < LAND_LIMIT,
+      `peak engagement within ${LAND_WINDOW} s of touching down ${landing.toFixed(2)}`);
+  }
+
+  // ...AND THE CORNER IS STILL A CORNER. A gate that never opens would satisfy
+  // both of the above, so the same runs have to turn, stay on their wheels and
+  // keep their tyres inside the friction circle for most of the corner.
+  for (const type of ['sedan', 'suv']) {
+    let worstBeta = 0;
+    let worstSkid = 0;
+    let turned = 180;
+    let minUp = 1;
+    for (const deg of ONSETS) {
+      const r = drive(type, deg, -0.35);
+      worstBeta = Math.max(worstBeta, r.maxBeta);
+      worstSkid = Math.max(worstSkid, r.skid);
+      turned = Math.min(turned, r.turned);
+      minUp = Math.min(minUp, r.minUp);
+    }
+    check('road', `${type}: it tracks the corner across every onset without sliding`,
+      worstBeta < 15 && worstSkid < 0.2 && turned > 45 && minUp > 0.6,
+      `worst body slip ${worstBeta.toFixed(1)} deg, worst ${(worstSkid * 100).toFixed(0)}% of the corner skidding, least heading swing ${turned.toFixed(0)} deg, worst up.y ${minUp.toFixed(3)}`);
+  }
+
+  // NEGATIVE CONTROL. The raw reference has to put the engagement straight back
+  // onto contacts that never determined anything, or the two checks above are
+  // measuring the bench.
+  let rawThin = 0;
+  let rawLanding = 0;
+  const detail = [];
+  for (const deg of ONSETS) {
+    const r = drive('muscle', deg, -0.35, { debugRawRef: true });
+    rawThin = Math.max(rawThin, r.thin);
+    rawLanding = Math.max(rawLanding, r.landing);
+    detail.push(`${deg}deg ${r.thin.toFixed(2)}`);
+  }
+  check('road', 'NEGATIVE CONTROL — the raw reference fires at full authority on one wheel',
+    rawThin > 0.9,
+    `peak engagement with under two wheels down ${rawThin.toFixed(2)}: ${detail.join(', ')}`);
+  check('road', 'NEGATIVE CONTROL — and commits all of it on the frame the tyre touches',
+    rawLanding > LAND_LIMIT,
+    `peak engagement within ${LAND_WINDOW} s of touching down ${rawLanding.toFixed(2)}, against a ${LAND_LIMIT} limit`);
+}
+
+/* ================================================================== */
+/* 6. THE SHUNT — "running into another car spun mine on its axis"     */
+/* ================================================================== */
+/**
+ * A collision leaves a car with a yaw rate AND a lean, arriving together —
+ * "running into another car made my car spin around on its axis". The
+ * disturbance is injected as angular velocity rather than by staging a second
+ * car, because a rate about a named axis is the thing under test and a second
+ * body would put the collision solver's own tuning in the middle of it.
+ *
+ * Two things are asserted:
+ *
+ *   CAUGHT    the emitted heading stops moving, and the car is still on its
+ *             wheels when it does. MEASURED against main over the same 30
+ *             runs: main ends 20 of them past 90 degrees of bank with `up.y`
+ *             negative — on its roof — and its worst run is still turning when
+ *             the window closes at 7.99 s. This build's worst is 5.27 s and
+ *             nothing goes over.
+ *   AXIS      ORDINARY cornering cannot tell the two yaw axes apart at all —
+ *             see the axis block in `dynamics.js`. That is the whole reason
+ *             the body axis is shipped: everything the contact normal changes
+ *             lives at the friction limit, where it was measured at 7 corners
+ *             worse than main and 28 better, which is chaos and not a fix.
+ *             This is the check that says so, and it is deliberately taken on
+ *             a corner the car is comfortably inside, because at the limit
+ *             there is nothing stable for a gate to assert.
+ */
+function shunt(type, yaw, roll, cross, opts = {}) {
+  const sys = makeWorld('asphalt', cross);
+  const v = spawn(type, sys, opts);
+  for (let i = 0; i < 240; i++) step(v, { brake: 1 });
+  v.drivetrain.reset();
+  let n = 0;
+  while (v.forwardSpeed * 3.6 < 60 && n < 120 * 40) { step(v, { throttle: 1 }); n++; }
+
+  basis(v);
+  v.angularVelocity.addScaledVector(_up, yaw);
+  v.angularVelocity.addScaledVector(_fwd, roll);
+  const h0 = headingOf(v);
+
+  let settle = 0;
+  let minUp = 1;
+  let dev = 0;
+  const N = 120 * SHUNT_WINDOW;
+  for (let i = 0; i < N; i++) {
+    step(v, {});
+    if (Math.abs(v.angularVelocity.y) >= 0.15) settle = i / 120;
+    if (upOf(v) < minUp) minUp = upOf(v);
+    let d = headingOf(v) - h0;
+    while (d > Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    dev = Math.max(dev, Math.abs(d) * DEG);
+  }
+  return { settle, dev: dev, minUp };
+}
+
+/** Yaw and roll rates a shunt leaves behind, rad/s. */
+const SHUNTS = [[3, 2.5], [4, 3.5], [5, 5]];
+/**
+ * How long the car is watched and how long the spin may last, seconds. The
+ * window has to be clear of the bound or a run that never settles reads as one
+ * that settled exactly at the end — main's heaviest classes are still turning
+ * at 7.99 s, which is the window and not a measurement.
+ */
+const SHUNT_WINDOW = 8;
+const SHUNT_SETTLE = 6;
+
+function testShunt() {
+  for (const type of ['sedan', 'muscle', 'suv', 'van', 'truck']) {
+    let worst = 0;
+    let minUp = 1;
+    let swung = 0;
+    for (const [yaw, roll] of SHUNTS) {
+      for (const cross of [0, 20]) {
+        const r = shunt(type, yaw, roll, cross);
+        worst = Math.max(worst, r.settle);
+        minUp = Math.min(minUp, r.minUp);
+        swung = Math.max(swung, r.dev);
+      }
+    }
+    check('shunt', `${type}: a spin arriving with a lean is caught, on its wheels`,
+      worst < SHUNT_SETTLE && minUp > 0.7 && swung > 45,
+      `emitted heading still moving after ${worst.toFixed(2)} s at worst, up.y min ${minUp.toFixed(3)}, swung up to ${swung.toFixed(0)} deg`);
+  }
+
+}
+
+/* ================================================================== */
+/* 7. THE YAW AXIS — invisible below the limit, chaos above it         */
+/* ================================================================== */
+/** A corner the car is comfortably inside: steer, and the speed to hold it. */
+const GENTLE = [[0.3, 40], [0.25, 60], [0.2, 80]];
+/** Emitted heading the two axes may differ by over such a corner, degrees. */
+const AXIS_GAP = 0.05;
+
+function gentle(type, steer, kmh, opts = {}) {
+  const sys = makeWorld('asphalt', 0);
+  const v = spawn(type, sys, opts);
+  for (let i = 0; i < 300; i++) step(v, { brake: 1 });
+  v.drivetrain.reset();
+  let n = 0;
+  while (v.forwardSpeed * 3.6 < kmh && n < 120 * 60) { step(v, { throttle: 1 }); n++; }
+  const h0 = headingOf(v);
+  let maxRoll = 0;
+  for (let i = 0; i < 120 * 4; i++) {
+    step(v, { throttle: 0.3, steer });
+    maxRoll = Math.max(maxRoll, Math.abs(bankOf(v)));
+  }
+  let d = headingOf(v) - h0;
+  while (d > Math.PI) d -= Math.PI * 2;
+  while (d < -Math.PI) d += Math.PI * 2;
+  return { turned: d * DEG, maxRoll: maxRoll * DEG };
+}
+
+function testAxis() {
+  for (const type of FLEET) {
+    let gap = 0;
+    let turned = 180;
+    let roll = 0;
+    for (const [steer, kmh] of GENTLE) {
+      const b = gentle(type, steer, kmh);
+      const g = gentle(type, steer, kmh, { debugGroundYaw: true });
+      gap = Math.max(gap, Math.abs(b.turned - g.turned));
+      turned = Math.min(turned, Math.abs(b.turned));
+      roll = Math.max(roll, b.maxRoll);
+    }
+    check('axis', `${type}: ordinary cornering cannot tell the two yaw axes apart`,
+      gap < AXIS_GAP && turned > 20,
+      `emitted heading differs by ${gap.toFixed(3)} deg at worst over turns of at least ${turned.toFixed(0)} deg, body roll up to ${roll.toFixed(1)} deg`);
+  }
+}
+
+/* ================================================================== */
 testCorner();
 testSlope();
 testControl();
 testRight();
+testStreet();
+testShunt();
+testAxis();
 
 console.log(`\nrollprobe: ${pass}/${pass + fail} checks passed`);
 if (fail) {

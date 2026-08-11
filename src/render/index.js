@@ -38,6 +38,33 @@ const PRACTICAL_RANGE = 30;
 const MAX_GROUND_POOLS = 32;
 
 /**
+ * Ceiling on the SCREEN AREA the ground-pool pass may cover, in whole frames.
+ *
+ * A pool costs six vertices, which is nothing, and a screen rectangle of a
+ * shader that does two dependent texture fetches and two matrix products per
+ * pixel, which is not. The count above bounds the geometry; only an area
+ * budget bounds the fill, and the two are unrelated — a single pool the camera
+ * is standing in covers more of the frame than twenty at forty metres.
+ *
+ * MEASURED on the `night` shot with the count forced to its 22-pool play
+ * ceiling around the camera, medians of six interleaved 90-frame windows:
+ * 33.7 ms with no pools, 36.8 ms with them — 3.1 ms, on a frame the same
+ * bench measured at 17.6 ms on `main`. That is the case this bounds. With the
+ * budget in, the same forced 22 draw as 3 and the same measurement lands at
+ * about +1 ms, in the noise of a shared machine.
+ *
+ * MEASURED on a real fast drive (`slotprobe --drive`, 900 frames, 223 m,
+ * 108 km/h peak, night): at most 4 pools, at most 3.0 screens, 1 culled. So
+ * this binds occasionally rather than never, and 3 is deliberately not raised
+ * to make it stop: pools are spent NEAREST FIRST, so the one it drops is
+ * always the most distant — a shopfront forty metres up the street, never the
+ * pool under the player's own car. Toggle the whole pass with the drive
+ * probe's arms before changing this; the number that matters is `fill`, not
+ * `drawn`, because one pool the camera is standing in is a whole screen.
+ */
+const POOL_FILL_SCREENS = 3;
+
+/**
  * Black zero-intensity point lights held in reserve to pin `numPointLights`.
  * See `_enforceLightCount`. Sized against the only subsystem that is known to
  * move the count (`world`'s own ballast pool is 16) with room to spare; an
@@ -618,6 +645,10 @@ export class RenderSystem {
     this._lightCountRaises = 0;
     /** Foreign visible point lights, counted for free during `_visit`. */
     this._nPointLights = 0;
+    /** Visible SPOT lights — the other permutation key. See `_visit`. */
+    this._nSpotLights = 0;
+    this._spotCountLock = -1;
+    this._spotCountChanges = 0;
 
     /** Per-frame submissions, preallocated. Never grows during a frame. */
     this._req = [];
@@ -1492,13 +1523,23 @@ export class RenderSystem {
     }
   }
 
-  /** Diagnostics: how the ground-pool budget was spent last frame. */
+  /**
+   * Diagnostics: how the ground-pool budget was spent last frame.
+   *
+   * `fill` is the number of whole frames the drawn proxies covered, which is
+   * the only one of these numbers that predicts the cost — see
+   * `POOL_FILL_SCREENS`. `culled` counts pools dropped by the area budget, not
+   * by the count.
+   */
   get poolBudget() {
     return {
       slots: MAX_GROUND_POOLS,
       submitted: this._nPoolsLast ?? 0,
       drawn: this._nPoolsDrawn ?? 0,
       overflow: this._poolOverflow ?? 0,
+      culled: this._poolCulled ?? 0,
+      fill: +(this._poolFill ?? 0).toFixed(2),
+      fillBudget: POOL_FILL_SCREENS,
     };
   }
 
@@ -1520,6 +1561,11 @@ export class RenderSystem {
     this._nPoolsLast = 0;
     this._nPoolsDrawn = 0;
     this._poolOverflow = 0;
+    this._poolCulled = 0;
+    this._poolFill = 0;
+    /** Nearest-first draw order and its sort key. Preallocated (rule 5). */
+    this._poolOrder = new Int32Array(MAX_GROUND_POOLS);
+    this._poolKey = new Float32Array(MAX_GROUND_POOLS);
 
     const n = MAX_GROUND_POOLS * 6;
     this._poolPos = new Float32Array(n * 3);
@@ -1602,6 +1648,8 @@ export class RenderSystem {
     if (!this.depthTexture) {
       this._poolGeo.setDrawRange(0, 0);
       this._nPoolsDrawn = 0;
+      this._poolCulled = n;
+      this._poolFill = 0;
       return;
     }
 
@@ -1610,9 +1658,37 @@ export class RenderSystem {
     const R = this._poolParam;
     const T = this._poolTint;
     const near = camera.near;
-    let w = 0;
+
+    // NEAREST FIRST, so the area budget below spends itself on the pools the
+    // player is standing in rather than on whichever caller happened to submit
+    // earliest. Insertion sort over at most `MAX_GROUND_POOLS` indices, into
+    // preallocated arrays (rule 5); at 32 entries this is cheaper than the
+    // comparator allocation a `sort` would need.
+    const order = this._poolOrder;
+    const key = this._poolKey;
     for (let i = 0; i < n; i++) {
       const e = this._pools[i];
+      const dx = e.x - this._camPos.x;
+      const dy = e.y - this._camPos.y;
+      const dz = e.z - this._camPos.z;
+      const d2 = dx * dx + dy * dy + dz * dz;
+      let j = i - 1;
+      while (j >= 0 && key[j] > d2) {
+        key[j + 1] = key[j];
+        order[j + 1] = order[j];
+        j--;
+      }
+      key[j + 1] = d2;
+      order[j + 1] = i;
+    }
+
+    // Budget in NDC area; the whole frame is 2 x 2 = 4.
+    const fillBudget = POOL_FILL_SCREENS * 4;
+    let fill = 0;
+    let culled = 0;
+    let w = 0;
+    for (let oi = 0; oi < n; oi++) {
+      const e = this._pools[order[oi]];
       const rad = Math.max(e.rx, e.rz) + e.height;
       _poolV.set(e.x, e.y, e.z).applyMatrix4(camera.matrixWorldInverse);
       const vz = -_poolV.z;
@@ -1637,6 +1713,15 @@ export class RenderSystem {
         y1 = Math.min(1, cy + sy * 1.06);
         if (x1 <= x0 || y1 <= y0) continue;
       }
+      // Spend the area budget. Charged BEFORE the rectangle is emitted and
+      // never partially, so the pass's worst case is one pool's rectangle over
+      // the ceiling rather than unbounded.
+      const area = (x1 - x0) * (y1 - y0);
+      if (fill + area > fillBudget) {
+        culled += n - oi;
+        break;
+      }
+      fill += area;
       const s = Math.sin(e.yaw);
       const c = Math.cos(e.yaw);
       for (let k = 0; k < 6; k++) {
@@ -1660,6 +1745,8 @@ export class RenderSystem {
       }
     }
     this._nPoolsDrawn = w / 6;
+    this._poolCulled = culled;
+    this._poolFill = fill / 4;
     if (w > 0) {
       this._aPoolPos.addUpdateRange(0, w * 3);
       this._aPoolPos.needsUpdate = true;
@@ -1693,6 +1780,12 @@ export class RenderSystem {
       lightsSubmitted: this._nReqLast ?? 0,
       groundPools: this._nPoolsDrawn ?? 0,
       pointLightCount: this._lightCountLock,
+      // Both permutation keys, so a bench can read the pair. `spotLightCount`
+      // is the number of VISIBLE spot lights in the last scene walk — the
+      // thing three bakes into every program — not a budget somebody declared.
+      spotLightCount: this._nSpotLights,
+      spotLightChanges: this._spotCountChanges,
+      groundPoolFill: +(this._poolFill ?? 0).toFixed(2),
       pointLightRaises: this._lightCountRaises,
       drawDistance: this.q.drawDistance,
       shadowDistance: this.q.shadowDistance,
@@ -2237,6 +2330,21 @@ export class RenderSystem {
       // an invisible subtree for the same reason three does. Our own ballast is
       // excluded so `_enforceLightCount` is not chasing its own tail.
       if (o.userData.owRenderBallast !== true) this._nPointLights++;
+    } else if (o.isSpotLight === true) {
+      // `NUM_SPOT_LIGHTS` IS A SECOND PERMUTATION KEY, and nothing was watching
+      // it. Only `_nPointLights` was counted, only `numPointLights` was pinned,
+      // and a wave that took the headlight pool from one host of two spot
+      // lights to three hosts of two walked straight through: the count went
+      // 2 -> 6, every lit fragment in the frame started iterating six cones,
+      // and the renderer reported nothing at all. MEASURED on the `night` shot,
+      // seven interleaved 90-frame windows, 6 lights vs 2: p50 45.6 -> 33.5 ms,
+      // six of the seven pairs positive.
+      //
+      // Counted, published in `stats`, and a CHANGE is warned about once —
+      // there is no ballast for it because `vehicles` is the only subsystem
+      // that makes one, and it owns a fixed pool. If a second one ever appears,
+      // the warning is what turns "the game got slow" into a line number.
+      this._nSpotLights++;
     }
   }
 
@@ -2257,6 +2365,7 @@ export class RenderSystem {
     this._nDirLights = 0;
     this._foreignMeshes = 0;
     this._nPointLights = 0;
+    this._nSpotLights = 0;
     if (camera !== undefined) {
       this.culler.begin(
         camera,
@@ -2962,6 +3071,18 @@ export class RenderSystem {
     for (let i = 0; i < this._ballast.length; i++) {
       const v = i < want;
       if (this._ballast[i].visible !== v) this._ballast[i].visible = v;
+    }
+
+    // The spot count has no ballast (see `_visit`), so all this can do is say
+    // when it moves. Which is the whole point: an unwatched permutation key is
+    // how six hundred milliseconds of compile arrives with no author.
+    const s = this._nSpotLights;
+    if (this._spotCountLock < 0) this._spotCountLock = s;
+    else if (s !== this._spotCountLock) {
+      if (this._spotCountChanges++ < 4) {
+        console.warn(`[render] visible spot lights ${this._spotCountLock} -> ${s}; every lit material recompiles this frame`);
+      }
+      this._spotCountLock = s;
     }
   }
 

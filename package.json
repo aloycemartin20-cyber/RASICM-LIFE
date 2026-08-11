@@ -139,7 +139,8 @@
     "plume": "node src/fx/plumeprobe.mjs",
     "bossbar": "node src/game/bossbarprobe.mjs",
     "lmsweep": "node src/world/lmsweep.mjs",
-    "credit": "node src/peds/creditprobe.mjs"
+    "credit": "node src/peds/creditprobe.mjs",
+    "slotdrive": "node src/render/slotprobe.mjs --drive"
   },
   "dependencies": {
     "three": "^0.180.0"
