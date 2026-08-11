@@ -330,6 +330,23 @@ export const LIBRARY = {
       macro: [0.09, 0.26, 0.12, 0.3],
       weather: [0.3, 0.5, 0.5, 0.4],
       grime: [0.22, 2.4, 0.9, 0.45],
+      /**
+       * GALVANISED sheet, so a rubbed arris really IS bright zinc under the
+       * spangle — this is the one corrugated surface where a light neutral wear
+       * at metalness 1 is the right answer, and it is not the one the review
+       * complained about. The RUSTED variant lives in `buildings/palette.js` and
+       * overrides both of these to iron oxide; do not "fix" the pair here.
+       *
+       * Why the rusted sheet is a palette variant rather than a library entry
+       * beside `mill_steel_rusted`: a library key gets its own BAKE, because
+       * `_bakeKey` is keyed by name — MEASURED on `--shot=mill`, a second
+       * corrugated set costs 16.8 MiB of a frame already carrying 703 MiB in 77
+       * sets against a 640 MiB soft cap. The bake would buy a different dent
+       * field, and it does not even buy that: `uvMode` defaults to planar WORLD
+       * projection, so two sheets on two buildings already sample different
+       * parts of the texture. `mat` params merge `{...def.mat, ...opts}`, so the
+       * palette can carry the whole difference for nothing.
+       */
       wearColor: 0x9aa0a4,
       wearMaterial: [0.32, 1.0, 0, 0.85],
     },
@@ -1547,6 +1564,18 @@ Object.assign(LIBRARY, {
       roughness: [0.98, -0.01, 0.14],
     },
   },
+  /**
+   * The variant whose paint has gone entirely: gantries, hoppers, the furnace
+   * shell. It used to take `mill_steel`'s wear pair verbatim through `$ref`,
+   * which is a light neutral at metalness 1 — right for painted steel rubbed
+   * back to bright metal, and wrong here for the same reason it was wrong on
+   * `metal_rust` (see the note there, and `src/materials/millstat.mjs`, which
+   * measures this off the frame rather than off these numbers).
+   *
+   * `bridge_steel` and `plate_steel` deliberately KEEP the inherited pair:
+   * green over red lead still mostly holding, and bare plate with mill scale,
+   * are both surfaces where wear really does expose bright metal.
+   */
   mill_steel_rusted: {
     glsl: MILL_STEEL,
     surface: 'metal',
@@ -1554,7 +1583,11 @@ Object.assign(LIBRARY, {
       size: 1024, worldSize: 2.0, relief: 0.060, seed: 79,
       tintA: 0x5a4a3a, param: [1, 0.95, 0.10, 0.15],
     },
-    mat: { $ref: 'mill_steel' },
+    mat: {
+      $ref: 'mill_steel',
+      wearColor: 0x6e3a1e,
+      wearMaterial: [0.86, 0.0, 0, 0.6],
+    },
   },
   /** Bridge green over red lead, still mostly holding. */
   bridge_steel: {

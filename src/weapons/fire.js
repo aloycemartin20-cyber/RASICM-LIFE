@@ -63,9 +63,16 @@ export class FireField {
     /* Preallocated — a fire ticks every frame and may not allocate (rule 5). */
     this._point = new THREE.Vector3();
     this._incident = new THREE.Vector3(0, 1, 0);
+    /**
+     * `source` NAMES THE ACTOR, NOT THE MECHANISM. It used to say `'fire'`,
+     * which is neither: `burn` already says how, and `ui` / `audio` read
+     * `source` to decide whether the player earned the hitmarker and the tick.
+     * A flare is fired from the player's own arsenal — `weapons` has no other
+     * user — so the man who lit it is the man who owns the burn.
+     */
     this._payload = {
       target: null, amount: 0, headshot: false, part: 'torso', killed: false,
-      point: this._point, incident: this._incident, source: 'fire', burn: true,
+      point: this._point, incident: this._incident, source: 'player', burn: true,
     };
     this._cursor = 0;
     this.stats = { lit: 0, ticks: 0, burned: 0 };

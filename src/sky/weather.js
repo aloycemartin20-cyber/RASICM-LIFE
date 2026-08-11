@@ -115,16 +115,39 @@ export const WEATHER_STATES = {
    * completely soft: no key, no shadows worth the name, everything lit by a
    * bright grey dome. Turbidity up because the mill haze has nothing to burn off
    * it. This is the Pittsburgh default and it is a LOOK, not an absence of one.
+   *
+   * "A LOOK, NOT AN ABSENCE OF ONE" WAS A CLAIM THIS VECTOR COULD NOT KEEP.
+   *
+   * With `cloudDetail` at 0.72 the deck photographed as a flat white card —
+   * measured over 45 000 px of sky in the `mill` shot at sd 2.22, 0.75 of it
+   * after a high-pass. The cause was in `clouds.js`, not here (a coverage of
+   * 0.98 saturated the density threshold, which in turn zeroed the erosion
+   * term), and it is fixed there. But the vector was authored AGAINST the
+   * broken shader — every knob below that governs base structure had been
+   * turned down, because turning it up did nothing:
+   *
+   *   cloudDetail  0.72 -> 0.95   erosion is live again, and a stratocumulus
+   *                               base is the lumpiest thing in the sky
+   *   cloudShear   0.10 -> 0.24   the base rolls downwind of the top. 0.10 is
+   *                               a fair-weather number on a 6 m/s wind
+   *   cloudStratus 0.86 -> 0.80   Pittsburgh's overcast is stratoCUMULUS, not
+   *                               a featureless stratus lid: keep a fifth of
+   *                               the cumuliform profile in the mix
+   *   cloudDensity 5.60 -> 6.60   the new mapping averages ~0.57 of the old
+   *                               saturated depth, so the deck is held at the
+   *                               same opacity. Without this the thinnest
+   *                               cells pass ~20% of the sky behind them, and
+   *                               an overcast with blue in it is not one
    */
   overcast: {
     cloudCoverage: 0.98,
-    cloudDensity: 5.60,
+    cloudDensity: 6.60,
     cloudAbsorb: 1.45,
     cloudBaseKM: 0.80,
     cloudTopKM: 1.95,
-    cloudStratus: 0.86,
-    cloudShear: 0.10,
-    cloudDetail: 0.72,
+    cloudStratus: 0.80,
+    cloudShear: 0.24,
+    cloudDetail: 0.95,
     cirrusCoverage: 0.05,
     cirrusOpacity: 0.10,
     turbidity: 2.30,

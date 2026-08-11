@@ -135,7 +135,35 @@ export const SURFACES = {
   rust: V('metal_rust', { ...M, scale: 1.2 }),
   rust_deep: V('metal_rust', { ...M, scale: 1.5, tint: 0x9a6238 }),
   corrugated: V('corrugated', { ...M, scale: 2.4, tint: 0x9aa1a4 }),
-  corrugated_rust: V('corrugated', { ...M, scale: 2.4, tint: 0xa0714c }),
+  /**
+   * A REAL rusted variant, not `corrugated` under a brown multiply.
+   *
+   * It used to be tint-only, and a tint cannot fix it: `alb *= owTintCol` runs
+   * AFTER the wear mix (`materials/shader.js:802,858`), so the brown recoloured
+   * the neutral wear layer while leaving its ROUGHNESS 0.32 and METALNESS 1.0
+   * untouched. Every silo, stack and hangar wall the kit paints a 0.6-0.85 wear
+   * mask on (`buildings/landmarks.js`, `airfield.js`) was therefore a polished
+   * mirror returning the sky through a rust filter — the same defect
+   * `metal_rust` was corrected for, and the reason `millstat.mjs` exists.
+   *
+   * The pair below is the one `metal_rust` was measured to: oxide colour,
+   * metalness 0 because Fe2O3 is a dielectric, roughness 0.86 because corrosion
+   * product is powder, and the tint amount pulled back to 0.6 so the baked
+   * spangle, dents and perforations survive under the mask. MEASURED on
+   * `--shot=mill`, over the pixels that actually move between the two pairs
+   * (2299 of them against a 93 px two-frame noise floor): the wear layer stops
+   * returning the sky, and on a lit close-up of the same geometry g-b goes
+   * -0.1 -> +1.3 with the colder-than-neutral share 41.2% -> 37.9%.
+   *
+   * Tint unchanged, so the delta is the wear pair and nothing else.
+   */
+  corrugated_rust: V('corrugated', {
+    ...M,
+    scale: 2.4,
+    tint: 0xa0714c,
+    wearColor: 0x6e3a1e,
+    wearMaterial: [0.86, 0.0, 0, 0.6],
+  }),
 
   // ----------------------------------------------------------- roofs ------
   roof_tar: V('asphalt', { ...M, scale: 2.2, tint: 0x8b8781, weather: [0.55, 0.15, 0.1, 0.4] }),

@@ -63,10 +63,23 @@
  *   `maxBodies` rather than taken out of the crowd's share, so a wave of goons
  *   does not silently demote the street around them to capsules.
  *
+ * ---------------------------------------------------------------------------
+ * AND A WALL HAS TO STOP HIS ROUNDS, NOT JUST HIS FEET
+ * ---------------------------------------------------------------------------
+ * The controller above fixed where a goon can WALK. It did nothing about where
+ * he can SHOOT, and the only gate before `_strike` was a distance test — so a
+ * rifleman at 30 m put a round through a brick wall every 1.3 s and the reflex
+ * move was still worth nothing. `police` has refused to fire without
+ * `sys.rayVisible()` since it was written (`src/police/officer.js:236`); this
+ * file now mirrors it, retry cadence included.
+ *
  * THE GATE: `node src/peds/coverprobe.mjs`. It spawns a hostile on one side of
  * a building proven solid by an independent geometric footprint (rasterised off
  * the DRAWN mesh, never off the collider this file resolves against) and
- * asserts the path never enters it and never leaves the ground band.
+ * asserts the path never enters it, never leaves the ground band, and that not
+ * one point of damage crosses the wall — that last one against `debugIgnoreLos`
+ * as its own negative control, so a silent goon is proven to be blocked rather
+ * than merely unarmed.
  */
 
 import * as THREE from 'three';
@@ -94,6 +107,35 @@ export const HOSTILE_BODIES = 10;
  * as men off this street rather than as a uniform.
  */
 const GOON_SHAPES = ['jacketM', 'hoodieM', 'hoodedM', 'puffaM', 'workM', 'millM'];
+
+/**
+ * A blocked shot is retried at this cadence rather than at the weapon's.
+ * Mirrors `TUNE.fire.losRetry` in `src/police/tune.js` (0.45 s) and exists for
+ * the same reason: a man who cannot see you has to keep LOOKING, at a rate
+ * cheap enough to run on every hostile in a wave — one `raycastAny` each, ~3 Hz
+ * — and quick enough that stepping out of cover is answered inside a third of a
+ * second instead of at the end of a whole fire cycle.
+ */
+const LOS_RETRY = 0.35;
+
+/**
+ * Below this the two men are within arm's length: it is a punch, not a shot,
+ * and there is no wall you can stand behind at that range. The melee default
+ * `hostileRange` is 2.6 m, so one constant skips the ray for every hands-on
+ * enemy without naming him.
+ */
+const LOS_MIN = 2.6;
+
+/**
+ * Where a ranged enemy who cannot see you walks to.
+ *
+ * He has no firing position, so he keeps coming — round the corner, into the
+ * doorway — instead of holding his stand-off distance aiming at brickwork. The
+ * gate above only ever fires when the ray is BLOCKED, which before this change
+ * never happened at all; without it "cover works" would have shipped as "a wave
+ * that loses sight of you freezes", which is a different kind of broken.
+ */
+const LOS_PUSH = 6;
 
 /** Defaults, one for one with the numbers `game/hostiles.js` shipped. */
 const DEF = {
@@ -123,8 +165,18 @@ export class PedHostiles {
 
     this.kills = 0;
 
+    /**
+     * NEGATIVE CONTROL, ARMED ON THE LIVE CODE — same shape as the
+     * `debugIgnorePause` switches in `game` and `weapons`. `coverprobe` flips
+     * this to prove that the wall is what stopped the rounds, and not the
+     * harness failing to arm the goon. Never set in play.
+     */
+    this.debugIgnoreLos = false;
+
     /* ---- scratch: nothing below may allocate per frame ---- */
     this._spawn = new THREE.Vector3();
+    this._losA = new THREE.Vector3();
+    this._losB = new THREE.Vector3();
     this._tracer = { from: new THREE.Vector3(), to: new THREE.Vector3(), speed: 420 };
     this._dmg = {
       target: null, amount: 0, headshot: false, killed: false,
@@ -220,6 +272,8 @@ export class PedHostiles {
     ped.homeZ = this._spawn.z;
     ped.attackCd = 1.2 + rng.float() * 1.4;
     ped._hostileCounted = false;
+    // Nothing between him and you until a ray says otherwise. See `_canSee`.
+    ped._losClear = true;
     // His own face target, allocated once per pooled body. A shared scratch
     // vector would work only for as long as every hostile in the world is
     // looking at the same man, which is a coincidence and not a contract.
@@ -229,6 +283,24 @@ export class PedHostiles {
     ped._hostZ = this._spawn.z;
 
     this._attachController(ped);
+    /**
+     * HIT CAPSULES ARE NOT THE SKINNED BODY'S — see `Ped.detachBody`.
+     *
+     * A pedestrian gets his colliders from `attachBody`, which is right for the
+     * crowd: a stranger past the skinned ring is also past the range anyone
+     * aims at one. A mission enemy is not a stranger. `tracks.js` spawns every
+     * wave at 45-150 m against a body ring of 49 m on ultra and 81 m on high,
+     * so a goon the player could see, aim at and hear was PHYSICALLY
+     * BULLETPROOF — measured `ped.colliders.length` 4 at 10/30/50/70 m and 0 at
+     * 100 and 140 m, alive at every one of them.
+     *
+     * They are made here, once, and driven off the ped transform for as long as
+     * he has no bones. Made AFTER `spawn()` because the capsule radii are
+     * scaled by `ped.scale`, and synced immediately because an unsynced capsule
+     * sits at the world origin catching rounds until the first `lateUpdate`.
+     */
+    ped._makeColliders();
+    ped.syncColliders();
     this.live.push(ped);
     return ped;
   }
@@ -387,7 +459,11 @@ export class PedHostiles {
     ped._faceAt.set(tx, ped.position.y + 1.1, tz);
     ped.faceTarget = ped._faceAt;
 
-    const stop = ped.ranged ? Math.min(ped.hostileRange * 0.6, 18) : ped.hostileRange;
+    // A rifleman holds his stand-off — unless he cannot see you, in which case
+    // he has no stand-off to hold and closes to `LOS_PUSH` looking for a line.
+    const stop = ped.ranged
+      ? (ped._losClear ? Math.min(ped.hostileRange * 0.6, 18) : LOS_PUSH)
+      : ped.hostileRange;
 
     /* --- leashed enemies hold the ground the chapter is about --- */
     const hx = ped.homeX - ped.position.x;
@@ -404,14 +480,61 @@ export class PedHostiles {
       ped.desiredSpeed = 0;
     }
 
-    // Hands up when he is shooting, down when he is closing. The same aim layer
-    // `crew.js` and the officer pool use.
-    ped.animator?.setAct('film', ped.ranged && d <= ped.hostileRange ? 0.9 : 0);
+    // Hands up when he is shooting, down when he is closing — and down when a
+    // wall is in the way, so a blocked ray reads on the man rather than only in
+    // the damage that never arrives. The same aim layer `crew.js` and the
+    // officer pool use.
+    ped.animator?.setAct('film',
+      ped.ranged && d <= ped.hostileRange && ped._losClear ? 0.9 : 0);
 
     ped.attackCd -= dt;
     if (!targetAlive || ped.attackCd > 0 || d > ped.hostileRange) return;
+
+    /**
+     * THE ONE GATE THIS FILE WAS MISSING. Distance was the whole test, so a
+     * goon shot through brickwork, floors and parked traffic; putting a
+     * building between yourself and him — the reflex move — bought nothing at
+     * all. `police` has never fired without this check, and the shape here is
+     * its shape: on a blocked ray, back off to the retry cadence and return
+     * without spending the fire cycle, so he re-tests three times a second and
+     * opens up the instant you lean out.
+     */
+    if (ped.ranged && d > LOS_MIN && !this._canSee(ped, anchor)) {
+      ped._losClear = false;
+      ped.attackCd = LOS_RETRY;
+      return;
+    }
+    ped._losClear = true;
+
     ped.attackCd = ped.ranged ? 1.05 + this.rng.float() * 0.5 : 1.35 + this.rng.float() * 0.4;
     this._strike(ped, anchor, d);
+  }
+
+  /**
+   * Nothing solid between his shoulder and your chest.
+   *
+   * The ray leaves from exactly where `_strike` puts the tracer, so what is
+   * tested is the line the player watches the shot travel down — not a
+   * convenient pair of centres that agrees with nothing on screen. `MASK.SIGHT`
+   * is statics, props and debris: glass and foliage do not stop a man seeing
+   * you, and neither does the crowd he is standing in.
+   *
+   * A missing or throwing `physics` answers TRUE. Every offline rig in this
+   * tree builds a partial engine, and a goon who can never shoot is a worse
+   * failure mode than one who occasionally shoots through a wall the bench
+   * never built.
+   */
+  _canSee(ped, anchor) {
+    if (this.debugIgnoreLos) return true;
+    const phys = this.phys;
+    if (!phys?.lineOfSight) return true;
+    this._losA.set(ped.position.x, ped.position.y + 1.45 * ped.scale, ped.position.z);
+    this._losB.set(anchor.x, anchor.y + 1.1, anchor.z);
+    try {
+      return phys.lineOfSight(this._losA, this._losB, phys.MASK?.SIGHT) === true;
+    } catch {
+      return true;
+    }
   }
 
   _strike(ped, anchor, d) {

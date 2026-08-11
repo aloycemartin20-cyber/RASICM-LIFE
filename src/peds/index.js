@@ -1411,6 +1411,11 @@ export class PedSystem {
         p._seatPose(true);
         if (p.alive) this.far.addSeated(p);
       } else {
+        // A ped who kept his hit capsules without a body drives them off his
+        // own transform — `Ped.syncColliders`. Free for the crowd, which has
+        // none out here, and it is what makes a mission enemy at 140 m as
+        // shootable as the far-LOD figure the player is aiming at.
+        p.syncColliders();
         // far LOD: advance the stride phase from real ground speed, exactly as
         // the skinned animator does, so a ped that walks into body range does
         // not pop mid-step

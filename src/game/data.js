@@ -138,10 +138,25 @@ export const SHOPS = [
   { id: 'shop_food2', name: 'Incline Diner', x: -560, z: 504, kind: 'food', price: 45 },
 ];
 
+/**
+ * The three working slips.
+ *
+ * `x`/`z` is the PIER HEAD and is over water on purpose: a boat delivery ends
+ * at the pier, `findWaterSpot` moors against it, and the objective marker
+ * belongs on the surface there. `stage` is the dry apron behind it — where a
+ * chapter that names a dock actually plays out, because a `protect` ward, a
+ * wave of hostiles and a parked car all need ground.
+ *
+ * Both are authored, and both are gated: `src/game/groundtruthprobe.mjs`
+ * measures every `stage` against the emitted terrain and road graph over six
+ * rng seeds. MEASURED before the split — `dock_south` was 8.8 m under the
+ * Monongahela, with zero dry samples in the 5-12 m annulus `protect` stages
+ * in, which is what made Carson CH 6 unplayable.
+ */
 export const DOCKS = [
-  { id: 'dock_south', name: 'South Side Docks', x: -88, z: 280, worldId: 'dk_south' },
-  { id: 'dock_north', name: 'North Shore Slip', x: -24, z: -264, worldId: 'dk_north' },
-  { id: 'dock_point', name: 'Point Marina', x: -744, z: -88, worldId: 'dk_point' },
+  { id: 'dock_south', name: 'South Side Docks', x: -88, z: 280, stage: { x: -100, z: 212 }, worldId: 'dk_south' },
+  { id: 'dock_north', name: 'North Shore Slip', x: -24, z: -264, stage: { x: 12, z: -260 }, worldId: 'dk_north' },
+  { id: 'dock_point', name: 'Point Marina', x: -744, z: -88, stage: { x: -724, z: -164 }, worldId: 'dk_point' },
 ];
 
 export const AIRPORTS = [
@@ -203,7 +218,27 @@ export const HIDDEN_PACKAGES = [
   { id: 'pk12', x: 488, z: 832 },
 ];
 
-/** Race circuits. Checkpoint loops that use bridges. */
+/**
+ * Race circuits. Checkpoint loops that use bridges.
+ *
+ * A GATE IS A FLAT 2D RADIUS (`R.checkpoint`, 26 m), so a checkpoint further
+ * than that from any lane is a checkpoint no car can pass and the circuit is
+ * unfinishable. Five of these were authored in a river: THE TRIANGLE's 1, 5
+ * and 6 sat 8.7-11.0 m under the Monongahela and the Allegheny, and SOUTH
+ * RUN's 3 and 5 — Dylan CH 1, the first chapter of his campaign — sat 6.6 and
+ * 9.3 m under the Mon. They are now on the DECKS of the bridges the blurbs
+ * already claimed the circuits used, mid-span where the crossing is the point.
+ *
+ * `points[0]` is also the start line (`mission.startLineOf`), and that one has
+ * to be on LAND: `race.init` spawns the three rivals with `findRoadSpot` in an
+ * 18-60 m ring around it, and every metre of that ring is river when the gate
+ * is mid-span. THE TRIANGLE's list is therefore rotated — the same loop, begun
+ * downtown.
+ *
+ * `src/game/groundtruthprobe.mjs` measures every point here against the
+ * emitted road graph over six rng seeds, and carries the five river gates as
+ * its negative control.
+ */
 export const RACE_TRACKS = {
   triangle: {
     id: 'triangle',
@@ -213,8 +248,8 @@ export const RACE_TRACKS = {
     par: 175,
     reward: 1200,
     points: [
-      { x: -224, z: 208 }, { x: 96, z: 104 }, { x: 312, z: -120 },
-      { x: 32, z: -248 }, { x: -368, z: -152 }, { x: -552, z: 96 },
+      { x: 96, z: 104 }, { x: 312, z: -120 }, { x: 32, z: -248 },
+      { x: -436, z: -128 }, { x: -396, z: 168 }, { x: -108, z: 312 },
     ],
   },
   riverloop: {
@@ -225,7 +260,7 @@ export const RACE_TRACKS = {
     par: 108,
     reward: 900,
     points: [
-      { x: 480, z: 240 }, { x: 784, z: 416 }, { x: 920, z: 128 },
+      { x: 480, z: 240 }, { x: 792, z: 400 }, { x: 904, z: 120 },
       { x: 680, z: -160 }, { x: 384, z: -32 },
     ],
   },
@@ -237,8 +272,8 @@ export const RACE_TRACKS = {
     par: 95,
     reward: 750,
     points: [
-      { x: -160, z: 480 }, { x: 176, z: 632 }, { x: 528, z: 720 },
-      { x: 312, z: 448 }, { x: -16, z: 384 },
+      { x: -160, z: 480 }, { x: 176, z: 632 }, { x: 563, z: 731 },
+      { x: 312, z: 420 }, { x: -120, z: 356 },
     ],
   },
 };
@@ -584,7 +619,12 @@ export const BOSSES = {
     hp: 1400, phases: 3, kind: 'brute', color: '#1d6f6a', scale: 1.35,
     weak: 'Armour plate is bolted to his chest — hit him from behind',
     attacks: ['slam', 'sweep', 'charge'], minions: [3, 4, 5],
-    arena: { x: -744, z: -88, r: 176 },
+    // The Point Marina APRON, not the pier head 76 m out in the Ohio. `boss.js`
+    // stages a brute with `findGroundSpot` around this centre and teleports the
+    // player 25-60 m off him; the authored coordinate was 8.3 m under the
+    // water, so Carson CH 7 put both of them on the riverbed. The 176 m leash
+    // still covers the whole marina, water included.
+    arena: { x: -724, z: -164, r: 176 },
   },
   brick: {
     id: 'brick',
@@ -608,7 +648,10 @@ export const BOSSES = {
     hp: 1500, phases: 3, kind: 'driver', color: '#5b21b6', scale: 1,
     weak: 'Front is plated — wreck the rear wheels',
     attacks: ['ram', 'spread', 'smoke'], minions: [3, 4, 4],
-    arena: { x: -240, z: -280, r: 240 },
+    // North Shore bank by the Sixth Street approach. The authored centre was
+    // 6.0 m under the Allegheny — survivable only because a `driver` boss
+    // spawns on a road, which is luck, not design.
+    arena: { x: -224, z: -344, r: 240 },
   },
 };
 

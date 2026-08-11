@@ -6,12 +6,6 @@
  * to remaining health, a weak point the brothers call out over the radio, a
  * telegraphed attack set, and a minion wave per phase.
  *
- * `ui` has no dedicated boss bar, and inventing one would mean adding HUD
- * drawing outside this module. The objective panel already carries an eyebrow, a
- * line, a count and a 0..1 progress bar, so the boss drives that: name on top,
- * the weak point as the line, phase as the count, and damage dealt as the bar.
- * It reads correctly and costs `ui` nothing.
- *
  * The telegraph is the whole design: every attack announces itself for ~0.8 s
  * (less as phases escalate), and that window is when you move. Without it a
  * brute that closes and hits is just damage on a timer.
@@ -19,10 +13,40 @@
  * Killing the boss is not the end of the chapter — his death flips the fight
  * into the ESCAPE phase (wanted 4, ally radio call, win at zero stars). See
  * `_escape`.
+ *
+ * ---------------------------------------------------------------------------
+ * THE BOSS BAR, AND WHY IT IS NOT THE OBJECTIVE PANEL ANY MORE
+ * ---------------------------------------------------------------------------
+ * This header used to say: *`ui` has no dedicated boss bar, and inventing one
+ * would mean adding HUD drawing outside this module. The objective panel
+ * already carries an eyebrow, a line, a count and a 0..1 progress bar, so the
+ * boss drives that.* Both halves of that were wrong by the time it was read.
+ *
+ * `ui` DOES take extra HUD widgets — the registry (`src/ui/hud.js`,
+ * `static deps = ['ui','game']`) is the sanctioned way to add one without
+ * editing `src/ui/index.js` — so nothing had to be invented. And the panel
+ * substitute did not read: a `1 - hpFrac` progress bar FILLS UP as the boss
+ * goes DOWN, which is the same inversion `protect` shipped with (a bar that
+ * rose while the man it was about was dying), and it shared its one line with
+ * the attack telegraph, so during the moment that matters most the panel was
+ * showing "SLAM — MOVE" instead of his health.
+ *
+ * So the fight publishes its own state on `mission:boss` and `ui` draws it.
+ * The objective panel keeps the telegraph, which is what it is good at.
+ *
+ * ---------------------------------------------------------------------------
+ * THE FLANK
+ * ---------------------------------------------------------------------------
+ * Every boss's `weak` string tells you where to stand — *"Armour plate is
+ * bolted to his chest — hit him from behind"*, *"Front is plated — wreck the
+ * rear wheels"* — and nothing read it. All four fights took identical damage
+ * from every bearing, so the one piece of coaching the game gives you was
+ * false and the optimal play was to stand still and hold the trigger. See
+ * `_flank`.
  */
 
 import { BOSSES, R, BOY_ORDER } from './data.js';
-import { clamp01, dist, driveToward } from './util.js';
+import { clamp01, dist, driveToward, wrapAngle, yawOf } from './util.js';
 
 /**
  * Beats after the boss drops, the fight is not over — the kill flips to an
@@ -39,6 +63,54 @@ const TELL_NAME = {
   ram: 'RAM', spread: 'SPREAD', smoke: 'SMOKE',
 };
 
+/**
+ * THE FLANK, PRICED.
+ *
+ * `FRONT_ARC` is the half-angle of the plated cone measured off his facing;
+ * beyond `REAR_ARC` you are behind him and every point lands. In between it
+ * ramps, so there is no line on the ground to stand exactly on.
+ *
+ * `FRONT_TAKE` 0.45 is the tuning, and it is deliberately not brutal: a
+ * frontal assault costs a bit over twice the ammunition and time, which is a
+ * fight that is HARDER from the front rather than a wall you cannot climb.
+ * A boss you simply could not hurt head-on would make the first thirty seconds
+ * of every one of these chapters read as a bug.
+ *
+ * MEASURED on the emitted health (`src/game/bossbarprobe.mjs`): identical
+ * damage applied from behind takes 2.22x as much off him as the same damage
+ * from dead ahead, and a purely frontal fight still kills all four bosses.
+ */
+const FRONT_ARC = 1.22;   // rad, ~70 deg either side of his nose
+const REAR_ARC = 1.92;    // rad, ~110 deg — past the shoulder, you are behind
+const FRONT_TAKE = 0.45;
+
+/**
+ * What the boss bar is drawn from, published on `mission:boss`.
+ *
+ * ONE object, mutated in place and emitted every frame of the fight — rule 5
+ * does not stop at the renderer, and a fresh literal per frame for the whole
+ * of a three-minute chapter is exactly the allocation that rule is about.
+ * There is one `MissionRunner` and one live `M`, so there can never be two
+ * fights wanting two records; listeners must read it and not retain it, which
+ * is the same contract `peds.crewState()` publishes under.
+ */
+const HUD = {
+  id: '', name: '', weak: '', colour: '#ff3b4e',
+  phase: 0, phases: 1, health: 1, active: false,
+};
+
+function publish(g, B, phase, health, active) {
+  HUD.id = B.id;
+  HUD.name = B.name;
+  HUD.weak = B.weak;
+  HUD.colour = B.color;
+  HUD.phase = phase;
+  HUD.phases = B.phases;
+  HUD.health = health;
+  HUD.active = active;
+  g.ctx?.events?.emit('mission:boss', HUD);
+}
+
 export const bossTrack = {
   init(M, c, g) {
     const B = BOSSES[c.bossId];
@@ -49,6 +121,8 @@ export const bossTrack = {
     // integer over it takes `missions.running` false for the whole chapter —
     // silently, in five other subsystems at once. See `MissionRunner._begin`.
     M.bossPhase = 0;
+    /** The health `_flank` last agreed with. Seeded so frame one prices too. */
+    M.bossHp = B.hp;
     M.minionT = 5;
     M.tell = '';
     M.tellT = 0;
@@ -109,6 +183,10 @@ export const bossTrack = {
     const alive = veh ? !veh.destroyed : !!ent && !ent.dead;
     if (!alive) return this._escape(M, dt, g);
 
+    // BEFORE the health is read: the bearing prices whatever landed since the
+    // last frame, and the phase, the bar and the wave all key off the result.
+    this._flank(M, g, veh, ent);
+
     const hpFrac = veh
       ? clamp01(veh.health / veh.maxHealth)
       : clamp01(ent.health / ent.maxHealth);
@@ -135,8 +213,13 @@ export const bossTrack = {
     }
 
     g.marker(M, 0, bx, bz, B.name, 'B');
+    // The panel keeps the TELEGRAPH — the thing that changes what you do in the
+    // next second — and hands the health to the boss bar. Its progress slot is
+    // -1 (no bar) rather than `1 - hpFrac`, which drew a meter filling UP as he
+    // went down.
     g.objective(M, M.tell ? `${M.tell} — MOVE` : B.weak, null,
-      `Phase ${phase + 1} of ${B.phases}`, 1 - hpFrac, B.name);
+      `Phase ${phase + 1} of ${B.phases}`, -1, B.name);
+    publish(g, B, phase, hpFrac, true);
 
     // ---- leash ----------------------------------------------------------
     const away = dist(g.px, g.pz, B.arena.x, B.arena.z);
@@ -147,6 +230,74 @@ export const bossTrack = {
 
     if (veh) this._driver(M, dt, g, B, phase, veh);
     else this._melee(M, dt, g, B, phase, ent);
+  },
+
+  /* ------------------------------------------------------------- flank -- */
+
+  /**
+   * Price the bearing on the health he ACTUALLY LOST since the last frame.
+   *
+   * WHY IT IS DONE HERE AND NOT AT THE WEAPON. Damage reaches a boss down four
+   * separate paths — rounds through `peds.hurtHostile`, swings through the
+   * melee riposte, `explosion` through the blast pool, and a car through
+   * `vehicles.damage()` — and only some of them raise a `damage:dealt` this
+   * module could listen for. His health is the one artefact all four end up
+   * writing, so that is what is read (rule 12: the emitted quantity, not an
+   * intermediate). It also means a weapon added tomorrow is priced without
+   * anyone remembering this file exists.
+   *
+   * The bearing is the PLAYER's, not the impact point's: cover, ricochet and
+   * splash all move where a round lands, and "get behind him" is an
+   * instruction about where the man stands.
+   *
+   * ONE HONEST LIMIT, because it is a real difference and not a rounding one:
+   * the reduction is applied to damage `peds` has already taken off, so a
+   * single blow larger than his remaining priced health kills him one hit
+   * early. The largest single hit in the game is 90 actor points against
+   * bosses of 900-1600, so that is the last six per cent of one swing at the
+   * very end of a long fight — and closing it would mean un-killing a hostile
+   * the `peds` system has already flagged dead, which is worth far more than
+   * the six per cent.
+   */
+  _flank(M, g, veh, ent) {
+    const now = veh ? veh.health : ent.health;
+    if (!Number.isFinite(now)) return;
+    const prev = M.bossHp;
+    // First frame of the fight, or a heal: adopt and wait for real damage.
+    if (!Number.isFinite(prev) || now >= prev) {
+      M.bossHp = now;
+      return;
+    }
+    const take = this._takeFor(g, veh, ent);
+    const kept = (prev - now) * (1 - take);
+    if (kept <= 0) {
+      M.bossHp = now;
+      return;
+    }
+    const max = veh ? veh.maxHealth : ent.maxHealth;
+    const back = Math.min(max, now + kept);
+    M.bossHp = back;
+    // Write the priced value back so every OTHER reader — the phase gate, the
+    // bar, the kill drop, `peds`' own death test — agrees about how hurt he is.
+    // Two subsystems keeping their own boss health is the defect this whole
+    // file exists downstream of.
+    if (veh) veh.health = back;
+    else ent.health = back;
+  },
+
+  /** 0..1 of the damage that survives, from the player's bearing on him. */
+  _takeFor(g, veh, ent) {
+    const bx = veh ? veh.position.x : ent.position.x;
+    const bz = veh ? veh.position.z : ent.position.z;
+    const facing = veh ? yawOf(veh) : (ent.yaw ?? 0);
+    // Both angles in the same convention as `driveToward`: atan2(dx, dz), +z
+    // forward, so a zero difference is the player standing on his nose.
+    const toPlayer = Math.atan2(g.px - bx, g.pz - bz);
+    const off = Math.abs(wrapAngle(toPlayer - facing));
+    if (off <= FRONT_ARC) return FRONT_TAKE;
+    if (off >= REAR_ARC) return 1;
+    const t = (off - FRONT_ARC) / (REAR_ARC - FRONT_ARC);
+    return FRONT_TAKE + (1 - FRONT_TAKE) * t * t * (3 - 2 * t);
   },
 
   /* ----------------------------------------------------- escape phase -- */
@@ -166,6 +317,9 @@ export const bossTrack = {
       g.say(ally, c.escapeLine ?? 'They called in the crooked cops — lose the heat!');
       g.notify(M.B.name, 'DOWN — NOW LOSE THE HEAT', 'gold');
       g.wq.uiSfx('kill', 1);
+      // Empty, then gone. The bar's last frame reads zero rather than
+      // vanishing at whatever it happened to be showing.
+      publish(g, M.B, M.B.phases - 1, 0, false);
     }
     M.escapeGrace -= dt;
     const w = g.heat.wanted;

@@ -43,6 +43,35 @@ const WALL_CLOCK_BUILD =
 const LAMP_RANK_KEY =
   typeof location !== 'undefined' &&
   new URLSearchParams(location.search).get('owLampRankKey') === '1';
+
+/**
+ * How much of `q.lightSlots` the street may hold, and why it is not all of it.
+ *
+ * `render._assignLightSlots` never evicts a same-band incumbent: a newcomer at
+ * the same priority whose slots are all held simply goes unlit and rides its
+ * emissive shell. Lamps submit at priority 2, and so does most of what a night
+ * street throws — `weapons/ballistics.js` submits THREE requests per rocket in
+ * flight (flare 2, motor 2, coil 1). So a pool held end to end by practicals is
+ * a rocket over a lamp-lined avenue that lights nothing, and the lamp is the
+ * one emitter of the pair that has a good emissive fallback.
+ *
+ * Hence a fixed RESERVE rather than a fraction: three slots stay out of the
+ * street's reach wherever the budget allows it, which is 5 lamps at the 8-slot
+ * tiers and 3 at 4-6 — the floor, because below three the road under the camera
+ * is carried by the additive fill alone (see `sodium_glow` in palette.js).
+ */
+const LAMP_SLOT_RESERVE = 3;
+const LAMP_SLOTS_MIN = 3;
+const LAMP_SLOTS_MAX = 5;
+
+/**
+ * One cobra head as a punctual light: candela-ish at `_litMix` 1, and the
+ * metres past which it is cut off. The range is also the candidate radius —
+ * see `_submitLamps`.
+ */
+const LAMP_INTENSITY = 46;
+const LAMP_RANGE = 26;
+
 /** True when streamed construction must resolve identically every run. */
 const detBuild = (ctx) => ctx.config.deterministic === true && !WALL_CLOCK_BUILD;
 
@@ -618,8 +647,13 @@ export class PropSystem {
       const d = m.userData.owEmissive;
       if (!d) continue;
       if (d.additive) {
-        // The pool on the road: nothing at all by day, a hint at midnight.
-        m.opacity = (d.peak ?? 0.055) * mix * mix;
+        // The pool on the road: nothing at all by day, and at midnight the only
+        // thing lighting the carriageway past the punctual lamps. `peak` is
+        // half of its brightness — the vertex ramp in `kit_street.js` is the
+        // other half, and the two are documented together on `sodium_glow` in
+        // palette.js. `base` / `night` belong to the branch below and this
+        // branch has never read them.
+        m.opacity = (d.peak ?? 0.045) * mix * mix;
         m.visible = mix > 0.08;
       } else {
         m.emissiveIntensity = d.base + d.night * mix;
@@ -629,14 +663,23 @@ export class PropSystem {
   }
 
   /**
-   * THE TWO OR THREE NEAREST LAMPS ARE REAL LIGHTS.
+   * THE NEAREST FEW LAMPS ARE REAL LIGHTS, and how few is a function of the
+   * QUALITY BUDGET rather than a constant.
+   *
+   * It was `Math.min(3, ...)` on every tier, which made `q.lightSlots` a lie
+   * for the one emitter that has thousands of candidates: raising the preset
+   * from 4 slots to 8 bought the street nothing at all, because the cap and not
+   * the pool was the binding constraint. It now scales — see `LAMP_SLOTS_MAX`
+   * and the reserve above — with the same distance scoring and the same keys.
    *
    * Every other lamp in the city is emissive plus bloom, which is the only way
    * a night city fits inside `q.lightSlots`. But an emissive lens cannot put a
    * pool on the road, and "wet asphalt that mirrors the sodium lamps" is the
    * money shot in DESIGN.md. `render.submitLight` scores requests into a FIXED
    * pool every frame, so this cannot move the visible-light count and cannot
-   * trigger the shader-permutation recompile that a per-lamp PointLight would.
+   * trigger the shader-permutation recompile that a per-lamp PointLight would —
+   * and the slot lights exist and are shaded whether or not anything is using
+   * them, so spending four of them instead of three costs no fragment work.
    *
    * Each submission is keyed by the LAMP'S IDENTITY (tile key + index in that
    * tile's lamp list), never by its rank in the pick. Rank is a property of
@@ -646,6 +689,32 @@ export class PropSystem {
    * a handover is a genuine key change and rides the renderer's ~0.15 s fade.
    * `src/props/lampprobe.mjs` measures this on pixels; `?owLampRankKey=1` is
    * its negative control.
+   *
+   * THE PICK RADIUS IS THE LIGHT'S OWN RANGE, and that is not cosmetic. It used
+   * to be 46 m against a 26 m range, so the fourth and fifth candidates were
+   * lamps `render` fades to nothing (`fade = 1 - smoothstep(d, range*0.72,
+   * range)`) — MEASURED on `night` at 8 slots: applied intensity 25.3, 25.3,
+   * 24.8, 0.3, 0.0. A slot held by a lamp emitting 0.0 is not free
+   * (`_assignLightSlots` tests `level`, the crossfade, not the intensity) and a
+   * same-band newcomer is never allowed to evict it, so the budget went to two
+   * dark lamps AND locked a rocket out of the pool. Picking inside the range
+   * means the extra slots are spent where the street really is lamp-dense — a
+   * twin-arm downtown avenue, a junction — and left free everywhere else.
+   *
+   * IT ALSO WEAKENS `lampprobe`'S NEGATIVE CONTROL, and that is not a defect in
+   * the fix — say it out loud because the next person will meet it as a red
+   * check. `owLampRankKey=1` keys a slot by RANK, so how far the slot's
+   * position teleports on a reshuffle is bounded by how far apart the CANDIDATES
+   * are; trimming a 46 m search to the light's own 26 m makes the legacy bug
+   * milder as well as making the fix correct. MEASURED, control arm, three
+   * trees: 0.267 shipped, 0.236 with this trim alone, 0.196 with the brighter
+   * `sodium_glow` on top (a bigger swing is a bigger normaliser). The defect is
+   * still plainly there — the two best-tracked lamps score 0.034 / 0.030 fixed
+   * against 0.130 / 0.083 in the control, and the pool-key jump diagnostic is
+   * 0 against 40 — but the probe's headline `max` is capped by a lamp tracked
+   * for 29 frames of 184 that scores ~0.197 in BOTH arms, so the max can no
+   * longer clear an absolute 0.25 floor. That floor was a property of the old
+   * search radius, not of the bug.
    */
   _submitLamps(ctx) {
     const r = this.render;
@@ -654,7 +723,7 @@ export class PropSystem {
     const cam = this._camXZ;
     const pick = (this._lampPick ??= []);
     pick.length = 0;
-    const R2 = 46 * 46;
+    const R2 = LAMP_RANGE * LAMP_RANGE;
     for (const rec of this.tiles.values()) {
       if (rec.lod !== 0 || !rec.lamps) continue;
       for (let j = 0; j < rec.lamps.length; j++) {
@@ -670,10 +739,16 @@ export class PropSystem {
     }
     if (!pick.length) return;
     pick.sort((a, b) => a.d2 - b.d2);
-    const n = Math.min(3, pick.length);
+    // The renderer's OWN slot count, not `q.lightSlots` — `render` clamps it,
+    // and a lamp submitted into a pool that does not exist is a wasted sort.
+    const budget = Math.min(
+      LAMP_SLOTS_MAX,
+      Math.max(LAMP_SLOTS_MIN, (r.lightSlots | 0) - LAMP_SLOT_RESERVE)
+    );
+    const n = Math.min(budget, pick.length);
     for (let i = 0; i < n; i++) {
       const p = pick[i];
-      r.submitLight(p.x, p.y, p.z, SODIUM_LIGHT, 46 * this._litMix, 26, 2,
+      r.submitLight(p.x, p.y, p.z, SODIUM_LIGHT, LAMP_INTENSITY * this._litMix, LAMP_RANGE, 2,
         LAMP_RANK_KEY ? 9000 + i : p.key);
     }
   }

@@ -40,12 +40,24 @@ import { clamp01, dist, driveToward } from './util.js';
  * within `TRAVEL_ARRIVE` of it before any of these `init` functions run. So a
  * track can stage its content around the POI and know the player is there;
  * chapters that name nowhere stage around the player instead.
+ *
+ * A POI with a `stage` gives that instead: a `DOCKS` coordinate is the PIER
+ * HEAD, over water on purpose, and staging a ward, a wave of hostiles or a
+ * parked car on it puts them on the riverbed. `MissionRunner._start` already
+ * resolves `startPoi` through the same field — this is the belt to its braces,
+ * because a track reached any other way must get the same answer.
  */
 function anchor(M, c, g) {
-  if (M.startPoi) return M.startPoi;
-  const p = g.wq.focusPos(g._anchorV);
-  M._anchor.x = p.x;
-  M._anchor.z = p.z;
+  const p = M.startPoi;
+  if (p) {
+    if (!p.stage) return p;
+    M._anchor.x = p.stage.x;
+    M._anchor.z = p.stage.z;
+    return M._anchor;
+  }
+  const f = g.wq.focusPos(g._anchorV);
+  M._anchor.x = f.x;
+  M._anchor.z = f.z;
   return M._anchor;
 }
 

@@ -165,6 +165,10 @@ function fakeWq(ui) {
     uiSfx() {},
     sfx() {},
     groundY: () => 0,
+    // `WorldQuery.surfaceY` — the ground or the water lying over it. Flat land
+    // in here, so the two agree; the stub carries it because `mission.marker`
+    // and every objective glow read it, not `groundY`.
+    surfaceY: () => 0,
     focusPos() { return this.pos; },
     playerPos() { return this.pos; },
     playerVehicle: () => null,

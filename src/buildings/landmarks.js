@@ -371,6 +371,57 @@ function steelBowl(T, lib, lm, rng, gy) {
 }
 
 // -------------------------------------------------------- Old Blast Furnace --
+
+/**
+ * THE MILL'S FIVE STACKS, AS OFFSETS FROM THE LANDMARK CENTRE.
+ *
+ * The geometry below is emitted FROM this table — the brick stacks and the
+ * furnace crown are both built by reading it — so it cannot describe a stack
+ * that is not there, and a stack cannot move without it moving.
+ *
+ * IT IS EXPORTED BECAUSE SOMETHING HAS TO KNOW WHERE THE SMOKE COMES OUT, AND
+ * IT IS NOT THIS SUBSYSTEM.
+ *
+ * `fx` owns plumes; `buildings` owns stacks. `fx` cannot import this (rule 2)
+ * and there is no Object3D to hang `userData.fxSmoke` on either, because every
+ * landmark is merged into a per-tile static batch and comes out of
+ * `TileBuilder.build()` as a handful of meshes at the world origin — which is
+ * why the smoke contract in `src/fx/ambience.js` has had a documented tag
+ * route and ZERO producers since it was written. So `fx` carries the same five
+ * anchors, and `src/fx/plumeprobe.mjs` imports BOTH and fails the moment they
+ * disagree by more than a few centimetres. A probe may reach across
+ * subsystems; a subsystem may not. The real fix — an emitter node the tile
+ * builder can carry, so the tag route works — is `src/buildings/tile.js`'s to
+ * make, and this table is what it would be built from.
+ *
+ *   dx, dz   metres from the landmark centre
+ *   top      metres above the landmark's ground, i.e. where the flue opens
+ *   r        flue radius there, which is the plume's birth radius
+ *   kind     'smoke' — dirty industrial | 'steam' — a hot-blast stove venting
+ */
+const FURNACE_CROWN_H = 10;
+/** base radius, top radius, height. The three brick stacks in the ore yard. */
+const MILL_BRICK = [
+  { dx: -34, dz: -20, rBase: 2.6, r: 2.00, top: 44 },
+  { dx: -43, dz: -25, rBase: 2.3, r: 1.75, top: 38 },
+  { dx: -52, dz: -30, rBase: 2.0, r: 1.50, top: 32 },
+];
+/** The four hot-blast stoves. Only the first vents into the frame. */
+const MILL_STOVES = [
+  { dx: 20, dz: -12 }, { dx: 35, dz: -12 },
+  { dx: 20, dz: 4 }, { dx: 35, dz: 4 },
+];
+const MILL_STOVE_VENT = { top: 57, r: 1.1 };
+
+export const MILL_STACKS = [
+  { dx: 0, dz: 0, top: 66, r: 3.4, kind: 'smoke' },
+  ...MILL_BRICK.map((b) => ({ dx: b.dx, dz: b.dz, top: b.top, r: b.r, kind: 'smoke' })),
+  {
+    dx: MILL_STOVES[0].dx, dz: MILL_STOVES[0].dz,
+    top: MILL_STOVE_VENT.top, r: MILL_STOVE_VENT.r, kind: 'steam',
+  },
+];
+
 /**
  * The mill. A blast furnace is a vertical machine: the stack, four hot-blast
  * stoves beside it, the dust catcher, the skip hoist running up the side and a
@@ -379,13 +430,17 @@ function steelBowl(T, lib, lm, rng, gy) {
 function blastFurnace(T, lib, lm, rng, gy) {
   const x = lm.x;
   const z = lm.z;
+  const crown = MILL_STACKS[0];
 
   // --- the furnace stack ---
   cyl(T, 'rust_deep', x, gy, z, 6.5, 12, 20, [0.7, 0.6, 0.3]);
   cyl(T, 'rust', x, gy + 12, z, 7.4, 16, 20, [0.75, 0.55, 0.3], 5.4);
   cyl(T, 'rust_deep', x, gy + 28, z, 5.4, 20, 20, [0.7, 0.6, 0.3], 4.4);
   cyl(T, 'rust', x, gy + 48, z, 4.4, 8, 20, [0.7, 0.5, 0.25], 3.2);
-  cyl(T, 'corrugated_rust', x, gy + 56, z, 3.4, 10, 16, [0.75, 0.6, 0.3]);
+  // The crown is built DOWN from the published flue height, so the smoke and
+  // the steel cannot end up at two different altitudes.
+  cyl(T, 'corrugated_rust', x + crown.dx, gy + crown.top - FURNACE_CROWN_H, z + crown.dz,
+    crown.r, FURNACE_CROWN_H, 16, [0.75, 0.6, 0.3]);
   // bustle pipe
   const ring = new THREE.TorusGeometry(7.6, 0.85, 8, 24);
   ring.rotateX(Math.PI / 2);
@@ -403,11 +458,12 @@ function blastFurnace(T, lib, lm, rng, gy) {
 
   // --- four hot-blast stoves ---
   for (let i = 0; i < 4; i++) {
-    const sx = x + 20 + (i % 2) * 15;
-    const sz = z - 12 + Math.floor(i / 2) * 16;
+    const sx = x + MILL_STOVES[i].dx;
+    const sz = z + MILL_STOVES[i].dz;
     cyl(T, 'rust_deep', sx, gy, sz, 4.6, 40, 18, [0.7, 0.55, 0.3]);
     cyl(T, 'rust', sx, gy + 40, sz, 4.6, 5.5, 18, [0.7, 0.5, 0.25], 2.2);
-    cyl(T, 'rust_deep', sx, gy + 45, sz, 1.1, 12, 10, [0.7, 0.5, 0.25]);
+    cyl(T, 'rust_deep', sx, gy + 45, sz, MILL_STOVE_VENT.r,
+      MILL_STOVE_VENT.top - 45, 10, [0.7, 0.5, 0.25]);
     for (let r = 0; r < 5; r++) {
       const rg = cylinderY(4.75, 0.5, 18, { open: true });
       trs(_m, sx, gy + 5 + r * 8, sz, 0, 1, 1, 1);
@@ -449,8 +505,8 @@ function blastFurnace(T, lib, lm, rng, gy) {
   }
 
   // --- stacks and gantries ---
-  for (let i = 0; i < 3; i++) {
-    cyl(T, 'brick_dark', x - 34 - i * 9, gy, z - 20 - i * 5, 2.6 - i * 0.3, 44 - i * 6, 14, [0.6, 0.65, 0.35], 2.0 - i * 0.25);
+  for (const b of MILL_BRICK) {
+    cyl(T, 'brick_dark', x + b.dx, gy, z + b.dz, b.rBase, b.top, 14, [0.6, 0.65, 0.35], b.r);
   }
   for (let i = 0; i < 8; i++) {
     T.put(Kit.truss(lib, 'rust'), x - 44 + i * 4, gy + 15, z + 40, 0, 1);
@@ -473,15 +529,10 @@ function blastFurnace(T, lib, lm, rng, gy) {
    */
   T.box('metal', x, gy + 30, z, 18, 60, 18);
   T.box('metal', x - 4, gy + 7, z + 24, chW, 14, chD);
-  for (let i = 0; i < 4; i++) {
-    const sx = x + 20 + (i % 2) * 15;
-    const sz = z - 12 + Math.floor(i / 2) * 16;
-    T.box('metal', sx, gy + 22.5, sz, 8.4, 45, 8.4);
-  }
+  for (const s of MILL_STOVES) T.box('metal', x + s.dx, gy + 22.5, z + s.dz, 8.4, 45, 8.4);
   T.box('metal', x - 20, gy + 9, z + 6, 9.4, 20, 9.4);
-  for (let i = 0; i < 3; i++) {
-    const r = 2.6 - i * 0.3;
-    T.box('concrete', x - 34 - i * 9, gy + (44 - i * 6) / 2, z - 20 - i * 5, r * 1.8, 44 - i * 6, r * 1.8);
+  for (const b of MILL_BRICK) {
+    T.box('concrete', x + b.dx, gy + b.top / 2, z + b.dz, b.rBase * 1.8, b.top, b.rBase * 1.8);
   }
   for (let i = 0; i < 4; i++) T.box('metal', x + 46, gy + 9, z + 20 + i * 9.5, 7.6, 18, 7.6);
 }
@@ -776,12 +827,39 @@ function pointFountain(T, lib, lm, rng, gy) {
  * A market shed: a long steel-trussed hall open on both sides, a brick head
  * building at one end, and a row of awninged stalls down each side.
  */
+/** Market hall: length, width, eaves. Shared with `MARKET_GRIDDLES` below. */
+const MKT_L = 96;
+const MKT_W = 30;
+const MKT_H = 11;
+const MKT_BAYS = Math.round(MKT_L / 6);
+/** Half-width of a stall counter's centreline off the hall's axis. */
+const MKT_STALL_X = MKT_W / 2 - 2.4;
+/** Centre of stall bay `i`, in metres from the landmark centre along z. */
+const mktBayZ = (i) => -MKT_L / 2 + ((i + 0.5) / MKT_BAYS) * MKT_L;
+
+/**
+ * TWO GRIDDLES IN THE MARKET, AS OFFSETS FROM THE LANDMARK CENTRE.
+ *
+ * Same contract and same reason as `MILL_STACKS` — `fx` carries the matching
+ * anchors and `src/fx/plumeprobe.mjs` fails if they drift. `top` is the height
+ * of a hot plate over the counter, which is `gy + 1.86` (the counter top the
+ * stall loop below builds) plus half a metre of stove.
+ *
+ * These are the cheap half of "the city produces something": a food stall is
+ * two emitters and it puts moving, lit, wind-sheared white steam at head
+ * height in the one landmark the player walks THROUGH rather than past.
+ */
+export const MARKET_GRIDDLES = [
+  { dx: -MKT_STALL_X, dz: mktBayZ(6), top: 2.36 },
+  { dx: MKT_STALL_X, dz: mktBayZ(11), top: 2.36 },
+];
+
 function stripMarket(T, lib, lm, rng, gy) {
   const x = lm.x;
   const z = lm.z;
-  const L = 96;
-  const W = 30;
-  const H = 11;
+  const L = MKT_L;
+  const W = MKT_W;
+  const H = MKT_H;
 
   // head building
   box(T, 'brick_red', x, gy + 7, z - L / 2 - 8, W + 6, 14, 16, 0, [0.35, 0.5, 0.3], _sharedChamfer());
@@ -795,7 +873,7 @@ function stripMarket(T, lib, lm, rng, gy) {
   T.putS(Kit.signFace(lib, 'neon_amber'), x, gy + 12.4, z - L / 2 + 0.25, 0, 16, 1.4, 1);
 
   // the hall: portal frames every 6 m
-  const bays = Math.round(L / 6);
+  const bays = MKT_BAYS;
   for (let i = 0; i <= bays; i++) {
     const pz = z - L / 2 + (i / bays) * L;
     for (const s of [-1, 1]) {
@@ -821,9 +899,9 @@ function stripMarket(T, lib, lm, rng, gy) {
   const awn = Kit.awning(lib, rng.pick(['awning_canvas', 'awning_green', 'awning_navy']));
   const awnF = Kit.awningFrame(lib, 'steel_dark');
   for (let i = 0; i < bays; i++) {
-    const pz = z - L / 2 + ((i + 0.5) / bays) * L;
+    const pz = z + mktBayZ(i);
     for (const s of [-1, 1]) {
-      const sx = x + s * (W / 2 - 2.4);
+      const sx = x + s * MKT_STALL_X;
       box(T, 'timber', sx, gy + 0.9, pz, 3.2, 1.8, 4.6, 0, [0.7, 0.6, 0.3], _sharedChamfer());
       box(T, 'timber_dark', sx, gy + 1.86, pz, 3.6, 0.14, 5.0, 0, [0.75, 0.6, 0.3]);
       const rot = s > 0 ? -Math.PI / 2 : Math.PI / 2;

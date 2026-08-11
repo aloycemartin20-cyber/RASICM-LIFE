@@ -1,7 +1,15 @@
 /**
  * ===========================================================================
- * HUD — the ward health bar
+ * HUD — the ward health bar, and the boss health bar
  * ===========================================================================
+ *
+ * Two widgets, one subsystem, one reason: both are somebody ELSE'S health, and
+ * `ui` had no place to draw either. The ward's story is below; the boss's is
+ * the same story told about the other end of the fight — `src/game/boss.js`
+ * published a name, a phase and a health fraction and the only thing on screen
+ * was the objective panel's progress bar, driven by `1 - hpFrac`, i.e. a meter
+ * that FILLED UP as the boss went down while sharing its single line with the
+ * attack telegraph. See `BossBar`.
  *
  * A `protect` chapter has exactly one way to lose: the brother you are standing
  * over runs out of HP. Everything else on screen during one of those chapters
@@ -161,10 +169,232 @@ export class WardBar {
   }
 }
 
+/* ========================================================================== */
+/* the boss bar                                                               */
+/* ========================================================================== */
+
+/** Most phases any boss has. Ticks are pooled to this and shown/hidden. */
+const MAX_PHASE_TICKS = 5;
+/**
+ * The fill's approach rate, per second.
+ *
+ * THE WARD'S FILL SNAPS AND THIS ONE DOES NOT, AND THAT IS DELIBERATE.
+ * The ward bar is a FAIL CONDITION read at a glance — a bar that lags is a bar
+ * that lies about whether you are about to lose, so it is pinned to the truth
+ * and only its ghost chip drains. A boss bar is a PROGRESS read: what the
+ * player needs from it is "how much did that burst take off", and a value that
+ * teleports gives him a new number instead of an amount. So the fill eases and
+ * the chip trails further behind it, which is the pair that makes a shotgun
+ * blast legible as a bite. At 9/s it is within 1% of the truth in 0.5 s, so it
+ * is never lying by anything a person could act on.
+ */
+const BOSS_FILL_RATE = 9;
+const BOSS_CHIP_RATE = 2.1;
+
+/**
+ * Name, weak point, phase ticks and a smoothly depleting meter.
+ *
+ * Driven from `mission:boss` (`src/game/boss.js`) — the fight publishes its own
+ * state and this draws it. Nothing here reads the boss entity, his health or
+ * the mission runner.
+ */
+export class BossBar {
+  constructor(parent) {
+    this.root = el('div', 'ow-boss', parent);
+    /**
+     * Top centre, and on its own SCRIM.
+     *
+     * The chrome layer covers the canvas, so `pointer-events:none` — a hit box
+     * over the crosshair would eat a click. The scrim is the part that is not
+     * decoration: a boss fight happens outdoors under a bright sky, and the
+     * first version of this was a thin dark bar laid straight over a sunlit
+     * tree, where neither the empty half of the track nor the phase ticks
+     * could be told from the foliage behind them. A soft vertical fade behind
+     * the whole widget costs one gradient and makes it legible over anything.
+     */
+    this.root.style.cssText =
+      'position:absolute;left:50%;top:calc(var(--u) * 9);transform:translateX(-50%);' +
+      'display:flex;flex-direction:column;align-items:center;pointer-events:none;' +
+      'width:calc(460px * var(--k));padding:calc(var(--u) * 2) 0;';
+
+    /**
+     * The scrim is its OWN element rather than a background on the root, and
+     * the reason is that a radial gradient is clipped to its box: put it on
+     * the root and it can only reach zero alpha at the corners, so it reads as
+     * a translucent RECTANGLE laid over the sky — which is what the first cut
+     * did, visibly. An oversized child whose ellipse closes inside its own
+     * bounds has no edge anywhere. Absolutely positioned and FIRST in DOM
+     * order; the siblings below are `position:relative` so they paint over it.
+     */
+    this.scrim = el('i', 'ow-boss-scrim', this.root);
+    this.scrim.style.cssText =
+      'position:absolute;left:-14%;right:-14%;top:-18%;bottom:-18%;' +
+      'background:radial-gradient(ellipse 50% 50% at 50% 50%,' +
+      'rgba(6,9,13,.72) 0%, rgba(6,9,13,.5) 42%, rgba(6,9,13,0) 100%);';
+
+    this.name = el('div', 'ow-boss-name', this.root, '');
+    this.name.style.cssText =
+      'position:relative;font-family:var(--fm);font-size:calc(13px * var(--k));' +
+      'letter-spacing:.34em;text-shadow:var(--sh-o1);white-space:nowrap;';
+
+    this.track = el('div', 'ow-boss-track', this.root);
+    this.track.style.cssText =
+      'position:relative;width:100%;height:calc(9px * var(--k));' +
+      'margin-top:calc(var(--u) * 1.2);background:rgba(8,12,17,.92);' +
+      'box-shadow:0 0 0 calc(1px * var(--k)) rgba(232,226,212,.22),' +
+      '0 calc(2px * var(--k)) calc(6px * var(--k)) rgba(3,6,9,.7);overflow:hidden;';
+
+    this.chip = el('i', 'ow-boss-chip', this.track);
+    this.chip.style.cssText =
+      'position:absolute;left:0;top:0;height:100%;width:100%;' +
+      'background:rgba(255,224,196,.34);';
+
+    this.fill = el('i', 'ow-boss-fill', this.track);
+    this.fill.style.cssText = 'position:absolute;left:0;top:0;height:100%;width:100%;';
+
+    /**
+     * Phase ticks: the boundaries his health has to cross for the next wave.
+     *
+     * Drawn OVER the fill, and LIGHT with a dark outline rather than dark on
+     * its own — a dark tick is invisible on the empty half of the track, which
+     * is precisely the half a player checks to see how far the next phase is.
+     */
+    this.ticks = [];
+    for (let i = 0; i < MAX_PHASE_TICKS; i++) {
+      const t = el('i', 'ow-boss-tick', this.track);
+      t.style.cssText =
+        'position:absolute;top:0;height:100%;width:calc(2px * var(--k));' +
+        'background:rgba(240,233,219,.72);' +
+        'box-shadow:0 0 0 calc(1px * var(--k)) rgba(6,9,13,.9);display:none;';
+      this.ticks.push(t);
+    }
+
+    this.weak = el('div', 'ow-boss-weak', this.root, '');
+    this.weak.style.cssText =
+      'position:relative;font-family:var(--fm);font-size:calc(8.6px * var(--k));' +
+      'letter-spacing:.2em;color:var(--ink-2);text-shadow:var(--sh-o1);' +
+      'margin-top:calc(var(--u) * .9);white-space:nowrap;';
+
+    this.active = false;
+    this.health = 1;
+    this.fillValue = 1;
+    this.chipValue = 1;
+    this.colour = FALLBACK;
+    this._pulse = 0;
+    this._rawName = undefined;
+    this._rawWeak = undefined;
+    this._rawColour = undefined;
+    this._wrotePhases = -1;
+    this._wroteFill = -1;
+    this._wroteChip = -1;
+    this._wroteHot = null;
+    setStyle(this.root, 'display', 'none');
+  }
+
+  /** @param {object} s the `mission:boss` record. Read, never retained. */
+  set(s) {
+    const h = clamp01(s.health);
+    if (!this.active) {
+      this.active = true;
+      // Open on the truth. Fading in from the last fight's value would read as
+      // a boss taking damage nobody dealt.
+      this.fillValue = h;
+      this.chipValue = h;
+      this._pulse = 0;
+      setStyle(this.root, 'display', 'flex');
+    }
+    this.health = h;
+
+    // Compare the RAW strings first: `toUpperCase()` on an unchanged name would
+    // otherwise allocate once per frame for the whole fight (rule 5).
+    if (s.name !== this._rawName) {
+      this._rawName = s.name;
+      setText(this.name, String(s.name ?? '').toUpperCase());
+    }
+    if (s.weak !== this._rawWeak) {
+      this._rawWeak = s.weak;
+      setText(this.weak, String(s.weak ?? '').toUpperCase());
+    }
+    if (s.colour !== this._rawColour) {
+      this._rawColour = s.colour;
+      this.colour = s.colour || FALLBACK;
+      setStyle(this.name, 'color', this.colour);
+      this._wroteHot = null;
+    }
+
+    // Ticks move only when the boss does, i.e. once per fight.
+    const phases = Math.max(1, Math.min(MAX_PHASE_TICKS + 1, s.phases | 0));
+    if (phases !== this._wrotePhases) {
+      this._wrotePhases = phases;
+      for (let i = 0; i < MAX_PHASE_TICKS; i++) {
+        const on = i < phases - 1;
+        setStyle(this.ticks[i], 'display', on ? 'block' : 'none');
+        // A phase turns over at `hpFrac = 1 - k/phases`, and the fill is drawn
+        // from the left, so that is exactly where the mark goes.
+        if (on) setStyle(this.ticks[i], 'left', (((i + 1) / phases) * 100).toFixed(3) + '%');
+      }
+    }
+  }
+
+  hide() {
+    if (!this.active) return;
+    this.active = false;
+    setStyle(this.root, 'display', 'none');
+  }
+
+  update(dt) {
+    if (!this.active) return;
+    this.fillValue = damp(this.fillValue, this.health, BOSS_FILL_RATE, dt);
+    // The chip only ever drains toward the fill; a boss that is healed (no
+    // fight does today, but a phase heal is one line away) snaps both, so the
+    // ghost can never sit BEHIND the bar and read as damage about to land.
+    this.chipValue = this.chipValue > this.fillValue
+      ? damp(this.chipValue, this.fillValue, BOSS_CHIP_RATE, dt)
+      : this.fillValue;
+
+    const crit = this.health < CRITICAL;
+    this._pulse = crit ? (this._pulse + dt) % 1 : 0;
+
+    // Quantised to a tenth of a percent so a settled bar stops writing style
+    // strings entirely (rule 5) while still moving smoothly on the way down.
+    const f = Math.round(this.fillValue * 1000);
+    if (f !== this._wroteFill) {
+      this._wroteFill = f;
+      setStyle(this.fill, 'width', (f / 10).toFixed(1) + '%');
+    }
+    const c = Math.round(this.chipValue * 1000);
+    if (c !== this._wroteChip) {
+      this._wroteChip = c;
+      setStyle(this.chip, 'width', (c / 10).toFixed(1) + '%');
+    }
+
+    const hot = crit ? '#ff3b4e' : this.colour;
+    if (hot !== this._wroteHot) {
+      this._wroteHot = hot;
+      /**
+       * A HOT LEADING EDGE, and it is the only part of the bar a player reads
+       * precisely. The boss colours in `data.js` are identity marks — teal,
+       * rust, maroon, violet — and every one of them is dark enough that a
+       * flat fill of it against a dark track leaves the exact level ambiguous.
+       * The last few per cent burning out to near-white puts a hard, findable
+       * edge exactly where his health is.
+       */
+      setStyle(this.fill, 'background',
+        'linear-gradient(90deg, rgba(8,12,17,.55) 0%, ' + hot + ' 76%, #fff3e2 100%)');
+    }
+    if (crit) setStyle(this.root, 'opacity', (0.74 + 0.26 * Math.cos(this._pulse * 6.283)).toFixed(3));
+    else setStyle(this.root, 'opacity', '1');
+  }
+
+  dispose() {
+    this.root.remove();
+  }
+}
+
 /**
  * The subsystem. Reads `game.getHudState().ward` — the record `game` already
  * publishes — and draws it. Draws nothing at all when there is no ward, which
- * is every chapter but one.
+ * is every chapter but one. Same for the boss bar off `mission:boss`.
  */
 export class HudSystem {
   static id = 'hud';
@@ -179,7 +409,44 @@ export class HudSystem {
     const parent = ui?.objective?.root ?? ui?.topRight ?? ui?.chromeLayer ?? ui?.root
       ?? document.getElementById('ui') ?? document.body;
     this.bar = new WardBar(parent);
+    // The boss bar is NOT in the objective panel: it is top centre, it is the
+    // widest thing on screen during a fight, and it must not inherit the
+    // panel's right-hand column or its fade.
+    const layer = ui?.chromeLayer ?? ui?.root ?? document.getElementById('ui') ?? document.body;
+    this.boss = new BossBar(layer);
     this._lastRaw = ctx.time.raw;
+
+    /**
+     * The fight publishes; nothing polls it. `_boss` is the record's own
+     * fields COPIED OUT — `src/game/boss.js` emits one reused object (rule 5),
+     * so retaining the reference would be retaining whatever the next fight
+     * happens to put in it.
+     */
+    this._boss = { name: '', weak: '', colour: '', phase: 0, phases: 1, health: 1 };
+    this._bossOn = false;
+    this._onBoss = (p) => {
+      if (!p || p.active !== true || !Number.isFinite(p.health)) {
+        this._bossOn = false;
+        return;
+      }
+      const b = this._boss;
+      b.name = p.name; b.weak = p.weak; b.colour = p.colour;
+      b.phase = p.phase; b.phases = p.phases; b.health = p.health;
+      this._bossOn = true;
+    };
+    /**
+     * Three canonical lifecycle events as well, and each one closes a hole the
+     * others do not: a chapter that FAILS or COMPLETES stops emitting without
+     * ever saying `active:false`, and a chapter that is replaced (abort, then
+     * the next `startMission` in the same breath) says nothing at all. The
+     * `objective` backstop in `lateUpdate` catches even that.
+     */
+    this._off = [
+      ctx.events.on('mission:boss', this._onBoss),
+      ctx.events.on('mission:start', () => { this._bossOn = false; }),
+      ctx.events.on('mission:complete', () => { this._bossOn = false; }),
+      ctx.events.on('mission:fail', () => { this._bossOn = false; }),
+    ];
   }
 
   /**
@@ -196,14 +463,25 @@ export class HudSystem {
     this._lastRaw = raw;
 
     const game = ctx.peek('game');
-    const ward = typeof game?.getHudState === 'function' ? game.getHudState().ward : null;
+    const hud = typeof game?.getHudState === 'function' ? game.getHudState() : null;
+    const ward = hud ? hud.ward : null;
     if (ward && Number.isFinite(ward.health)) this.bar.set(ward.name, ward.health);
     else this.bar.hide();
     this.bar.update(rawDt);
+
+    // `objective` is null the moment the runner has no live chapter, so this is
+    // the one condition that cannot be missed by an event that never fired.
+    if (this._bossOn && hud?.objective) this.boss.set(this._boss);
+    else this.boss.hide();
+    this.boss.update(rawDt);
   }
 
   dispose() {
+    for (const off of this._off ?? []) off?.();
+    this._off = null;
     this.bar?.dispose();
     this.bar = null;
+    this.boss?.dispose();
+    this.boss = null;
   }
 }

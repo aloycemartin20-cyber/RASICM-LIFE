@@ -544,12 +544,59 @@ export const SURFACES = {
 export const EMISSIVE = {
   sodium_lamp: { color: 0xffc17a, base: 0.22, night: 5.5, rough: 0.35 },
   /**
-   * The pool of light a sodium lamp throws on the road. Additive, flat on the
-   * ground and deliberately timid: this is a hint that the lamp is lit, not a
-   * light source. It was a volumetric cone once and a critic saw solid orange
-   * wedges standing on the pavement.
+   * The pool of light a sodium lamp throws on the road, and — measured, not
+   * assumed — the only thing lighting the carriageway beyond the two or three
+   * lamps that hold a real punctual slot. With it switched off entirely, the
+   * road centreline beside the five nearest carriageway lamps on `night` reads
+   * 8.4 / 5.9 / 13.7 / 23.7 / 28.5 of 255. It is not a hint any more; the
+   * comment here used to call it one.
+   *
+   * ONLY `peak` DRIVES IT. `base` and `night` are the non-additive path's
+   * fields (`props._driveLights`) and this entry used to carry both, inert, at
+   * 0.0 and 1.0 — a knob that looks live and moves nothing.
+   *
+   * `peak` IS HALF THE BRIGHTNESS. The other half is the vertex ramp in
+   * `kit_street.js` (`POOL_PEAK`), so what actually reaches the road is
+   *
+   *     peak x POOL_PEAK x litMix^2       0.045 x 0.72 = 0.0324 at full night
+   *
+   * and the two were tuned in separate passes by people who could each only see
+   * their own half. Read them together or not at all.
+   *
+   * COLOUR IS WHY THIS NUMBER MOVED, not brightness. The pool ran at
+   * `SODIUM_DEEP` while the punctual light from the SAME lamp head runs at
+   * `SODIUM` (`props.SODIUM_LIGHT`) — i.e. the bounce off the asphalt was more
+   * saturated than the source that made it, which is backwards in the one
+   * direction a surface cannot be: reflected light picks up the surface's grey
+   * and the ambient, it does not gain chroma. An additive layer that saturated
+   * is a filter over everything it covers, and it is what turned the near
+   * carriageway and the footway beside it into one hueless orange sheet.
+   *
+   * MEASURED on `night`, 1280x720, one boot, one variable at a time — road
+   * centreline luminance beside the five nearest carriageway lamps (mean), and
+   * the r-b spread over the washed region as the "how orange is it" number:
+   *
+   *   0.055 SODIUM_DEEP   crown mean 41.8   r-b 54.2   shipped before this
+   *   0.0403 SODIUM       crown mean 43.1   r-b 36.4   luminance-matched swap
+   *   0.045 SODIUM        crown mean 45.2   r-b 37.8   shipped
+   *   0.050 SODIUM        crown mean 47.6   r-b 39.6
+   *   0.045 0xffa050      crown mean 42.6   r-b 42.5   half-way hue, worse both
+   *
+   * So the swap buys a THIRD off the chroma and the road gets brighter rather
+   * than darker, because luminance per unit opacity is higher at the lighter
+   * hue. 0.045 banks 3.4 of that as crown headroom and leaves the rest.
+   *
+   * WHY NOT MORE. Additive light knows nothing about albedo, so every stop it
+   * gains compresses the ratio between asphalt and the concrete kerb beside it:
+   * MEASURED at the nearest lamp, road:pavement runs 8.4:91 unlit, 37.3:131.5
+   * at the old value and 42.1:137.8 here — a real surface holds ~1:4 and the
+   * fill is walking it toward 1:3. Past this the frame reads as a decal, which
+   * is the failure the sweep in `kit_street.js` documents from the other side.
+   * The next stop for a brighter road is REAL light (`props._submitLamps`, and
+   * its budget scales with `q.lightSlots` now) or a narrower pool, not a bigger
+   * number here.
    */
-  sodium_glow: { color: SODIUM_DEEP, base: 0.0, night: 1.0, additive: true, peak: 0.055 },
+  sodium_glow: { color: SODIUM, additive: true, peak: 0.045 },
   /**
    * INTENSITY SCALES WITH AREA, NOT WITH IMPORTANCE. A 22 mm neon tube can sit
    * five stops over white and still read as a tube, because bloom has almost

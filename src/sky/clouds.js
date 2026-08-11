@@ -80,6 +80,8 @@ uniform vec4 uCloudLight;
 uniform vec3 uSkyOrigin;
 
 const float SK_CIRRUS_KM = 7.8;
+/** Half the deck's depth, in km. The two-shell integration in skCirrus. */
+const float SK_CIRRUS_HALF = 0.42;
 
 /** Weather-scale coverage, in kilometres. Mirrored exactly on the CPU. */
 float skCloudMacro( vec2 p ) {
@@ -136,6 +138,24 @@ float skCloudProfile( float hf ) {
   cumulus *= 0.55 + 0.45 * ( 1.0 - hf );
   float stratus = smoothstep( 0.0, 0.16, hf ) * ( 1.0 - smoothstep( 0.62, 1.0, hf ) );
   return mix( cumulus, stratus, uCloudShape.z );
+}
+
+/**
+ * How much of the sheet is ABOVE hf, in slab units. Closed form, no sampling.
+ *
+ * A trapezoid fit to the stratus lobe above — 0 to 1 over [0, 0.16], flat to
+ * 0.62, back to 0 over [0.62, 1], total 0.73 of the slab. Multiplied by the
+ * horizontal shape term it gives the optical depth of the deck over a sample,
+ * which is the quantity an overcast's base brightness is actually a function
+ * of, and it costs six instructions instead of a second light march.
+ */
+float skSheetColumn( float hf ) {
+  float a = clamp( hf, 0.0, 1.0 );
+  float t = a - 0.62;
+  float below = a < 0.16 ? a * a / 0.32
+              : a < 0.62 ? 0.08 + ( a - 0.16 )
+                         : 0.54 + t - t * t / 0.76;
+  return max( 0.0, 0.73 - below );
 }
 
 /**
@@ -211,6 +231,52 @@ float skCloudDensity( vec3 pos, int oct, bool detail ) {
    */
   float lift = cov * 0.62 * hf * ( 1.0 - 0.85 * uCloudShape.z );
   float d = smoothstep( 1.0 - cov * 0.92 + lift, 1.0 - cov * 0.50 + lift, n ) * prof;
+
+  /**
+   * A SHEET IS NOT A THRESHOLD, AND THAT IS WHY THE OVERCAST WAS A WHITE CARD.
+   *
+   * At overcast's coverage of 0.98 the threshold above runs from 0.10 to 0.51
+   * across a field whose mean is 0.5, so most of the deck comes back CLAMPED
+   * AT 1 and the whole sheet is one optical depth. Two things follow, and the
+   * second is the one that sent this hunt to the wrong end of the file twice:
+   *
+   *   - the light march reports the same tau at every sample, so the shading
+   *     has nothing to differ ABOUT;
+   *   - the erosion below is written as 'd - (1-d) * bite', so at d = 1 it
+   *     subtracts exactly ZERO. A saturated sheet switches off its own detail.
+   *     Turning 'cloudDetail' up did nothing, which is what it looks like when
+   *     the knob is downstream of the fault.
+   *
+   * MEASURED on the 'mill' shot before this, over a 45 000 px sky patch:
+   * sd 2.22, of which 0.75 survives a high-pass. That is a card, not a sky.
+   *
+   * An overcast is not cumulus with the coverage turned up. It is a CONTINUOUS
+   * deck whose optical depth varies three- or four-fold across a
+   * stratocumulus cell — dark cell centres, bright thin rims, and a base whose
+   * shape you can read. So the sheet gets its own mapping: never zero, because
+   * an overcast has no holes, and never saturated, because a saturated deck
+   * has no base.
+   *
+   * 'w' is the domain warp already computed above — a value-noise pair at
+   * 1.8 km, which is the scale a stratocumulus organises its cells on. This
+   * function runs of the order of a hundred times per pixel, so reusing it
+   * rather than sampling a second field is not a saving, it is the difference
+   * between shipping this and not.
+   *
+   * 'sheetK' is deliberately a smoothstep on the stratus blend rather than the
+   * blend itself: at 'cloudStratus' 0.05 (scattered) a raw mix would lay a few
+   * per cent of continuous deck across the CLEAR AIR BETWEEN THE BILLOWS, and
+   * a thin grey veil over the zenith is the exact failure the note above this
+   * one is about.
+   */
+  float sheetK = smoothstep( 0.25, 0.72, uCloudShape.z );
+  if ( sheetK > 0.001 ) {
+    float cell = clamp( 0.5 + ( w.x + w.y ) * 0.95, 0.0, 1.0 );
+    float sheet = prof * cov
+                * ( 0.42 + 0.58 * smoothstep( 0.28, 0.76, n ) )
+                * ( 0.60 + 0.40 * cell );
+    d = mix( d, sheet, sheetK );
+  }
   if ( d <= 0.002 ) return 0.0;
 
   if ( detail ) {
@@ -234,7 +300,17 @@ float skCloudDensity( vec3 pos, int oct, bool detail ) {
      * the top is turbulent. Eroding uniformly gave a deck that was equally
      * ragged at both ends and therefore had no ceiling and no read.
      */
-    float bite = ( 0.22 + 0.78 * hf * hf ) * uCloudParams.z;
+    /**
+     * ...and the weighting INVERTS for a sheet, which is the other half of the
+     * overcast fix. A cumulus is turbulent at the crown and flat at the base,
+     * which is what 'hf*hf' says. A stratocumulus is the other way up: its top
+     * is a smooth inversion lid and everything a person on the ground can see
+     * of it — the lumps, the rolls, the ragged fringe under a shower — is on
+     * the UNDERSIDE. Eroding a sheet from the top only erodes the half nobody
+     * is standing under.
+     */
+    float bite = mix( 0.22 + 0.78 * hf * hf,
+                      0.95 - 0.55 * hf, sheetK ) * uCloudParams.z;
     d = clamp( d - ( 1.0 - d ) * ( 0.70 - 0.80 * e ) * bite, 0.0, 1.0 );
   }
   return d;
@@ -372,6 +448,10 @@ vec4 skCloudSlab( vec3 ro, vec3 rd,
   phM *= 4.0 * SK_PI;
 
   float sigma = uCloudParams.y * uCloudLight.x;
+  // Hoisted: both are uniform over the march and the sheet branch below is in
+  // the innermost loop in the subsystem.
+  float sheetK = smoothstep( 0.25, 0.72, uCloudShape.z );
+  float thickKM = max( 0.05, uCloudShape.y - uCloudShape.x );
 
   vec3 sum = vec3( 0.0 );
   float trans = 1.0;
@@ -426,7 +506,41 @@ vec4 skCloudSlab( vec3 ro, vec3 rd,
     float hf = clamp( ( skCloudAltKM( p ) - uCloudShape.x )
                       / max( 0.05, uCloudShape.y - uCloudShape.x ), 0.0, 1.0 );
     // Self-occlusion of the ambient: deep in the deck you see very little sky.
-    float amb = uCloudLight.y * ( 0.22 + 0.78 * exp( -d * sigma * 1.4 ) );
+    float occ = 0.22 + 0.78 * exp( -d * sigma * 1.4 );
+
+    /**
+     * ...AND SELF-OCCLUSION IS NOT WHAT MAKES AN OVERCAST READABLE.
+     * TRANSMISSION IS. This is the term the flat white card was really made of.
+     *
+     * Under a sheet the direct terms are worth almost nothing — the sun is
+     * behind a kilometre of water — so the pixel is very nearly
+     * 'ambGround * occ', and 'occ' above saturates instantly: at overcast's
+     * sigma of 9.6 the exponent is -13 d, which is dead by a density of 0.3.
+     * Every base sample therefore returned the SAME number, the ambient
+     * colours are constant across the sky, and the deck came out as one value
+     * however much structure the density field had. Fixing the density alone
+     * moved the measured sky sd from 2.22 to 2.72 and that is exactly why:
+     * there was structure in the medium and nothing in the lighting read it.
+     *
+     * What a stratocumulus base actually shows you is how much daylight got
+     * THROUGH the deck to reach it — bright where the sheet is thin, two or
+     * three stops down where it is thick. That is the column ABOVE the sample,
+     * not the density AT it, and it is available here for nothing: the sheet's
+     * density is its horizontal shape times the vertical profile, so dividing
+     * one out recovers the other, and 'skSheetColumn' integrates the rest of
+     * the profile analytically. No second march.
+     *
+     * The 0.06 / 0.62 pair is chosen so the MEAN occlusion lands within a
+     * couple of per cent of the 0.22 it replaces — this is a change in the
+     * variance of the deck, not in its exposure, and it has to be possible to
+     * say so.
+     */
+    if ( sheetK > 0.001 ) {
+      float shape = d / max( skCloudProfile( hf ), 0.25 );
+      float colAbove = shape * skSheetColumn( hf ) * thickKM;
+      occ = mix( occ, 0.06 + 0.62 * exp( -colAbove * sigma * 0.30 ), sheetK );
+    }
+    float amb = uCloudLight.y * occ;
     lum += mix( ambGround, ambSky, hf * hf ) * amb;
 
     // Analytic segment integration (exact for constant media over dt).
@@ -466,14 +580,46 @@ vec4 skCloudSlab( vec3 ro, vec3 rd,
  * anisotropic ridge only modulates its density between 0.35 and 1.4.
  */
 float skCirrusBand( vec2 p, float cov, float seed, float base,
-                    float rotKmInv, float lenKM, float aniso, int oct ) {
+                    float rotKmInv, float lenKM, float aniso, int oct,
+                    float lod ) {
   vec2 w = vec2( skVal2( p * 0.30 + seed ), skVal2( p * 0.30 + seed + 11.7 ) ) - 0.5;
   float n = skFbm2( p * 0.78 + w * 1.3, oct + 1 );
-  float d = smoothstep( 1.0 - cov * 1.65, 1.0 - cov * 0.60, n );
+  /**
+   * A WIDER RAMP, BECAUSE ICE HAS NO EDGE — AND WIDER STILL WITH DISTANCE,
+   * BECAUSE THAT IS WHAT A MIP LEVEL IS.
+   *
+   * The old window was '1.05 cov' wide, which at the authored coverages (0.14
+   * to 0.22) is 0.23 of a field whose standard deviation is about 0.13 — a
+   * fibre went from full density to nothing inside two standard deviations of
+   * the noise. A cirrus is ice sublimating into dry air; its margin is
+   * kilometres of thinning, not a boundary. So the window is half again as
+   * wide, and widened ABOUT ITS OWN CENTRE ('1 - 1.125 cov', to the digit),
+   * which is what keeps this a softness change rather than a coverage change:
+   * dropping the low knot alone would have put half again as much cirrus in
+   * every sky, and "the edges got softer" would then have been reported off a
+   * frame that also had more cloud in it.
+   *
+   * 'lod' (0 near, 1 far) is the other half, and it is the one that matters at
+   * dawn. The margin's width IN PIXELS is the window's width in n divided by
+   * the field's screen-space gradient, and that gradient grows without bound
+   * as the ray flattens toward a shell 7.8 km up — below 15 degrees of
+   * elevation it is over 400 m of deck per pixel, several times the width of a
+   * fibre. A window that is comfortable overhead is therefore a cut line at
+   * the horizon, which is exactly where the low sun puts a x7 forward lobe
+   * behind it. Widening the window with distance until the whole field maps to
+   * a gentle wash is the same trade a mip level makes, for the same reason,
+   * and it costs one mix.
+   */
+  float halfW = cov * 0.525 * ( 1.0 + 2.4 * lod );
+  float mid = 1.0 - cov * 1.125;
+  float d = smoothstep( mid - halfW, mid + halfW, n );
   if ( d <= 0.001 ) return 0.0;
 
-  // Fronts: the layer arrives in bands with clean sky between them.
-  d *= smoothstep( 0.36, 0.66, skVal2( p * 0.12 + seed * 0.5 ) );
+  // Fronts: the layer arrives in bands with clean sky between them. Same
+  // reasoning as the ramp above — the band EDGE is a threshold on an 8 km
+  // feature, so its window is widened in step or it becomes the hard edge the
+  // density ramp just stopped being.
+  d *= smoothstep( 0.28, 0.72, skVal2( p * 0.12 + seed * 0.5 ) );
   if ( d <= 0.001 ) return 0.0;
 
   float ang = base + ( skVal2( p * rotKmInv + seed ) - 0.5 ) * 1.1;
@@ -482,7 +628,20 @@ float skCirrusBand( vec2 p, float cov, float seed, float base,
   float fa = 1.0 / max( 0.4, lenKM );
   vec2 q = vec2( pr.x * fa, pr.y * fa * aniso );
   float f = skSmoothRidge2( q + vec2( seed ), oct );
-  return d * ( 0.35 + 1.05 * f );
+  // The fibre modulation goes the same way: a 375 m fibre seen from 60 km is
+  // under a pixel across, so past that it is resolved to its own MEAN (0.875)
+  // rather than sampled once and aliased.
+  return d * mix( 0.35 + 1.05 * f, 0.875, lod );
+}
+
+/** Both cirrus families on one shell sample. */
+float skCirrusDeck( vec2 p, float cov, float lod ) {
+  // Two decorrelated families 75 degrees apart: each square of sky is dominated
+  // by one of them, but the frame always contains both, and two families 75
+  // degrees apart cannot share a vanishing point.
+  float d1 = skCirrusBand( p, cov, 0.0, 0.24, 0.135, 1.5, 4.0, 2, lod );
+  float d2 = skCirrusBand( p + 137.4, cov * 0.92, 4.7, 1.56, 0.098, 2.0, 3.4, 2, lod );
+  return 1.0 - ( 1.0 - d1 ) * ( 1.0 - d2 * 0.85 );
 }
 
 /** Cirrus deck at 7.8 km. Returns rgb premultiplied, a = opacity. */
@@ -491,8 +650,29 @@ vec4 skCirrus( vec3 ro, vec3 rd, vec3 sunDir, vec3 sunHigh,
   float cov = clamp( uCloudParams2.x, 0.0, 1.0 );
   if ( cov <= 0.002 || uCloudParams2.y <= 0.002 ) return vec4( 0.0 );
 
+  /**
+   * TWO SHELLS, NOT ONE — the cirrus's version of the answer the slab reached
+   * by marching.
+   *
+   * The header of this file says it outright: *integration is what kills the
+   * shimmer — a marched slab averages the field along the ray instead of
+   * thresholding it once.* This layer thresholded it once, at a single radius,
+   * and then wondered why its edges were hard. A real cirrus deck is 600 m to
+   * a kilometre thick, so sampling its floor and its ceiling and averaging is
+   * not a blur hack, it is the layer.
+   *
+   * And it is ADAPTIVE for free, which is the part that matters here: the two
+   * taps are displaced horizontally by roughly 'thickness / rd.y', so they
+   * nearly coincide overhead — where one sample was always enough — and
+   * separate to kilometres near the horizon, where 'd(distance)/d(elevation)'
+   * is over 400 m per screen pixel and one sample never was. That is exactly
+   * the region the 'fade' term below had to amputate.
+   */
   float tc = skRaySphere( ro, rd, SK_GROUND_R + SK_CIRRUS_KM * 0.001 );
   if ( tc <= 0.0 ) return vec4( 0.0 );
+  float tcLo = skRaySphere( ro, rd, SK_GROUND_R + ( SK_CIRRUS_KM - SK_CIRRUS_HALF ) * 0.001 );
+  float tcHi = skRaySphere( ro, rd, SK_GROUND_R + ( SK_CIRRUS_KM + SK_CIRRUS_HALF ) * 0.001 );
+  if ( tcLo <= 0.0 || tcHi <= 0.0 ) return vec4( 0.0 );
   float distKM = tc * 1000.0;
 
   // Distance fade, doing antialiasing as much as atmospherics: below ~15 degrees
@@ -506,14 +686,20 @@ vec4 skCirrus( vec3 ro, vec3 rd, vec3 sunDir, vec3 sunHigh,
   if ( fade <= 0.004 ) return vec4( 0.0 );
 
   vec2 wind = vec2( uCloudParams2.z, uCloudParams2.w ) * uCloudParams.w;
-  vec2 p = ( ro + rd * tc ).xz * 1000.0 + wind * 2.4;
+  vec2 pLo = ( ro + rd * tcLo ).xz * 1000.0 + wind * 2.4;
+  vec2 pHi = ( ro + rd * tcHi ).xz * 1000.0 + wind * 2.4;
 
-  // Two decorrelated families 75 degrees apart: each square of sky is dominated
-  // by one of them, but the frame always contains both, and two families 75
-  // degrees apart cannot share a vanishing point.
-  float d1 = skCirrusBand( p, cov, 0.0, 0.24, 0.135, 1.5, 4.0, 2 );
-  float d2 = skCirrusBand( p + 137.4, cov * 0.92, 4.7, 1.56, 0.098, 2.0, 3.4, 2 );
-  float d = 1.0 - ( 1.0 - d1 ) * ( 1.0 - d2 * 0.85 );
+  /**
+   * The mip level, and DISTANCE IS THE RIGHT PROXY FOR IT.
+   *
+   * At a fixed shell altitude the deck's metres-per-pixel is proportional to
+   * the slant range, so distKM is the footprint. 12 km is roughly overhead
+   * (a fibre is tens of pixels across and deserves every octave); by 62 km a
+   * 375 m fibre is under a pixel and sampling it once can only alias.
+   */
+  float lod = smoothstep( 12.0, 62.0, distKM );
+
+  float d = 0.5 * ( skCirrusDeck( pLo, cov, lod ) + skCirrusDeck( pHi, cov, lod ) );
   float a = clamp( d * uCloudParams2.y * fade, 0.0, 0.70 );
   if ( a <= 0.002 ) return vec4( 0.0 );
 

@@ -323,6 +323,14 @@ export class MeleeSolver {
      * punch, and the range curve exists for bullets losing energy over 400 m.
      *
      * The impulse is the knockback.
+     *
+     * IT ALSO CARRIES THE PLAYER'S CLAIM TO THE HITMARKER, IMPLICITLY.
+     * `physics.emitImpact` raises the `damage:dealt` for this swing with no
+     * `source` on it, and `ui._isPlayerSource` / `audio._isPlayerSource` read an
+     * absent source as the player — which is true only because this call and
+     * `src/weapons/ballistics.js` are `fireBullet`'s only callers, and both are
+     * his. Give an AI a `fireBullet` and it must carry a `source` through to
+     * that payload, or every enemy round starts drawing the player a hitmarker.
      */
     phys.fireBullet({
       origin: this._origin,

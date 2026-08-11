@@ -61,7 +61,7 @@
  * sit permanently red because of them.
  *
  * ────────────────────────────────────────────────────────────────────────────
- * THE FIVE ASSERTIONS
+ * THE ASSERTIONS
  * ────────────────────────────────────────────────────────────────────────────
  *   0 SITE      the site survives re-validation on the exact footprint the
  *               assertions read: ≥ 40 m² of drawn massing, both ends clear of
@@ -77,6 +77,23 @@
  *   4 DROPS     the 28% kill drop exists:
  *               over N staged mission kills the observed rate is within a
  *               binomial band of 0.28 and the drops are health and ammo.
+ *   5 COVER     not one point of damage crosses the wall in eight seconds of a
+ *               PINNED ranged goon firing at the player through it, and his
+ *               hands come down while the ray is blocked.
+ *   6 CONTROL   the same goon, the same wall, the same eight seconds with
+ *               `hostiles.debugIgnoreLos` set — rounds MUST cross. Inline,
+ *               every run, because "he did not shoot" and "he could not shoot"
+ *               are indistinguishable from outside: a goon out of range, out of
+ *               ammo or never spawned scores a perfect zero on gate 5.
+ *   7 REACH     a round fired at a hostile standing 40 / 80 / 120 / 160 m away
+ *               names a hit part on HIM and takes health off him. Measured
+ *               `ped.colliders.length` before the fix: 4 at 10/30/50/70 m and
+ *               ZERO at 100 and 140 m, alive at every one of them — the skinned
+ *               body ring is 49 m on ultra and 81 m on high, and
+ *               `game/tracks.js` spawns every wave at 45-150 m.
+ *   8 CONTROL   take the hit capsules off the same man and fire the identical
+ *               shot with no frame in between: it must pass clean through him
+ *               at every range. That is the reverted defect, reproduced live.
  *
  * `--legacy` restores the old integrator on the live hostiles — the two lines
  * `game/hostiles.js` shipped, `position += dir * speed * dt` and a downward
@@ -112,6 +129,37 @@ const BAND_HI = 2.0;
 const CELL = 0.5;
 /** Anything whose lowest vertex is above this off the ground is massing. */
 const MASSING_Y = 3.0;
+
+/* ---- the firefight half ------------------------------------------------- */
+/**
+ * Seconds per arm of the cover-fire test. Long enough to clear the spawn
+ * cooldown (1.2-2.6 s), the 0.4 s the aim layer takes to ease down and four to
+ * seven fire cycles on top — so a zero in the blocked arm is a zero over
+ * several shots he was ready to take, not a zero over none.
+ */
+const FIRE_SECONDS = 8;
+/**
+ * What the staged goon's round is worth. Small deliberately: the assertion
+ * counts EVENTS, and the control arm has to be survivable twice over so the
+ * second site is not run against a corpse or a respawn.
+ */
+const FIRE_DMG = 3;
+/** Ranges the hit capsules are measured at. */
+const REACH_M = [40, 80, 120, 160];
+/** Bearings tried when looking for an empty lane out to the longest range. */
+const REACH_BEARINGS = 96;
+/** Bind-pose torso midpoint, metres up the rig: (Hips 0.952 + Neck 1.432) / 2. */
+const CHEST_Y = 1.192;
+/** Actor points per staged round. Any positive number the goon can survive. */
+const REACH_DAMAGE = 20;
+/** Road spots tried before giving up on finding an empty 160 m lane. */
+const REACH_STANDS = 8;
+/**
+ * `q.lodBias` on the ULTRA preset, pinned for the range test — see the note in
+ * `REACH_FIRE`. It puts the skinned-body ring at 58 * 0.85 = 49 m, so 40 m is a
+ * bodied hostile and 80 / 120 / 160 m are not.
+ */
+const REACH_LOD_BIAS = 0.85;
 
 /* ==================================================================== */
 /* page-side helpers, as source strings                                  */
@@ -568,6 +616,203 @@ return rows;
 `;
 
 /**
+ * DOES THE WALL STOP HIS ROUNDS? Two arms over the same site, the same man and
+ * the same seconds, differing in one live field:
+ *
+ *   blocked  the shipping gate is armed         -> nothing may cross
+ *   open     `hostiles.debugIgnoreLos` is set   -> rounds MUST cross, or the
+ *                                                  first arm proved nothing
+ *
+ * He is PINNED (`speed: 0`) so what is measured is the wall and not his pathing
+ * round it, and given a range far past the crossing so distance can never be
+ * what stopped him. Damage is counted only when the event's `source` is THIS
+ * man, so a stray cop or a passing car cannot fail the gate on his behalf.
+ *
+ * `peds.lodScale` is lifted for the run because the aim layer is read off
+ * `animator.act` — the EASED value the pose is actually built from, not the
+ * target the brain just wrote — and that only advances for a ped holding a
+ * skinned body. A crossing can be 70 m end to end against a 49 m body ring on
+ * the low preset, so without this the drawn hands would be unreadable at
+ * exactly the sites the gate most wants.
+ */
+const COVER_FIRE = `
+const peds = ctx.peek('peds');
+const player = ctx.peek('player');
+const mgr = peds.hostiles;
+const S = ARG.site;
+const lod0 = peds.lodScale;
+peds.lodScale = 3;
+mgr.debugIgnoreLos = false;
+player.teleport({ x: S.tx, y: S.ty + 1.0, z: S.tz }, 0);
+peds.clearHostiles();
+await window.__PUMP__(10);
+
+const goon = peds.spawnHostile({ x: S.ax, y: S.ay, z: S.az },
+  { hp: 1e6, dmg: ARG.dmg, ranged: true, speed: 0, range: 400 });
+if (!goon) { peds.lodScale = lod0; return { ok: false, why: 'the hostile pool refused to spawn' }; }
+
+let hits = 0;
+let dealt = 0;
+const off = ctx.events.on('damage:dealt', (e) => {
+  if (!e || e.source !== goon) return;
+  const t = e.target;
+  if (t === 'player' || t?.isPlayer === true || t === player) { hits++; dealt += e.amount ?? 0; }
+});
+
+const arm = async () => {
+  hits = 0; dealt = 0;
+  const frames = ARG.frames;
+  let late = 0;
+  for (let k = 0; k < frames; k += 6) {
+    await window.__PUMP__(6);
+    // The aim layer is only meaningful once the spawn cooldown has expired and
+    // the first ray has actually been cast, so the peak is taken over the last
+    // third of the arm rather than over all of it.
+    if (k > frames * 0.66) late = Math.max(late, goon.animator?.act?.film ?? 0);
+  }
+  return {
+    hits, dealt: +dealt.toFixed(1),
+    film: +(goon.animator?.act?.film ?? -1).toFixed(3),
+    filmLate: +late.toFixed(3),
+    body: !!goon.body,
+    d: +Math.hypot(goon.position.x - player.position.x,
+                   goon.position.z - player.position.z).toFixed(1),
+  };
+};
+
+const blocked = await arm();
+mgr.debugIgnoreLos = true;
+const open = await arm();
+mgr.debugIgnoreLos = false;
+off();
+peds.clearHostiles();
+peds.lodScale = lod0;
+return { ok: true, blocked, open };
+`;
+
+/**
+ * CAN YOU HIT A MAN YOU CAN SEE? One empty lane, four distances down it, and a
+ * per-distance control that takes the hit capsules away and fires the identical
+ * round.
+ *
+ * The crowd and the crew are cleared first, and that is staging, not
+ * convenience: both carry hit capsules of their own, and a stranger who wanders
+ * into the line would stop the round on his ribs and be scored as the goon
+ * having no colliders at all.
+ *
+ * SELECTION IS NOT AN ASSERTION. The lane is chosen with a raycast whose mask
+ * deliberately DROPS `ACTOR` and `RAGDOLL` — what is being selected is an empty
+ * stretch of CITY, measured with no hostile anywhere in the world. Whether a
+ * man standing in it can be hit is the question the assertions ask, and a
+ * selection that consulted that same answer would be exactly the circular gate
+ * rule 12 is about.
+ */
+const REACH_FIRE = `
+const peds = ctx.peek('peds');
+const phys = ctx.peek('physics');
+const w = ctx.peek('world');
+const player = ctx.peek('player');
+const RANGES = ARG.ranges;
+const MAXR = RANGES[RANGES.length - 1];
+
+const autoWas = peds.crewAuto;
+const lodWas = peds.lodScale;
+peds.crewAuto = false;
+/**
+ * THE BODY RING IS PINNED TO THE PRESET THE DEFECT WAS MEASURED ON.
+ *
+ * _assignLod hands a skinned body to anyone inside LOD1 * lodBias, and lodBias
+ * runs 0.85 on ultra to 2.4 on low — a ring of 49 m to 139 m for the
+ * same 58 m constant. This probe boots q=low for speed, where every range
+ * below 160 m would keep its body and the bodiless path this gate exists for
+ * would barely be exercised. Pinning the scale to the ultra value puts 80, 120
+ * and 160 m past the ring and leaves 40 m inside it, which is exactly the split
+ * the original measurement reported: 4 colliders near, zero far.
+ */
+peds.lodScale = ARG.lodScale;
+peds.despawnCrew?.();
+peds.clearHostiles();
+peds.debugStage('clean');
+await window.__PUMP__(2);
+const restore = () => { peds.crewAuto = autoWas; peds.lodScale = lodWas; };
+
+const p = player.position;
+const eye = { x: p.x, y: p.y + 1.5, z: p.z };
+const CITY = phys.MASK.BULLET & ~phys.LAYER.ACTOR & ~phys.LAYER.RAGDOLL;
+const aimAt = (x, y, z) => {
+  const dx = x - eye.x, dy = y - eye.y, dz = z - eye.z;
+  const len = Math.hypot(dx, dy, dz) || 1e-6;
+  return { dir: { x: dx / len, y: dy / len, z: dz / len }, len };
+};
+
+let lane = null;
+for (let b = 0; b < ARG.bearings && !lane; b++) {
+  const th = (b / ARG.bearings) * Math.PI * 2;
+  const ux = Math.cos(th), uz = Math.sin(th);
+  const fx = p.x + ux * MAXR, fz = p.z + uz * MAXR;
+  const fy = w.walkableHeightAt(fx, fz);
+  if (!Number.isFinite(fy)) continue;
+  if (w.isWater?.(fx, fz)) continue;
+  const a = aimAt(fx, fy + ARG.chest, fz);
+  if (phys.raycast(eye, a.dir, a.len - 0.5, CITY).hit) continue;
+  lane = { ux, uz };
+}
+if (!lane) { restore(); return { ok: false, why: 'no clear ' + MAXR + ' m lane from this stand' }; }
+
+const out = [];
+for (const R of RANGES) {
+  const gx = p.x + lane.ux * R, gz = p.z + lane.uz * R;
+  const gy = w.walkableHeightAt(gx, gz);
+  if (!Number.isFinite(gy)) { out.push({ R, staged: false, why: 'no walkable ground' }); continue; }
+  const goon = peds.spawnHostile({ x: gx, y: gy, z: gz },
+    { hp: 1e6, dmg: 0, ranged: false, speed: 0, range: 0.5 });
+  if (!goon) { out.push({ R, staged: false, why: 'the hostile pool refused to spawn' }); continue; }
+  // Two frames so the LOD pass has run and the controller has clamped him to
+  // the ground: the shot is aimed at where he ACTUALLY ended up.
+  await window.__PUMP__(2);
+  const a = aimAt(goon.position.x, goon.position.y + ARG.chest * goon.scale, goon.position.z);
+  const foul = phys.raycast(eye, a.dir, a.len - 0.35, CITY);
+  if (foul.hit) {
+    peds.despawnHostile(goon);
+    out.push({ R, staged: false,
+      why: 'lane fouled at ' + foul.distance.toFixed(1) + ' m by ' + foul.surface });
+    continue;
+  }
+
+  const seen = [];
+  const off = ctx.events.on('bullet:impact', (e) => {
+    if (!e || e.exit) return;
+    seen.push({
+      part: e.part ?? null,
+      onGoon: e.actor === goon,
+      surface: e.surface,
+      d: +Math.hypot(e.point.x - eye.x, e.point.y - eye.y, e.point.z - eye.z).toFixed(1),
+    });
+  });
+  const shot = () => {
+    seen.length = 0;
+    const hp = goon.health;
+    phys.fireBullet({
+      origin: eye, dir: a.dir, damage: ARG.damage, maxDist: a.len + 40,
+      penetration: 0, dropoff: 1, mask: phys.MASK.BULLET,
+    });
+    return { first: seen[0] ?? null, n: seen.length, hp: +(hp - goon.health).toFixed(2) };
+  };
+  const armed = shot();
+  const caps = goon.colliders.length;
+  const body = !!goon.body;
+  // THE CONTROL, with no frame in between so nothing can hand them back.
+  goon._dropColliders();
+  const bare = shot();
+  off();
+  peds.despawnHostile(goon);
+  out.push({ R, staged: true, caps, body, armed, bare, d: +a.len.toFixed(1) });
+}
+restore();
+return { ok: true, ranges: out };
+`;
+
+/**
  * THE NEGATIVE CONTROL. Reinstate, on the live hostile manager, exactly the
  * integrator `game/hostiles.js` shipped: add the desired displacement straight
  * onto the position and take the floor from a downward raycast that starts
@@ -774,7 +1019,14 @@ try {
     await run(`ctx.peek('peds').clearHostiles(); window.__GOON__ = null; return true;`);
     const map = (args.map || path.some((p) => p.inside))
       ? await run(MAP_SRC, { site: S, path }) : null;
-    runs.push({ name, site: S, path, map });
+
+    // The SHOOTING half, at the same crossing and with the same wall between
+    // them. Deliberately after the walk: a second, pinned goon in the street
+    // would perturb the path samples gates 1-3 read.
+    const fire = await runAsync(COVER_FIRE,
+      { site: S, frames: Math.round(FIRE_SECONDS * 60), dmg: FIRE_DMG });
+
+    runs.push({ name, site: S, path, map, fire });
   }
 
   if (!runs.length) {
@@ -808,6 +1060,24 @@ try {
     rec(`3 CHASES  ${r.name}: he goes round rather than standing still`,
       dMin < d0 - 3,
       `closed ${d0.toFixed(1)} m -> ${dMin.toFixed(1)} m`);
+
+    const f = r.fire;
+    if (!f?.ok) {
+      rec(`5 COVER   ${r.name}`, false, f?.why ?? 'the firefight arm did not run');
+      continue;
+    }
+    rec(`5 COVER   ${r.name}: nothing crosses the wall, and his hands come down`,
+      f.blocked.hits === 0 && f.blocked.dealt === 0 &&
+      f.blocked.body && f.blocked.filmLate <= 0.05,
+      `${f.blocked.hits} round(s) / ${f.blocked.dealt} HP through ${f.blocked.d} m of ` +
+      `building in ${FIRE_SECONDS} s, aim layer ${f.blocked.film} ` +
+      `(peak ${f.blocked.filmLate} over the last third)` +
+      (f.blocked.body ? '' : ', NO SKINNED BODY — the drawn aim layer is not readable'));
+    rec(`6 CONTROL ${r.name}: debugIgnoreLos puts rounds through the same wall`,
+      f.open.hits > 0 && f.open.dealt > 0 && f.open.body && f.open.filmLate > 0.3,
+      `${f.open.hits} round(s) / ${f.open.dealt} HP in the same ${FIRE_SECONDS} s, ` +
+      `aim layer peak ${f.open.filmLate}` +
+      (f.open.body ? '' : ', NO SKINNED BODY — the drawn aim layer is not readable'));
   }
   rec('the path was read off the DRAWN transform, not the AI position field',
     anyDrawn, anyDrawn ? 'mesh.matrixWorld' : 'no skinned body was ever assigned — fell back to h.position');
@@ -857,6 +1127,61 @@ try {
     okRate && kinds.length > 0 && kinds.every((k) => k === 'health' || k === 'ammo'),
     `${drop.drops}/${drop.kills} = ${(rate * 100).toFixed(1)}% (want 28% ±${(3 * sd * 100).toFixed(1)}), ` +
     `kinds ${JSON.stringify(drop.kinds)}`);
+
+  /* ------------------------------------------------------- 7/8 REACH */
+  /**
+   * A different question and a different staging: not "can he shoot me" but
+   * "can I shoot him". It needs open ground rather than a wall, so it gets its
+   * own stand — the first road spot that yields an empty lane out to 160 m.
+   */
+  let reach = null;
+  for (let k = 0; k < REACH_STANDS && !reach; k++) {
+    const [name, ax, az] = ANCHORS[k * 3 % ANCHORS.length];
+    const at = await run(`
+      const w = ctx.peek('world');
+      const near = w.roads.nearestEdge(ARG.x, ARG.z, 500);
+      if (!near?.edge) return null;
+      const e = near.edge;
+      const na = w.roads.nodes[e.a], nb = w.roads.nodes[e.b];
+      const x = na.x + (nb.x - na.x) * near.t;
+      const z = na.z + (nb.z - na.z) * near.t;
+      const y = w.walkableHeightAt(x, z);
+      if (!Number.isFinite(y)) return null;
+      ctx.peek('player').teleport({ x, y: y + 1.0, z }, 0);
+      return { x, y, z };
+    `, { x: ax, z: az });
+    if (!at) continue;
+    await settle();
+    const r = await runAsync(REACH_FIRE, {
+      ranges: REACH_M, bearings: REACH_BEARINGS, chest: CHEST_Y,
+      damage: REACH_DAMAGE, lodScale: REACH_LOD_BIAS,
+    });
+    if (r?.ok && r.ranges.every((q) => q.staged)) { reach = { name, ...r }; break; }
+    log(`  ..${name}: ${r?.why ??
+      r.ranges.filter((q) => !q.staged).map((q) => `${q.R} m ${q.why}`).join('; ')}`);
+  }
+
+  if (!reach) {
+    rec('7 REACH   a lane clear of city out to 160 m was staged', false,
+      `no stand in ${REACH_STANDS} produced one — the range half could not run`);
+  } else {
+    log(`  ..${reach.name}: firing down one lane at ${REACH_M.join(' / ')} m`);
+    for (const q of reach.ranges) {
+      rec(`7 REACH   ${q.R} m: the round names a hit part on the man standing there`,
+        q.staged && !!q.armed.first?.onGoon && !!q.armed.first.part && q.armed.hp > 0,
+        q.staged
+          ? `part ${q.armed.first?.part ?? 'NONE'} on ${q.armed.first?.onGoon ? 'him' : q.armed.first?.surface ?? 'nothing'} ` +
+            `at ${q.armed.first?.d ?? '?'} m, -${q.armed.hp} HP, ` +
+            `${q.caps} hit capsule(s), skinned body ${q.body ? 'yes' : 'no'}`
+          : q.why);
+    }
+    const staged = reach.ranges.filter((q) => q.staged);
+    rec('8 CONTROL drop the hit capsules and the identical shot passes through him',
+      staged.length === REACH_M.length &&
+      staged.every((q) => !q.bare.first?.onGoon && q.bare.hp === 0),
+      staged.map((q) => `${q.R} m ${q.bare.first?.onGoon ? 'STILL HIT' :
+        q.bare.first ? `through to ${q.bare.first.surface}` : 'no impact'} / -${q.bare.hp} HP`).join(' · '));
+  }
 
   if (noCollider) {
     log(`\n  NOTE, not a failure and NOT THIS DIRECTORY'S: ${noCollider} drawn crossing(s) were ` +

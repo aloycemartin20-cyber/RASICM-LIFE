@@ -19,6 +19,7 @@ import {
 import { AIRBASE } from './plan.js';
 import { JobQueue, RingTracker } from './streaming.js';
 import { publishInclineTracks } from './incline.js';
+import { Router } from './route.js';
 
 /** `?owNoWarmFix=1` reverts this subsystem's pre-warm to the pre-fix behaviour,
  *  so the two arms can be interleaved in one measurement session. */
@@ -116,10 +117,12 @@ async function withFrameTarget(renderer, fn) {
  *   bridges.js     truss / arch / suspension superstructure, piers, parapets
  *   water.js       the river sheet and its scrolling normal layers
  *   streaming.js   the amortised job queue + ring bookkeeping
+ *   route.js       road routing in metres + the street name at a point
  *
  * PUBLIC API — `const w = ctx.get('world')`, see ARCHITECTURE.md
  *   w.CITY_SIZE  w.heightAt  w.surfaceAt  w.roads  w.districtAt  w.lotsInTile
  *   w.schedule   w.tileOf    w.isWater    w.streamingIdle
+ *   w.routeTo    w.streetAt
  * plus the pre-existing helpers other subsystems still call: groundHeight,
  * spawn, isOpen, levelToWorld/worldToLevel, overlapCapsule, queryAabb,
  * sweepCapsule, prewarmMaterials, getHudState.
@@ -322,6 +325,8 @@ export class WorldSystem {
      */
     this.pois = city.pois ?? [];
     this._poiById = new Map(this.pois.map((p) => [p.id, p]));
+    /** Routing and street names over the graph above — see `route.js`. */
+    this._router = new Router(this.roads);
     const tPlan = performance.now();
 
     /* ---- 3. renderers -------------------------------------------------- */
@@ -1353,6 +1358,23 @@ export class WorldSystem {
     return 'grass';
   }
 
+  /**
+   * Waypoints from one world position to another by road, or null when there is
+   * no road answer. A REUSED array — see `route.js` for the full contract, the
+   * waypoint shape and what null means.
+   */
+  routeTo(fromX, fromZ, toX, toZ, opts = null) {
+    return this._router.routeTo(fromX, fromZ, toX, toZ, opts);
+  }
+
+  /**
+   * The name of the street at (x, z), or null when the point is not on one.
+   * Pass `y` on a bridge — see `route.js`.
+   */
+  streetAt(x, z, y = NaN) {
+    return this._router.streetAt(x, z, y);
+  }
+
   /** `{ id, name, density, wealth, palette }` — nearest district by d/r. */
   districtAt(x, z) {
     let best = null;
@@ -1780,6 +1802,7 @@ export class WorldSystem {
     if (this._floorHandle >= 0) this.physics?.removeStatic(this._floorHandle);
     this._floorMesh?.geometry?.dispose();
     this.root?.parent?.remove(this.root);
+    this._router = null;
     for (const l of this._ballast ?? []) l.parent?.remove(l);
     this._ballast = null;
     this._pointLights = null;

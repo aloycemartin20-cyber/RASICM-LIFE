@@ -754,6 +754,21 @@ export class UiSystem {
 
     on('damage:dealt', (e) => {
       if (!e || this._isPlayerTarget(e.target)) return;
+      if (!this._isPlayerSource(e.source)) {
+        /**
+         * NOT YOUR SHOT, NOT YOUR HITMARKER. Two brothers put a round into
+         * something every 1.5 s each (`src/peds/crew.js`), so the HUD was
+         * drawing a centre-screen X and a floating damage number roughly every
+         * 0.75 s with the player's trigger untouched — which is exactly as much
+         * information as no hitmarker at all.
+         *
+         * The crew still has to READ as helping, so a brother's kill leaves a
+         * small mark and nothing else: no damage number, and none of the audio
+         * `hitmarker()` would have played.
+         */
+        if (e.killed && this._isAllySource(e.source)) this._allyMarker();
+        return;
+      }
       const kind = e.killed ? 'kill' : e.headshot ? 'head' : e.armour ? 'armour' : 'hit';
       this.hitmarker(kind);
       if (e.point) {
@@ -937,6 +952,46 @@ export class UiSystem {
   _isPlayerTarget(t) {
     if (!t) return false;
     return t === 'player' || t === this.ctx.peek('player') || t.isPlayer === true;
+  }
+
+  /**
+   * Did the PLAYER deal this? A hitmarker that fires for somebody else's round
+   * is not feedback, it is noise, and it makes every honest one worthless too.
+   *
+   * `source` is OPTIONAL on `damage:dealt` (ARCHITECTURE.md: "branch on
+   * presence, never assume the field is there"), so ABSENT has to mean
+   * something, and here it means the player. That is not an assumption: the one
+   * emitter in the tree that leaves it unset is `physics.emitImpact`, which is
+   * reachable only from `physics.fireBullet`, whose only two callers are
+   * `src/weapons/ballistics.js` and `src/weapons/melee.js` — the player's own
+   * rounds and his own swings. Everything that is NOT the player stamps itself:
+   * the crew (`src/peds/crew.js`), the mission hostiles (`src/peds/hostile.js`),
+   * a ped's punch (`src/peds/index.js`) and the player's melee model, which
+   * names him outright.
+   */
+  _isPlayerSource(s) {
+    if (s == null) return true;
+    if (s === 'player') return true;
+    const p = this.ctx.peek('player');
+    return s === p || s.isPlayer === true || (!!p && s === p.movement);
+  }
+
+  /** One of the brothers — the only non-player source that earns a mark. */
+  _isAllySource(s) {
+    return !!s && typeof s === 'object' && (s.isCrew === true || !!s.crew);
+  }
+
+  /**
+   * A brother's kill, muted: a third-size mark for a fifth of the life, no
+   * damage number and no tick. `Hitmarkers.spawn` hands back the pooled item
+   * and `a` / `life` are the scale and duration its own update reads, so this
+   * is the marker the player already knows, quietly.
+   */
+  _allyMarker() {
+    const it = this.hit.spawn('hit');
+    if (!it) return;
+    it.a = 0.32;
+    it.life = 0.16;
   }
 
   /** `vehicle:enter` is emitted for peds boarding too — only toast for us. */

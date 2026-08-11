@@ -106,6 +106,8 @@ export class MissionRunner {
     this._markers = [];
     this._objective = { eyebrow: '', text: '', timer: null, count: '', progress: -1 };
     this._startPayload = { id: '', chapter: '', name: '', zone: '', track: '' };
+    /** Reused staging record — see `_stageOf`. Never handed out twice at once. */
+    this._stagePoi = { id: '', name: '', x: 0, z: 0 };
     this._endPayload = { id: '', name: '', cash: 0, respect: 0, reason: '' };
     this._rewards = [];
     /** Lazy pools: the glowing ground ring + marked-vehicle glows, ward NPCs. */
@@ -232,7 +234,7 @@ export class MissionRunner {
        * A race stages at its own start line even though the chapter names no
        * POI — you drive to the grid, you do not materialise on it.
        */
-      startPoi: this.wq.poi(c.at ?? c.from ?? '') ?? startLineOf(c),
+      startPoi: this._stageOf(this.wq.poi(c.at ?? c.from ?? '')) ?? startLineOf(c),
     };
     this.M = M;
 
@@ -258,6 +260,31 @@ export class MissionRunner {
     this.ctx.events.emit('mission:start', p);
     this.wq.uiSfx('regen', 0.8);
     return M;
+  }
+
+  /**
+   * The point a chapter is STAGED on, for a POI whose own coordinate is not
+   * standable.
+   *
+   * A `DOCKS` record's `x`/`z` is the pier head and is over water on purpose —
+   * a boat moors there and the delivery marker belongs on the surface — but
+   * `travel` walks you to it, `forceBegin` teleports you six metres off it, and
+   * every track anchors its content around it. `stage` is the dry apron behind
+   * the pier, and it is what all of those want. `tracks.anchor()` prefers it
+   * too, so a track reached any other way gets the same answer.
+   *
+   * The record is REUSED. Only one mission is live at a time and `startPoi` is
+   * read, never retained, so one is enough — and `_start` is not a place to
+   * allocate a new object per chapter.
+   */
+  _stageOf(poi) {
+    if (!poi?.stage) return poi ?? null;
+    const s = this._stagePoi;
+    s.id = poi.id;
+    s.name = poi.name;
+    s.x = poi.stage.x;
+    s.z = poi.stage.z;
+    return s;
   }
 
   /* ==================================================================== */
@@ -293,7 +320,7 @@ export class MissionRunner {
       context,
       focusX: f.x,
       focusZ: f.z,
-      focusY: this.wq.groundY(f.x, f.z),
+      focusY: this.wq.surfaceY(f.x, f.z),
       onDone: () => this._sceneEnded(M),
     }) === true;
   }
@@ -556,7 +583,7 @@ export class MissionRunner {
    */
   marker(M, i, x, z, name, label = null, ringR = 0) {
     const m = this._markerPool[i] ?? this._markerPool[0];
-    m.position.set(x, this.wq.groundY(x, z) + 1.4, z);
+    m.position.set(x, this.wq.surfaceY(x, z) + 1.4, z);
     m.label = label ?? (name ? name[0].toUpperCase() : '');
     m.name = name;
     if (!this._markers.includes(m)) this._markers.push(m);
@@ -764,7 +791,7 @@ export class MissionRunner {
         }
         ring.position.set(
           v.position.x,
-          this.wq.groundY(v.position.x, v.position.z, v.position.y + 8) + 0.08,
+          this.wq.surfaceY(v.position.x, v.position.z, v.position.y + 8) + 0.08,
           v.position.z
         );
         const s = 3.0 + 0.3 * Math.sin(t * 3.2 + n * 1.7);
@@ -846,7 +873,7 @@ export class MissionRunner {
     f.yaw = 0;
     f.shirt.color.setHex(opts.color ?? 0x9aa4b2);
     f.ringMat.color.setHex(opts.accent ?? opts.color ?? 0x7bf0d8);
-    f.group.position.set(x, this.wq.groundY(x, z), z);
+    f.group.position.set(x, this.wq.surfaceY(x, z), z);
     f.group.visible = true;
     return f;
   }
@@ -943,7 +970,7 @@ export class MissionRunner {
       const want = Math.atan2(this.px - f.x, this.pz - f.z);
       f.yaw += (want - f.yaw) * Math.min(1, dt * 3);
       f.group.rotation.y = f.yaw;
-      f.group.position.y = this.wq.groundY(f.x, f.z) + Math.sin(f.anim * 1.8) * 0.02;
+      f.group.position.y = this.wq.surfaceY(f.x, f.z) + Math.sin(f.anim * 1.8) * 0.02;
     }
   }
 
@@ -1021,13 +1048,13 @@ export class MissionRunner {
   }
 
   grenadeWarn(x, z) {
-    const v = this._anchorV.set(x, this.wq.groundY(x, z) + 0.4, z);
+    const v = this._anchorV.set(x, this.wq.surfaceY(x, z) + 0.4, z);
     this.wq.ui?.spawnGrenade?.(v, 1.2);
   }
 
   explode(x, z, radius, damage) {
     const e = this._boom ??= { position: new THREE.Vector3(), radius: 8, damage: 60 };
-    e.position.set(x, this.wq.groundY(x, z) + 0.7, z);
+    e.position.set(x, this.wq.surfaceY(x, z) + 0.7, z);
     e.radius = radius;
     e.damage = damage;
     this.ctx.events.emit('explosion', e);

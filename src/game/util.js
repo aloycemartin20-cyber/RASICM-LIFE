@@ -16,7 +16,7 @@
  */
 
 import * as THREE from 'three';
-import { POI, SAFEHOUSES, SHOPS, SHOPS_BY_KIND, GAS_STATIONS } from './data.js';
+import { POI, SAFEHOUSES, SHOPS, SHOPS_BY_KIND, GAS_STATIONS, DOCKS } from './data.js';
 
 const TAU = Math.PI * 2;
 
@@ -138,6 +138,25 @@ export class WorldQuery {
       if (Number.isFinite(h)) return h;
     }
     return 0;
+  }
+
+  /**
+   * The surface an OBJECTIVE floats on: the ground, or the water lying over it.
+   *
+   * `groundY` is the RIVERBED. `WATER_Y` is 0 and `RIVER_BED` is -11
+   * (`src/world/plan.js`), so every marker, glow ring and figure the mission
+   * layer put over water was drawn ~9 m under the surface — including Carson
+   * CH 1's boat ring, which is the first objective a new save ever sees, and
+   * every crate of his salvage chapter.
+   *
+   * ANYTHING THE PLAYER LOOKS AT GOES THROUGH THIS. Anything that has to touch
+   * the ground — a capsule, a wheel, a spawn height — still goes through
+   * `groundY`, because a hostile standing on the water is a different bug.
+   */
+  surfaceY(x, z, fromY = 260) {
+    const g = this.groundY(x, z, fromY);
+    const w = this.world?.waterLevelAt?.(x, z);
+    return Number.isFinite(w) && w > g ? w : g;
   }
 
   isWater(x, z) {
@@ -262,7 +281,7 @@ export class WorldQuery {
         return out;
       }
       const hit = roads.nearestEdge(x, z, 40);
-      if (!hit?.edge) continue;
+      if (!this._drivableTo(hit)) continue;
       // Snap onto the lane centre so nothing spawns half on the kerb.
       let px = x, pz = z, pyaw = a;
       if (roads.laneCenter) {
@@ -311,8 +330,27 @@ export class WorldQuery {
       out.ok = true;
       return out;
     }
-    // Nothing legal found — fall back to a jittered point near the anchor so a
-    // mission still starts rather than silently spawning nothing.
+    /**
+     * Nothing legal in the ring at all. This is what an anchor ON THE WATER
+     * looks like — a pier, a boss arena on a marina — and the old answer was a
+     * jittered point at `min` from that anchor, i.e. still in the river.
+     * Ask the graph for the nearest lane to the ANCHOR instead and snap to it.
+     * `ok` stays false because the annulus was not honoured, but the answer is
+     * a carriageway rather than the riverbed.
+     */
+    const far = roads?.nearestEdge ? roads.nearestEdge(cx, cz, ANCHOR_ROAD_REACH) : null;
+    if (this._drivableTo(far) && roads.laneCenter) {
+      const t = clamp01(typeof far.t === 'number' ? far.t : 0.5);
+      roads.laneCenter(far.edge.id ?? far.edge, far.lane ?? 0, t, this._v);
+      out.x = this._v.x;
+      out.z = this._v.z;
+      out.y = this.groundY(out.x, out.z);
+      out.yaw = roads.laneYaw ? roads.laneYaw(far.edge, far.lane ?? 0) : 0;
+      out.ok = false;
+      return out;
+    }
+    // No road graph at all (a bench with no `world`): a jittered point near the
+    // anchor so a mission still starts rather than silently spawning nothing.
     const a = this.rng.float() * TAU;
     out.x = cx + Math.cos(a) * min;
     out.z = cz + Math.sin(a) * min;
@@ -320,6 +358,26 @@ export class WorldQuery {
     out.yaw = a;
     out.ok = false;
     return out;
+  }
+
+  /**
+   * Is this `nearestEdge` hit somewhere a CAR may be put?
+   *
+   * `roads.nearestEdge` answers with the nearest edge of any kind, and two of
+   * those kinds are not road: mill trackage (`rail`) is in the graph so
+   * `roadmesh` can draw ballast, and — until `netgen.closeNetwork` — a stranded
+   * fragment no car can reach. A mission that spawns its marked car on either
+   * is a mission that cannot be completed, and neither failure says anything
+   * when it happens.
+   */
+  _drivableTo(hit) {
+    const e = hit?.edge;
+    if (!e || e.rail) return false;
+    const roads = this.world?.roads;
+    const main = roads?.driveMain;
+    if (main === undefined || main < 0) return true;
+    const n = roads.nodes[e.a];
+    return !n || n.component === undefined || n.component === main;
   }
 
   /** A dry point that need not be near a road — crates, enemies, hold points. */
@@ -335,8 +393,19 @@ export class WorldQuery {
       out.x = x; out.z = z; out.y = this.groundY(x, z); out.yaw = a; out.ok = true;
       return out;
     }
-    out.x = cx; out.z = cz; out.y = this.groundY(cx, cz); out.yaw = 0;
-    return out;
+    /**
+     * 140 samples and not one of them was dry, open ground. Handing the caller
+     * back the point it asked about is how a `protect` ward, a boss and every
+     * wave of hostiles came to stand on the riverbed: MEASURED at the South
+     * Side Docks, 2160 samples of the 5-12 m annulus and ZERO dry ones, and
+     * the old fallback returned (cx, cz) — 8.8 m under the Monongahela — with
+     * `ok` false that nobody reads.
+     *
+     * Fall through to the road resolver. It is the same annulus, it never
+     * returns water, and its own last resort is the nearest lane to the anchor
+     * — pavement is not the verge this asked for, but it is ground.
+     */
+    return this.findRoadSpot(min, max, cx, cz, out);
   }
 
   /**
@@ -361,11 +430,10 @@ export class WorldQuery {
       return out;
     }
     if (nearShore) return this.findWaterSpot(min, max, cx, cz, out, false);
-    // No water within reach: fall back to the nearest dock, which is on water
-    // by construction.
-    const d = this.nearestOf(
-      [{ x: -88, z: 280 }, { x: -24, z: -264 }, { x: -744, z: -88 }], cx, cz
-    );
+    // No water within reach: fall back to the nearest dock's PIER HEAD, which
+    // is over water by construction — that is what the coordinate on a `DOCKS`
+    // record is, and why the dry point beside it is a separate `stage` field.
+    const d = this.nearestOf(DOCKS, cx, cz);
     out.x = d.poi.x; out.z = d.poi.z; out.y = 0; out.yaw = 0;
     return out;
   }
@@ -429,3 +497,12 @@ const EMPTY_OPTS = Object.freeze({});
 
 /** How far a moored boat may sit from a bank and still be walkable-to. */
 const SHORE_REACH = 22;
+
+/**
+ * How far `findRoadSpot` will reach from the ANCHOR when its whole annulus was
+ * illegal. Generous on purpose: this only runs when the anchor itself is in a
+ * river or walled in, and the alternative answer is the riverbed. The widest
+ * gap between a pier head and the nearest lane in the authored table is 75 m
+ * (`dock_point`), so 400 m is slack, not a target.
+ */
+const ANCHOR_ROAD_REACH = 400;

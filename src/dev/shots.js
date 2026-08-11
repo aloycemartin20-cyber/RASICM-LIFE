@@ -116,6 +116,11 @@ function holdCamera(e, pos, target) {
 }
 
 function shotChrome(engine, shot) {
+  // Anything the `pursuit` staging seated goes back to the crowd the moment a
+  // different shot is applied — see `releaseStagedDrivers`. This runs on both
+  // apply paths and at the shutter, so it cannot be missed the way
+  // `clearTraffic` once was.
+  if (shot !== SHOTS.pursuit) releaseStagedDrivers(engine);
   engine.ctx.peek('ui')?.hideZoneToast?.();
   for (const n of document.querySelectorAll('.ow-zone, [class*="zone"]')) {
     n.style.display = 'none';
@@ -210,6 +215,212 @@ function frameVehicle(e, kind, { dist = 8.2, height = 1.25, swing = 0.62, aimY =
   cam.position.set(v.position.x + ox * dist, v.position.y + height, v.position.z + oz * dist);
   cam.lookAt(v.position.x, v.position.y + aimY, v.position.z);
   holdCamera(e, cam.position, { x: v.position.x, y: v.position.y + aimY, z: v.position.z });
+}
+
+/**
+ * PUT SOMEBODY BEHIND EVERY WHEEL IN THE TABLEAU — without this the pursuit
+ * shot photographs the exact defect it was added to disprove.
+ *
+ * `vehicles._updateHeadlights` skips any car that is neither the player's nor
+ * has `v.driver` — correct, because a parked car must not burn its lamps, and
+ * fatal for a staged still: `police._stagePursuit` spawns five cars and seats
+ * nobody. MEASURED on the first cut of this shot at 22:00, three stars, five
+ * cars in frame: `hosts [{has:false},{has:false},{has:false}]`, zero road
+ * pools, and every headlight in the picture an emissive quad throwing nothing.
+ * A reviewer would have scored the multi-host headlight work off a frame in
+ * which it was switched off.
+ *
+ * Both calls are the published doors — `peds.attachDriver` is the ONE way a
+ * body enters that system (`police/officer.js` uses the same one), and
+ * `vehicles.setDriver` is what sets the field the headlight pass reads. It is
+ * also the honest fiction: a pursuit has people in the cars.
+ */
+function seatStagedDrivers(e) {
+  const peds = e.ctx.peek('peds');
+  const veh = e.ctx.peek('vehicles');
+  if (!peds?.attachDriver || !veh?.setDriver) return 0;
+  releaseStagedDrivers(e);
+  const seated = (e.__shotDrivers = []);
+  let n = 0;
+  for (const v of veh.vehicles ?? []) {
+    // Only what `police` has just staged: `_stagedVehicles` is private, but a
+    // frozen tableau is exactly the set of cars that are stopped with their
+    // lightbars lit plus the quarry, and re-seating a car that already has a
+    // driver would take a second body for nothing.
+    if (v.driver || v.destroyed) continue;
+    if (!(v.lightbarOn || v === e.ctx.peek('police')?.quarry?.vehicle)) continue;
+    let ped = null;
+    try {
+      ped = peds.attachDriver(v, 0, { archetype: 'office' });
+    } catch {
+      ped = null;
+    }
+    if (!ped) continue;   // `peds` owns its own budget and may say no
+    veh.setDriver(v, ped, 0);
+    seated.push({ v, ped });
+    n++;
+  }
+  return n;
+}
+
+/**
+ * GIVE THE BODIES BACK — and this is not tidiness, it is a leak with teeth.
+ *
+ * `police._clearStage` despawns its tableau by calling `vehicles.despawn`,
+ * which frees the CAR and says nothing to `peds`. A ped left in `STATE.DRIVING`
+ * with a recycled vehicle stops updating its own position, stands frozen where
+ * the car last was and holds a `q.pedBudget` slot until distance streaming
+ * happens to notice it — `traffic._unseatPed` carries the same write-up. Seat
+ * five and never release them and a batch session (`tools/shotset.mjs`,
+ * `tools/screenshots.mjs`) starves the crowd a shot at a time.
+ *
+ * So: released before the tableau is re-staged, and released by `shotChrome`
+ * the moment any OTHER shot is applied. Duck-typed down the same chain
+ * `traffic` uses, because `peds` has no `detachDriver` yet.
+ */
+function releaseStagedDrivers(e) {
+  const list = e.__shotDrivers;
+  if (!list?.length) return;
+  e.__shotDrivers = null;
+  const peds = e.ctx.peek('peds');
+  const veh = e.ctx.peek('vehicles');
+  for (const { v, ped } of list) {
+    try {
+      veh?.clearDriver?.(v, ped);
+      if (typeof peds?.detachDriver === 'function') peds.detachDriver(v);
+      else if (typeof peds?.pullFromVehicle === 'function') {
+        peds.pullFromVehicle(v, { x: v.position.x + 1.4, y: v.position.y, z: v.position.z });
+      }
+    } catch { /* a shot must never take the boot down */ }
+  }
+}
+
+/**
+ * Stage a three-star pursuit and frame it FROM THE CAR BEING CHASED.
+ *
+ * WHY THIS SHOT EXISTS. `vehicles` promoted the headlight pool from one host to
+ * three and gave every other headlit car in range a projected road pool, and
+ * `props` now spends up to five punctual slots on the nearest lamps — and NO
+ * SHOT IN THIS SET SHOWS ANY OF IT. `chase` is the closest and it does not: at
+ * 20:12 the night factor (`_updateHeadlights`, `1 - (alt+0.02)/0.14`) is barely
+ * off zero, and it stages onto whatever road is nearest a riverside plaza. So
+ * the one claim the night-lighting work is judged on — "you can read the road,
+ * the kerb and the lane lines ahead of you during a 3-star night pursuit" —
+ * had no frame in the review set at all. That is the same hole the searchlight
+ * pair was added to close, and it shipped the same way: through a harness that
+ * could not photograph the defect.
+ *
+ * FRAMED FROM THE STAGED QUARRY, not from authored coordinates — the fifth
+ * time in this file, see `frameBeam` / `frameVehicle` / `frameActor`.
+ * `police.debugStage('pursuit')` puts a fleeing car on the real road graph
+ * 34 m in front of the lens facing it, and four cruisers with their bars lit
+ * behind that — MEASURED at this anchor, 12 / 25 / 37 / 53 m back down the
+ * lane. Standing off the QUARRY puts its face and its own headlights in the
+ * near field with the cruisers' beams stacked up the avenue behind it;
+ * standing where the shot was authored would frame whatever the road graph
+ * happened to put 34 m away this generation.
+ *
+ * THE STANDOFF IS AN EXPOSURE DECISION, not a taste one, and the numbers are
+ * worth keeping because they are also a FINDING about the headlight work. All
+ * three spot pairs point back into the lens here, and the road they land on is
+ * the brightest thing in the frame. MEASURED over the whole frame at 1280x720,
+ * `tools/analyze.mjs`, at three standoffs:
+ *
+ *   dist 12.4   p99 249   0.94 % over 250   street patch L203
+ *   dist  8.4   p99 247   0.55 % over 250   street patch L153
+ *   dist  8.0, aimed higher (shipped)
+ *               p99 245   0.46 % over 250   street patch L178
+ *
+ * `night`, for scale, is p99 189 and 0.03 % over 250. So a car park's worth of
+ * headlights aimed at the camera does blow the near carriageway, and the
+ * further INTO the beams the lens stands the worse it gets — 12.4 m is deep in
+ * the hot spot, not clear of it. The shot is composed to show the falloff
+ * rather than to hide the level; whether ~0.5 % of a night frame at full beam
+ * is acceptable is a judgement for the reviewer, which is the point of having
+ * the frame at all.
+ *
+ * THE AXIS IS THE PRE-STAGING CAMERA'S FORWARD, and it has to be: everything
+ * `_stagePursuit` places is `_cam + _fwd * d` snapped to the nearest lane, so
+ * that ray is the one line the whole tableau is strung along, and the quarry is
+ * turned to face back down it. Two alternatives were tried and both frame an
+ * empty street, for the same underlying reason — each car snaps to whatever
+ * road edge is nearest ITS distance, so nothing derived from one car's pose
+ * describes the queue:
+ *
+ *   the quarry's own quaternion   its lane can bend away from the line
+ *   the nearest cruiser's position at a junction that cruiser is on the CROSS
+ *                                 street, and the axis comes out ~90 degrees
+ *                                 wrong — MEASURED, it put the lens on the
+ *                                 quarry's flank with the queue behind camera
+ *
+ * `dist`/`side`/`eye` place the lens ahead of and beside the quarry, `aimAhead`
+ * aims it back down the line so the receding cruisers are the depth in the
+ * frame, and `markAlong`/`markSide` are where the brother goes — see the shot's
+ * `player` block. `markSide` is a SIGNED offset from the pursuit axis rather
+ * than from `side`, so he can be stood on either kerb.
+ *
+ * NO `clearTraffic` ON THIS SHOT, deliberately: the pre-shutter sweep despawns
+ * anything nearby that is `destroyed || speed < 0.6` and skips only `v._staged`,
+ * which `police._spawnAt` does not set. It would delete the entire tableau —
+ * five frozen cars — between the last pumped frame and the photograph.
+ */
+function framePursuit(e, { dist = 8.0, side = 3.2, eye = 1.7, aimAhead = 17, aimY = 3.4, markAlong = 1.0, markSide = 5.8 } = {}) {
+  const shot = SHOTS.pursuit;
+  // A mark resolved from a PREVIOUS apply must never be photographed: shots run
+  // back to back in one session and the staging can legitimately fail here.
+  if (shot?.player) shot.player.at = null;
+  const police = e.ctx.peek('police');
+  if (!police?.debugStage) return;
+
+  const cam = e.ctx.camera;
+  cam.updateMatrixWorld();
+  const me = cam.matrixWorld.elements;
+  // Camera forward flattened to XZ — a camera looks down its own -Z.
+  const fl = Math.hypot(me[8], me[10]) || 1;
+  const ax = -me[8] / fl;
+  const az = -me[10] / fl;
+
+  police.debugStage('pursuit');
+  const q = police.quarry?.vehicle;
+  if (!q?.position) return;
+  seatStagedDrivers(e);
+
+  const rx = -az;
+  const rz = ax;
+  const g = (x, z) => police.groundAt?.(x, z, q.position.y + 6) ?? q.position.y - 0.6;
+
+  // Ahead of the quarry — back toward where the lens already was — and off its
+  // shoulder, low.
+  const px = q.position.x - ax * dist + rx * side;
+  const pz = q.position.z - az * dist + rz * side;
+  // Aimed PAST the quarry at the cruiser on its tail (12 m behind it here), so
+  // both are in frame and the rest of the queue recedes behind them. Pulled
+  // part of the way back across the carriageway so the quarry sits off-centre,
+  // and aimed HIGH enough that the blown near carriageway is not half the
+  // picture — see the standoff table above.
+  const tx = q.position.x + ax * aimAhead + rx * side * 0.35;
+  const tz = q.position.z + az * aimAhead + rz * side * 0.35;
+  const ty = g(tx, tz) + aimY;
+  cam.position.set(px, g(px, pz) + eye, pz);
+  cam.lookAt(tx, ty, tz);
+  holdCamera(e, cam.position, { x: tx, y: ty, z: tz });
+
+  // The brother, out of the car and back on the kerb the lens is standing at,
+  // watching the queue come: the cruiser beams are his key light, he is clear
+  // of the car's silhouette, and he is far enough off its door that the
+  // contextual-action prompt does not fire and paint 'TAKE THE ...' across the
+  // middle of the frame — MEASURED, 3.4 m off the flank still triggers it.
+  // Resolved here and consumed at `shot:applied`; `player.at` is the only way
+  // to place him against something `apply` has just staged.
+  if (shot?.player) {
+    const mx = q.position.x + ax * markAlong + rx * markSide;
+    const mz = q.position.z + az * markAlong + rz * markSide;
+    shot.player.at = [mx, g(mx, mz) + 0.2, mz];
+    // Turned back to his own car, which is also where the pursuit is coming
+    // from, so he reads three-quarter to the lens rather than as a back.
+    // An actor looks down -Z, so facing `d` is `atan2(-d.x, -d.z)`.
+    shot.player.yaw = Math.atan2(mx - q.position.x, mz - q.position.z);
+  }
 }
 
 function frameActor(e, { dist = 3.0, height = 1.62, side = 0.55, aimY = 1.45 } = {}) {
@@ -602,6 +813,47 @@ const STEEL_CITY_SHOTS = {
     weather: 'scattered',
     viewmodel: false,
     doc: 'Police pursuit — cruisers, lightbars at dusk, traffic reacting, wanted HUD.',
+  },
+  pursuit: {
+    /**
+     * THE ANCHOR IS CHOSEN, NOT INHERITED, and it is the difference between
+     * this shot and an empty street.
+     *
+     * `police._stagePursuit` snaps EVERY car in the tableau to the road graph
+     * independently — `nearestEdge` at 34, 48, 61, 75 and 90 m — and downtown's
+     * longest edge is about 100 m, so a 90 m queue crosses junctions wherever
+     * you put it. Where the QUARRY's 34 m mark lands next to a junction it
+     * takes the cross street's lane yaw and the car that the whole shot is of
+     * comes out broadside with its pursuit behind the lens.
+     *
+     * MEASURED by re-applying this shot along the avenue and reading the
+     * emitted staging — angle between the quarry's nose and the line back to
+     * the nearest cruiser, and the cruisers' scatter either side of it:
+     *
+     *   near z    -26   4    34   64    94    124   154   184
+     *   misalign   5°  51°  27°  71°   15°    9°   18°   35°
+     *   scatter   22   47   49   57    14     3     4    40   m, worst cruiser
+     *
+     * 124 is the only anchor where all four cruisers sit inside a lane width of
+     * the quarry's own line, at 12 / 25 / 37 / 53 m behind it. `night` and
+     * `hero`'s 64 is the worst of the eight. Re-measure if the road graph is
+     * regenerated; this is a property of the edges, not of the district.
+     *
+     * Low — 1.35 m rather than the 5 m establishing eye — because what is being
+     * judged is at road level.
+     */
+    pos: [-232, 5, 150], look: [-232, 12, -40], fov: 62, time: 22.0, ground: true,
+    onRoad: { near: [-232, 124], eye: 1.35, aheadM: 46 },
+    weather: 'overcast',
+    viewmodel: false,
+    apply: (e) => framePursuit(e),
+    // `at` and `yaw` are FILLED IN BY `framePursuit` against the staged car —
+    // the values here are only the shape, and are nulled on every apply so a
+    // failed staging can never photograph the last shot's mark. `idle` because
+    // a shot settles for hundreds of frames and every other state is a scripted
+    // input that walks him out of frame.
+    player: { at: null, yaw: 0, state: 'idle', shoulder: -1 },
+    doc: 'A 3-star pursuit at 22:00 on a lamp-lined downtown avenue, framed from the car being chased with a brother out at the kerb. THE frame for night lighting: judge whether the carriageway, the kerb line and the lane paint are readable under the lamps and the headlights rather than black; whether more than one car in it throws light (the player car, the nearest cruiser and the pool under every other headlit car); whether the sodium pools have shape and a falloff instead of reading as flat orange decals; and whether a man standing in the beams is lit by them.',
   },
   combat: {
     pos: [-210, 4, 100], look: [-260, 3, 40], fov: 65, time: 16.5, ground: true,

@@ -1138,11 +1138,36 @@ export class AudioSystem {
     // damage is handled by _onDamageTaken.
     const t = p.target;
     if (t === 'player' || t?.isPlayer === true || t === this.ctx.peek('player')) return;
+    if (!this._isPlayerSource(p.source)) {
+      // Somebody else's round. The man it landed on still grunts — that is HIS
+      // voice, not the player's feedback — but the tick on the loudest bus
+      // belongs to the shot the player actually took. Two brothers firing every
+      // 1.5 s were ticking it roughly twice a second on their own.
+      if (p.point && t && this.rng.float() < 0.3) this.bark('hurt', p.point, { level: 0.85 });
+      return;
+    }
     this.ui(p.headshot ? 'headshot' : 'hitmarker', 1);
     if (p.killed) this.ui('kill', 1);
     else if (p.point && p.target && this.rng.float() < 0.3) {
       this.bark('hurt', p.point, { level: 0.85 });
     }
+  }
+
+  /**
+   * Did the PLAYER deal this? The same predicate `ui` applies before it draws a
+   * hitmarker, and it has to be the same one or the X and the tick disagree.
+   *
+   * `source` is OPTIONAL on `damage:dealt`, so ABSENT means the player — the
+   * one emitter that leaves it unset is `physics.emitImpact`, reachable only
+   * from `physics.fireBullet`, whose only callers are the player's ballistics
+   * and his own melee sweep. Everything else stamps itself: the crew, the
+   * mission hostiles, a ped's punch, and the player's melee model.
+   */
+  _isPlayerSource(s) {
+    if (s == null) return true;
+    if (s === 'player') return true;
+    const p = this.ctx.peek('player');
+    return s === p || s.isPlayer === true || (!!p && s === p.movement);
   }
 
   _onDamageTaken(p) {

@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 /**
  * WARD BAR PROBE — during a protect chapter, does anything on screen tell the
- * player how his brother is doing?
+ * player how his brother is doing? And, section 4, the same question asked at
+ * the other end of a fight: during a BOSS chapter, does anything on screen
+ * tell him how the boss is doing?
  *
  *   node src/ui/wardprobe.mjs
  *   node src/ui/wardprobe.mjs --port=5173      (reuse a running vite)
@@ -62,6 +64,22 @@
  * with `hide()` DELETED scored 11/11 — because the objective panel fades out
  * by itself when a chapter ends and takes the row's layout box with it. The
  * check that actually bites is a chapter with no ward and the panel UP.
+ *
+ * ---------------------------------------------------------------------------
+ * SECTION 4 — THE BOSS BAR
+ * ---------------------------------------------------------------------------
+ * Same defect, same measurement, other end of the fight. All three CH7 fights
+ * drew the boss's health as the objective panel's progress slot fed
+ * `1 - hpFrac` — a meter that filled UP as he went down, sharing its one line
+ * with the attack telegraph. `src/game/bossbarprobe.mjs` gates the mechanism
+ * headlessly (the record on `mission:boss`, and the flank damage term); this
+ * gates the only thing node cannot see, which is whether a PIXEL moved.
+ *
+ * It reuses `trackers()` unchanged and against the same standard: sweep every
+ * element under the HUD root, without naming the widget, and report how many
+ * are wide in proportion to the boss's health at four levels. The truth source
+ * is `game.missions.M.bossEnt.health / maxHealth` — the entity `peds` owns,
+ * not the record the bar is drawn from.
  */
 import { chromium } from 'playwright';
 import { startServer } from '../../tools/lib/server.mjs';
@@ -157,11 +175,18 @@ const snap = () =>
       }
     }
 
+    const bossEnt = M?.bossEnt ?? M?.bossVeh ?? null;
+
     return {
       // TRUTH — peds' own numbers for the same man.
       wardId,
       hp: c ? +c.hp.toFixed(3) : null,
       maxHp: c ? c.maxHp : null,
+      // TRUTH for section 4 — the boss ENTITY's health, which is `peds`' (or
+      // `vehicles`') number, not the record `mission:boss` carries and not
+      // anything the bar was drawn from.
+      bossHp: bossEnt ? +Number(bossEnt.health).toFixed(3) : null,
+      bossMaxHp: bossEnt ? bossEnt.maxHealth : null,
       up: c ? c.up : null,
       isWard: c ? !!c.ward : null,
       crewBacked: !!M?.ward?.crew,
@@ -259,13 +284,13 @@ async function setWard(frac) {
  * across every sample. `full` is the reading at 100%; an element qualifies
  * when `width/full` equals `hp/maxHp` at each level, within `tol` of `full`.
  */
-function trackers(samples, tol = 0.035) {
+function trackers(samples, tol = 0.035, frac = (s) => s.hp / s.maxHp) {
   const first = samples[0];
   const keys = Object.keys(first.widths).filter((k) => first.widths[k] > 2);
   return keys.filter((k) => samples.every((s) => {
     const w = s.widths[k];
     if (w === undefined) return false;
-    const want = (s.hp / s.maxHp) * first.widths[k];
+    const want = frac(s) * first.widths[k];
     return Math.abs(w - want) <= tol * first.widths[k];
   }));
 }
@@ -407,6 +432,139 @@ async function caseLifetime(wide) {
 }
 
 /* ======================================================================== */
+/* 4 — the boss bar                                                         */
+/* ======================================================================== */
+
+/** Carson CH7 "..." — `track: 'boss'`, THE HARBORMASTER, three phases. */
+async function stageBoss() {
+  const idx = await inGame(`
+    const boy = game.characters.boy;
+    return boy.story.findIndex((c) => c.track === 'boss');`);
+  await inGame(`
+    game.missions.abort();
+    game.hostiles.clear();
+    game.heat.clear && game.heat.clear('probe');
+    game.economy.char().chapter = ARG;
+    game.startMission(ARG);
+    game.missions.skipIntro();
+    game.missions.forceBegin();
+    return true;`, idx);
+  await pump(30);
+  return idx;
+}
+
+/**
+ * Put the boss at `frac` of full and let the HUD settle.
+ *
+ * `M.bossHp` is written alongside `health` because it is the flank term's
+ * running total: leaving it stale would have `_flank` read the staging as a
+ * frontal hit and refund most of it, so the four levels would collapse toward
+ * each other and the sweep would have nothing to correlate against. This is
+ * STAGING — the assertion downstream still reads the entity's own health after
+ * the fact, whatever it turned out to be.
+ *
+ * The minions and the attack timer are pinned so the only thing moving during
+ * a sample is this function, and the player is kept alive so the chapter
+ * cannot fail underneath the measurement.
+ */
+async function setBoss(frac) {
+  await inGame(`
+    const M = game.missions.M;
+    const B = M && (M.bossEnt || M.bossVeh);
+    if (!B) return false;
+    for (const h of M.spawnedHostiles) if (h.active && h !== B) game.hostiles.despawn(h);
+    M.atkT = 9999; M.minionT = 9999; M.tellT = 0; M.tell = '';
+    B.health = Math.max(1, ARG * B.maxHealth);
+    M.bossHp = B.health;
+    const pl = e.ctx.peek('player');
+    if (pl?.health) { pl.health.value = pl.health.max; pl.dead = false; }
+    return true;`, frac);
+  // The boss fill EASES rather than snapping (see BOSS_FILL_RATE in hud.js),
+  // so give it long enough to be within a fraction of a per cent of the truth.
+  await pump(40);
+  return snap();
+}
+
+async function caseBoss() {
+  const A = '4 the boss bar';
+  const idx = await stageBoss();
+  const s0 = await setBoss(1);
+
+  rec(A, 'the boss chapter is live with a boss on his feet',
+    s0.missionActive && s0.track === 'boss' && s0.bossMaxHp > 0,
+    `chapter ${idx}, track ${s0.track}, ${s0.bossHp}/${s0.bossMaxHp} hp, ` +
+    `objective "${s0.objText}"`);
+
+  const levels = [1, 0.68, 0.37, 0.13];
+  const samples = [s0];
+  for (const f of levels.slice(1)) samples.push(await setBoss(f));
+
+  const bossFrac = (s) => s.bossHp / s.bossMaxHp;
+  const hit = trackers(samples, 0.035, bossFrac);
+  rec(A, 'something on screen is WIDE in proportion to the BOSS\'s health',
+    hit.length > 0,
+    `${hit.length} element(s) tracked ${samples.map((s) => (bossFrac(s) * 100).toFixed(0) + '%').join(' -> ')}` +
+    (hit.length ? `: ${hit.join(', ')}` : ' — NOTHING ON SCREEN DRAWS THE BOSS\'S HP'));
+
+  const named = hit.filter((k) => /ow-boss-fill/.test(k));
+  rec(A, 'the tracking element is the boss health bar',
+    named.length > 0,
+    named.length ? named.join(', ') : `tracked: ${hit.join(', ') || 'none'}`);
+
+  /**
+   * THE DEFECT, EXACTLY. The bar the player HAD was the objective panel's
+   * progress slot fed `1 - hpFrac`, so it grew as he shrank. Nothing under the
+   * HUD root may be wide in proportion to the INVERSE of his health — and this
+   * is the check that a build which merely re-pointed the old panel bar at
+   * `hpFrac` would still pass, while the shipped defect cannot.
+   */
+  const inverted = trackers(samples, 0.035, (s) => 1 - bossFrac(s));
+  rec(A, 'and NOTHING on screen fills up as the boss goes down',
+    inverted.length === 0,
+    inverted.length ? `INVERTED: ${inverted.join(', ')}` : 'no inverted meter on screen');
+
+  // The name is on screen, or a bar with no owner is just a bar.
+  const nameUp = await page.evaluate(() => {
+    const n = document.querySelector('.ow-boss-name');
+    const r = n?.getBoundingClientRect();
+    return { text: (n?.textContent ?? '').trim(), w: +(r?.width ?? 0).toFixed(1) };
+  });
+  rec(A, 'the boss is named next to his bar',
+    nameUp.w > 10 && nameUp.text.length > 2,
+    `"${nameUp.text}" at ${nameUp.w} px`);
+
+  // Phase ticks: THE HARBORMASTER has three phases, so two marks.
+  const ticks = await page.evaluate(() => {
+    const out = [];
+    for (const t of document.querySelectorAll('.ow-boss-tick')) {
+      const r = t.getBoundingClientRect();
+      if (r.width > 0.2 && r.height > 0.2) out.push(+r.left.toFixed(1));
+    }
+    return out;
+  });
+  rec(A, 'the phase boundaries are marked on the track',
+    ticks.length === 2, `${ticks.length} tick(s) drawn at x ${ticks.join(', ') || '—'}`);
+
+  // ...and it goes away with the fight. `caseLifetime`'s lesson applies: the
+  // boss bar is NOT in the objective panel, so a panel that fades cannot be
+  // what hides it.
+  const wide = named[0] ?? null;
+  await inGame(`game.missions.abort(); game.hostiles.clear(); return true;`);
+  await pump(30);
+  const after = await snap();
+  rec(A, 'free roam never shows it',
+    (wide ? (after.widths[wide] ?? 0) : 0) === 0 && !after.missionActive,
+    `${(wide ? (after.widths[wide] ?? 0) : 0).toFixed(1)} px in free roam`);
+
+  if (VERBOSE) {
+    for (const s of samples) {
+      const w = wide ? s.widths[wide] : null;
+      console.log(`   ${(bossFrac(s) * 100).toFixed(1).padStart(5)}% boss hp -> ${w?.toFixed(2) ?? '—'} px`);
+    }
+  }
+}
+
+/* ======================================================================== */
 
 let code = 0;
 try {
@@ -414,6 +572,7 @@ try {
   await caseTracking();
   const wide = await caseRange();
   await caseLifetime(wide);
+  await caseBoss();
   rec('0 boot', 'the page booted without a script error', errs.length === 0,
     errs.length ? errs.slice(0, 3).join(' | ') : 'clean');
 
@@ -428,7 +587,7 @@ try {
     console.log(`  ${r.ok ? 'ok  ' : 'FAIL'} ${r.name}`);
     if (!r.ok || VERBOSE) console.log(`       ${r.detail}`);
   }
-  console.log(`\nward bar: ${results.length - failed}/${results.length}`);
+  console.log(`\nward + boss bars: ${results.length - failed}/${results.length}`);
   code = failed ? 1 : 0;
 } catch (err) {
   console.error('probe threw:', err);

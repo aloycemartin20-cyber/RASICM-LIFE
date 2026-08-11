@@ -54,8 +54,14 @@
  *   node src/world/lmsweep.mjs --width=2.6        vehicle width, metres
  *
  * NEGATIVE CONTROL — lay every corridor as authored, straight through the six
- * sites, and watch it go red:
+ * sites, and watch the site assertions go red:
  *   node src/world/lmsweep.mjs --noreserve
+ *
+ * NEGATIVE CONTROL for the CONNECTIVITY assertion, which is a different fix in
+ * a different pass — ship the graph with its stranded fragments intact:
+ *   node src/world/lmsweep.mjs --noclose
+ * MEASURED: 9 drivable components, 96.74% of nodes and 97.46% of km on the
+ * main one, against 1 / 100.00% / 100.00% with `netgen.closeNetwork` on.
  */
 
 import { chromium } from 'playwright';
@@ -75,28 +81,37 @@ const args = Object.fromEntries(
 const VEH_W = Number(args.width ?? 2.6);
 const STEP = Number(args.step ?? 1.0);
 const NORESERVE = !!args.noreserve;
+const NOCLOSE = !!args.noclose;
 
 /**
- * RATCHET (ARCHITECTURE.md rule 13). The share of the drivable network that
- * has to sit in ONE connected component.
+ * The share of the drivable network that has to sit in ONE connected
+ * component. NOT a ratchet any more — it is the goal, and the goal is met.
  *
- * The goal is 100%, and the residual is not the reservation's doing. Measured
- * on the build this landed on, the same seven islands and the same 46 stranded
- * nodes appear in BOTH arms — a grid rail that runs off the map edge at
- * (-1409,-908), one that dies on the West End hillside, and five smaller ones:
+ * This used to be a RATCHET at 98.5 / 98.7, recording seven islands and 46
+ * stranded nodes that were present with the landmark reservation ON and OFF
+ * alike, i.e. not the reservation's doing. It had since decayed to 96.74% of
+ * nodes and 97.46% of km — nine components, 107 stranded nodes — because
+ * `netgen.pruneIslands` never pruned anything; it LABELLED. A fragment is
+ * worse than a hole: `sampleSpawn`, `findRoadSpot` and `route` all treat it as
+ * ordinary road, so traffic spawns on a rim street no car can leave and a
+ * mission stages its marked vehicle there.
  *
- *   reservation ON   3228 nodes / 174.12 km   98.57% of nodes, 98.73% of km
- *   reservation OFF  3244 nodes / 177.24 km   98.58% of nodes, 98.75% of km
+ * `netgen.closeNetwork` now bridges every fragment onto the main component or
+ * deletes it, so the honest bar is 100 and anything less is a regression, not
+ * a residual. MEASURED on this build, both arms, same machine:
  *
- * So reserving the six sites cost 0.01 percentage points of node connectivity
- * and islanded nothing: the island list is identical in both arms, down to the
- * node counts. That is what the ring roads are for — every street cut at a
- * site runs into the road round it instead of dead-ending at a wall.
+ *   --noclose  3286 nodes / 4601 edges / 171.17 km   9 components   96.74% / 97.46%
+ *   shipped    3280 nodes / 4603 edges / 171.17 km   1 component   100.00% / 100.00%
  *
- * LOWER THESE WHEN YOU IMPROVE THEM; NEVER RAISE ONE TO GO GREEN.
+ * The closure took nine components in, laid 6 links (0.19 km) and dropped 4
+ * unreachable edges (0.18 km). The six lost nodes are 2-3 node stubs no legal
+ * link could reach; the kilometres are unchanged to two decimal places because
+ * what it lays back in links is what it takes out in stubs.
+ *
+ * NEVER LOWER THESE. There is no such thing as an acceptable island.
  */
-const MIN_NODE_SHARE = 98.5;
-const MIN_KM_SHARE = 98.7;
+const MIN_NODE_SHARE = 100;
+const MIN_KM_SHARE = 100;
 
 const portOpen = (port) =>
   new Promise((res) => {
@@ -136,7 +151,7 @@ page.on('pageerror', (e) => errors.push(String(e.message)));
 let report = null;
 let failure = null;
 try {
-  const extra = NORESERVE ? '&nolmreserve=1' : '';
+  const extra = (NORESERVE ? '&nolmreserve=1' : '') + (NOCLOSE ? '&noclose=1' : '');
   await page.goto(`http://127.0.0.1:${PORT}/?capture=1&lockstep=1&prewarm=0&q=high${extra}`, {
     waitUntil: 'domcontentloaded',
     timeout: 120000,
@@ -370,6 +385,8 @@ try {
 
       return {
         noreserve: !!new URLSearchParams(location.search).get('nolmreserve'),
+        noclose: !!new URLSearchParams(location.search).get('noclose'),
+        closure: roads.closure ?? null,
         reserveOn: roads.landmarkReserve?.on !== false,
         reserve: roads.landmarkReserve ?? null,
         clearance: w.landmarkClearance ?? null,
@@ -429,15 +446,22 @@ if (args.json) {
   writeFileSync(resolve(String(args.json)), JSON.stringify(report, null, 2));
 }
 
-const arm = report.noreserve || !report.reserveOn
-  ? 'NEGATIVE CONTROL — landmark reservation OFF (?nolmreserve=1)'
-  : 'shipped';
+const arms = [];
+if (report.noreserve || !report.reserveOn) arms.push('landmark reservation OFF (?nolmreserve=1)');
+if (report.noclose || !report.closure) arms.push('network closure OFF (?noclose=1)');
+const arm = arms.length ? `NEGATIVE CONTROL — ${arms.join(' + ')}` : 'shipped';
 console.log(`world landmark sweep — ${arm}`);
 console.log(`  reserve:               ${report.clearance} m clear of every site` +
   (report.reserve?.on
     ? `, cut ${report.reserve.cutKm.toFixed(2)} km from ${report.reserve.cut} corridors, ` +
       `${report.reserve.dropped} stubs dropped, ${report.reserve.exempt} exempt corridor(s) crossing`
     : ' — OFF'));
+console.log(`  closure:               ` +
+  (report.closure
+    ? `${report.closure.components} drivable component(s) in, ${report.closure.bridged} link(s) laid ` +
+      `(${report.closure.bridgedKm.toFixed(2)} km), ${report.closure.droppedEdges} unreachable edge(s) ` +
+      `dropped (${report.closure.droppedKm.toFixed(2)} km)`
+    : '— OFF'));
 console.log(`  swept:                 ${report.edgesSwept} drivable edges, ${report.lanesSwept} lanes, ` +
   `${report.samples} samples at ${STEP} m`);
 console.log('');
@@ -494,10 +518,10 @@ const driver = report.sites.reduce((s, p) => s + p.driverHits, 0);
 if (carriage > 0) fails.push(`${carriage} carriageway sample(s) inside a landmark site`);
 if (driver > 0) fails.push(`${driver} driver-corridor sample(s) inside a landmark site`);
 if (C.nodeShare < MIN_NODE_SHARE) {
-  fails.push(`only ${C.nodeShare}% of drivable nodes are in one component (RATCHET ${MIN_NODE_SHARE}%)`);
+  fails.push(`only ${C.nodeShare}% of drivable nodes are in one component (must be ${MIN_NODE_SHARE}%)`);
 }
 if (C.kmShare < MIN_KM_SHARE) {
-  fails.push(`only ${C.kmShare}% of drivable km is in one component (RATCHET ${MIN_KM_SHARE}%)`);
+  fails.push(`only ${C.kmShare}% of drivable km is in one component (must be ${MIN_KM_SHARE}%)`);
 }
 if (C.bridgesOff.length) fails.push(`bridge(s) islanded: ${C.bridgesOff.join(', ')}`);
 if (C.poisOff.length) fails.push(`POI(s) islanded or unresolved: ${C.poisOff.map((p) => p.id).join(', ')}`);

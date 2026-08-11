@@ -411,6 +411,177 @@ export const BRIDGES = [
   { id: 'br_mckees', name: 'McKees Rocks Bridge', river: 'ohio', kind: 'arterial', a: [-1204, -520], b: [-1296, -172], lanes: 4, deckY: 20, style: 'truss' },
 ];
 
+/* ------------------------------------------------------- street names ---- */
+
+/**
+ * THE STREET VOCABULARY — what `world.streetAt(x, z)` speaks.
+ *
+ * `netgen` already names everything it authors by hand: the connectors
+ * (Liberty Avenue, Butler Street, Carson Street …), the quays and parkways, the
+ * eleven bridges and their approaches, the landmark rings, the Mt. Washington
+ * climbs. Those names go straight onto the emitted edge as `edge.name` and this
+ * table must never restate one — a name that appears twice is two roads with
+ * one identity, which is worse for wayfinding than no name at all.
+ *
+ * What was left anonymous is the bulk of the city: the DISTRICT GRIDS. Every
+ * rail `netgen.gridDistrict` lays carries `district` and a corridor id of the
+ * form `<district>_u<i>` / `_v<j>` / `_a<j>` (`u` and `v` are the two families
+ * of parallel streets in the district's own rotated frame, `a` the service
+ * alleys), plus whatever run suffix the clipping passes tagged it with — see
+ * `CORRIDOR_RUN` below. The index is stable — it comes from the district's
+ * radius and `GRID_STYLE` spacing, not from the rng, which only jitters the
+ * rail's position — so a name indexed by it names the same street every boot.
+ *
+ * SIZES ARE NOT GUESSES. `gridDistrict` lays `ceil(2 * r * 1.12 / a) + 1` rails
+ * of the `u` family, the same in `b` for `v`, and one alley slot per `v` row:
+ * measured against the emitted graph, the largest index actually reached is
+ * exactly one less than each array's length below. `src/world/routeprobe.mjs`
+ * asserts that EVERY emitted grid corridor resolves to a name, so a district
+ * whose grid grows will go red here rather than quietly falling back to null.
+ *
+ * The names are Pittsburgh's, per neighbourhood: numbered streets where the
+ * real city numbers them (the Strip, Lawrenceville, the South Side), named
+ * avenues where it names them, and `Way` for the alleys, which is what
+ * Pittsburgh calls them.
+ */
+export const DISTRICT_STREETS = {
+  point: {
+    along: ['Commonwealth Place', 'Fort Pitt Boulevard', 'Fort Duquesne Boulevard', 'Point Way', 'Marina Drive'],
+    cross: ['Portage Path', 'Penn Lawn Drive', 'Gateway Walk', 'Blockhouse Walk'],
+    // `GRID_STYLE.park` sets `alleys: 0`, so the Point has none.
+    alley: [],
+  },
+  downtown: {
+    along: ['Penn Avenue', 'Forbes Avenue', 'Boulevard of the Allies', 'Oliver Avenue', 'Sixth Avenue',
+      'Seventh Avenue', 'Bigelow Boulevard', 'Centre Avenue', 'Webster Avenue', 'Duquesne Way',
+      'Wylie Avenue', 'Bedford Avenue'],
+    cross: ['Stanwix Street', 'Wood Street', 'Market Street', 'Smithfield Street', 'Cherry Way',
+      'Ross Street', 'Tenth Street', 'Ninth Street', 'Eighth Street', 'Seventh Street'],
+    alley: ['Strawberry Way', 'Montour Way', 'Exchange Way', 'Coffey Way', 'Barbeau Way',
+      'Fancourt Way', 'Garrison Way', 'Graeme Way', 'Tito Way'],
+  },
+  strip: {
+    along: ['Eleventh Street', 'Twelfth Street', 'Fourteenth Street', 'Fifteenth Street', 'Seventeenth Street',
+      'Eighteenth Street', 'Twentieth Street', 'Twenty-First Street', 'Twenty-Second Street'],
+    cross: ['Railroad Street', 'Terminal Way', 'Herron Avenue', 'Melwood Avenue', 'Wharf Street',
+      'Waterfront Way', 'Belmont Street', 'Boundary Street'],
+    alley: ['Spring Way', 'Mulberry Way', 'Ganges Way', 'Cabinet Way', 'Bellefonte Way',
+      'Juniper Way', 'Vespucius Way'],
+  },
+  lawren: {
+    along: ['Thirty-Fourth Street', 'Thirty-Fifth Street', 'Thirty-Sixth Street', 'Thirty-Seventh Street',
+      'Thirty-Eighth Street', 'Thirty-Ninth Street', 'Fortieth Street', 'Forty-Third Street',
+      'Forty-Fifth Street', 'Fifty-First Street'],
+    cross: ['Willow Street', 'Hatfield Street', 'Foster Street', 'Charlotte Street', 'Holmes Street',
+      'Fisk Street', 'Harrison Street', 'McCandless Avenue'],
+    alley: ['Comrie Way', 'Duncan Way', 'Berlin Way', 'Sassafras Way', 'Plummer Way',
+      'Ligonier Way', 'Keystone Way'],
+  },
+  northsh: {
+    along: ['Federal Street', 'Sandusky Street', 'Anderson Street', 'Isabella Street', 'General Robinson Street',
+      'Reedsdale Street', 'North Shore Drive', 'Art Rooney Avenue', 'Mazeroski Way', 'Tony Dorsett Drive',
+      'Scotland Street'],
+    cross: ['East Ohio Street', 'Cedar Avenue', 'East North Avenue', 'Madison Avenue', 'Chestnut Street',
+      'Nash Street', 'Progress Street', 'Lockhart Street', 'Foreland Street'],
+    alley: ['Wettach Way', 'Compromise Way', 'Suismon Way', 'Avery Way', 'Middle Way',
+      'Tripoli Way', 'Voskamp Way', 'Jacksonia Way'],
+  },
+  troy: {
+    along: ['Lowrie Street', 'Ley Street', 'Claim Street', 'Froman Street', 'Harpster Street',
+      'Herman Street', 'Province Street', 'Basin Street', 'Goettman Street'],
+    cross: ['Wicklines Lane', 'Hatteras Street', 'Homer Street', 'Vinial Street', 'Ravine Street',
+      'Straubs Lane', 'Bushnell Street'],
+    alley: ['Bohemian Way', 'Baltic Way', 'Vista Way', 'Osgood Way', 'Hilltop Way', 'Cowley Way'],
+  },
+  southside: {
+    along: ['South Fourth Street', 'South Sixth Street', 'South Seventh Street', 'South Ninth Street',
+      'South Twelfth Street', 'South Thirteenth Street', 'South Fifteenth Street', 'South Seventeenth Street',
+      'South Eighteenth Street', 'South Twentieth Street', 'South Twenty-Second Street'],
+    cross: ['Sarah Street', 'Wharton Street', 'Jane Street', 'Mary Street', 'Sidney Street',
+      'Bingham Street', 'Josephine Street', 'Mission Street', 'Muriel Street'],
+    alley: ['Larkins Way', 'Wrights Way', 'Fox Way', 'Harcum Way', 'Pius Way',
+      'Salisbury Way', 'Cuthbert Way', 'Fisher Way'],
+  },
+  mtwash: {
+    along: ['Virginia Avenue', 'Republic Street', 'Bigham Street', 'Southern Avenue', 'Boggs Avenue',
+      'Merrimac Street', 'Kearsarge Street', 'Norton Street', 'Ulysses Street'],
+    cross: ['Amabell Street', 'Haberman Avenue', 'Warrington Avenue', 'Wyoming Street', 'Belonda Street',
+      'Meridan Street', 'Plymouth Street'],
+    alley: ['Sweetbriar Way', 'Gearing Way', 'Sumner Way', 'Hallock Way', 'Estella Way', 'Fingal Way'],
+  },
+  steelrow: {
+    along: ['Amity Street', 'Ann Street', 'Doyle Avenue', 'Munhall Road', 'Whitaker Way',
+      'Waterfront Drive', 'Bessemer Avenue'],
+    cross: ['Furnace Street', 'Slag Street', 'Ingot Street', 'Cast House Row', 'Hot Metal Street', 'Tandem Way'],
+    alley: ['Cinder Way', 'Ladle Way', 'Tuyere Way', 'Scale Way', 'Coke Way'],
+  },
+  westend: {
+    along: ['Main Street', 'Wabash Street', 'Sanctus Street', 'Alexander Street', 'Lorenz Avenue',
+      'Chartiers Avenue', 'Independence Street', 'Noblestown Road', 'Crane Avenue', 'Berry Street'],
+    cross: ['Elliott Street', 'Woodville Avenue', 'Obey Street', 'Hassler Street', 'Middletown Road',
+      'Broadhead Fording Road', 'Herschel Street', 'Stafford Street'],
+    alley: ['Bergman Way', 'Sylvania Way', 'Fairhaven Way', 'Dagmar Way', 'Ilona Way',
+      'Cuba Way', 'Kearns Way'],
+  },
+  northside: {
+    along: ['Chateau Street', 'Beaver Avenue', 'Columbus Avenue', 'Fulton Street', 'Sheffield Street',
+      'Juniata Street', 'Pennsylvania Avenue', 'Liverpool Street', 'Adams Street', 'Bidwell Street'],
+    cross: ['Manhattan Street', 'Marshall Avenue', 'Allegheny Avenue', 'Ridge Avenue', 'Western Avenue',
+      'North Franklin Street', 'Fontella Street', 'Decatur Street'],
+    alley: ['Faulsey Way', 'Rush Way', 'Dounton Way', 'Massachusetts Way', 'Fayette Way',
+      'Stedman Way', 'Boquet Way'],
+  },
+  hazel: {
+    along: ['Second Avenue', 'Hazelwood Avenue', 'Flowers Avenue', 'Elizabeth Street', 'Gladstone Street',
+      'Chatsworth Avenue', 'Johnston Avenue', 'Tecumseh Street', 'Lytle Street'],
+    cross: ['Blair Street', 'Berwick Street', 'Monongahela Street', 'Melvin Street', 'Nansen Street',
+      'Rakoczy Street', 'Tullymet Street', 'Winterburn Avenue'],
+    alley: ['Hazel Way', 'Glenwood Way', 'Alluvian Way', 'Dilworth Way', 'Renova Way',
+      'Berkshire Way', 'Chaucer Way'],
+  },
+};
+
+/**
+ * The four hill climbs `netgen.switchbacks` lays without a name. Their corridor
+ * ids are already the real streets; this is where they become copy the HUD can
+ * print. (The three Mt. Washington climbs — Sycamore, Shiloh, Bailey — are
+ * named at the corridor, so they are deliberately absent.)
+ */
+export const CORRIDOR_STREETS = {
+  rialto: 'Rialto Street',
+  steuben: 'Steuben Street',
+  greentree: 'Greentree Road',
+  hazelclimb: 'Sylvan Avenue',
+};
+
+/**
+ * `lawren_u7~af1#0` -> `lawren_u7`. Three passes cut a corridor into runs and
+ * each tags the pieces: `~n` (landmark reserve, `netgen.reserveLandmarks`),
+ * `~af n` (airfield clip, `airfield.js`) and `#n` (dedup,
+ * `netgen.dedupeCorridors`). All three are still the same street, and none of
+ * these markers can appear in an authored corridor id.
+ */
+const CORRIDOR_RUN = /[~#](?:af)?\d+/g;
+/** `lawren_u7` -> district `lawren`, family `u`, index 7. */
+const GRID_CORRIDOR = /^([a-z]+)_([uva])(\d+)$/;
+
+/**
+ * The street name of an emitted corridor id, or null if the plan does not name
+ * it. Pure lookup — `route.js` owns the policy of which edge to ask about.
+ */
+export function corridorStreetName(corridorId) {
+  if (typeof corridorId !== 'string' || corridorId === '') return null;
+  const base = corridorId.replace(CORRIDOR_RUN, '');
+  const fixed = CORRIDOR_STREETS[base];
+  if (fixed) return fixed;
+  const g = GRID_CORRIDOR.exec(base);
+  if (!g) return null;
+  const set = DISTRICT_STREETS[g[1]];
+  if (!set) return null;
+  const list = g[2] === 'u' ? set.along : g[2] === 'v' ? set.cross : set.alley;
+  return list[+g[3]] ?? null;
+}
+
 /** Lane geometry, shared by the mesh builder, traffic and the minimap. */
 export const ROAD_KIND = {
   highway: { laneWidth: 3.9, shoulder: 2.6, sidewalk: 0, kerb: 0.0, speed: 33, paint: 'highway' },

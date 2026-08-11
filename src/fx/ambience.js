@@ -21,7 +21,82 @@ import { V, cone } from './util.js';
  */
 
 const TWO_PI = Math.PI * 2;
-const MAX_EMITTERS = 24;
+/**
+ * 24 was the whole pool, and it was shared with explosions and burning wrecks.
+ * The seven standing city producers below never expire, so the ceiling is
+ * lifted by exactly that many and the transient budget is unchanged. An
+ * emitter is a small record and the per-frame cost is one distance test.
+ */
+const MAX_EMITTERS = 32;
+
+/**
+ * ===========================================================================
+ * THE CITY'S STANDING PRODUCERS
+ * ===========================================================================
+ *
+ * NOTHING IN THIS CITY EMITTED SMOKE OR STEAM. Not the blast furnace, not the
+ * market, not a grate — the tag route documented above (`userData.fxSmoke` on
+ * any Object3D) has been correct and complete since it was written and has had
+ * ZERO producers, so a dying mill town had five cold stacks in its signature
+ * shot.
+ *
+ * The tag route is not what was missing. What is missing is a NODE to hang the
+ * tag on: `buildings` merges every landmark into a per-tile static batch and
+ * `TileBuilder.build()` returns a handful of meshes whose transforms are all
+ * the identity, so there is no per-stack Object3D anywhere in the scene and
+ * `_scan` has nothing to find. Fixing that is `src/buildings/tile.js`'s job,
+ * not this file's.
+ *
+ * So there is a second route, and it obeys the same two rules the tag route
+ * does:
+ *
+ *   WHERE a landmark is comes from `world.landmarks`, never from a copy —
+ *   that is the authority, and the last time two subsystems each decided where
+ *   a landmark was, the Point Fountain ended up 8.7 m under the Ohio.
+ *
+ *   HOW HIGH the flue is comes from `buildings`, which built the stack. It
+ *   cannot be imported (rule 2), so it is mirrored here and the mirror is
+ *   GATED: `src/fx/plumeprobe.mjs` imports `MILL_STACKS` and `MARKET_GRIDDLES`
+ *   from `src/buildings/landmarks.js` alongside this table and fails if any
+ *   anchor moves by more than 5 cm. A probe may reach across subsystems; a
+ *   subsystem may not.
+ *
+ * `dx/dz/top` are metres from the landmark's published centre and its ground.
+ * Exported for `plumeprobe.mjs` only — nothing in `src/` reads it.
+ */
+export const PRODUCERS = [
+  {
+    landmark: 'lm_mill',
+    /**
+     * The furnace crown at 66 m is the one that has to read from across the
+     * river, so it is the only plume with a cull past 300 m. The three brick
+     * stacks behind it run cooler and thinner — a working mill does not have
+     * five identical columns, and the variation is most of what stops the
+     * silhouette reading as a decal.
+     */
+    plumes: [
+      { dx: 0, dz: 0, top: 66, r: 3.4, kind: 'smoke', rate: 9.0, rise: 2.6, dark: 0.125, cull: 420 },
+      { dx: -34, dz: -20, top: 44, r: 2.00, kind: 'smoke', rate: 5.4, rise: 2.0, dark: 0.150, cull: 340 },
+      { dx: -43, dz: -25, top: 38, r: 1.75, kind: 'smoke', rate: 4.8, rise: 1.9, dark: 0.170, cull: 320 },
+      { dx: -52, dz: -30, top: 32, r: 1.50, kind: 'smoke', rate: 4.2, rise: 1.8, dark: 0.190, cull: 300 },
+      { dx: 20, dz: -12, top: 57, r: 1.10, kind: 'steam', rate: 5.0, rise: 2.8, cull: 300 },
+    ],
+    /**
+     * Refraction only, no particles at all (see `addHeat`): the cast house
+     * runners are the hottest thing in the city and a whole mill site of these
+     * is close to free.
+     */
+    heat: [{ dx: -4, dz: 24, top: 15.4, radius: 7, strength: 0.42, cull: 260 }],
+  },
+  {
+    landmark: 'lm_market',
+    plumes: [
+      { dx: -12.6, dz: -9, top: 2.36, r: 0.30, kind: 'steam', rate: 4.4, rise: 1.7, cull: 110 },
+      { dx: 12.6, dz: 21, top: 2.36, r: 0.30, kind: 'steam', rate: 4.0, rise: 1.6, cull: 110 },
+    ],
+    heat: [],
+  },
+];
 
 class Emitter {
   constructor() {
@@ -57,6 +132,14 @@ class Emitter {
     this.local = false;
     /** Cull distance — an emitter beyond this stops spending particles. */
     this.cull = 140;
+    /**
+     * A permanent city fixture rather than a transient. Two consequences, both
+     * in `update`: it is PREFILLED when the camera comes into range, and it is
+     * the last thing `_acquire` will recycle.
+     */
+    this.standing = false;
+    /** Has this emitter been prefilled since it last came into range? */
+    this.warm = false;
   }
 }
 
@@ -81,6 +164,8 @@ export class Ambience {
 
     this._scanTimer = 0;
     this._tracked = new Set();
+    /** PRODUCERS entry -> { x, z, gy, tags[], heat }. See `_producers`. */
+    this._standing = new Map();
     this.heat = [];
     this._tmp = new THREE.Vector3();
     this._fwd = new THREE.Vector3();
@@ -91,13 +176,25 @@ export class Ambience {
   /*  emitters                                                            */
   /* --------------------------------------------------------------------- */
 
+  /**
+   * A free slot, else the most spent one — and a STANDING city source is taken
+   * only when there is nothing else at all. Without the last clause a busy
+   * firefight could evict the mill, and since a standing source has infinite
+   * duration its `age / duration` is 0, which made it tie with every other
+   * infinite source and hand the decision to array order.
+   */
   _acquire() {
     let oldest = null;
+    let standing = null;
     for (const e of this.emitters) {
       if (!e.active) return e;
+      if (e.standing) {
+        if (!standing) standing = e;
+        continue;
+      }
       if (!oldest || e.age / e.duration > oldest.age / oldest.duration) oldest = e;
     }
-    return oldest;
+    return oldest ?? standing;
   }
 
   /** Finite-duration smoke column (explosions, burning wreck). */
@@ -127,6 +224,8 @@ export class Ambience {
     e.oz = o.oz ?? 0;
     e.local = o.local === true;
     e.cull = o.cull ?? 140;
+    e.standing = o.standing === true;
+    e.warm = false;
     e.object = null;
     e.tag = this._tag++;
     return e.tag;
@@ -150,6 +249,7 @@ export class Ambience {
       steam: o.steam,
       ox: o.ox, oy: o.oy, oz: o.oz, local: o.local,
       cull: o.cull,
+      standing: o.standing,
     });
     if (o.object) {
       for (const e of this.emitters) if (e.tag === tag) e.object = o.object;
@@ -176,7 +276,19 @@ export class Ambience {
     }
   }
 
-  _puff(e, now, dt) {
+  /**
+   * @param {number} spread  when > 0 this is a PREFILL puff: its birth is
+   *   backdated by up to `spread` seconds so it arrives already part-way along
+   *   its own trajectory. The particle path is a closed form of age
+   *   (`particles.js` vertex shader), so a backdated birth is not an
+   *   approximation of an older puff — it IS one, at the position and size it
+   *   would have reached. A prefilled emitter therefore has a full column the
+   *   frame it starts rather than a stub growing out of a chimney for ten
+   *   seconds while the player watches. The extras (fire, embers, haze) are
+   *   skipped: they are short-lived, so backdating them produces one
+   *   simultaneous burst that then dies all at once, which pulses.
+   */
+  _puff(e, now, dt, spread = 0) {
     const fx = this.fx;
     const rng = fx.rng;
     cone(V, rng, 0, 1, 0, 0.6, 0.7);
@@ -193,7 +305,7 @@ export class Ambience {
     s.size1 = r * e.growth * rng.range(0.8, 1.25);
     s.sizeCurve = 0.7;
     s.life = e.life * rng.range(0.75, 1.25);
-    s.delay = -rng.float() * dt;
+    s.delay = spread > 0 ? -rng.float() * spread : -rng.float() * dt;
     s.drag = 0.75;
     s.gravity = 0.42; // buoyant, keeps accelerating upward
     s.rot = rng.float() * TWO_PI;
@@ -231,6 +343,8 @@ export class Ambience {
     s.fadeIn = 0.07;
     s.seed = rng.float();
     fx.emitLit(s);
+
+    if (spread > 0) return;
 
     // ---- burning gas at the root -----------------------------------------
     if (e.fire > 0 && rng.float() < e.fire) {
@@ -445,6 +559,97 @@ export class Ambience {
     });
   }
 
+  /* --------------------------------------------------------------------- */
+  /*  standing city producers                                             */
+  /* --------------------------------------------------------------------- */
+
+  /** Is `tag` still held by a live emitter? */
+  _live(tag) {
+    if (!tag) return false;
+    for (const e of this.emitters) if (e.tag === tag && e.active) return true;
+    return false;
+  }
+
+  /** Register one plume at a producer's resolved world position. */
+  _standUp(pl, st) {
+    this._tmp.set(st.x + pl.dx, st.gy + pl.top, st.z + pl.dz);
+    if (pl.kind === 'steam') {
+      return this.addSource(this._tmp, {
+        radius: pl.r, rate: pl.rate, rise: pl.rise ?? 2.2,
+        dark: 0.70, life: 3.0, growth: 4.6, ember: 0, haze: 0.12,
+        steam: true, wind: 0.85, alpha: 0.32, cull: pl.cull, standing: true,
+      });
+    }
+    return this.addSource(this._tmp, {
+      radius: pl.r, rate: pl.rate, rise: pl.rise ?? 2.0,
+      dark: pl.dark ?? 0.12,
+      /**
+       * Long-lived and fast-growing, because a mill plume is a SILHOUETTE
+       * feature: it has to stay coherent for the two hundred metres of sky it
+       * crosses before the wind shears it out, and a 3 s puff dies inside its
+       * own chimney. The wind gain is near-full for the same reason — the
+       * bend downwind is what tells you which way the weather is going, and
+       * it is the difference between a plume and a stationary grey cone.
+       */
+      life: 9.5, growth: 5.4, ember: 0.06, haze: 0.32,
+      wind: 0.92, alpha: 0.5, cull: pl.cull, standing: true,
+    });
+  }
+
+  /**
+   * Stand the city's standing producers up, once `world` can say where they
+   * are. See the PRODUCERS note at the top of this file for why they are a
+   * table here rather than a tag on a mesh.
+   *
+   * Runs on the same slow timer as `_scan`, and is IDEMPOTENT — deliberately.
+   * `_acquire` recycles the oldest emitter when the pool is full, and although
+   * an infinite-duration source is the last thing it will take (its
+   * age/duration ratio is zero), "last" is not "never". A mill that goes out
+   * for the rest of the session because a firefight needed a slot would be a
+   * bug nobody could reproduce, so a plume whose tag is no longer live is
+   * simply stood back up on the next pass.
+   */
+  _producers() {
+    const world = this.fx?.ctx?.peek?.('world');
+    const list = world?.landmarks;
+    if (!Array.isArray(list) || list.length === 0) return;
+    for (const p of PRODUCERS) {
+      let st = this._standing.get(p);
+      if (!st) {
+        // `world` is the authority on where a landmark is (ARCHITECTURE.md
+        // rule 12) and on the ground under it. Nothing here re-derives either.
+        let lm = null;
+        for (const l of list) if (l.id === p.landmark) { lm = l; break; }
+        const gy = lm && world.heightAt?.(lm.x, lm.z);
+        if (!Number.isFinite(gy)) continue;
+        st = {
+          x: lm.x, z: lm.z, gy,
+          tags: new Array(p.plumes.length).fill(0),
+          heat: new Array(p.heat.length).fill(null),
+        };
+        this._standing.set(p, st);
+      }
+      for (let i = 0; i < p.plumes.length; i++) {
+        if (!this._live(st.tags[i])) st.tags[i] = this._standUp(p.plumes[i], st);
+      }
+      /**
+       * The heat sources are re-checked by IDENTITY, not by a "did I do this"
+       * flag, because `FXSystem._clearStageVents` empties `this.heat` wholesale
+       * (`heat.length = 0`) whenever a debug stage is set up. A boolean would
+       * have left the cast house cold for the rest of the session after
+       * somebody pressed a dev key, which is the kind of bug that gets
+       * reported as "the shimmer is flaky".
+       */
+      for (let i = 0; i < p.heat.length; i++) {
+        if (st.heat[i] && this.heat.includes(st.heat[i])) continue;
+        const h = p.heat[i];
+        this._tmp.set(st.x + h.dx, st.gy + h.top, st.z + h.dz);
+        this.addHeat(this._tmp, { radius: h.radius, strength: h.strength, cull: h.cull });
+        st.heat[i] = this.heat[this.heat.length - 1];
+      }
+    }
+  }
+
   /**
    * A pure refraction source — a blast furnace, a flare stack, a hot roof.
    * Costs no particles at all: it only writes into the half-res distortion
@@ -502,7 +707,24 @@ export class Ambience {
       const cull = e.cull;
       if (d2 > cull * cull) {
         e.acc = 0;
+        e.warm = false;
         continue;
+      }
+      /**
+       * A STANDING SOURCE IS ALREADY RUNNING WHEN YOU GET THERE.
+       *
+       * Without this, driving up to the mill shows four chimneys with a
+       * three-metre stub over each, growing into a plume over the next ten
+       * seconds — and a capture, which teleports the camera and presses the
+       * shutter ninety frames later, photographs the stub. So the first frame
+       * inside the cull radius pays for the emitter's whole backlog at once,
+       * with the puffs' births spread across a full particle lifetime.
+       * Bounded at 48 so no arrival costs more than one explosion would.
+       */
+      if (e.standing && !e.warm) {
+        e.warm = true;
+        const n = Math.min(48, Math.round(e.rate * e.life));
+        for (let i = 0; i < n; i++) this._puff(e, now, dt, e.life);
       }
       const near = cull * 0.62;
       const fade = d2 < near * near ? 1 : 1 - (Math.sqrt(d2) - near) / (cull - near);
@@ -555,9 +777,10 @@ export class Ambience {
     this._shimmer(dt, now, camera);
 
     this._scanTimer += dt;
-    if (this._scanTimer > 2 && scene) {
+    if (this._scanTimer > 2) {
       this._scanTimer = 0;
-      this._scan(scene);
+      if (scene) this._scan(scene);
+      this._producers();
     }
   }
 }

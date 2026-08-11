@@ -31,6 +31,13 @@ import {
  */
 
 const MAP_EDGE = 1420;
+/**
+ * Steepest grade a street may hold. Steel City is steep. Steel City is not
+ * vertical: 32% is Canton Avenue, the steepest street in the United States.
+ * One owner, because `closeNetwork` must not lay a link the height solve would
+ * have refused to keep.
+ */
+const MAX_GRADE = 0.30;
 const _seg = { d2: 0, t: 0 };
 
 /* ------------------------------------------------------------- polylines -- */
@@ -309,6 +316,23 @@ function ringWeldDisabled() {
   } catch { /* no location */ }
   try {
     if (typeof process !== 'undefined' && process?.env?.OW_NO_RINGWELD === '1') return true;
+  } catch { /* no process */ }
+  return false;
+}
+
+/**
+ * A/B hatch for the network closure (`closeNetwork`), same shape again.
+ * `?noclose=1` on the page — or `OW_NO_CLOSE=1` from Node — ships the graph
+ * with its stranded fragments intact, which is what `lmsweep`'s connectivity
+ * assertion is proved against: MEASURED, 9 drivable components / 96.74% of
+ * nodes with the closure off, 1 / 100.00% with it on.
+ */
+function closureDisabled() {
+  try {
+    if (typeof location !== 'undefined' && new URLSearchParams(location.search).get('noclose') === '1') return true;
+  } catch { /* no location */ }
+  try {
+    if (typeof process !== 'undefined' && process?.env?.OW_NO_CLOSE === '1') return true;
   } catch { /* no process */ }
   return false;
 }
@@ -1869,13 +1893,19 @@ function buildGraph(corridors, terrain) {
 
   // --- height relaxation ------------------------------------------------
   relaxHeights(graph, 3);
-  // Steel City is steep. Steel City is not vertical: 32% is Canton Avenue,
-  // which is the steepest street in the United States.
-  limitGrades(graph, 0.30, 160);
+  limitGrades(graph, MAX_GRADE, 160);
+
+  // --- one drivable network, no exceptions ------------------------------
+  // Bridge every stranded fragment onto the main component, or delete it.
+  // Runs after the height solve so a closing link is a chord between two
+  // SOLVED nodes and its grade is the grade the player drives, and before
+  // `finalise` because it re-indexes the node and edge arrays.
+  closeNetwork(graph, terrain);
 
   graph.finalise();
 
-  // Prune stranded fragments: anything not reachable from the largest island.
+  // Label what survived. After `closeNetwork` the drivable graph is one
+  // component; the labels are what routing, spawning and `game` read.
   pruneIslands(graph);
 
   return graph;
@@ -2130,8 +2160,264 @@ function relaxHeights(graph, passes) {
   }
 }
 
+/* ------------------------------------------------------ network closure -- */
+
+/**
+ * How far a closing link may reach for the network it was cut off from.
+ *
+ * MEASURED over six rng seeds on the emitted graph: every stranded fragment
+ * worth keeping sits 7-38 m from the main component, so the reach is not what
+ * decides the answer — the ground between is. 70 m is the point past which a
+ * "link" stops being the missing end of a street and becomes a road of its
+ * own, laid blind across whatever is in the way.
+ */
+const ISLAND_LINK_MAX = 70;
+/**
+ * How far the link's own surface may sit from the terrain it crosses. Looser
+ * than `weldLandmarkDeadEnds`'s 1.6 m because these two ends were solved
+ * independently and are up to 70 m apart rather than 42; tight enough that the
+ * link neither floats nor buries. MEASURED across six seeds: at 1.6 m a whole
+ * 67-node, 2.5 km rim district is unbridgeable and has to be deleted; at 2.5 m
+ * every fragment above 0.15 km bridges and only 2-3 node stubs are dropped.
+ * Raising it further buys nothing — 3.0 m deletes exactly the same stubs.
+ */
+const ISLAND_LINK_TOL = 2.5;
+
+/**
+ * ONE DRIVABLE NETWORK. Bridge every stranded fragment onto the main
+ * component; delete what cannot be bridged.
+ *
+ * `pruneIslands` never pruned anything — it labelled. So the emitted graph
+ * shipped with up to nine drivable components and 107 stranded nodes, and a
+ * fragment is worse than a hole: `sampleSpawn`, `findRoadSpot` and `route`
+ * all treat it as ordinary road, so traffic spawns on a rim street no car can
+ * leave, a mission stages a marked vehicle on it, and A* costs a full search
+ * before returning null. `src/world/lmsweep.mjs`'s connectivity assertion is
+ * the gate.
+ *
+ * A link is laid only where it is a road a car can take — dry the whole way,
+ * clear of a reserved landmark site, off airfield and airbase pavement, under
+ * the city grade limit, and hugging the terrain within `ISLAND_LINK_TOL`. The
+ * candidate is the CHEAPEST legal pair between the fragment and everything
+ * already joined to the main component, not the geometrically nearest pair:
+ * the nearest pair is usually the one separated by a 12 m step, and the pair
+ * 10 m further along is flat.
+ */
+function closeNetwork(graph, terrain) {
+  if (closureDisabled()) return;
+  const N = graph.nodes.length;
+  const comp = drivableComponents(graph);
+  let nc = 0;
+  for (let i = 0; i < N; i++) if (comp[i] + 1 > nc) nc = comp[i] + 1;
+  if (nc <= 1) {
+    graph.closure = { components: nc, bridged: 0, bridgedKm: 0, droppedEdges: 0, droppedKm: 0 };
+    return;
+  }
+
+  const members = [];
+  for (let c = 0; c < nc; c++) members.push([]);
+  for (let i = 0; i < N; i++) if (comp[i] >= 0) members[comp[i]].push(i);
+  let main = 0;
+  for (let c = 1; c < nc; c++) if (members[c].length > members[main].length) main = c;
+
+  // Union-find over component ids: a fragment may reach the main component
+  // through another fragment it merged with earlier in the same pass.
+  const parent = new Int32Array(nc);
+  for (let c = 0; c < nc; c++) parent[c] = c;
+  const find = (c) => {
+    while (parent[c] !== c) c = parent[c] = parent[parent[c]];
+    return c;
+  };
+
+  const linkOk = (a, b) => {
+    const d = Math.hypot(b.x - a.x, b.z - a.z);
+    if (d < 0.5 || d > ISLAND_LINK_MAX) return 0;
+    if (Math.abs(b.y - a.y) / d > MAX_GRADE) return 0;
+    const steps = Math.max(3, Math.ceil(d / 4));
+    for (let k = 0; k <= steps; k++) {
+      const t = k / steps;
+      const x = a.x + (b.x - a.x) * t;
+      const z = a.z + (b.z - a.z) * t;
+      if (terrain.waterDist(x, z) <= 8) return 0;
+      if (nearestSiteDist(x, z) <= 8) return 0;
+      if (airfieldAt(x, z) || airbaseAt(x, z)) return 0;
+      const yLin = a.y + (b.y - a.y) * t;
+      if (Math.abs(terrain.heightAt(x, z) - yLin) > ISLAND_LINK_TOL) return 0;
+    }
+    return d;
+  };
+
+  let bridged = 0;
+  let bridgedM = 0;
+  for (let pass = 0; pass < nc; pass++) {
+    let merged = 0;
+    for (let c = 0; c < nc; c++) {
+      const root = find(c);
+      if (root === find(main)) continue;
+      let best = null;
+      for (const i of members[c]) {
+        const a = graph.nodes[i];
+        for (let j = 0; j < N; j++) {
+          if (comp[j] < 0 || find(comp[j]) === root) continue;
+          const b = graph.nodes[j];
+          if (Math.abs(b.x - a.x) > ISLAND_LINK_MAX || Math.abs(b.z - a.z) > ISLAND_LINK_MAX) continue;
+          if (best && Math.hypot(b.x - a.x, b.z - a.z) >= best.d) continue;
+          const d = linkOk(a, b);
+          if (d > 0) best = { d, a, b };
+        }
+      }
+      if (!best) continue;
+      graph.addEdge(best.a.id, best.b.id, {
+        kind: 'street',
+        lanes: 2,
+        corridor: 'island_link',
+        name: 'Connector',
+      });
+      parent[find(comp[best.b.id])] = root;
+      bridged++;
+      bridgedM += best.d;
+      merged++;
+    }
+    if (!merged) break;
+  }
+
+  // Whatever is still off the main component is road nobody can reach. It is
+  // drawn, it is spawned on and it is routed over; delete it.
+  const kill = new Uint8Array(graph.edges.length);
+  let dropped = 0;
+  let droppedM = 0;
+  for (const e of graph.edges) {
+    if (e.rail) continue;
+    const c = comp[e.a] >= 0 ? comp[e.a] : comp[e.b];
+    if (c < 0 || find(c) === find(main)) continue;
+    kill[e.id] = 1;
+    dropped++;
+    droppedM += e.len;
+  }
+  if (dropped) compactGraph(graph, kill);
+  graph.closure = {
+    components: nc,
+    bridged,
+    bridgedKm: bridgedM / 1000,
+    droppedEdges: dropped,
+    droppedKm: droppedM / 1000,
+  };
+  console.log(
+    `[world] network closure: ${nc} drivable component(s) -> 1; ` +
+    `${bridged} link(s) laid (${(bridgedM / 1000).toFixed(2)} km), ` +
+    `${dropped} unreachable edge(s) dropped (${(droppedM / 1000).toFixed(2)} km)`
+  );
+}
+
+/**
+ * Component label per node over the DRIVABLE (non-rail) edges only, -1 where
+ * a node carries nothing a car can use. Rail is excluded deliberately: a
+ * trolley line welded onto two road fragments does not make them one road.
+ */
+function drivableComponents(graph) {
+  const n = graph.nodes.length;
+  const comp = new Int32Array(n).fill(-1);
+  const stack = [];
+  let c = 0;
+  for (let i = 0; i < n; i++) {
+    if (comp[i] !== -1) continue;
+    const n0 = graph.nodes[i];
+    let drivable = false;
+    for (let k = 0; k < n0.links.length; k++) if (!graph.edges[n0.links[k]].rail) drivable = true;
+    if (!drivable) continue;
+    stack.length = 0;
+    stack.push(i);
+    comp[i] = c;
+    while (stack.length) {
+      const cur = stack.pop();
+      const node = graph.nodes[cur];
+      for (let k = 0; k < node.links.length; k++) {
+        const e = graph.edges[node.links[k]];
+        if (e.rail) continue;
+        const o = e.a === cur ? e.b : e.a;
+        if (comp[o] === -1) {
+          comp[o] = c;
+          stack.push(o);
+        }
+      }
+    }
+    c++;
+  }
+  return comp;
+}
+
+/**
+ * Rebuild `nodes` and `edges` without the killed edges, dropping any node left
+ * with nothing on it, and re-assign ids so `nodes[i].id === i` still holds.
+ * Call BEFORE `finalise` — the spatial indices are built from these arrays.
+ */
+function compactGraph(graph, kill) {
+  const remap = new Int32Array(graph.nodes.length).fill(-1);
+  const nodes = [];
+  const edges = [];
+  const keep = (nid) => {
+    if (remap[nid] !== -1) return remap[nid];
+    const n = graph.nodes[nid];
+    remap[nid] = nodes.length;
+    n.id = nodes.length;
+    n.links.length = 0;
+    nodes.push(n);
+    return n.id;
+  };
+  for (const e of graph.edges) {
+    if (kill[e.id]) continue;
+    const a = keep(e.a);
+    const b = keep(e.b);
+    e.a = a;
+    e.b = b;
+    e.id = edges.length;
+    edges.push(e);
+    nodes[a].links.push(e.id);
+    nodes[b].links.push(e.id);
+  }
+  graph.nodes = nodes;
+  graph.edges = edges;
+}
+
+/**
+ * Label the connected components and publish them.
+ *
+ * THE NAME IS A LIE AND ALWAYS WAS: this prunes nothing and never did, which
+ * is how nine drivable components came to ship. `closeNetwork`, above, is the
+ * pass that removes anything. The name is kept because `world/probe.mjs` and
+ * `world/railsweep.mjs` both name it in prose; read it as "labelIslands".
+ *
+ * Two labellings, because two questions are being asked and conflating them
+ * has already cost this project a gate: `mainComponent` is over EVERY edge
+ * (what `roadgraph.sameComponent` and `world/probe.mjs` have always read),
+ * while `node.component` / `graph.driveMain` are over the DRIVABLE edges only
+ * — the graph a car is actually confined to, and the one road ROUTING and
+ * `game`'s spawn resolver must ask about. `closeNetwork` has already made the
+ * drivable graph one component, so every drivable node here reads `driveMain`;
+ * anything else is a rail-only node, which reads -1.
+ */
 function pruneIslands(graph) {
   const n = graph.nodes.length;
+  const drive = drivableComponents(graph);
+  let driveMain = -1;
+  {
+    const size = [];
+    for (let i = 0; i < n; i++) {
+      if (drive[i] < 0) continue;
+      size[drive[i]] = (size[drive[i]] ?? 0) + 1;
+    }
+    let bestSize = 0;
+    for (let c = 0; c < size.length; c++) {
+      if ((size[c] ?? 0) > bestSize) {
+        bestSize = size[c];
+        driveMain = c;
+      }
+    }
+  }
+  for (let i = 0; i < n; i++) graph.nodes[i].component = drive[i];
+  graph.driveComponent = drive;
+  graph.driveMain = driveMain;
+
   const comp = new Int32Array(n).fill(-1);
   const stack = [];
   let best = -1;

@@ -73,6 +73,18 @@ const HITBOXES = [
   ['leg', 'UpLegL', 'FootL', 0.098, 0.65],
 ];
 
+/**
+ * The same four segments in BIND-POSE model space, resolved once off `RIG` —
+ * the very table `createSkeleton` builds the real bones from, so the standing
+ * capsules cannot drift away from the silhouette they stand in for. Used by
+ * `syncColliders` for a ped who has no bones to read.
+ */
+const HITBOX_BIND = HITBOXES.map(([, a, b]) => {
+  const pa = RIG.bindPos[RIG.index(a)];
+  const pb = RIG.bindPos[RIG.index(b)];
+  return [pa.x, pa.y, pa.z, pb.x, pb.y, pb.z];
+});
+
 let _nextId = 1;
 
 export class Ped {
@@ -299,15 +311,19 @@ export class Ped {
 
   /**
    * Hit capsules pushed onto the animated skeleton every frame, so a headshot
-   * is a headshot because of where the round landed. Only bodies carry them:
-   * a pedestrian too far away for a skinned mesh is also too far away to be
-   * aimed at with any precision, and 150 colliders is already a linear scan
-   * on every raycast.
+   * is a headshot because of where the round landed.
+   *
+   * The CROWD carries them only while it carries a body: a stranger too far
+   * away for a skinned mesh is also too far away to be aimed at with any
+   * precision, and 150 colliders is already a linear scan on every raycast. A
+   * MISSION ENEMY is the exception and `PedHostiles.spawn` makes them itself —
+   * you can see him, so you have to be able to hit him. See `syncColliders`.
    */
   _makeColliders() {
     const phys = this.sys.phys;
     if (!phys || this.colliders.length) return;
-    for (const [part, a, b, r, dmg] of HITBOXES) {
+    for (let k = 0; k < HITBOXES.length; k++) {
+      const [part, a, b, r, dmg] = HITBOXES[k];
       const c = phys.addCollider({
         shape: 'capsule',
         radius: r * this.scale,
@@ -316,7 +332,7 @@ export class Ped {
         part,
         damageScale: dmg,
       });
-      c.userData = { a, b };
+      c.userData = { a, b, bind: HITBOX_BIND[k] };
       this.colliders.push(c);
     }
   }
@@ -329,13 +345,53 @@ export class Ped {
 
   /** Push the hit capsules onto the animated skeleton. */
   syncColliders() {
-    if (!this.alive || !this.animator?.bones) return;
+    if (!this.alive || !this.colliders.length) return;
     const an = this.animator;
+    if (an?.bones) {
+      for (let i = 0; i < this.colliders.length; i++) {
+        const c = this.colliders[i];
+        an.bonePos(c.userData.a, this._v);
+        an.bonePos(c.userData.b, this._v2);
+        c.setSegment(this._v.x, this._v.y, this._v.z, this._v2.x, this._v2.y, this._v2.z);
+      }
+      return;
+    }
+
+    /**
+     * NO BONES, AND STILL A MAN YOU CAN SHOOT.
+     *
+     * Past the skinned ring there is no skeleton to read, and this used to mean
+     * no colliders at all — the reason a mission enemy at 100 m was bulletproof
+     * while being drawn, audibly firing, and perfectly aimable. The capsules
+     * are placed on the BIND pose instead: `RIG`'s own bone positions, scaled
+     * by `this.scale` and stood on `this.position` at `this.yaw`, which is the
+     * pose the far-LOD instanced figure is drawn in bar its stride phase.
+     *
+     * So the torso and the head are where the silhouette is, and only the legs
+     * carry the stride's worth of error — the cheapest part of the man to be
+     * approximate about, at a range where a leg is under a pixel wide. It is
+     * deliberately NOT a re-derivation of the proportions: the same table
+     * `Rig.createSkeleton` builds real bones from is the one used here, so the
+     * two cannot disagree.
+     */
+    const s = this.scale;
+    const cs = Math.cos(this.yaw);
+    const sn = Math.sin(this.yaw);
+    const px = this.position.x;
+    const py = this.position.y;
+    const pz = this.position.z;
     for (let i = 0; i < this.colliders.length; i++) {
       const c = this.colliders[i];
-      an.bonePos(c.userData.a, this._v);
-      an.bonePos(c.userData.b, this._v2);
-      c.setSegment(this._v.x, this._v.y, this._v.z, this._v2.x, this._v2.y, this._v2.z);
+      const b = c.userData.bind;
+      if (!b) continue;
+      const ax = b[0] * s;
+      const az = b[2] * s;
+      const bx = b[3] * s;
+      const bz = b[5] * s;
+      c.setSegment(
+        px + ax * cs + az * sn, py + b[1] * s, pz - ax * sn + az * cs,
+        px + bx * cs + bz * sn, py + b[4] * s, pz - bx * sn + bz * cs
+      );
     }
   }
 
@@ -367,7 +423,19 @@ export class Ped {
   }
 
   detachBody() {
-    this._dropColliders();
+    /**
+     * A MISSION ENEMY KEEPS HIS HIT CAPSULES WHEN HE LOSES HIS BODY.
+     *
+     * For the crowd, body and colliders are the same fact and dropping both
+     * here is right. For a hostile they are not: `_assignLod` refuses a body
+     * past `LOD1 * lodBias` — 58 m scaled by 0.85 on ultra, 1.4 on high, so a
+     * ring of 49 to 81 m — while `game/tracks.js` spawns every wave at
+     * 45-150 m. This line was what made a visible, shooting enemy immune to a
+     * rifle. `syncColliders` drives them off the ped transform for as long as
+     * `bones` is null, and `_down` still drops them the moment he goes down —
+     * a corpse's hit boxes belong to the ragdoll.
+     */
+    if (!this.isHostile || !this.alive) this._dropColliders();
     if (!this.body) return null;
     const b = this.body;
     b.group.visible = false;
