@@ -1,5 +1,5 @@
 import {
-  RIVERS, DISTRICTS, HILLS, BLUFF,
+  RIVERS, DISTRICTS, HILLS, BLUFF, HALF_CITY,
   WATER_Y, RIVER_BED, RIVER_SHORE, RIVER_BANK,
   clamp01, smoothstep, smootherstep, lerp, segDist2,
 } from './plan.js';
@@ -71,6 +71,57 @@ function fbm2(x, z, oct = 4, lac = 2.07, gain = 0.5) {
  */
 const RIVER_FADE0 = 1700;
 const RIVER_FADE1 = 2200;
+
+/**
+ * A RIVER LEAVES THE MAP THROUGH A GAP IN THE RIM, NOT INTO A WALL.
+ *
+ * THE DEFECT THIS EXISTS FOR. The carve above dissolves on a Chebyshev radius,
+ * but the rim it dissolves INTO is a function of the same radius and is still
+ * climbing there: between `RIVER_FADE0` and 1900 the rim goes from nothing to
+ * ~200 m. MEASURED on the Ohio's own centreline before this term (z = -600,
+ * 4-octave analytic): -4.7 m at x = -1700, 27.7 at -1796, 126.8 at -1836,
+ * 195.1 at -1900 — 200 m of climb over 200 m of run, a 45-degree face dead
+ * across the mouth of the valley. Because the far ring samples at 64 m the
+ * quad slope is 2.3, which is over the `terrainMesh` rock threshold, so the
+ * face comes out as EXPOSED ROCK and at dawn it is lit square on: the pale
+ * "iceberg shelf" the reviews kept reporting on the western horizon. The money
+ * shot in DESIGN.md is golden hour down the Ohio and it ended in a dam.
+ *
+ * The fix is not to carve further — past its last vertex `segDist2` clamps and
+ * the channel becomes a disc, which is the crater the fade was written to
+ * erase. It is to stop the RIM standing up inside the corridor: the ridge line
+ * is notched where a river runs under it, so the valley floor walks out to the
+ * map edge at the rolling-country level and the horizon closes on both sides
+ * of it.
+ *
+ * GATED ON `HALF_CITY`, and that bound is the whole safety argument: the notch
+ * is exactly zero at the map edge and opens outside it, so no baked height, no
+ * collider, no lot, no road and no spawn inside the playable city moves by a
+ * millimetre. MEASURED over a 20 m grid across the whole 6 km field: 2 267 of
+ * 90 601 samples change, every one of them outside `HALF_CITY`, and the worst
+ * change inside it is 0.000000 m.
+ *
+ * `RIM_GAP` is measured from the WATERLINE, so the gap is a river-width plus
+ * two of these across — 1.8 km on the Ohio, which is what a river valley in
+ * this landscape is. It was 300 m first, and 300 m over a 200 m rim is a
+ * 30-degree wall: over `terrainMesh`'s 0.60 rock threshold, so the notch's own
+ * edge came out as two more pale shelves. Read that as the rule: any face this
+ * term leaves behind must be gentler than the rock threshold or the fix
+ * photographs as the defect.
+ */
+const RIM_GAP = 800;
+const RIM_NOTCH = 0.88;
+/** Metres past `HALF_CITY` over which the notch opens. Shorter than the carve's
+ *  own fade on purpose: the rim must be out of the way BEFORE the channel that
+ *  was holding it back has gone at `RIVER_FADE1`. */
+const RIM_NOTCH_RUN = 130;
+/**
+ * `?owNoRimNotch=1` puts the dam back. NEGATIVE CONTROL for the far-horizon
+ * assertion in `src/world/probe.mjs` — a gate that has never failed is not
+ * evidence of anything (ARCHITECTURE.md, rule 12).
+ */
+const NO_RIM_NOTCH =
+  typeof location !== 'undefined' && new URLSearchParams(location.search).has('owNoRimNotch');
 
 /**
  * Band limits, both in metres of wavelength. `DETAIL_NYQUIST` is the sample
@@ -226,6 +277,11 @@ export function rawHeight(x, z, spacing = 0) {
     if (d < hl.r) h += hl.h * smootherstep(1 - d / hl.r);
   }
 
+  // Which river is nearest, and how far outside its waterline we are. Taken
+  // HERE rather than at the carve below because the rim needs it too — see
+  // `RIM_GAP`. One call either way; `_riv` is untouched between the two uses.
+  riverAt(x, z, _riv);
+
   // ---- the rim: hills beyond the city, so the horizon has a silhouette --
   const rr = Math.max(Math.abs(x), Math.abs(z));
   if (rr > 1180) {
@@ -238,7 +294,14 @@ export function rawHeight(x, z, spacing = 0) {
     // rectangular patches disagreeing by tens of metres. Drop the octaves the
     // caller's grid cannot carry; the silhouette is in the first two.
     const oct = spacing > 0 ? Math.max(1, Math.min(4, Math.floor(Math.log2(RIM_OCT0 / (2.2 * spacing)) / 1.078) + 1)) : 4;
-    h += t * (26 + ridge2(x * 0.0016, z * 0.0016, oct) * 210);
+    let rim = t * (26 + ridge2(x * 0.0016, z * 0.0016, oct) * 210);
+    // The notch a river cuts through the ridge on its way off the map. See
+    // `RIM_GAP`: zero at `HALF_CITY`, so nothing in the city moves.
+    if (rr > HALF_CITY && !NO_RIM_NOTCH) {
+      const gap = 1 - smootherstep(_riv.s / RIM_GAP);
+      rim *= 1 - RIM_NOTCH * gap * smootherstep((rr - HALF_CITY) / RIM_NOTCH_RUN);
+    }
+    h += rim;
   }
 
   // ---- Mt. Washington --------------------------------------------------
@@ -272,7 +335,6 @@ export function rawHeight(x, z, spacing = 0) {
   }
 
   // ---- the rivers ------------------------------------------------------
-  riverAt(x, z, _riv);
   if (_riv.s < RIVER_SHORE) {
     let ry;
     let w;
@@ -293,7 +355,10 @@ export function rawHeight(x, z, spacing = 0) {
     // crater on the right of `farview`. Nothing out here is reachable, water is
     // only drawn to the map edge, and the horizon wants a ridge rather than a
     // gorge, so let the channel dissolve back into the hills.
-    const rr = Math.max(Math.abs(x), Math.abs(z));
+    //
+    // What it must NOT do is hand the valley back to the rim: the ridge is
+    // notched over the same band so the channel dissolves into a VALLEY FLOOR
+    // rather than into a 200 m face. See `RIM_GAP`.
     if (rr > RIVER_FADE0) w *= 1 - smootherstep((rr - RIVER_FADE0) / (RIVER_FADE1 - RIVER_FADE0));
     if (w > 0) h = lerp(h, ry, w);
   }

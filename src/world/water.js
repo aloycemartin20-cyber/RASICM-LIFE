@@ -17,6 +17,9 @@ import { RIVERS, WATER_Y } from './plan.js';
  */
 
 const OVER = 24; // metres of overlap under the bank, so there is never a seam
+/** Metres the mirrored sheet sits under the pool level AT the waterline, where
+ *  there is no bank height to mirror. See `ribbon`. */
+const BURY = 1.5;
 
 export class Water {
   constructor({ ctx, root, rng, terrain }) {
@@ -138,12 +141,27 @@ function ribbon(acc, riv, y, terrain) {
         const o = (c / COLS - 0.5) * 2 * hw;
         const vx = x + px * o;
         const vz = z + pz * o;
-        // Follow the ground down rather than dropping to a fixed depth: a
-        // straight dive from the waterline to -1 m cuts THROUGH a bank that
-        // climbs faster than it, and the buried sheet reappears as a grey wall
-        // along the shore.
+        // MIRROR THE BANK, do not hug it.
+        //
+        // A straight dive from the waterline to a fixed -1 m cuts THROUGH a
+        // bank that climbs faster than it, and the buried sheet reappears as a
+        // grey wall along the shore. Hugging the ground at `g - 0.6` cannot cut
+        // through the ANALYTIC surface — but the surface that is DRAWN past a
+        // kilometre is the clipmap's, sampled at 32 or 64 m, and that runs up
+        // to 6.5 m below the field it was sampled from (MEASURED at 2.5 km on
+        // the `farlod` shot: drawn 46.3 against 39.8 analytic, and 17.2 against
+        // 10.9). 0.6 m of burial does not survive that, so the sheet surfaced
+        // in sheets ACROSS THE HILLSIDES either side of the Ohio — glossy,
+        // pale, specular, and read in review as the white "iceberg shelves" on
+        // the western horizon.
+        //
+        // Mirroring the bank about the pool level dives at exactly the rate the
+        // bank climbs, so it cannot cut through by construction — the original
+        // objection — and the burial then GROWS with the bank instead of being
+        // a constant that a coarse ring can eat: 2 * (g - y) + BURY under the
+        // ground, which is 14.6 m under a 7 m bank where 0.6 m used to be.
         const g = terrain ? terrain.heightAt(vx, vz) : -99;
-        const vy = g > y ? g - 0.6 : y;
+        const vy = g > y ? 2 * y - g - BURY : y;
         row.push(acc.vert(vx, vy, vz, 0, 1, 0, vx * 0.01, vz * 0.01, 0, 0, 0));
       }
       if (prev) for (let c = 0; c < COLS; c++) acc.faceQuad(prev[c], row[c], row[c + 1], prev[c + 1], 0, 1, 0);

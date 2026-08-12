@@ -164,11 +164,29 @@ const md = [
   'byte-identical images.',
   '',
 ];
-for (const [, title, caption, file] of done) {
-  md.push(`### ${title}`, '', `![${title}](${file})`, '', `*${caption}*`, '');
+/**
+ * The index is the gallery's README and it covers the WHOLE gallery, not this
+ * run: a partial re-capture (`--only=a,b`) is the normal workflow for fixing
+ * one flagged frame, and rebuilding the index from `done` alone silently
+ * dropped every other entry — measured, a two-shot fix truncated 16 rows.
+ * So the index walks `SET`: a row for every shot whose PNG exists on disk
+ * (captured this run or already resident), and a comment for anything absent,
+ * so the file never claims an image it cannot show.
+ */
+const absent = [];
+for (const [id, title, caption] of SET) {
+  const file = `${id.replace(/^mkt_/, '')}.png`;
+  if (existsSync(join(OUT, file))) {
+    md.push(`### ${title}`, '', `![${title}](${file})`, '', `*${caption}*`, '');
+  } else {
+    absent.push(id);
+  }
 }
 if (failed.length) {
   md.push('', '<!-- not captured this run:', ...failed.map(([id, why]) => `     ${id}: ${why}`), '-->', '');
+}
+if (absent.length) {
+  md.push('', `<!-- no PNG on disk: ${absent.join(', ')} -->`, '');
 }
 writeFileSync(join(OUT, 'README.md'), md.join('\n'));
 

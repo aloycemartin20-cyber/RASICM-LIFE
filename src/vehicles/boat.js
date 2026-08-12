@@ -196,6 +196,16 @@ export function buildBoatHull(spec, lod = 0) {
   }
   lamp('policeRed', transform(new THREE.SphereGeometry(0.045, 8, 6), { pos: [-s.hwMax * 0.85, s.sheerY + 0.06, s.bowZ - 1.0] }));
   lamp('drl', transform(new THREE.SphereGeometry(0.045, 8, 6), { pos: [s.hwMax * 0.85, s.sheerY + 0.06, s.bowZ - 1.0] }));
+  // The stern light rides a staff off the transom coaming — the raised
+  // all-round lamp is right for a workboat, but a sphere 0.5 m over the deck
+  // with nothing under it photographs as a floating white dot from any
+  // quarter (gallery QA, screenshots/boat.png).
+  const sternStaff = tubeBetween(
+    new THREE.Vector3(0, s.deckY + 0.02, s.sternZ + 0.2),
+    new THREE.Vector3(0, s.deckY + 0.5, s.sternZ + 0.2),
+    0.016, 8
+  );
+  out.chrome.push(sternStaff);
   lamp('reverse', transform(new THREE.SphereGeometry(0.05, 8, 6), { pos: [0, s.deckY + 0.5, s.sternZ + 0.2] }));
 
   return out;
