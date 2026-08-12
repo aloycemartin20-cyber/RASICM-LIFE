@@ -103,6 +103,33 @@ const C = {
   teal: [0.056, 0.126, 0.130],
   gold: [0.282, 0.200, 0.054],
 
+  /**
+   * BRIGHT NOTES — the ONE in six who is not wearing charcoal.
+   *
+   * These are authored garments, and they exist because the previous way of
+   * producing a bright note was to multiply whatever family colour had just
+   * been drawn by 2.1-4.2x. That is not how a dye works. Scaling a colour
+   * scales its CHROMA with its value, so `plum` (0.082, 0.048, 0.088) came out
+   * (0.344, 0.202, 0.370) — a fluorescent violet at 0.37 blue, brighter than
+   * any wool ever woven and the single loudest thing in a downtown frame. It
+   * is the "random saturated primaries" defect, and it was in a four-line
+   * post-process rather than in the wardrobe, which is why the wardrobe read
+   * correct at every review.
+   *
+   * A real bright garment is LESS saturated than a dark one of the same hue,
+   * not more: pigment load falls as the base cloth gets whiter. So each of
+   * these was authored at its own value, and `crowdprobe.mjs` gate SWATCH
+   * holds every emitted top garment to within jitter of one of them.
+   */
+  shellRed: [0.232, 0.058, 0.044],
+  shellOrange: [0.318, 0.132, 0.040],
+  shellYellow: [0.352, 0.288, 0.074],
+  shellTeal: [0.074, 0.208, 0.212],
+  shellBlue: [0.078, 0.148, 0.286],
+  shellGreen: [0.098, 0.196, 0.108],
+  duffel: [0.286, 0.222, 0.140],
+  raspberry: [0.196, 0.070, 0.098],
+
   // hi-vis is a genuinely bright pigment
   hivis: [0.430, 0.560, 0.036],
   hivisOrange: [0.600, 0.250, 0.026],
@@ -254,6 +281,16 @@ function makeFabric(rng, S) {
   return f;
 }
 
+/**
+ * NEGATIVE CONTROL for `crowdprobe.mjs` gate SWATCH. `--legacypalette`
+ * restores the multiply-a-dark-colour bright note, and the gate must go red:
+ * a scaled colour lands within jitter of NO swatch in `C`.
+ */
+export const PALETTE_LEGACY = { brightScale: false };
+
+/** Notes for an archetype that declares none. */
+const NOTE_FALLBACK = ['bone', 'cream', 'camel', 'mustard', 'shellRed', 'shellTeal'];
+
 /** Pull a colour with a small deterministic hue/value jitter. */
 function pick(rng, names, jitter = 0.10) {
   const c = C[names[rng.u32() % names.length]] ?? C.charcoal;
@@ -285,12 +322,14 @@ function pick(rng, names, jitter = 0.10) {
 export const SHAPES = {
   overcoatM: {
     fab: 'melton',
+    stubble: 0.35,
     hem: 0.68, bulk: 1.02, flare: 1.20, waist: 0.99, shoulder: 1.06, thick: 0.012,
     legs: 'trouser', feet: 'dress', hair: 'short', hat: null,
     extras: ['lapels', 'buttons', 'scarf'], sleeveR: 0.053, doc: 'downtown overcoat',
   },
   suitM: {
     fab: 'worsted',
+    stubble: 0.22,
     hem: 0.78, bulk: 0.97, flare: 0.85, waist: 0.95, shoulder: 1.10, thick: 0.006,
     legs: 'trouser', feet: 'dress', hair: 'short', hat: null,
     extras: ['lapels', 'tie', 'collar', 'buttons'], sleeveR: 0.047, doc: 'suit and tie',
@@ -318,6 +357,7 @@ export const SHAPES = {
   },
   jacketM: {
     fab: 'leather',
+    stubble: 0.70, beard: 1.0,
     hem: 0.82, bulk: 1.04, flare: 0.95, shoulder: 1.05, thick: 0.010,
     legs: 'jeans', feet: 'boot', hair: 'short', hat: null,
     extras: ['collar', 'belt'], sleeveR: 0.051, doc: 'bomber and jeans',
@@ -331,12 +371,14 @@ export const SHAPES = {
   },
   hoodieM: {
     fab: 'fleece',
+    stubble: 0.85,
     hem: 0.80, bulk: 1.06, flare: 1.0, shoulder: 1.03, thick: 0.014,
     legs: 'jeans', feet: 'trainer', hair: 'buzz', hat: null,
     extras: ['hood'], sleeveR: 0.054, doc: 'hoodie, hood down',
   },
   hoodedM: {
     fab: 'fleece',
+    stubble: 0.90,
     hem: 0.80, bulk: 1.06, flare: 1.0, shoulder: 1.03, thick: 0.014,
     legs: 'jeans', feet: 'trainer', hair: 'bald', hat: null,
     extras: ['hoodUp'], sleeveR: 0.054, doc: 'hoodie, hood up',
@@ -350,6 +392,7 @@ export const SHAPES = {
   },
   puffaM: {
     fab: 'nylon',
+    stubble: 0.60,
     hem: 0.74, bulk: 1.14, flare: 1.10, shoulder: 1.02, thick: 0.030,
     legs: 'jeans', feet: 'boot', hair: 'short', hat: 'beanie',
     extras: ['quilt', 'collar'], sleeveR: 0.063, doc: 'quilted puffa',
@@ -363,24 +406,28 @@ export const SHAPES = {
   },
   workM: {
     fab: 'duck',
+    stubble: 0.80, beard: 1.0,
     hem: 0.79, bulk: 1.10, flare: 0.95, belly: 0.35, shoulder: 1.08, thick: 0.014,
     legs: 'trouser', feet: 'work', hair: 'buzz', hat: 'hard',
     extras: ['hivis', 'collar', 'belt'], sleeveR: 0.056, doc: 'hi-vis and hard hat',
   },
   millM: {
     fab: 'duck',
+    stubble: 0.90, beard: 1.0,
     hem: 0.80, bulk: 1.12, flare: 0.9, belly: 0.5, shoulder: 1.09, thick: 0.012,
     legs: 'trouser', feet: 'work', hair: 'short', hat: 'ball',
     extras: ['collar', 'belt', 'apron'], sleeveR: 0.055, doc: 'millhand',
   },
   shirtM: {
     fab: 'poplin',
+    stubble: 0.30,
     hem: 0.88, bulk: 0.99, flare: 0.7, shoulder: 1.02, thick: 0.002,
     legs: 'trouser', feet: 'dress', hair: 'short', hat: null,
     extras: ['collar', 'belt', 'buttons'], sleeveR: 0.043, doc: 'shirtsleeves',
   },
   joggerM: {
     fab: 'tech',
+    stubble: 0.45,
     hem: 0.86, bulk: 0.95, flare: 0.7, shoulder: 1.0, thick: 0.004,
     legs: 'legging', feet: 'trainer', hair: 'buzz', hat: null,
     extras: ['zip'], sleeveR: 0.040, doc: 'running kit',
@@ -394,12 +441,14 @@ export const SHAPES = {
   },
   oldM: {
     fab: 'knit',
+    stubble: 0.55, beard: 0.6, age: 1.0,
     hem: 0.76, bulk: 1.05, flare: 0.9, belly: 0.55, shoulder: 0.96, thick: 0.010,
     legs: 'trouser', feet: 'dress', hair: 'bald', hat: 'flat',
     extras: ['collar', 'buttons', 'stoop'], sleeveR: 0.051, doc: 'flat cap and cardigan',
   },
   oldF: {
     fab: 'melton',
+    age: 1.0, stubble: 0,
     hem: 0.70, bulk: 1.0, flare: 1.18, bust: 0.5, waist: 0.98, hipW: 1.10, shoulder: 0.92,
     thick: 0.011,
     legs: 'skirt', feet: 'dress', hair: 'bob', hat: null,
@@ -407,9 +456,71 @@ export const SHAPES = {
   },
   studentM: {
     fab: 'denim',
+    stubble: 0.55,
     hem: 0.84, bulk: 0.94, flare: 0.85, shoulder: 0.99, thick: 0.008,
     legs: 'jeans', feet: 'trainer', hair: 'long', hat: 'beanie',
     extras: ['pack', 'collar'], sleeveR: 0.046, doc: 'rucksack and beanie',
+  },
+
+  /* ---------------------------------------------------------------- *
+   * BUILD, not just wardrobe.
+   *
+   * The twenty above are twenty GARMENTS on essentially one body: bulk runs
+   * 0.90-1.14 and shoulder 0.92-1.10, which is a 24% spread on a crowd whose
+   * real spread is more than double that. Geometry is shared per silhouette
+   * and a body is pooled without regard to shape, so the only place build can
+   * live is here — a heavy man and a rangy one have to be two entries, and
+   * `height` in `makeOutfit` then scales each of them again.
+   *
+   * These six are deliberately at the ENDS of the range rather than more
+   * points in the middle, because what "one silhouette a dozen times" means
+   * in a screenshot is that nothing in frame is shaped unlike anything else.
+   * ---------------------------------------------------------------- */
+  heavyM: {
+    fab: 'duck',
+    stubble: 0.75, beard: 0.8,
+    hem: 0.80, bulk: 1.26, flare: 0.92, belly: 0.95, waist: 1.06, hipW: 1.14, shoulder: 1.12,
+    thick: 0.014,
+    legs: 'jeans', feet: 'work', hair: 'buzz', hat: 'ball',
+    extras: ['collar', 'belt', 'hem'], sleeveR: 0.068, doc: 'heavy build, chore coat',
+  },
+  leanM: {
+    fab: 'melton',
+    stubble: 0.25,
+    hem: 0.62, bulk: 0.88, flare: 1.22, belly: 0, waist: 0.92, hipW: 0.94, shoulder: 1.14,
+    thick: 0.011,
+    legs: 'trouser', feet: 'dress', hair: 'short', hat: null,
+    extras: ['lapels', 'buttons', 'scarf', 'hem'], sleeveR: 0.046, doc: 'tall, lean, long coat',
+  },
+  vestM: {
+    fab: 'nylon',
+    stubble: 0.85, beard: 1.0,
+    hem: 0.86, bulk: 1.16, flare: 0.88, belly: 0.55, shoulder: 1.10, thick: 0.024,
+    legs: 'jeans', feet: 'work', hair: 'short', hat: 'beanie',
+    extras: ['quilt', 'collar', 'belt', 'hem'], sleeveR: 0.050, doc: 'gilet over flannel',
+  },
+  rainF: {
+    fab: 'tech',
+    stubble: 0,
+    hem: 0.72, bulk: 1.02, flare: 1.16, bust: 0.7, waist: 0.97, hipW: 1.06, shoulder: 0.98,
+    thick: 0.010,
+    legs: 'legging', feet: 'boot', hair: 'tail', hat: null,
+    extras: ['hoodUp', 'zip', 'hem'], sleeveR: 0.052, doc: 'rain shell, hood up',
+  },
+  parkaM: {
+    fab: 'duck',
+    stubble: 0.65,
+    hem: 0.66, bulk: 1.12, flare: 1.05, shoulder: 1.06, thick: 0.020,
+    legs: 'jeans', feet: 'boot', hair: 'short', hat: null,
+    extras: ['hood', 'zip', 'pack', 'hem'], sleeveR: 0.058, doc: 'long parka and pack',
+  },
+  cardiganF: {
+    fab: 'knit',
+    stubble: 0, age: 0.4,
+    hem: 0.68, bulk: 0.96, flare: 1.06, bust: 0.8, waist: 0.94, hipW: 1.12, shoulder: 0.90,
+    thick: 0.016,
+    legs: 'skirt', feet: 'boot', hair: 'bun', hat: null,
+    extras: ['collar', 'bag', 'hem'], sleeveR: 0.052, doc: 'long cardigan and skirt',
   },
 };
 
@@ -427,8 +538,13 @@ export const SHAPE_IDS = Object.keys(SHAPES);
  */
 export const ARCHETYPES = {
   office: {
-    shapes: { overcoatM: 3, suitM: 3, officeF: 3, coatF: 2, dressF: 1, shirtM: 2, studentM: 1 },
+    shapes: {
+      overcoatM: 3, suitM: 3, officeF: 3, coatF: 2, dressF: 1, shirtM: 2, studentM: 1,
+      leanM: 2, cardiganF: 1, rainF: 1,
+    },
     top: ['charcoal', 'navy', 'black', 'slate', 'graphite', 'camel', 'midGrey', 'forest'],
+    // a downtown bright note is a scarf-grade colour, never a primary
+    note: ['camel', 'bone', 'cream', 'shellBlue', 'raspberry', 'duffel', 'shellTeal'],
     under: ['white', 'paleGrey', 'paleDenim', 'bone', 'cream', 'steelBlue'],
     bottom: ['charcoal', 'navy', 'black', 'graphite', 'slate', 'midGrey'],
     accent: ['burgundy', 'navy', 'teal', 'oxblood', 'mustard', 'charcoal', 'plum'],
@@ -438,8 +554,10 @@ export const ARCHETYPES = {
     props: { phone: 0.30, umbrella: 0.18, coffee: 0.16 },
   },
   mill: {
-    shapes: { workM: 4, millM: 4, jacketM: 3, puffaM: 2, hoodieM: 2, oldM: 1 },
+    shapes: { workM: 4, millM: 4, jacketM: 3, puffaM: 2, hoodieM: 2, oldM: 1, heavyM: 4, vestM: 3 },
     top: ['olive', 'khaki', 'navy', 'charcoal', 'rust', 'brown', 'denim', 'graphite'],
+    // the workwear note is safety colour or nothing
+    note: ['hivisOrange', 'hivis', 'shellOrange', 'shellYellow', 'duffel', 'rust'],
     under: ['midGrey', 'khaki', 'paleGrey', 'olive', 'bone'],
     bottom: ['denim', 'khaki', 'charcoal', 'brown', 'olive', 'graphite'],
     accent: ['hivis', 'hivisOrange', 'rust', 'mustard', 'slag'],
@@ -452,8 +570,10 @@ export const ARCHETYPES = {
     shapes: {
       jacketM: 3, jacketF: 3, hoodieM: 3, hoodieF: 2, hoodedM: 2, puffaM: 2, puffaF: 2,
       studentM: 2, coatF: 2, oldM: 1, oldF: 1, shirtM: 1,
+      heavyM: 2, leanM: 2, vestM: 2, parkaM: 2, rainF: 2, cardiganF: 1,
     },
     top: ['charcoal', 'navy', 'olive', 'denim', 'black', 'maroon', 'brown', 'forest', 'slate', 'rust', 'plum'],
+    note: ['shellRed', 'shellTeal', 'shellBlue', 'shellGreen', 'mustard', 'duffel', 'bone', 'camel'],
     under: ['midGrey', 'paleGrey', 'bone', 'white', 'burgundy', 'teal'],
     bottom: ['denim', 'charcoal', 'black', 'khaki', 'graphite', 'paleDenim'],
     accent: ['burgundy', 'mustard', 'teal', 'gold', 'oxblood', 'paleGrey', 'slag'],
@@ -465,8 +585,10 @@ export const ARCHETYPES = {
   nightlife: {
     shapes: {
       jacketF: 3, dressF: 3, jacketM: 3, shirtM: 3, hoodieM: 2, coatF: 2, hoodedM: 1, officeF: 1,
+      leanM: 2, vestM: 1,
     },
     top: ['black', 'oxblood', 'plum', 'burgundy', 'navy', 'charcoal', 'teal', 'maroon'],
+    note: ['raspberry', 'gold', 'cream', 'white', 'shellRed', 'bone'],
     under: ['white', 'bone', 'gold', 'burgundy', 'paleGrey'],
     bottom: ['black', 'charcoal', 'denim', 'graphite'],
     accent: ['gold', 'burgundy', 'teal', 'slag', 'plum'],
@@ -476,8 +598,12 @@ export const ARCHETYPES = {
     props: { phone: 0.34, cigarette: 0.22 },
   },
   residential: {
-    shapes: { oldM: 3, oldF: 3, jacketM: 2, coatF: 2, hoodieF: 2, puffaF: 2, shirtM: 2, studentM: 1 },
+    shapes: {
+      oldM: 3, oldF: 3, jacketM: 2, coatF: 2, hoodieF: 2, puffaF: 2, shirtM: 2, studentM: 1,
+      cardiganF: 3, heavyM: 2, parkaM: 2, vestM: 1,
+    },
     top: ['brown', 'olive', 'camel', 'maroon', 'navy', 'midGrey', 'forest', 'tan'],
+    note: ['duffel', 'cream', 'bone', 'mustard', 'shellGreen', 'raspberry'],
     under: ['cream', 'bone', 'paleGrey', 'white'],
     bottom: ['brown', 'charcoal', 'khaki', 'denim', 'graphite'],
     accent: ['mustard', 'burgundy', 'teal', 'moss'],
@@ -487,8 +613,10 @@ export const ARCHETYPES = {
     props: { phone: 0.14, umbrella: 0.14 },
   },
   park: {
-    shapes: { joggerM: 4, joggerF: 4, hoodieF: 2, hoodieM: 2, oldM: 1, oldF: 1, studentM: 1 },
+    shapes: { joggerM: 4, joggerF: 4, hoodieF: 2, hoodieM: 2, oldM: 1, oldF: 1, studentM: 1, rainF: 2, parkaM: 1 },
     top: ['charcoal', 'slag', 'teal', 'navy', 'forest', 'hivis', 'graphite', 'plum'],
+    // running kit is the one place a real crowd IS bright
+    note: ['hivis', 'shellYellow', 'shellTeal', 'shellRed', 'shellBlue', 'shellGreen'],
     under: ['paleGrey', 'white', 'bone'],
     bottom: ['black', 'charcoal', 'graphite', 'navy'],
     accent: ['hivis', 'slag', 'teal', 'gold'],
@@ -499,8 +627,12 @@ export const ARCHETYPES = {
     joggerBias: 0.62,
   },
   market: {
-    shapes: { millM: 2, jacketM: 3, coatF: 3, oldF: 3, oldM: 2, hoodieM: 2, shirtM: 2, officeF: 1 },
+    shapes: {
+      millM: 2, jacketM: 3, coatF: 3, oldF: 3, oldM: 2, hoodieM: 2, shirtM: 2, officeF: 1,
+      cardiganF: 3, heavyM: 2, parkaM: 1,
+    },
     top: ['brown', 'olive', 'rust', 'navy', 'camel', 'maroon', 'charcoal', 'tan', 'moss'],
+    note: ['duffel', 'mustard', 'shellRed', 'cream', 'camel', 'shellGreen'],
     under: ['cream', 'bone', 'paleGrey', 'white', 'khaki'],
     bottom: ['denim', 'brown', 'charcoal', 'khaki'],
     accent: ['mustard', 'slag', 'teal', 'burgundy', 'gold'],
@@ -586,16 +718,40 @@ export function makeOutfit(rng, archetypeId, opts = {}) {
   const skin = SKIN[rng.u32() % SKIN.length];
   const hair = pickHair(rng);
 
-  const top = pick(rng, A.top, 0.13);
-  // One person in six is wearing something that is not charcoal. A rustbelt
-  // winter crowd really is mostly dark wool, but a street where EVERY coat sits
-  // at 0.04 albedo reads as a row of silhouettes the moment the sun comes out,
-  // and GTA V's crowds always have a few bright notes in them.
+  /**
+   * One person in six wears something that is not charcoal — drawn from the
+   * archetype's OWN note list, not manufactured by scaling a dark colour. See
+   * the `shell*` block in `C`. `PALETTE_LEGACY` puts the scaling back for
+   * `crowdprobe.mjs` gate SWATCH's negative control.
+   */
+  /**
+   * THE DRAW COUNT AND ORDER ARE PART OF THE CONTRACT.
+   *
+   * This is one shared `Rng` walked once per pedestrian, and everything after
+   * it — the height, the gait, the props, and through `peds/index.js` the next
+   * pedestrian's spawn point — comes off the same stream. Choosing the bright
+   * note with its own extra `pick()` (three draws where there was one) shifted
+   * every subsequent value in the city: the crowd came out standing in
+   * different places, and `shadowprobe.mjs` lost the pedestrian it measures the
+   * contact shadow on. So the note is selected from THE SAME SINGLE DRAW the
+   * old scale factor used, in the same position, and the stream is unchanged.
+   */
+  const family = pick(rng, A.top, 0.13);
+  let top = family;
   if (rng.float() < 0.22) {
     const g = rng.range(2.1, 4.2);
-    top[0] = Math.min(0.50, top[0] * g);
-    top[1] = Math.min(0.50, top[1] * g);
-    top[2] = Math.min(0.50, top[2] * g);
+    if (PALETTE_LEGACY.brightScale) {
+      top = [
+        Math.min(0.50, family[0] * g), Math.min(0.50, family[1] * g), Math.min(0.50, family[2] * g),
+      ];
+    } else {
+      const list = A.note ?? NOTE_FALLBACK;
+      const u = (g - 2.1) / 2.1;                       // 0..1
+      const c = C[list[Math.min(list.length - 1, Math.floor(u * list.length))]] ?? C.camel;
+      // the fractional part carries the value jitter, so one draw does both
+      const v = 1 + (((u * list.length) % 1) - 0.5) * 0.16;
+      top = [Math.max(0.008, c[0] * v), Math.max(0.008, c[1] * v), Math.max(0.008, c[2] * v)];
+    }
   }
   // a jumper or shirt under the coat, related to but never equal to the top
   const under = pick(rng, A.under, 0.14);

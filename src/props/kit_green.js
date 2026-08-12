@@ -45,6 +45,16 @@ import {
  * cards have to be SPREAD IN SPACE and FOLDED or the hash has nothing to bite on.
  */
 
+/**
+ * `?owLegacyCanopy=1` restores the canopy as it was scored: card normals with
+ * no shell bias, the crown-interior AO applied to everything down to a 40 cm
+ * shrub, the unclustered card scatter and the thin far tier. A fix you cannot
+ * un-apply is a fix you cannot prove — `src/props/foliageprobe.mjs` runs this
+ * arm as its control, the same way `src/world/probe.mjs` runs `--nodedup`.
+ */
+const LEGACY_CANOPY =
+  typeof location !== 'undefined' && /[?&]owLegacyCanopy=1/.test(location.search);
+
 const _m = new THREE.Matrix4();
 const _v = new THREE.Vector3();
 const _v2 = new THREE.Vector3();
@@ -81,7 +91,15 @@ function leafSpray(w, h, seed, opts = {}) {
   const uo = hash3i(seed, 3, 71);
   const vo = hash3i(seed, 4, 71);
   const mir = hash3i(seed, 5, 71) < 0.5 ? -1 : 1;
-  const N = 8;
+  /**
+   * SEVEN, not eight. The card budget buys silhouette, and an odd fan has no
+   * pair of parallel edges to line up into a flat side — so seven wedges reads
+   * less like a polygon than eight does while costing 12.5 % fewer triangles,
+   * which is exactly what pays for the extra CARDS the clustering needs. The
+   * per-vertex radius wobble below is what actually kills the polygon read;
+   * the count only decides how much it costs.
+   */
+  const N = opts.n ?? (LEGACY_CANOPY ? 8 : 7);
   const pos = new Float32Array((N + 1) * 3);
   const uv = new Float32Array((N + 1) * 2);
   const idx = [];
@@ -126,6 +144,26 @@ function biasNormals(a, from, ox, oy, oz, amount) {
 }
 
 /**
+ * The widest a foliage card may be, in metres, whatever a species asks for.
+ * A London plane's leaf runs 15-25 cm, so this is a spray of roughly eight
+ * blades across — a twig's worth. Anything wider reads as a cutout.
+ */
+const CARD_MAX = 1.12;
+
+/**
+ * THE UNDERSTOREY'S SHARE OF THE CROWN-INTERIOR TREATMENT.
+ *
+ * Hedges, scrub, bank willow and ivy are all shallow — half a metre of leaves
+ * at most — and every one of them inherited an AO curve and a normal blend
+ * authored for the inside of a plane tree. Same defect as the shrubs, same two
+ * numbers: less occlusion, because there is nothing there to occlude with, and
+ * more of the shell direction in the normal, because a clipped hedge really
+ * does shade like a box and a bank of willow really does shade like a mound.
+ */
+const SMALL_AO = LEGACY_CANOPY ? 1 : 0.42;
+const SMALL_BIAS = LEGACY_CANOPY ? 0.55 : 0.82;
+
+/**
  * A CANOPY: cards distributed through a volume of overlapping LOBES, not over
  * one smooth ellipsoid.
  *
@@ -147,6 +185,27 @@ function canopy(n, rx, ry, rz, seed, opts = {}) {
   const lobes = opts.lobes ?? 5;
   const bias = opts.bias ?? 0.55;
   const flat = opts.flat ?? 0;   // 1 = conical/columnar bias, 0 = round
+  /** Cards per sprig, and how far one may wander from its sprig centre. */
+  const clump = LEGACY_CANOPY ? 1 : (opts.clump ?? 6);
+  const SPRIG = opts.sprig ?? 0.44;
+  /** 1/3 spreads cards evenly through the lobe volume; >1/3 packs them in. */
+  const pack = opts.pack ?? 1 / 3;
+  /**
+   * HOW MUCH CROWN-INTERIOR AO THIS THING HAS EARNED.
+   *
+   * The interior of a 3 m plane crown is genuinely dark: there are four metres
+   * of leaves between that card and the sky. The interior of a 40 cm box hedge
+   * is not — there is nothing in there to occlude with — and applying the same
+   * curve to both is half of why a critic panel scored "shrubs that render as
+   * unlit black blobs". The other half is the shading normal, which is `bias`.
+   * Scaled by the crown's own size so a species never has to remember to set
+   * it, with an explicit override for the clipped forms.
+   */
+  const ao = opts.ao ?? clamp01((Math.min(rx, ry) - 0.35) / 1.5);
+  /** Hard ceiling on card width in metres — see CARD_MAX. */
+  const cap = opts.cap ?? CARD_MAX;
+  /** Imposter tiers size every card the same: see the `ramp` note below. */
+  const even = !!opts.even;
   const cy = ry + lift;
 
   const L = [];
@@ -202,12 +261,33 @@ function canopy(n, rx, ry, rz, seed, opts = {}) {
     const h4 = hash3i(seed, i, 5);
     const h5 = hash3i(seed, i, 6);
 
-    const th = h0 * TAU;
-    const ph = Math.acos(1 - 2 * (0.06 + 0.90 * h1));
-    const rr = inner + (1 - inner) * Math.cbrt(h2);
-    let px = lb.x + Math.sin(ph) * Math.cos(th) * rx * lb.r * rr;
-    let py = lb.y + Math.cos(ph) * ry * lb.r * rr * (1 - flat * 0.25);
-    let pz = lb.z + Math.sin(ph) * Math.sin(th) * rz * lb.r * rr;
+    /**
+     * SPRIGS. Foliage does not sit evenly through a lobe: it hangs off the
+     * ends of twigs in bunches, with air between the bunches. Scattering cards
+     * uniformly through the lobe volume is what makes a procedural crown read
+     * as a cloud of confetti — the density is the same everywhere, so there is
+     * no structure at any scale between "one card" and "the whole tree", and
+     * the eye reads the only scale it can find, which is the card.
+     *
+     * Every `clump` consecutive cards therefore share a sprig centre drawn on
+     * the lobe and only jitter within `SPRIG` of it. Same card count, same
+     * triangles, but now there is a scale in between: bunches of leaves, which
+     * is what a crown is made of and what makes the cards stop being the
+     * subject.
+     */
+    const sg = Math.floor(i / clump);
+    const g0 = hash3i(seed, sg, 51);
+    const g1 = hash3i(seed, sg, 52);
+    const g2 = hash3i(seed, sg, 53);
+    const th = clump > 1 ? g0 * TAU : h0 * TAU;
+    const ph = Math.acos(1 - 2 * (0.06 + 0.90 * (clump > 1 ? g1 : h1)));
+    const rr = inner + (1 - inner) * Math.pow(clump > 1 ? g2 : h2, pack);
+    const jx = clump > 1 ? (h0 - 0.5) * SPRIG * rx * lb.r : 0;
+    const jy = clump > 1 ? (h1 - 0.5) * SPRIG * ry * lb.r : 0;
+    const jz = clump > 1 ? (h2 - 0.5) * SPRIG * rz * lb.r : 0;
+    let px = lb.x + Math.sin(ph) * Math.cos(th) * rx * lb.r * rr + jx;
+    let py = lb.y + Math.cos(ph) * ry * lb.r * rr * (1 - flat * 0.25) + jy;
+    let pz = lb.z + Math.sin(ph) * Math.sin(th) * rz * lb.r * rr + jz;
 
     // keep the whole thing inside the species' crown envelope
     let q = Math.hypot(px / rx, py / ry, pz / rz);
@@ -237,11 +317,35 @@ function canopy(n, rx, ry, rz, seed, opts = {}) {
      * self-shadow, and none of them is on the outline.
      */
     const depth = clamp01(1 - q);
-    const s = size * (0.68 + 0.62 * depth) * (0.76 + 0.48 * h3);
+    /**
+     * CARD SCALE, and this is the number the critics measured as "wrong".
+     *
+     * The two multipliers used to run to 1.30 and 1.24, so the biggest card on
+     * a plane tree came out 2.0 m across — not a spray of leaves, a cutout of
+     * a shrub hung inside a tree. The ramp still runs with depth, for the
+     * reason below, but over a much narrower range and against a hard ceiling
+     * in METRES: whatever a species asks for, no card is wider than a person is
+     * tall, because past that the eye stops reading leaves and starts reading
+     * the card. The mass the smaller cards give up is bought back by the sprig
+     * clustering above, which packs them instead of spreading them.
+     */
+    /**
+     * `depth` is the wrong axis for an IMPOSTER tier. Its cards sit ON the
+     * lobe centres, which are out near the crown's own rim, so a depth ramp
+     * makes exactly the cards that are meant to BE the crown the smallest ones
+     * — the tier gets thinner the harder you pack it. `even` turns the ramp
+     * off and leaves only the per-card spread.
+     */
+    const ramp = LEGACY_CANOPY
+      ? (0.68 + 0.62 * depth) * (0.76 + 0.48 * h3)
+      : even ? (0.88 + 0.24 * h3)
+        : (0.74 + 0.40 * depth) * (0.80 + 0.36 * h3);
+    const s = LEGACY_CANOPY ? size * ramp : Math.min(size * ramp, cap);
     const g = leafSpray(1.02 * s, 0.80 * s, seed * 31 + i, {
       fold: 0.12 + 0.22 * h4,
       droop: 0.08 + 0.22 * h0,
       pitch,
+      n: opts.cardN,
     });
 
     // face roughly outward, then twist hard so no two cards share a normal
@@ -271,7 +375,7 @@ function canopy(n, rx, ry, rz, seed, opts = {}) {
     const mul = [
       0.15 + 0.55 * h2 * outward,
       0.10 + 0.26 * h1 + 0.12 * (1 - outward),
-      0.16 + 0.78 * (1 - outward) * (1 - outward),
+      (0.16 + 0.78 * (1 - outward) * (1 - outward)) * (LEGACY_CANOPY ? 1 : ao),
     ];
     const v0 = a.verts;
     a.add(g, m, null, mul);
@@ -387,15 +491,29 @@ function trunkAndBranches(h, r0, seed, opts = {}) {
   const plan = opts.plan ?? branchPlan(h, seed, opts);
   const pts = plan.pts;
   const segs = pts.length - 1;
-  parts.push([tube(pts, r0, 8, { taper: opts.taper ?? 0.34, mg: 0.55 }), null]);
+  /**
+   * THE FAR TRUNK IS THINNER, AND THAT IS A FIX, NOT A SAVING.
+   *
+   * At 300 m a trunk is a bar one or two pixels wide, and bark mips to a pale
+   * grey — so the one part of a distant tree that resolves cleanly is the part
+   * that should be least visible, and it out-reads the crown. Taking 22 % off
+   * the radius and 3 of the 8 radial segments makes the bar sub-pixel, which
+   * is where it belongs, and pays for the imposter cards at the same time.
+   */
+  const far = !!opts.far;
+  parts.push([tube(pts, r0 * (far ? 0.78 : 1), far ? 5 : 8,
+    { taper: opts.taper ?? 0.34, mg: 0.55 }), null]);
 
   /**
    * ROOT FLARE. Seven buttresses, not five, and they start wider and land
    * lower: the join between a trunk and the ground is the one part of a tree
    * the player walks right up to, and a cylinder meeting a pavement in a clean
    * circle is the tell that survives every other improvement.
+   *
+   * Nobody has ever seen one at the far tier — a 20 cm buttress at 300 m is a
+   * fifth of a pixel — so the far trunk does without them entirely.
    */
-  for (let i = 0; i < 7; i++) {
+  for (let i = 0; i < (far ? 0 : 7); i++) {
     const a = (i / 7) * TAU + hash3i(seed, i, 11) * 0.8;
     const rr = r0 * (1.7 + hash3i(seed, i, 12) * 1.3);
     parts.push([tube([
@@ -549,13 +667,57 @@ export function registerTrees(K) {
       branches: Math.max(3, sp.branches - 2), reach: sp.reach, rise: sp.rise, crown: fenv,
     });
     P(K, `tree_${sp.id}_far_wood`, () => trunkAndBranches(sp.h, sp.r, fseed, {
-      twigs: 0, plan: fplan,
+      twigs: 0, plan: fplan, far: !LEGACY_CANOPY,
     }), sp.bark);
-    const fgeo = canopy(Math.max(22, Math.round(sp.n * 0.30)), sp.crown[0], sp.crown[1], sp.crown[2], fseed, {
-      size: sp.size * 1.7, lift: sp.h * sp.lift, inner: 0.30,
-      pitch: sp.pitch * 1.9, lobes: 4, flat: sp.flat ?? 0, bias: 0.75,
-      lobesAt: fplan.prim.map((b) => b.tip),
-    });
+    /**
+     * THE FAR TIER IS A LOBE IMPOSTER, NOT A THINNER CANOPY.
+     *
+     * "Every tree past ~40 m is a bare armature" was the third foliage defect
+     * scored, and the previous answer to it — a third of the cards at 1.7x the
+     * size — could not work, for a reason that is arithmetic rather than taste.
+     * Fifty-three cards spread evenly through a crown volume cover about a
+     * quarter of that crown's silhouette (MEASURED: 0.264 fill, against 0.067
+     * for the branches inside the same box), and a quarter-covered crown at
+     * 300 m is a haze with sticks through it. The trunk, meanwhile, is a pale
+     * vertical bar two pixels wide that the eye has no trouble at all with —
+     * so the tree reads as a stick with a smudge on top. That is a lollipop,
+     * and a row of them along a ridge is the loudest thing in the frame.
+     *
+     * The fix is to stop pretending a distant crown has interior structure.
+     * The same card count, packed hard onto the lobe centres (`pack` well above
+     * the 1/3 that spreads them evenly through the lobe volume) at 2.4x the
+     * size and a flat size ramp, so each lobe is a solid blob and the crown is
+     * the union of six of them. Blade pitch goes coarse to match: past ~90 m
+     * the mip chain averages fine blades away and a few big soft cards read as
+     * a mass where many small ones read as noise. Normals lean hard out of the
+     * shell, so the blobs shade like the volume they stand for.
+     *
+     * WHAT THE NUMBER TO WATCH IS. Not the card count — OVERDRAW, the ratio of
+     * emitted card area to the crown's own silhouette area. The bake covers a
+     * quarter of a card (contract note 2 at the top of this file), so at range,
+     * where the mip chain has averaged each card down to about that quarter and
+     * `alphaTest` 0.21 keeps roughly half of them, the number of OPAQUE layers
+     * over a point is overdraw x 0.25 x ~0.5. Under one layer and the crown is
+     * a haze with branches through it, which is what "bare armature" looks like
+     * from 300 m. MEASURED: the shipped tier ran 3.6-4.0 overdraw for 424
+     * triangles; this one runs 7-8 for 318, because packing beats spreading
+     * when the thing you are drawing is fifteen pixels tall.
+     */
+    const fgeo = LEGACY_CANOPY
+      ? canopy(Math.max(22, Math.round(sp.n * 0.30)), sp.crown[0], sp.crown[1], sp.crown[2], fseed, {
+        size: sp.size * 1.7, lift: sp.h * sp.lift, inner: 0.30,
+        pitch: sp.pitch * 1.9, lobes: 4, flat: sp.flat ?? 0, bias: 0.75,
+        lobesAt: fplan.prim.map((b) => b.tip),
+      })
+      : canopy(Math.max(34, Math.round(sp.n * 0.32)), sp.crown[0], sp.crown[1], sp.crown[2], fseed, {
+        size: sp.size * 2.4, lift: sp.h * sp.lift, inner: 0, pack: 1.6, clump: 4, sprig: 0.30, even: true,
+        pitch: sp.pitch * 2.4, lobes: 4, flat: sp.flat ?? 0, bias: 0.88, ao: 0.35,
+        // The near tier's 1.12 m ceiling is about reading LEAVES; nothing at
+        // 300 m does, and a sapling whose lobe is a metre across needs a card
+        // the size of the lobe or the tier has no density at all.
+        cardN: 6, cap: sp.crown[0] * 1.5,
+        lobesAt: fplan.prim.map((b) => b.tip),
+      });
     for (let li = 0; li < LEAVES.length; li++) {
       K.proto(`tree_${sp.id}_far_leaf${li}`, null, LEAVES[li], { geo: fgeo, shared: true });
     }
@@ -638,8 +800,25 @@ export function registerGreen(K) {
   }, 'soil');
 
   /* ---- shrubs / hedge blocks ----------------------------------------- */
+  /**
+   * A SHRUB IS A DOME, AND IT HAS TO SHADE LIKE ONE.
+   *
+   * "Shrubs that render as unlit black blobs" was scored on this line, and
+   * both causes are here rather than in the material. `ao` was inherited from
+   * a 3 m tree crown: a 40 cm bush has no interior to occlude, so the mask ran
+   * to 0.9 on cards that are 15 cm from open sky and the whole thing rendered
+   * at a fraction of its albedo — which is exactly what a sodium lamp cannot
+   * rescue at night, because there is nothing wrong with the light. And `bias`
+   * at 0.6 left enough of each card's own normal to shade the dome as a
+   * collage; at 0.85 the emitted normals lie along the dome and a lamp above
+   * it lights the top of the bush and leaves the underside dark, which is the
+   * read that says "object" instead of "hole".
+   */
   const shrub = (n, rx, ry, seed, size, pitch) =>
-    canopy(n, rx, ry, rx, seed, { size, lift: 0, inner: 0.16, pitch, lobes: 3, bias: 0.6 });
+    canopy(n, rx, ry, rx, seed, {
+      size, lift: 0, inner: 0.16, pitch, lobes: 3, bias: 0.85, ao: 0.30,
+      clump: 5, sprig: 0.5, cap: 0.62,
+    });
   P(K, 'shrub_a', () => shrub(40, 0.78, 0.50, 301, 0.62, 0.075), 'leaf_c');
   P(K, 'shrub_b', () => shrub(32, 0.60, 0.42, 307, 0.55, 0.062), 'leaf_a');
   P(K, 'shrub_c', () => shrub(46, 0.92, 0.60, 311, 0.68, 0.085), 'leaf_b');
@@ -664,8 +843,8 @@ export function registerGreen(K) {
       let oy = 0.7 * clamp01((py - 0.3) / 0.5) + 0.15;
       const ol = Math.hypot(ox, oy, pz) || 1;
       const v0 = a.verts;
-      a.add(g, m, null, [0.12 + 0.4 * h0, 0.12 + 0.22 * h1, 0.25 + 0.6 * (1 - h1)]);
-      biasNormals(a, v0, ox / ol, oy / ol, (pz * 2) / ol, 0.55);
+      a.add(g, m, null, [0.12 + 0.4 * h0, 0.12 + 0.22 * h1, (0.25 + 0.6 * (1 - h1)) * SMALL_AO]);
+      biasNormals(a, v0, ox / ol, oy / ol, (pz * 2) / ol, SMALL_BIAS);
       g.dispose();
     }
     return a.build();
@@ -690,8 +869,8 @@ export function registerGreen(K) {
         new THREE.Vector3(1, 1, 1)
       );
       const v0 = a.verts;
-      a.add(g, m, null, [0.18 + 0.4 * h0, 0.16 + 0.3 * h2, 0.20 + 0.5 * (1 - h1)]);
-      biasNormals(a, v0, px * 1.4, 0.55, pz * 1.4, 0.55);
+      a.add(g, m, null, [0.18 + 0.4 * h0, 0.16 + 0.3 * h2, (0.20 + 0.5 * (1 - h1)) * SMALL_AO]);
+      biasNormals(a, v0, px * 1.4, 0.55, pz * 1.4, SMALL_BIAS);
       g.dispose();
     }
     return a.build();
@@ -718,8 +897,8 @@ export function registerGreen(K) {
         new THREE.Vector3(1, 1, 1)
       );
       const v0 = a.verts;
-      a.add(g, m, null, [0.14 + 0.4 * h0, 0.14 + 0.26 * h2, 0.22 + 0.55 * (1 - h1)]);
-      biasNormals(a, v0, px * 1.2, 0.6, pz * 1.2, 0.55);
+      a.add(g, m, null, [0.14 + 0.4 * h0, 0.14 + 0.26 * h2, (0.22 + 0.55 * (1 - h1)) * SMALL_AO]);
+      biasNormals(a, v0, px * 1.2, 0.6, pz * 1.2, SMALL_BIAS);
       g.dispose();
     }
     return a.build();
@@ -829,8 +1008,8 @@ export function registerGreen(K) {
         new THREE.Vector3(1, 1, 1)
       );
       const v0 = a.verts;
-      a.add(g, m, null, [0.15 + 0.35 * h0, 0.15 + 0.25 * h2, 0.20 + 0.5 * (1 - y / 3.2)]);
-      biasNormals(a, v0, 0, 0.25, 0.97, 0.55);
+      a.add(g, m, null, [0.15 + 0.35 * h0, 0.15 + 0.25 * h2, (0.20 + 0.5 * (1 - y / 3.2)) * SMALL_AO]);
+      biasNormals(a, v0, 0, 0.25, 0.97, SMALL_BIAS);
       g.dispose();
     }
     return a.build();

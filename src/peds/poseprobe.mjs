@@ -32,14 +32,33 @@
  * itself (ARCHITECTURE.md rule 12). It is deliberately generous: it is looking
  * for a shoulder folded across the chest, not for stylistic disagreement.
  *
+ *   6 FINGERS  the emitted hand has four SEPARATE fingers where it is widest.
+ *              Measured as the dorsal silhouette across the finger mass: four
+ *              runs of surface with real daylight between them, over the
+ *              proximal half of the finger. `--legacyhand` restores the 17.5 mm
+ *              metacarpal pitch against 19.6 mm of finger and the same sweep
+ *              reads TWO masses, because interpenetrating tubes weld into a
+ *              paddle. Nothing else in this file could see that: the fingers
+ *              were four separate meshes with four separate names the whole
+ *              time, and every count-the-parts check passed.
+ *   7 STANDS   the standing rotation is real. Every clip in `clips.STANDS`
+ *              must differ from every other by a measurable amount of BODY,
+ *              taken as the RMS displacement of the emitted bone positions in
+ *              the actor's own frame — not as a difference of authored
+ *              numbers, which two clips can have while producing the same
+ *              silhouette. Also asserts the rotation is at least four deep and
+ *              that `animator` actually spreads a crowd over all of it.
+ *
  *   node src/peds/poseprobe.mjs
  *   node src/peds/poseprobe.mjs --worst
  *   node src/peds/poseprobe.mjs --legacy     # NEGATIVE CONTROL, must fail
+ *   node src/peds/poseprobe.mjs --legacyhand # NEGATIVE CONTROL, must fail
  */
 import * as THREE from 'three';
 import { RIG } from './rig.js';
 import { PedAnimator } from './animator.js';
-import { LEGACY, punch, dive, carryAdd, phoneAdd, smokeAdd, umbrellaAdd } from './clips.js';
+import { LEGACY, STANDS, CLIPS as CLIP_FNS, punch, dive, carryAdd, phoneAdd, smokeAdd, umbrellaAdd } from './clips.js';
+import { HAND_LEGACY } from './parts.js';
 import { buildOutfit } from './builder.js';
 import { makeOutfit, SHAPE_IDS } from './wardrobe.js';
 import { Rng } from '../core/rng.js';
@@ -51,6 +70,7 @@ const args = Object.fromEntries(
   })
 );
 LEGACY.mirrorSigns = !!args.legacy;
+HAND_LEGACY.on = !!args.legacyhand;
 
 /**
  * Anatomical swing limits, degrees, measured as the angle between a bone's
@@ -143,7 +163,7 @@ const SKIN_RATCHET = 2.85;
  *  a 0.2 mm seam edge growing to 2 mm is a 10x ratio and 1.8 mm of nothing. */
 const EDGE_FLOOR = 0.004;
 
-const CLIPS = ['idle', 'walk', 'jog', 'run', 'cower', 'wait', 'lean'];
+const CLIPS = ['idle', 'walk', 'jog', 'run', 'cower', 'wait', 'lean', 'guard'];
 /** Layer stacks the game actually produces — see `ped.js` `_updateGawk`,
  *  `_updateFlee`, `_applyCarry` and `hurt`, none of which clear the others. */
 const STACKS = [
@@ -404,6 +424,192 @@ function recorder() {
   };
 }
 
+/* ------------------------------------------------------------------ */
+/* 6 FINGERS — four fingers, on the emitted surface                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * A DORSAL SILHOUETTE SWEEP, because nothing cheaper can see the defect.
+ *
+ * Counting parts, counting connected components and counting ray crossings all
+ * report four fingers on a hand whose fingers interpenetrate — the tubes are
+ * still four separate open shells, they simply occupy the same space, and a
+ * viewer sees one paddle. What a viewer actually reads is the OUTLINE: looking
+ * at the back of the hand, four fingers are four runs of surface with gaps of
+ * sky between them.
+ *
+ * So: at stations along the finger, cast a fan of parallel rays from outside
+ * the dorsum straight at it, across the hand, and count runs of first-hit. The
+ * gate holds over the PROXIMAL half (u 0.24 to 0.52) — where the fingers are
+ * closest together and where a mitten shows — rather than at the tips, which
+ * separate on curl alone and would pass on the broken geometry too. Measured:
+ * fixed 4 runs at every station with 2.8-4.8 mm of gap; legacy 2 runs (the
+ * fingers weld into pairs) until u = 0.56.
+ */
+const STATION_U = [0.24, 0.28, 0.32, 0.36, 0.40, 0.44, 0.48, 0.52];
+const FAN_W = 241, FAN_STEP = 0.0004;
+
+function handTriangles(built, name) {
+  const p = built.parts.find((x) => x.name === name);
+  if (!p) return null;
+  const pos = built.geometry.getAttribute('position');
+  const idx = built.geometry.index;
+  const lo = p.start, hi = p.start + p.count;
+  const T = [];
+  for (let t = 0; t < idx.count; t += 3) {
+    const a = idx.getX(t);
+    if (a < lo || a >= hi) continue;
+    const c = idx.getX(t + 1), d = idx.getX(t + 2);
+    T.push([
+      new THREE.Vector3(pos.getX(a), pos.getY(a), pos.getZ(a)),
+      new THREE.Vector3(pos.getX(c), pos.getY(c), pos.getZ(c)),
+      new THREE.Vector3(pos.getX(d), pos.getY(d), pos.getZ(d)),
+    ]);
+  }
+  return T;
+}
+
+const _ray = new THREE.Ray(), _hit = new THREE.Vector3();
+function anyHit(T, o, d) {
+  _ray.set(o, d);
+  for (const t of T) if (_ray.intersectTriangle(t[0], t[1], t[2], false, _hit)) return true;
+  return false;
+}
+
+/**
+ * The hand frame is taken from the RIG's bone positions and the same palm
+ * normal `builder.js` hands `parts.hand` — those are the frame the hand is
+ * BUILT in, and a frame is not a measurement. Everything measured below is the
+ * emitted triangle soup inside it.
+ */
+function fingerSweep(built, side) {
+  const sx = side < 0 ? 'R' : 'L';
+  const wr = RIG.pos(`Hand${sx}`), el = RIG.pos(`Forearm${sx}`);
+  const W = new THREE.Vector3(...wr);
+  const D = new THREE.Vector3(wr[0] - el[0] || side * 0.013, wr[1] - el[1], wr[2] - el[2]).normalize();
+  const N = new THREE.Vector3(-side * 0.94, 0.05, 0.34).normalize();
+  const S = new THREE.Vector3().crossVectors(D, N).normalize();
+  const T = handTriangles(built, `hand${sx}`);
+  if (!T) return { runs: 0, gap: 0 };
+  let worstRuns = 9, worstGap = Infinity;
+  const o = new THREE.Vector3(), dir = new THREE.Vector3(), AXIS = new THREE.Vector3(), AY = new THREE.Vector3();
+  for (const u of STATION_U) {
+    const ang = 0.60 * (0.55 + u * 1.25);
+    AXIS.copy(D).multiplyScalar(Math.cos(ang)).addScaledVector(N, -Math.sin(ang) * 0.85).normalize();
+    const C = W.clone().addScaledVector(D, 0.081).addScaledVector(AXIS, 0.078 * u);
+    AY.crossVectors(S, AXIS).normalize();
+    dir.copy(AY).negate();
+    const hitRow = [];
+    for (let i = 0; i < FAN_W; i++) {
+      o.copy(C).addScaledVector(S, (i - (FAN_W - 1) / 2) * FAN_STEP).addScaledVector(AY, 0.05);
+      hitRow.push(anyHit(T, o, dir));
+    }
+    const runs = [];
+    let st = -1;
+    for (let i = 0; i < FAN_W; i++) {
+      if (hitRow[i] && st < 0) st = i;
+      else if (!hitRow[i] && st >= 0) { runs.push([st, i - 1]); st = -1; }
+    }
+    if (st >= 0) runs.push([st, FAN_W - 1]);
+    if (runs.length < worstRuns) worstRuns = runs.length;
+    if (runs.length >= 4) {
+      for (let i = 1; i < runs.length; i++) {
+        const g = (runs[i][0] - runs[i - 1][1] - 1) * FAN_STEP;
+        if (g < worstGap) worstGap = g;
+      }
+    }
+  }
+  return { runs: worstRuns, gap: worstGap === Infinity ? 0 : worstGap };
+}
+
+function fingerCheck() {
+  let runs = 9, gap = Infinity, where = '';
+  for (const id of SHAPE_IDS) {
+    const built = buildOutfit(id, { rng: new Rng(4242), lod: 0 });
+    for (const side of [-1, 1]) {
+      const r = fingerSweep(built, side);
+      if (r.runs < runs || (r.runs === runs && r.gap < gap)) {
+        runs = Math.min(runs, r.runs);
+        gap = Math.min(gap, r.gap);
+        where = `${id}/${side < 0 ? 'R' : 'L'}`;
+      }
+    }
+  }
+  return { runs, gap: gap === Infinity ? 0 : gap, where };
+}
+
+/* ------------------------------------------------------------------ */
+/* 7 STANDS — the standing rotation is more than one pose              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * MEASURED AS BODY, NOT AS NUMBERS. Two stand clips can differ in fifty
+ * authored degrees and still put the skeleton in the same place — a spine
+ * flexion cancelled by a hip tilt is exactly that — so the separation is taken
+ * as the RMS distance between the two clips' EMITTED bone positions, in the
+ * actor's own frame, averaged over the idle cycle. 40 mm is roughly "you can
+ * see it is a different person's posture across a street".
+ *
+ * The second half asserts the rotation is actually USED: a hundred outfits
+ * drawn from the real wardrobe must land on every entry, because a hash that
+ * happens to collapse to one bucket is the same defect as having one clip.
+ */
+function standCheck() {
+  const outfit = makeOutfit(new Rng(31), 'street', { shape: 'jacketM' });
+  const poses = new Map();
+  for (const name of STANDS) {
+    const { bones, root } = RIG.createSkeleton();
+    const group = new THREE.Group();
+    group.add(root);
+    const an = new PedAnimator(RIG, bones, {
+      gait: outfit.gait, height: outfit.height, scale: outfit.scale,
+    });
+    an.footIk = false;
+    an.stand = name;
+    an.setState({ clip: 'idle', speed: 0 });
+    const samples = [];
+    for (let f = 0; f < 240; f++) {
+      an.update(1 / 60, f / 60);
+      if (f % 24) continue;
+      group.updateMatrixWorld(true);
+      const row = new Float64Array(RIG.count * 3);
+      for (let i = 0; i < RIG.count; i++) {
+        _a.setFromMatrixPosition(bones[i].matrixWorld);
+        row[i * 3] = _a.x; row[i * 3 + 1] = _a.y; row[i * 3 + 2] = _a.z;
+      }
+      samples.push(row);
+    }
+    poses.set(name, samples);
+  }
+  let closest = Infinity, pair = '';
+  const names = [...poses.keys()];
+  for (let i = 0; i < names.length; i++) {
+    for (let j = i + 1; j < names.length; j++) {
+      const A = poses.get(names[i]), B = poses.get(names[j]);
+      let sum = 0, n = 0;
+      for (let k = 0; k < Math.min(A.length, B.length); k++) {
+        for (let b = 0; b < RIG.count; b++) {
+          sum += (A[k][b * 3] - B[k][b * 3]) ** 2 +
+            (A[k][b * 3 + 1] - B[k][b * 3 + 1]) ** 2 +
+            (A[k][b * 3 + 2] - B[k][b * 3 + 2]) ** 2;
+          n++;
+        }
+      }
+      const rms = Math.sqrt(sum / Math.max(1, n));
+      if (rms < closest) { closest = rms; pair = `${names[i]} vs ${names[j]}`; }
+    }
+  }
+  // spread: do a hundred real pedestrians reach every stand?
+  const seen = new Set();
+  const rng = new Rng(9001);
+  for (let i = 0; i < 100; i++) {
+    const o = makeOutfit(rng, 'street');
+    const an = new PedAnimator(RIG, null, { gait: o.gait, height: o.height, scale: o.scale });
+    seen.add(an.stand);
+  }
+  return { count: STANDS.length, closest, pair, used: seen.size, guard: typeof CLIP_FNS.guard === 'function' };
+}
+
 function mirrorCheck() {
   let worst = 0, where = '';
   for (const [name, fn] of SIDED) {
@@ -429,11 +635,21 @@ function mirrorCheck() {
 }
 
 const mirror = mirrorCheck();
+const fingers = fingerCheck();
+const stands = standCheck();
 const t0 = Date.now();
 const { worst, frames } = run();
 const secs = (Date.now() - t0) / 1000;
 
 const MID_T = 0.02; // metres past the midline, inside the chest slab
+/** Four fingers, and at least 2 mm of daylight between adjacent pairs at the
+ *  widest part of the hand. Anthropometry: an adult's relaxed inter-finger gap
+ *  is 1.5-4 mm, so 2.0 is the bottom of the real band, not a slack bar. */
+const FINGER_RUNS = 4;
+const FINGER_GAP = 0.0020;
+/** Distinct stands, and how far apart the closest pair has to be. */
+const STAND_MIN = 4;
+const STAND_RMS = 0.040;
 const MIRROR_T = 1e-9; // degrees — an exact algebraic property, not a tolerance
 const SEG_T = 0.002; // 0.2% — a rotation-only animator must be exact
 
@@ -448,6 +664,11 @@ console.log(`  5 MIDLINE worst hand past the spine, in-chest  : ${worst.mid > -I
 if (worst.mid > MID_T) console.log(`            ${worst.midWhere}`);
 console.log(`  4 SKIN    worst emitted edge / bind edge        : ${worst.skin.toFixed(3)}  (want <= ${SKIN_RATCHET}, RATCHET)`);
 console.log(`            ${(worst.skinBind * 1000).toFixed(1)} mm -> ${(worst.skinLen * 1000).toFixed(1)} mm   ${worst.skinWhere}`);
+console.log(`  6 FINGERS separate masses in the dorsal outline: ${fingers.runs}  (want >= ${FINGER_RUNS})   narrowest gap ${(fingers.gap * 1000).toFixed(2)} mm  (want >= ${(FINGER_GAP * 1000).toFixed(1)})`);
+console.log(`            worst of ${SHAPE_IDS.length * 2} hands: ${fingers.where}`);
+console.log(`  7 STANDS  standing clips in rotation          : ${stands.count}  (want >= ${STAND_MIN}), all ${stands.used === stands.count ? 'reached' : `${stands.used} reached`} by 100 pedestrians`);
+console.log(`            closest pair by emitted skeleton RMS : ${(stands.closest * 1000).toFixed(1)} mm  ${stands.pair}  (want >= ${STAND_RMS * 1000} mm)`);
+console.log(`            guarded combat stand present         : ${stands.guard ? 'yes' : 'NO'}`);
 
 const bad = [];
 if (worst.joint > 0) bad.push(`JOINT +${worst.joint.toFixed(0)} ${worst.jointName}`);
@@ -455,5 +676,11 @@ if (worst.seg > SEG_T) bad.push(`SEGMENT ${(worst.seg * 100).toFixed(2)}%`);
 if (mirror.worst > MIRROR_T) bad.push(`MIRROR ${mirror.worst.toFixed(1)}deg`);
 if (worst.mid > MID_T) bad.push(`MIDLINE ${(worst.mid * 1000).toFixed(0)}mm`);
 if (worst.skin > SKIN_RATCHET) bad.push(`SKIN ${worst.skin.toFixed(2)}`);
+if (fingers.runs < FINGER_RUNS) bad.push(`FINGERS ${fingers.runs} masses`);
+if (fingers.gap < FINGER_GAP) bad.push(`FINGERS gap ${(fingers.gap * 1000).toFixed(2)}mm`);
+if (stands.count < STAND_MIN) bad.push(`STANDS ${stands.count}`);
+if (stands.used < stands.count) bad.push(`STANDS only ${stands.used}/${stands.count} reached`);
+if (stands.closest < STAND_RMS) bad.push(`STANDS ${(stands.closest * 1000).toFixed(0)}mm apart`);
+if (!stands.guard) bad.push('STANDS no guard clip');
 console.log(bad.length ? `\nFAIL: ${bad.join(', ')}\n` : '\nPASS\n');
 process.exit(bad.length ? 1 : 0);

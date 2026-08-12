@@ -27,7 +27,7 @@ import * as THREE from 'three';
 import { RIG } from './rig.js';
 import { SHAPES } from './wardrobe.js';
 import { PedAnimator } from './animator.js';
-import { SEAT } from './clips.js';
+import { SEAT, STANDS } from './clips.js';
 import { buildPedRagdoll } from './doll.js';
 import { Wander } from './nav.js';
 
@@ -168,6 +168,15 @@ export class Ped {
      */
     this.isHostile = false;
     /**
+     * Set by `hostile.js` alongside `isHostile`: this goon carries a firearm
+     * rather than fists. Declared here — and cleared in `spawn` — because a ped
+     * is POOLED, and an undeclared field set by another subsystem survives the
+     * recycle: without this, the first rifleman to die hands his `ranged` on to
+     * whatever civilian next takes the slot, who then stands in a gun-fighter's
+     * guard on the pavement forever. The clip selection below reads it.
+     */
+    this.ranged = false;
+    /**
      * A `physics.createCharacter()` swept capsule, or null. When it exists it
      * is the AUTHORITY on where this pedestrian is: `_move` hands it the
      * displacement and copies the resolved position back. Only hostiles carry
@@ -190,6 +199,8 @@ export class Ped {
     this.bones = null;
     this.skeleton = null;
     this.animator = null;
+    /** See `setStand`. Latched from the animator at every `spawn`. */
+    this._standAuto = null;
     this.ragdoll = null;
     this.__ragdoll = null;
     this.mass = 78;
@@ -263,6 +274,37 @@ export class Ped {
     return !this.alive;
   }
 
+  /**
+   * Force this pedestrian's STANDING pose, or clear it with `null`.
+   *
+   * The posture a stopped pedestrian holds is resolved inside `PedAnimator`
+   * off the gait record, deliberately: a stand re-rolled on every state change
+   * reads as a twitch rather than as variety, so one man keeps one stance for
+   * his whole life. This is the override for the cases where that is the wrong
+   * owner — a doorman, a lookout, a man leaning on a railing the world actually
+   * has — and it exists because the field is on the ANIMATOR, which `spawn`
+   * rebuilds, so a caller writing `ped.animator.stand` directly would lose it
+   * on the next recycle.
+   *
+   * CALL AFTER `spawn`. Returns false and changes nothing if the name is not
+   * one of the authored stands, so a typo is a no-op that can be seen in a
+   * probe rather than a pedestrian frozen in the fallback pose.
+   */
+  setStand(name) {
+    if (name == null) {
+      this.stand = null;
+      // Back to the gait-derived stance this pedestrian was born with, latched
+      // in `spawn`. Re-deriving it here would be a second copy of the key
+      // `PedAnimator` builds from the gait record, and the two would drift.
+      if (this.animator && this._standAuto) this.animator.stand = this._standAuto;
+      return true;
+    }
+    if (STANDS.indexOf(name) < 0) return false;
+    this.stand = name;
+    if (this.animator) this.animator.stand = name;
+    return true;
+  }
+
   /* ================================================================== */
   /* lifecycle                                                          */
   /* ================================================================== */
@@ -316,6 +358,8 @@ export class Ped {
       probe: this.sys.probeFn,
     });
     this.animator.phase = rng.float();
+    /** The animator's OWN gait-derived stand, so `setStand(null)` can restore it. */
+    this._standAuto = this.animator.stand;
     this.wander = this.wander ?? new Wander();
 
     this.position.copy(position);
@@ -327,6 +371,20 @@ export class Ped {
     this.health = 100;
     this.maxHealth = 100;
     this.isHostile = false;
+    this.ranged = false;
+    /**
+     * FORCED STANDING POSE, or null to let the animator choose.
+     *
+     * `PedAnimator` picks a stand off this pedestrian's own gait record so one
+     * man does not change stance every time he stops walking (see the note on
+     * `animator.stand`). That is right for the ambient crowd and wrong for a
+     * placed character — a bouncer at a door, a man leaning on a railing the
+     * world actually has — where the WORLD, not the person, decides the
+     * posture. Set through `setStand`, which is the only thing that may write
+     * it: the animator is rebuilt on every `spawn`, so a bare field assignment
+     * would be silently dropped by the next recycle.
+     */
+    this.stand = null;
     this._fallV = 0;
     this.fear = 0;
     this.speed = 0;
@@ -1191,6 +1249,25 @@ export class Ped {
     else if (this.speed > this.runSpeed * 0.82) clip = 'run';
     else if (this.speed > this.baseSpeed * 1.45) clip = 'jog';
     else if (this.speed > 0.22) clip = 'walk';
+    /**
+     * A MAN IN A FIGHT DOES NOT STAND LIKE A MAN WAITING FOR A BUS.
+     *
+     * `clips.guard` — a staggered stance, weight on the back leg, both forearms
+     * carrying a weight in front of the chest — was authored and gated by
+     * `poseprobe` gate 7 STANDS, and until now NOTHING selected it: this ladder
+     * sent every armed goon and every brawler to the same relaxed weight-shift
+     * with the arms hanging, which is the "T-ish fist pose mid-fight" note.
+     *
+     * It replaces the STAND only. A hostile who is moving still walks, jogs and
+     * runs — there is no guarded locomotion clip, and blending a boxer's arms
+     * onto a run would be a worse artefact than the one this closes. `cower`
+     * and `wait` are above it on purpose: a man who has been made to cower is
+     * not squaring up, whatever he is carrying.
+     *
+     * `ranged` is cleared in `spawn`; see the note where it is declared for why
+     * that matters more than it looks.
+     */
+    else if (this.isHostile || this.ranged || this.state === STATE.FIGHT) clip = 'guard';
     else clip = 'idle';
 
     an.setState({

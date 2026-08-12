@@ -47,7 +47,7 @@
 import * as THREE from 'three';
 import { buildCarBody } from './body.js';
 import { buildWheel, buildBikeChassis } from './wheels.js';
-import { buildInterior, buildBoatInterior } from './interior.js';
+import { buildInterior, buildBoatInterior, emptyInterior } from './interior.js';
 import { buildBoatHull } from './boat.js';
 import { buildHeliBody } from './heli.js';
 import { buildPlaneBody } from './plane.js';
@@ -67,6 +67,7 @@ export function clearGeometryCache() {
     for (const k in entry.wheel) disposeList(entry.wheel[k]);
     for (const d of entry.doors ?? []) d.geo?.dispose?.();
     for (const r of entry.rotors ?? []) r.geo?.dispose?.();
+    entry.steer?.geo?.dispose?.();
     entry.turret?.geo?.dispose?.();
     entry.turret?.gun?.geo?.dispose?.();
   }
@@ -108,8 +109,10 @@ function geometryFor(spec, lod) {
     spec.kind === 'boat' ? buildBoatInterior(spec, lod)
       : spec.kind === 'bike' || spec.kind === 'heli' || spec.kind === 'plane' ||
         spec.kind === 'tram' || spec.kind === 'tank'
-        ? { seat: [], leather: [], dash: [], trim: [], chrome: [], cavity: [] }
-        : buildInterior(spec, lod);
+        ? emptyInterior()
+        // The car's own lofted shell, so the headliner and the door cards are
+        // patches OF the roof and the flank rather than boxes near them.
+        : buildInterior(spec, lod, body.surface ?? null);
 
   // Fold the interior into the body's material groups.
   const merged = {
@@ -124,8 +127,20 @@ function geometryFor(spec, lod) {
     seat: mergeAll(interior.seat ?? []),
     leather: mergeAll(interior.leather ?? []),
     dash: mergeAll(interior.dash ?? []),
+    /**
+     * THE HEADLINER IS ITS OWN GROUP AND IT COSTS ONE DRAW CALL AT LOD0.
+     *
+     * It cannot share `seat`: cloth seats sit around 0.05 linear and a headliner
+     * around 0.30, and the whole reason the group exists is that the cabin roof
+     * has to be the BRIGHTEST thing in the cabin. Folded into any of the dark
+     * interior materials it stops doing the one job it was added for. It is
+     * merged away into the single dark group at LOD1 like every other interior
+     * group, so the cost is one call on the handful of cars inside 22 m.
+     */
+    liner: mergeAll([...(body.liner ?? []), ...(interior.liner ?? [])]),
     lamps: {},
   };
+  const steer = interior.wheel ?? null;
   for (const k in body.lamps ?? {}) merged.lamps[k] = mergeAll(body.lamps[k]);
 
   /**
@@ -153,8 +168,10 @@ function geometryFor(spec, lod) {
     const dark = mergeAll([
       merged.trim, merged.chrome, merged.cavity, merged.grilleMesh,
       merged.plate, merged.disc, merged.seat, merged.leather, merged.dash,
+      merged.liner,
     ]);
     merged.trim = dark;
+    merged.liner = new THREE.BufferGeometry();
     merged.chrome = new THREE.BufferGeometry();
     merged.cavity = new THREE.BufferGeometry();
     merged.grilleMesh = new THREE.BufferGeometry();
@@ -193,8 +210,9 @@ function geometryFor(spec, lod) {
     merged.trim = mergeAll([
       merged.trim, merged.chrome, merged.cavity, merged.grilleMesh,
       merged.plate, merged.disc, merged.seat, merged.leather, merged.dash,
+      merged.liner,
     ]);
-    for (const k of ['chrome', 'cavity', 'grilleMesh', 'plate', 'disc', 'seat', 'leather', 'dash']) {
+    for (const k of ['chrome', 'cavity', 'grilleMesh', 'plate', 'disc', 'seat', 'leather', 'dash', 'liner']) {
       merged[k] = new THREE.BufferGeometry();
     }
     // Lamps collapse to front (white) and rear (red) clusters.
@@ -265,7 +283,7 @@ function geometryFor(spec, lod) {
   }
 
   e = {
-    body: merged, wheel: wheelGeo, doors, rotors, turret,
+    body: merged, wheel: wheelGeo, doors, rotors, turret, steer,
     anchors: body.anchors ?? {}, surface: body.surface ?? null,
   };
   GEO_CACHE.set(key, e);
@@ -492,13 +510,43 @@ function darkenInnerFaces(geo, side) {
 /* ------------------------------------------------------------------ */
 
 /**
+ * HOW SHINY IS THIS CLASS. See `paint.js` `paint({ gloss })`.
+ *
+ * A Peregrine that has been detailed and a Millhand 6 that has spent fifteen
+ * winters carrying scrap cannot share a clear layer, and until now they did:
+ * one `ccR` and one orange-peel scale for the whole fleet. The split is by
+ * WHAT THE VEHICLE IS FOR, not by price — a police cruiser lives outside and
+ * gets washed in a machine, which is exactly the middle of the range.
+ *
+ * Unknown ids land on 0.7, so a class added later reads as an ordinary car
+ * rather than as either extreme.
+ */
+const GLOSS = {
+  sports: 1.0, kessel: 1.0, muscle: 0.95,
+  sedan: 0.78, police: 0.68, suv: 0.72,
+  pickup: 0.42, van: 0.35, truck: 0.28, bus: 0.30,
+  bike: 0.95, boat: 0.85, tram: 0.35, tank: 0.10,
+};
+
+function glossFor(spec) {
+  const g = GLOSS[spec?.id];
+  if (g !== undefined) return g;
+  // Aircraft are polished; anything else is an ordinary car.
+  return spec?.kind === 'plane' || spec?.kind === 'heli' ? 0.85 : 0.7;
+}
+
+/**
  * Build one vehicle's scene graph.
  *
  * @returns {{ root, lodGroups, wheels, lampMats, paintMat, panels, bounds }}
  */
 export function buildVehicleModel(spec, mats, opts = {}) {
   const { paint, finish = 'gloss', flake = 0.5, wear = 0, plate = 'DCB 000', livery = null, rimStyle } = opts;
-  const paintMat = mats.paint(paint, { finish, flake, wear, clearcoat: finish === 'gloss' ? 1 : 0.2 });
+  const paintMat = mats.paint(paint, {
+    finish, flake, wear,
+    clearcoat: finish === 'gloss' ? 1 : 0.2,
+    gloss: opts.gloss ?? glossFor(spec),
+  });
   const plateMat = mats.plate(plate);
   const rimMat = mats.rim(rimStyle ?? (spec.wheel.style === 'steel' || spec.wheel.style === 'lorry' ? 'steel' : 'alloy'));
 
@@ -521,6 +569,12 @@ export function buildVehicleModel(spec, mats, opts = {}) {
   const rotors = [];
   /** Turret pivots — the tank's. `{ pivot, gun, lod }` per materialised LOD. */
   const turrets = [];
+  /**
+   * The front wheel node the steering wheel is slaved to. Assigned by the wheel
+   * loop below; `buildBodyLod` only ever runs after it, because nothing
+   * materialises a level until `setVehicleLod`.
+   */
+  let steerNode = null;
   // Anchors are read off the cached LOD0 geometry, which costs nothing to look
   // up; LOD0's meshes are NOT built just to get them.
   const anchors = geometryFor(spec, 0).anchors;
@@ -555,6 +609,7 @@ export function buildVehicleModel(spec, mats, opts = {}) {
     add(body.seat, mats.seat(), 'seats');
     add(body.leather, mats.leather(), 'leather');
     add(body.dash, mats.dash(), 'dash');
+    add(body.liner, mats.headliner(), 'headliner');
     if (livery) {
       const lv = liveryPanels(spec, mats.livery(livery));
       if (lv && lod < 2) g.add(lv);
@@ -586,6 +641,54 @@ export function buildVehicleModel(spec, mats, opts = {}) {
       pivot.add(m);
       g.add(pivot);
       doors.push({ pivot, mesh: m, side: d.side, lod });
+    }
+
+    // ---- steering wheel ---------------------------------------------------
+    /**
+     * IT TURNS, AND IT IS SLAVED TO THE ROAD WHEELS RATHER THAN TO AN INPUT.
+     *
+     * A steering wheel is mechanically connected to the rack; it does not have
+     * its own opinion about where the front wheels are pointing. So this reads
+     * the front wheel node `dynamics.syncTransforms` has already written — the
+     * same number the tyre model is solving with — and multiplies it by the
+     * rack ratio. Nothing new is published, nothing can drift out of step with
+     * the wheels you can see, and no per-frame hook is added to any system:
+     * the update happens in this mesh's own `onBeforeRender`, which three calls
+     * BEFORE it composes `modelViewMatrix`, so the pose is exact on the frame
+     * it is drawn rather than one late.
+     *
+     * SIGN. Positive node yaw swings the road wheels toward local +X (the car's
+     * left — see `DRIVER_SIDE` in index.js). The driver sits at -Z of the rim
+     * and therefore sees a +Z rotation as CLOCKWISE, so a left-hand turn is a
+     * negative spin about the column. Get this backwards and the rim winds the
+     * wrong way against wheels that are visible in the same frame.
+     *
+     * Geometry is built at the origin about +Z (`interior.js` `steeringWheel`),
+     * so the mesh transform is the whole placement and `rotation.z` is the
+     * column axis and nothing else.
+     */
+    const sw = e.steer;
+    if (sw?.geo?.attributes?.position?.count) {
+      const m = new THREE.Mesh(sw.geo, mats.leather());
+      m.name = 'steeringWheel';
+      m.matrixAutoUpdate = false;
+      m.position.set(sw.pos[0], sw.pos[1], sw.pos[2]);
+      m.rotation.set(sw.rot[0], sw.rot[1], sw.rot[2]);
+      m.updateMatrix();
+      // A boat's helm has no steered ROAD wheel to hang off — `spec.wheels` is
+      // empty for it — so it keeps the static mesh it always had rather than
+      // losing its wheel to a null node.
+      if (steerNode) {
+        const rake = sw.rot[0];
+        const ratio = sw.ratio ?? 5.2;
+        const node = steerNode;
+        m.onBeforeRender = function () {
+          this.rotation.set(rake, 0, -node.rotation.y * ratio);
+          this.updateMatrix();
+          if (this.parent) this.matrixWorld.multiplyMatrices(this.parent.matrixWorld, this.matrix);
+        };
+      }
+      g.add(m);
     }
 
     // ---- rotors ----------------------------------------------------------
@@ -646,6 +749,8 @@ export function buildVehicleModel(spec, mats, opts = {}) {
       node.name = `wheel${hp.index}`;
       node.position.set(hp.x, hp.top - hp.staticLen, hp.z);
       root.add(node);
+      // First steered hardpoint wins: that is the rack the column is on.
+      if (!steerNode && hp.steered) steerNode = node;
       const spin = new THREE.Group();
       node.add(spin);
       const lods = new Array(LOD_COUNT).fill(null);
@@ -803,6 +908,7 @@ export function modelStats(spec) {
     if (k === 'lamps') for (const l in e0.body.lamps) lod0 += safeTris(e0.body.lamps[l]);
     else lod0 += safeTris(e0.body[k]);
   }
+  if (e0.steer?.geo) { lod0 += safeTris(e0.steer.geo); tris += safeTris(e0.steer.geo); }
   for (const d of e0.doors ?? []) { lod0 += safeTris(d.geo); tris += safeTris(d.geo); }
   for (const r of e0.rotors ?? []) { lod0 += safeTris(r.geo); tris += safeTris(r.geo); }
   if (e0.turret) {

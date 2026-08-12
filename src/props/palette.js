@@ -330,12 +330,60 @@ export const SURFACES = {
       },
     },
   },
+  /**
+   * AUTUMN IS THREE SURFACES, NOT ONE, AND THE SEASON DOES THE WORK.
+   *
+   * There used to be a single `leaf_autumn`, so every turning tree in the city
+   * was the same orange and two of them within sight of each other read as one
+   * asset instanced twice. The three greens above already vary by `bake.seed`
+   * and `param`; autumn had never been given the same treatment.
+   *
+   * WHAT MAKES THEM DIFFERENT IS `bake.param.x`, NOT THE TINT, and that
+   * distinction is the whole design. `LEAF_CARD` mixes summer green into
+   * `mix(cAutumn, cDry, per-leaf)` by `smoothstep(0.55, 1.0, season)`, so
+   * season decides HOW MANY of the leaves on one card have turned and how far,
+   * per leaf. A tint cannot do that: it is one multiply over the whole card, so
+   * a tinted orange tree is uniformly orange and a half-turned tree is the one
+   * thing it can never be. Measured off the curve the shader actually uses:
+   *
+   *   season 0.76  ->  45 % turned   green with gold coming through it
+   *   season 0.93  ->  93 % turned   the orange tree that was already here
+   *   season 1.00  -> 100 % turned   the deep end, autumn and dry per leaf
+   *
+   * The tint then sets WHICH autumn each one is, and it is a MULTIPLY, so the
+   * rule from `leaf_a` applies with its sign flipped: `cAutumn` has a red:green
+   * ratio of 1.79, and a tint above that saturates the leaf toward russet while
+   * one below it washes the card back toward sand. `_c` is at 1.96 on purpose.
+   *
+   * `bake.seed` and `param.z` (blade shape) vary too. They cost nothing extra
+   * — `_bakeKey` already keys on `param`, so these are separate bakes whatever
+   * the seed says — and without them the three would share one blade layout
+   * and read as one tree recoloured, which is the defect one level down.
+   */
   leaf_autumn: {
     name: 'leaf_autumn', opts: {
       vertexMasks: true, wear: [0.05, 0.22, 0.58, 0], cloth: [0.50, 0.54, 0.0, 0],
       tint: 0xe8bd86, macro: [0.45, 0.24, 0.20, 0.55], roughness: [1, 0.05, 0.54],
       bake: { param: [0.93, 1.0, 0.16, 0] },
       three: { alphaTest: 0.21, sheen: 0.14, sheenColor: 0xd7a765, sheenRoughness: 0.7 },
+    },
+  },
+  /** ON THE TURN — a canopy still half green, gold coming up through it. */
+  leaf_autumn_b: {
+    name: 'leaf_autumn', opts: {
+      vertexMasks: true, wear: [0.05, 0.20, 0.60, 0], cloth: [0.52, 0.52, 0.0, 0],
+      tint: 0xe0d074, macro: [0.38, 0.24, 0.20, 0.55], roughness: [1, 0.05, 0.54],
+      bake: { seed: 197, param: [0.76, 1.0, 0.10, 0] },
+      three: { alphaTest: 0.21, sheen: 0.15, sheenColor: 0xc9bd66, sheenRoughness: 0.68 },
+    },
+  },
+  /** FULLY OVER — russet and dry, the last week before the street is bare. */
+  leaf_autumn_c: {
+    name: 'leaf_autumn', opts: {
+      vertexMasks: true, wear: [0.06, 0.26, 0.56, 0], cloth: [0.48, 0.56, 0.0, 0],
+      tint: 0xdc7038, macro: [0.52, 0.24, 0.18, 0.5], roughness: [1, 0.05, 0.56],
+      bake: { seed: 251, param: [1.0, 1.0, 0.34, 0] },
+      three: { alphaTest: 0.21, sheen: 0.12, sheenColor: 0xb86a3c, sheenRoughness: 0.74 },
     },
   },
   leaf_needle: {
@@ -682,6 +730,7 @@ export const SURFACE_TAG = {
   plastic: 'plastic', bag: 'fabric', tyre: 'rubber', glass_prop: 'glass',
   bark_street: 'wood', bark_plane: 'wood', bark_smooth: 'wood',
   leaf_a: 'foliage', leaf_b: 'foliage', leaf_autumn: 'foliage',
+  leaf_autumn_b: 'foliage', leaf_autumn_c: 'foliage',
   leaf_needle: 'foliage',
   leaf_c: 'foliage', scrub: 'foliage', grass_tuft: 'foliage',
   grass_blade: 'grass', verge: 'grass',

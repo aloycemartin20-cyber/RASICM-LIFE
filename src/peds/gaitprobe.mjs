@@ -61,11 +61,23 @@ const args = Object.fromEntries(
  * run consequently has no flight phase to speak of. Fixing that means
  * authoring per-clip lobe timings, which is a content job, not a maths one.
  * Lower these as they are closed. Never raise one.
+ *
+ * RUN LOWERED 1.20 -> 0.60 (measured 0.507), from two changes in `clips.js`,
+ * both of them content and both measured here:
+ *   `kneeStance` 30 -> 12 (jog 20 -> 10). That lobe shortens the leg at
+ *      mid-stance while the hip sweeps linearly, which moves an ankle that is
+ *      standing on the pavement. 1.104 -> 0.799.
+ *   `rollPhase`, now per clip, 1.2 -> 2.8 on jog and run. A pelvis rolling the
+ *      wrong way over a planted foot drags it sideways. 0.799 -> 0.507, and it
+ *      also took the run's stance duty from 0.50 to 0.43 against the authored
+ *      0.32 — the first movement toward a flight phase this rig has made.
+ * The flight phase is still not there, which is what keeps this over walk's
+ * 0.55. Lower it again when the run cycle gets its own lobe timings.
  */
 const T = {
   walk: { slide: 0.55, plant: 0.13 },
   jog: { slide: 0.55, plant: 0.30 },
-  run: { slide: 1.20, plant: 0.25 },
+  run: { slide: 0.60, plant: 0.25 },
   reach: 0.18,
   centre: 0.14,
   clear: 0.018,

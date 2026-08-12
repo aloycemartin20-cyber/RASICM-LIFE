@@ -132,6 +132,20 @@ export function buildOutfit(shapeId, { rng, lod = 0 } = {}) {
     }
   );
 
+  /**
+   * The hem band. Unconditional on every silhouette whose top garment is not
+   * tucked in (`hem < 0.86`): a cut edge is not a garment, and this is the
+   * lowest-cost, highest-reading piece of tailoring in the file — one ring of
+   * 22 segments against the ~90 the shell already spends per row.
+   */
+  if (S.hem < 0.86) {
+    add(P.hemBand(nz, { ...shellOpts, seg: R(22), depth: S.hem < 0.72 ? 0.030 : 0.022 }), {
+      material: 'cloth', bones: ['Hips', 'Spine', 'UpLegR', 'UpLegL'], bias: [1, 0.7, 0.3, 0.3],
+      joint: ['UpLegR', 'UpLegL'],
+      slot: SLOT.top, shade: 0.97, grime: 1.0, dirt: 0.85, dust: 0.10, wear: 0.30, name: 'hemBand',
+    });
+  }
+
   // quilting on a puffa: horizontal channels, the whole silhouette cue
   if (ex.has('quilt')) {
     for (let i = 0; i < 6; i++) {
@@ -166,6 +180,17 @@ export function buildOutfit(shapeId, { rng, lod = 0 } = {}) {
       material: 'cloth', bones: ['Neck', 'Spine2', 'Head'], bias: [1, 0.8, 0.25],
       slot: ex.has('lapels') ? SLOT.top : SLOT.under,
       grime: 1.0, dust: 0.25, wear: 0.16, name: 'collar',
+    });
+  }
+  // The front opening as CLOTH, not as a row of buttons floating on a smooth
+  // chest — two raised strips either side of centre, so the opening reads as
+  // the shadow between them.
+  if (ex.has('buttons') || ex.has('zip')) {
+    const p0 = Math.max(S.hem + 0.05, 0.86);
+    const p1 = ex.has('lapels') ? 1.22 : 1.34;
+    add(P.placket(nz, p0, p1, frontZ, ex.has('zip') ? 0.024 : 0.032), {
+      material: 'cloth', bones: ['Spine', 'Spine1', 'Spine2'], bias: [1, 1, 0.6],
+      slot: SLOT.top, shade: 1.03, grime: 0.8, dust: 0.2, wear: 0.18, name: 'placket',
     });
   }
   if (ex.has('tie')) {
@@ -246,6 +271,12 @@ export function buildOutfit(shapeId, { rng, lod = 0 } = {}) {
     material: 'cloth', bones: ['Hips', 'Spine', 'UpLegR', 'UpLegL'], bias: [1, 0.55, 0.5, 0.5],
     slot: SLOT.bottom, grime: 0.85, dirt: 0.2, dust: 0.16, name: 'pelvis',
   });
+  if (legs !== 'skirt') {
+    add(P.waistBand(nz, legs === 'legging' ? 0.960 : 0.968, hipW, bulk), {
+      material: 'cloth', bones: ['Hips', 'Spine'], bias: [1, 0.35],
+      slot: SLOT.bottom, shade: 1.02, grime: 0.9, dirt: 0.15, wear: 0.22, name: 'waistband',
+    });
+  }
 
   if (legs === 'skirt') {
     add(P.skirt(nz, { hem: S.hem < 0.7 ? 0.60 : 0.56, top: 0.99, flare: 1.0, pleats: 12 }), {
@@ -312,24 +343,47 @@ export function buildOutfit(shapeId, { rng, lod = 0 } = {}) {
   /* SKIN                                                               */
   /* ================================================================== */
 
+  /**
+   * ONE face colour field, shared by every surface the face is made of, so the
+   * lip, the nose, the ear and the cheek cannot drift out of register with
+   * each other the way four independently-authored tints would. See
+   * `parts.faceTone`.
+   */
+  const stubble = S.stubble ?? (S.bust ? 0 : 0.5);
+  const age = S.age ?? 0;
+  const skinTone = P.faceTone(head, { stubble, age });
+  const lipTone = P.faceTone(head, { stubble: 0, age, lip: 1 });
+  const earTone = P.faceTone(head, { stubble: stubble * 0.3, age, ear: 1 });
+
   add(P.headMesh(nz, head, { wide: S.bust ? 0.978 : 1.0, jaw: S.bust ? 0.92 : 1.0, cheek: S.bust ? 1.15 : 1 }), {
-    material: 'skin', bone: 'Head', slot: SLOT.skin, grime: 0.22, dirt: 0, dust: 0.04, name: 'head',
+    material: 'skin', bone: 'Head', slot: SLOT.skin, grime: 0.22, dirt: 0, dust: 0.04,
+    tone: skinTone, name: 'head',
   });
   add(P.nose(nz, head, { size: S.bust ? 0.90 : 1.0 }), {
-    material: 'skin', bone: 'Head', slot: SLOT.skin, grime: 0.16, dust: 0, name: 'nose',
+    material: 'skin', bone: 'Head', slot: SLOT.skin, grime: 0.16, dust: 0, tone: skinTone, name: 'nose',
   });
   add(P.nostrils(head, S.bust ? 0.90 : 1.0), {
     material: 'skin', bone: 'Head', slot: SLOT.skin, shade: 0.28, grime: 0.85, dust: 0, name: 'nostrils',
   });
-  if (!S.hat || S.hat === 'flat') {
-    add(P.ear(nz, head, -1), { material: 'skin', bone: 'Head', slot: SLOT.skin, grime: 0.4, name: 'earR' });
-    add(P.ear(nz, head, 1), { material: 'skin', bone: 'Head', slot: SLOT.skin, grime: 0.4, name: 'earL' });
+  // Ears are only ever hidden by something that COVERS an ear. A cap, a
+  // beanie or a hard hat sits above them, and a head with no ears under one
+  // is the mannequin silhouette from three-quarter view.
+  if (!ex.has('hoodUp')) {
+    add(P.ear(nz, head, -1), {
+      material: 'skin', bone: 'Head', slot: SLOT.skin, grime: 0.4, tone: earTone, name: 'earR',
+    });
+    add(P.ear(nz, head, 1), {
+      material: 'skin', bone: 'Head', slot: SLOT.skin, grime: 0.4, tone: earTone, name: 'earL',
+    });
   }
-  add(P.lips(head), { material: 'skin', bone: 'Head', slot: SLOT.skin, shade: 0.86, grime: 0.20, dust: 0, name: 'lips' });
+  add(P.lips(head), {
+    material: 'skin', bone: 'Head', slot: SLOT.skin, shade: 0.86, grime: 0.20, dust: 0,
+    tone: lipTone, name: 'lips',
+  });
   add(P.mouthLine(head), { material: 'skin', bone: 'Head', slot: SLOT.skin, shade: 0.42, grime: 0.6, dust: 0, name: 'mouth' });
   add(P.neck(nz, head, S.bust ? 0.90 : 1.0), {
     material: 'skin', bones: ['Neck', 'Head', 'Spine2'], bias: [1, 0.7, 0.4], slot: SLOT.skin,
-    grime: 0.4, name: 'neck',
+    grime: 0.4, tone: skinTone, name: 'neck',
   });
 
   // wrists + hands
@@ -349,7 +403,7 @@ export function buildOutfit(shapeId, { rng, lod = 0 } = {}) {
     const D = [down[0] / dl, down[1] / dl, down[2] / dl];
     // palm faces the thigh: the outward palm normal points inboard
     const palmN = [-side * 0.94, 0.05, 0.34];
-    add(P.hand(nz, wr, D, palmN, side, { curl: 0.60, scale: 1 }), {
+    add(P.hand(nz, wr, D, palmN, side, { curl: 0.60, scale: 1, lod }), {
       material: 'skin', bones: [`Hand${sx}`, `Fingers${sx}`, `Forearm${sx}`], bias: [1, 0.9, 0.35],
       slot: SLOT.skin, grime: 0.5, dirt: 0.1, name: `hand${sx}`,
     });
@@ -366,8 +420,8 @@ export function buildOutfit(shapeId, { rng, lod = 0 } = {}) {
   add(P.eyelid(head, 1), { material: 'skin', bone: 'Head', slot: SLOT.skin, shade: 0.88, grime: 0.35, dust: 0, name: 'lidL' });
   add(P.lowerLid(head, -1), { material: 'skin', bone: 'Head', slot: SLOT.skin, shade: 0.92, grime: 0.3, dust: 0, name: 'lowR' });
   add(P.lowerLid(head, 1), { material: 'skin', bone: 'Head', slot: SLOT.skin, shade: 0.92, grime: 0.3, dust: 0, name: 'lowL' });
-  if (!S.bust && (shapeId === 'millM' || shapeId === 'workM' || shapeId === 'oldM' || shapeId === 'jacketM')) {
-    add(P.beard(nz, head, shapeId === 'oldM' ? 0.6 : 1.0), {
+  if (S.beard) {
+    add(P.beard(nz, head, S.beard), {
       material: 'skin', bone: 'Head', slot: SLOT.hair, shade: 0.9, grime: 0.3, name: 'beard',
     });
   }

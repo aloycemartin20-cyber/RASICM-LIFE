@@ -45,6 +45,16 @@ const ANKLE_H = 0.082;
 
 const DEG = Math.PI / 180;
 
+/**
+ * How far into the opposite half of the chest a hand may reach before
+ * `_midlineGuard` swings the arm out, and how far past the line it puts it
+ * back. Metres at scale 1. 12 mm is a hand resting on the sternum; 20 mm is
+ * where `poseprobe.mjs` gate MIDLINE calls it a fold, so the guard fires
+ * before the gate does.
+ */
+const MIDLINE_KEEP = 0.012;
+const MIDLINE_MARGIN = 0.004;
+
 class Poser {
   constructor(rig) {
     this.rig = rig;
@@ -120,6 +130,21 @@ export class PedAnimator {
     this.phase = 0;
     this.idlePhase = opts.gait?.phase ?? 0;
     /**
+     * WHICH STAND THIS PERSON HAS. Resolved here rather than in `ped.js`
+     * because `ped.js` decides a pedestrian's STATE ("standing still"), not
+     * their posture, and one man must not change his stance every time he
+     * stops walking — a rotation that re-rolls on every state change reads as
+     * a twitch, not as variety. Drawn off the gait record this pedestrian
+     * already owns, so it is stable for his whole life, deterministic under a
+     * capture, and free of a second RNG draw (rule 4). `phase` and `idleRate`
+     * then offset the clip in time on top of it.
+     */
+    const g0 = opts.gait ?? {};
+    const key = Math.abs(
+      (g0.phase ?? 0) * 977 + (g0.armBias ?? 0) * 131 + (g0.splay ?? 0) * 37 + (g0.lean ?? 0) * 11
+    );
+    this.stand = C.STANDS[Math.floor(key) % C.STANDS.length];
+    /**
      * Seat arguments for the `sit` clip: how hard the car is turning (-1..1)
      * and how much footwell there is under the root (0..1). Preallocated and
      * written in place — `Ped._seatedVisual` sets it every frame, and a fresh
@@ -186,6 +211,9 @@ export class PedAnimator {
 
     this.iHandR = rig.index('HandR');
     this.iHandL = rig.index('HandL');
+    this.iUpperArmR = rig.index('UpperArmR');
+    this.iUpperArmL = rig.index('UpperArmL');
+    this.iSpine1 = rig.index('Spine1');
     this.legs = [
       [rig.index('UpLegR'), rig.index('LegR'), rig.index('FootR')],
       [rig.index('UpLegL'), rig.index('LegL'), rig.index('FootL')],
@@ -204,6 +232,13 @@ export class PedAnimator {
     this._v3 = new THREE.Vector3();
     this._v4 = new THREE.Vector3();
     this._v5 = new THREE.Vector3();
+    /** `_midlineGuard` scratch. Separate from `_v`..`_v5` because it reads the
+     *  spine ONCE and then loops twice over the hands — sharing them silently
+     *  overwrote the spine position with an up vector on the second hand, and
+     *  the guard then measured against (0, 1, 0). */
+    this._mSpine = new THREE.Vector3();
+    this._mUp = new THREE.Vector3();
+    this._mAxis = new THREE.Vector3();
     this._pole = new THREE.Vector3();
     this._elbow = new THREE.Vector3();
     this._target = new THREE.Vector3();
@@ -373,8 +408,9 @@ export class PedAnimator {
 
     /* --- layer 1: locomotion, crossfaded --- */
     P.reset();
-    const fn = C.CLIPS[clip] ?? C.idle;
-    const prev = C.CLIPS[this.prevClip] ?? C.idle;
+    // `idle` is a REQUEST for a stand, not a clip name — see `this.stand`.
+    const fn = C.CLIPS[clip === 'idle' ? this.stand : clip] ?? C.idle;
+    const prev = C.CLIPS[this.prevClip === 'idle' ? this.stand : this.prevClip] ?? C.idle;
     const ph = moving ? this.phase : this.idlePhase;
     // The fourth argument is the seat record. Every other clip in the table
     // takes three and ignores it, so this stays one call site.
@@ -432,6 +468,8 @@ export class PedAnimator {
     const root = this.bones[0];
     root.updateMatrixWorld(true);
 
+    this._midlineGuard(root);
+
     this._dropApplied = 0;    // the pose write above reset the pelvis
     if (this.footIk && this.diveT < 0) this._footIk(dt);
     else this._footHit[0] = this._footHit[1] = false;
@@ -482,6 +520,105 @@ export class PedAnimator {
       else b.position.copy(rig.localPos[i]);
       b.updateMatrix();
     }
+  }
+
+  /**
+   * THE LIMIT TABLE BOUNDS EVERY JOINT AND STILL DOES NOT BOUND THE HAND.
+   *
+   * `_writePose` clamps each bone's summed delta into an anatomical range, and
+   * a hand can be 30 cm inside the opposite half of the chest with every one
+   * of those joints legal — because the position is the PRODUCT of a chain of
+   * legal angles, and nothing in the pipeline ever looked at it. The failure
+   * is not gradual either: the two-bone elbow geometry flips over a cliff, so
+   * the same layer stack reads 0 mm at one shoulder value and 280 mm two
+   * degrees away, and no amount of retuning the clips finds a safe interior —
+   * measured across four candidate values of one clavicle channel while
+   * chasing exactly this, and confirmed by re-rolling the wardrobe RNG, which
+   * moved the offending configuration to a different silhouette without
+   * changing anything about the poses.
+   *
+   * So the bound belongs where the quantity lives. After the pose is written,
+   * each hand is measured in the ROOT frame against the chest slab
+   * `poseprobe.mjs` gate MIDLINE uses; if it has crossed, the whole arm is
+   * swung outboard about the shoulder — a world-space rotation on the
+   * UpperArm, the same mechanism `_footIk` uses to roll a sole onto a slope —
+   * by exactly the angle that puts the hand back on its own side plus a
+   * margin. An arm that has not crossed is not touched at all, so no authored
+   * clip changes, and a punch, a cower and a dive keep their reach.
+   *
+   * Costs two world reads and at most one quaternion per hand per frame, and
+   * allocates nothing.
+   */
+  _midlineGuard(root) {
+    const bones = this.bones;
+    const spine = this._mSpine.setFromMatrixPosition(bones[this.iSpine1].matrixWorld);
+    const rq = this._qc;
+    if (root.parent) root.parent.getWorldQuaternion(rq);
+    else rq.identity();
+    const inv = this._qd.copy(rq).invert();
+    const s = this.scale;
+    for (let k = 0; k < 2; k++) {
+      const sgn = k === 0 ? -1 : 1;                    // the ped's right is -x
+      const iHand = k === 0 ? this.iHandR : this.iHandL;
+      const iArm = k === 0 ? this.iUpperArmR : this.iUpperArmL;
+      /**
+       * Up to three passes. One is not enough: the correction is a small-angle
+       * step on a chain whose elbow the shoulder rotation also moves, so a
+       * single shot left a `jog + umbrella + hurt + dive` hand 31.7 mm across
+       * where the gate wants 20. Three converges on every configuration the
+       * probe drives (worst residual then reads in single-digit millimetres),
+       * and the loop exits on the first pass that finds nothing to do — which
+       * is every frame the character is not contorted, i.e. nearly all of them.
+       */
+      let best = Infinity;
+      for (let pass = 0; pass < 4; pass++) {
+        const hand = this._v2.setFromMatrixPosition(bones[iHand].matrixWorld);
+        const local = this._v3.copy(hand).sub(spine).applyQuaternion(inv);
+        if (Math.abs(local.y) > 0.20 * s || Math.abs(local.z) > 0.16 * s) break;
+        // >0 means this hand is in the other half of the chest
+        const past = -sgn * local.x;
+        if (past <= MIDLINE_KEEP * s) break;
+        // a pass that did not help will not help twice: stop rather than
+        // amplify. A residual inside the chest slab is a pose the clips have to
+        // answer for, and the gate reports it.
+        if (past >= best - 1e-4) break;
+        best = past;
+        /**
+         * ROTATE THE ARM TOWARD THE SIDE IT BELONGS ON, about whatever axis
+         * actually does that — `cross(shoulder->hand, outboard)`.
+         *
+         * Two simpler versions were measured and both fail on real stacks. A
+         * fixed rotation about the actor's vertical has moment arm `rz`, so it
+         * does nothing to an arm whose hand is level with its shoulder in
+         * depth and drives one folded BEHIND the shoulder further across —
+         * measured 73 mm. Taking `|r|` as the arm while rotating about the
+         * vertical over-rotates by the same ratio and left 32 mm on a dive.
+         * The cross-product axis is perpendicular to the arm by construction,
+         * so the full length of the arm is the lever and the direction is
+         * right whatever the pose is doing.
+         */
+        const arm = this._v4.setFromMatrixPosition(bones[iArm].matrixWorld);
+        const r = this._v5.copy(hand).sub(arm);
+        const len = r.length();
+        if (len < 0.02) break;
+        // outboard, in world: +x in the actor's frame is the ped's LEFT
+        const out = this._mUp.set(sgn, 0, 0).applyQuaternion(rq);
+        const axis = this._q3AxisFrom(r, out);
+        if (!axis) break;
+        const need = (past - MIDLINE_KEEP * s) + MIDLINE_MARGIN * s;
+        const ang = Math.asin(Math.min(0.72, need / len));
+        this._q3.setFromAxisAngle(axis, ang);
+        this._applyWorld(iArm, this._q3);
+        bones[iArm].updateMatrixWorld(true);
+      }
+    }
+  }
+
+  /** Unit axis that rotates `r` toward `dir`, or null if they are parallel. */
+  _q3AxisFrom(r, dir) {
+    const n = this._mAxis.crossVectors(r, dir);
+    if (n.lengthSq() < 1e-8) return null;
+    return n.normalize();
   }
 
   _wp(i, out) {

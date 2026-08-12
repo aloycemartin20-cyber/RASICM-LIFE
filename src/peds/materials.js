@@ -484,6 +484,16 @@ export class PedMaterials {
       color: 0xffffff,
       dithering: true,
     });
+    /**
+     * NOT RAISED, and the negative result is worth recording. Cloth was tried
+     * at 1.35 to make the weave read at conversational distance; the emitted
+     * frame was identical to three significant figures over the garment
+     * (mean 101.8/97.9/110.8 either way, `street` at 1920x1080). Under an
+     * overcast sky the diffuse response to a millimetre-scale normal is below
+     * the quantisation of the frame, so the reason a coat looks smooth at 4 m
+     * is the LIGHTING, not the map — which means the fix is a garment-scale
+     * height field in the geometry, not a bigger number here.
+     */
     const ns = slot === 'skin' ? 0.75 : slot === 'gear' ? 1.05 : 1.15;
     m.normalScale.set(ns, ns);
     m.aoMapIntensity = 0.8;

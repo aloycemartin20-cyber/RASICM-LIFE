@@ -9,7 +9,7 @@
  */
 
 import * as THREE from 'three';
-import { buildCharacter, MAT } from './mesh.js';
+import { buildCharacter, MAT, identityOf } from './mesh.js';
 import { buildTextures, disposeTextures } from './textures.js';
 
 const MAT_ORDER = ['skin', 'face', 'shirt', 'pants', 'leather', 'sole', 'hair', 'eye'];
@@ -41,16 +41,32 @@ export class CharacterRig {
     this.spec = spec;
     this._parent = keep;
 
+    // `brothers.js` authors the physical build; the face, the wardrobe and the
+    // years live in `mesh.js`'s IDENTITY, keyed by id. Stamping the id onto the
+    // build is what lets one call resolve both — `buildCharacter` falls back to
+    // the hair style for callers that hand it a raw brothers.js build, and this
+    // is the path that does not have to.
+    const build = { ...spec.build, id: spec.id };
+    const ID = identityOf(build);
+
     const q = this.ctx.config.q;
     this.textures = buildTextures(spec.palette, {
       anisotropy: Math.min(8, q?.anisotropy ?? 8),
       seed: 0x51ee5 + spec.id.charCodeAt(0) * 977,
-      stubble: spec.build.stubble ?? 0.3,
+      age: ID.age,
+      // The face atlas paints stubble as a MASKED beard rather than as noise
+      // over the whole head, so it wants the identity's coverage, with the
+      // build's `stubble` as the fallback for an unknown brother.
+      beard: ID.beard ?? spec.build.stubble ?? 0.3,
+      mouthW: ID.face?.mouthW ?? 1,
+      fold: ID.face?.fold ?? 0.5,
+      cloth: ID.cloth,
+      wear: ID.age > 0.6 ? 1.35 : ID.age > 0.3 ? 1.0 : 0.6,
       size: 256,
     });
 
     this.materials = MAT_ORDER.map((name) => this._material(name));
-    const built = buildCharacter(spec.build, this.materials);
+    const built = buildCharacter(build, this.materials);
     this.root = built.root;
     this.mesh = built.mesh;
     this.skeleton = built.skeleton;
@@ -87,9 +103,17 @@ export class CharacterRig {
 
     switch (name) {
       case 'skin':
-      case 'face':
         m.normalScale.set(0.28, 0.28);
         // Skin is never fully rough and never a mirror; the map does the rest.
+        m.roughness = 0.92;
+        break;
+      case 'face':
+        // The face's relief is CREASES, not pores — see the height budget in
+        // `makeFaceAtlas`. 0.8 against the first bake's pore amplitude turned
+        // every brother into a cauliflower; 0.45 against a crease-only height
+        // field is a nasolabial fold you can see at two metres and nothing at
+        // five.
+        m.normalScale.set(0.45, 0.45);
         m.roughness = 0.92;
         break;
       case 'shirt':

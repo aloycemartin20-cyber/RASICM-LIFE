@@ -492,6 +492,24 @@ export class VehicleSystem {
     for (const id of CLASS_IDS) this._specs.set(id, finalizeSpec(VEHICLE_SPECS[id]));
 
     this.mats = new VehicleMaterials(ctx).build();
+    /**
+     * THE PAINT'S ENV LEVEL IS AN AUTHORED NUMBER, SO IT HAS TO SURVIVE.
+     *
+     * `paint.js` steers the fleet's whole finish range off `envMapIntensity` —
+     * 0.46 to 0.66 across the gloss range, plus 0.10 for a dark body, 1.45 on
+     * chrome, 1.25 on the glass — and three overwrites every one of them with
+     * `scene.environmentIntensity` for as long as the material has no `envMap`
+     * of its own. `paint.js` measured the consequence and filed it (a 0-to-8
+     * sweep of the bonnet's env moved the pixel by under one count); this is the
+     * other half of that followup.
+     *
+     * `_all` is the registry `VehicleMaterials._reg` appends to, and it is
+     * handed over LIVE rather than copied: paints and glass tints are cached
+     * lazily, so most of the fleet's materials do not exist yet at this line.
+     * `render` re-binds when the array grows. No new environment is created and
+     * nothing recompiles — see `bindEnvMaterials`.
+     */
+    this.render?.bindEnvMaterials?.(this.mats._all);
     if (!VARIANTS) VARIANTS = paintVariants();
 
     this.root = new THREE.Group();
@@ -515,6 +533,14 @@ export class VehicleSystem {
      * subject every frame and a car that has settled two centimetres puts the
      * road under a different pixel. Comparing absolute pixel coordinates across
      * two captures would have measured the settle, not the shadow.
+     *
+     * WHAT IT IS WORTH, measured through that switch by `src/render/aoprobe.mjs`
+     * group 3: on `car` the pool covers 10 778 pixels of the metering band and
+     * makes them 1.22 linear darker, 2.08% of the band. Read the AVERAGE of the
+     * whole band instead and it comes out -0.05, i.e. "the shadow lights the
+     * road", because darkening 2% of the frame opens the auto-exposure on the
+     * other 98%. That trap is written up at length in `aoprobe.mjs`'s header and
+     * cost a wave; do not re-derive it from a frame mean.
      */
     if (typeof location !== 'undefined' &&
         new URLSearchParams(location.search).has('owNoCarShadow')) {
@@ -1791,6 +1817,10 @@ export class VehicleSystem {
     if (_fwdCam.lengthSq() > 1e-6) _fwdCam.normalize();
     const alpha = ctx.time.alpha;
     const lodCount = [0, 0, 0, 0];
+    // The pool resolves its quads against the DRAWN road, not the collider the
+    // wheels stand on — see groundshadow.js `_contactY`. Rebound each frame:
+    // `world` may arrive after this system and a stale binding is a burial.
+    this.groundShadows.bindWorld(ctx.peek('world'));
     this.groundShadows.begin();
 
     for (let i = 0; i < this.vehicles.length; i++) {
@@ -2736,30 +2766,88 @@ export class VehicleSystem {
       );
     } else {
       /**
-       * NOT `seatAnchor`, for two reasons. It allocates four Vector3s per call
-       * and this runs every frame (hard rule 5), and it returns the DRIVER'S
-       * HEAD — which on a muscle car is 35 cm behind the steering wheel, so a
-       * 65-degree lens parked there is 90% steering wheel. A cockpit camera
-       * belongs at the headrest, not at the eyeballs: back another 27 cm and up
-       * 10, which puts the rim across the bottom third and the road through the
-       * screen where the shot is asking for them.
+       * ──────────────────────────────────────────────────────────────────────
+       * THE STAGED COCKPIT EYE IS THE ONE THE GAME ACTUALLY USES
+       * ──────────────────────────────────────────────────────────────────────
+       * What was here put the lens in the PASSENGER seat, 13 cm above the
+       * driver's head and 29 cm behind it, and then aimed it upward:
+       *
+       *     _v2.set( -st.hwMax * 0.46, hip - comY + 0.55, st.cowlZ - 1.14 )
+       *
+       * Three separate faults, each provable off the style data alone. The x is
+       * NEGATIVE, and `DRIVER_SIDE` in this file is +1 — a body facing +Z has
+       * the car's left along +X, so that is the passenger's seat. The y is
+       * `floorY + 0.77` with no ceiling on it, where the seated head this game
+       * models is `min( beltY + 0.20, roofY - 0.30, floorY + 1.05 )`: on the
+       * sports spec (roofY 1.15, beltY 0.79) that is 1.025 against a head at
+       * 0.895 — 13 cm high, and 12.5 cm under the roof, which is what "jammed
+       * under the roof" measures as. And the aim point sat at `beltY + 0.55`,
+       * ABOVE the eye on every class, so the lens pitched UP into the lining.
+       * The frame it produced was headliner and sky with no dash in it at all.
+       *
+       * The eye is now the construction `player/camera.js` solves for the
+       * fourth view — the same floor / hip / head chain, the same driver-side
+       * offset — so the staged cockpit shot photographs the camera the player
+       * gets rather than a second, worse one that only exists for captures.
+       * RESTATED rather than imported: `camera.js` restates it from this
+       * subsystem for hard rule 2, and importing it back the other way would
+       * close exactly the loop that rule exists to prevent.
+       *
+       * `seatAnchor` is still not used: it allocates four Vector3s per call and
+       * this runs every frame (hard rule 5).
        */
       const st = v.spec.style;
-      const hip = st.groundY + Math.max(0.1, st.sillY - 0.16) + 0.22;
-      _v2.set(-st.hwMax * 0.46, hip - v.spec.comY + 0.55, st.cowlZ - 1.14)
-        .applyQuaternion(v.quaternion)
-        .add(v.position);
+      const floorY = st.groundY + Math.max(0.10, st.sillY - 0.16);
+      const hip = floorY + 0.22;
+      const head = Math.max(
+        hip + 0.42,
+        Math.min(st.beltY + 0.20, st.roofY - 0.30, floorY + 1.05)
+      );
+      /**
+       * ...AND THE RIG'S EYE IS NOT THE RIG'S PIVOT.
+       *
+       * The construction above is where `camera.js` puts the boom's PIVOT. The
+       * lens then sits a boom-length behind it: the near view is `dist: 0.02` in
+       * the `VIEWS` table, i.e. 2% of the chase distance, with `height: 0` so
+       * the boom is level. Tiny, and not optional — it is the difference between
+       * an eye 25 cm off the steering wheel and one 38 cm off it, and the rim is
+       * 37 cm across. Placing the lens at the pivot was the first version of
+       * this fix and the capture came back as one wheel filling the frame.
+       *
+       * MEASURED by running the real rig to convergence against each car class
+       * (the construction `paintprobe`'s `solveFourthView` uses): the published
+       * lens sits 0.131 m (sports) to 0.140 m (van) behind the pivot, and 0.382
+       * to 0.390 m behind the steering wheel's own centre. 0.135 is that boom.
+       * Restated rather than imported for hard rule 2, and a single number
+       * rather than the size-and-speed chain that produces it, because a staged
+       * subject is pinned at one speed and the whole spread is 9 mm.
+       */
+      const BOOM = 0.135;
+      const eyeX = DRIVER_SIDE * st.hwMax * 0.82 * 0.46;
+      const eyeY = head - v.spec.comY;
+      const eyeZ = st.cowlZ - 0.85 - BOOM;
+      _v2.set(eyeX, eyeY, eyeZ).applyQuaternion(v.quaternion).add(v.position);
       cam.position.copy(_v2);
       /**
-       * Aim THROUGH THE WINDSCREEN APERTURE, not along a fixed pitch. The
-       * aperture's height differs by 40 cm between a wedge and a van, so a
-       * hardcoded "8 m ahead and 0.55 m down" points at the headliner on one
-       * class and at the bonnet on another — the first cut of this framed the
-       * inside of the roof lining with the road nowhere in it. Deriving the
-       * target from `beltY` and `cowlZ`, the two numbers that define the
-       * aperture, makes it correct on every class by construction.
+       * ...and the aim is the rig's near-view pitch, not a point on the body.
+       *
+       * `CHASE.pitchBonnet` is -1.5 degrees and is what the rig eases to as the
+       * fourth view arrives, so a staged shot that used anything else would be
+       * framing a view the game never shows. Over the 14 m aim distance that is
+       * a 37 cm drop. Straight down the driver's own line rather than across to
+       * the centreline: at this eye offset a centreline target yaws the lens
+       * 1.5 degrees inboard, which walks the A-pillar into frame on one side and
+       * nothing into it on the other.
+       *
+       * Expressed as an offset from the EYE rather than from a body landmark,
+       * which is what makes it class-independent: the eye already carries the
+       * 40 cm spread of windscreen heights between a wedge and a van, so the
+       * pitch is the same 1.5 degrees on all six and nothing has to be re-derived
+       * per class. The previous version aimed at a fixed height over `beltY` and
+       * therefore pointed somewhere different on every one of them.
        */
-      _v3.set(0, st.beltY - v.spec.comY + 0.55, st.cowlZ + 14)
+      const AIM = 14;
+      _v3.set(eyeX, eyeY - AIM * 0.0262, eyeZ + AIM)
         .applyQuaternion(v.quaternion)
         .add(v.position);
       cam.lookAt(_v3);

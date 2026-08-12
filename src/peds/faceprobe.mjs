@@ -37,13 +37,24 @@
  * `parts.js` places them with — rule 12. The targets below are anthropometric
  * and are held here, deliberately not equal to what the code currently builds.
  *
+ *   7 TONE    the face is a COLOUR MAP as well as a mesh, measured on the
+ *             emitted vertex-colour and `owTint` attributes rather than on
+ *             any authored constant. Three things a photograph of a face has
+ *             and a mannequin does not: a warm-to-cool spread across the
+ *             skin, a vermilion whose hue is not the cheek's, and — on a man
+ *             who has not shaved — a jaw whose grime channel is measurably
+ *             above his forehead's. Geometry gates 1-6 were all green on the
+ *             build the critics called "painted-on faces", because every one
+ *             of those surfaces was the same flat value.
+ *
  *   node src/peds/faceprobe.mjs
  *   node src/peds/faceprobe.mjs --shape=puffaM --map
  *   node src/peds/faceprobe.mjs --legacy        # NEGATIVE CONTROL, must fail
+ *   node src/peds/faceprobe.mjs --flatface      # NEGATIVE CONTROL, must fail
  */
 import { RIG } from './rig.js';
 import { buildOutfit } from './builder.js';
-import { FACE_LEGACY } from './parts.js';
+import { FACE_LEGACY, TONE_LEGACY } from './parts.js';
 import { SHAPE_IDS, SHAPES } from './wardrobe.js';
 import { Rng } from '../core/rng.js';
 
@@ -61,6 +72,32 @@ const args = Object.fromEntries(
  * the numbers below are just a description of whatever the code does.
  */
 FACE_LEGACY.on = !!args.legacy;
+/**
+ * NEGATIVE CONTROL for gate 7. `--flatface` drops the face colour field and
+ * leaves the head one flat skin value — what shipped — so the warm/cool
+ * spread collapses to the shading noise, the lip hue step vanishes and the
+ * stubble channel goes to zero.
+ */
+TONE_LEGACY.flat = !!args.flatface;
+
+/**
+ * Gate 7 thresholds, and where each number comes from.
+ *
+ *   warmCool  p95/p05 of the emitted R/B ratio over the FRONT of the head.
+ *             A photographed face runs 1.25-1.6 between the malar flush and
+ *             the forehead; 1.10 is well under the low end and is comfortably
+ *             clear of the 1.03 the per-vertex shading mottle produces on its
+ *             own, which is what the flat control measures.
+ *   lipStep   median R/G over the lip vertices against the same ratio over the
+ *             head. Vermilion is 1.2-1.4x the surrounding skin in R/G; 1.06 is
+ *             a deliberately low bar because the lips also carry a shade
+ *             multiplier that the ratio divides out.
+ *   stubble   median `owTint.y` (the grime channel, which blends toward one
+ *             shared dark brown) over the jaw minus the same over the
+ *             forehead, on silhouettes that declare stubble. 0.04 is about
+ *             half a stop of beard shadow.
+ */
+const TONE_T = { warmCool: 1.10, lipStep: 1.06, stubble: 0.04 };
 
 /** Parts that are HEADGEAR: they may never be the nearest thing to an eye. */
 const HEADGEAR = new Set(['beanie', 'flatcap', 'ballcap', 'hardhat', 'hoodUp']);
@@ -368,10 +405,44 @@ function analyse(shapeId) {
   };
   const relief = { nose: reliefOf('nose'), brow: reliefOf('browR'), lips: reliefOf('lips') };
 
+  /* ---- 7 TONE — the emitted colour attributes, not the code's field ---- */
+  const col = geo.attributes.color.array;
+  const tint = geo.attributes.owTint.array;
+  const med = (a) => {
+    if (!a.length) return 0;
+    const b = a.slice().sort((x, y) => x - y);
+    return b[b.length >> 1];
+  };
+  const pctl = (a, q) => {
+    if (!a.length) return 0;
+    const b = a.slice().sort((x, y) => x - y);
+    return b[Math.min(b.length - 1, Math.max(0, Math.floor(b.length * q)))];
+  };
+  const faceRB = [], faceRG = [], lipRG = [], jawGrime = [], browGrime = [];
+  for (let v = 0; v < partOf.length; v++) {
+    const name = partOf[v];
+    const r = col[v * 3], g = col[v * 3 + 1], b = col[v * 3 + 2];
+    if (name === 'lips') { if (g > 1e-5) lipRG.push(r / g); continue; }
+    if (name !== 'head') continue;
+    // the FRONT of the head only: the occiput has no features to colour
+    if (L(v, 2) < 0.020) continue;
+    if (b > 1e-5) faceRB.push(r / b);
+    if (g > 1e-5) faceRG.push(r / g);
+    const y = L(v, 1);
+    if (y < 0.058) jawGrime.push(tint[v * 3 + 1]);
+    else if (y > 0.130) browGrime.push(tint[v * 3 + 1]);
+  }
+  const tone = {
+    warmCool: pctl(faceRB, 0.05) > 1e-6 ? pctl(faceRB, 0.95) / pctl(faceRB, 0.05) : 0,
+    lipStep: med(faceRG) > 1e-6 ? med(lipRG) / med(faceRG) : 0,
+    stubble: med(jawGrime) - med(browGrime),
+    wantsStubble: (SHAPES[shapeId].stubble ?? (SHAPES[shapeId].bust ? 0 : 0.5)) > 0.2,
+  };
+
   return {
     shapeId, hat: SHAPES[shapeId].hat ?? (SHAPES[shapeId].extras?.includes('hoodUp') ? 'hoodUp' : null),
     loose, headVerts, eye, browTop, blocked, worstHat, eyeHits, fanRays,
-    scalp, scalpWorst, scalpAt, balding, H, Wd, Dp, relief, tris: tris.length, occluders,
+    scalp, scalpWorst, scalpAt, balding, H, Wd, Dp, relief, tone, tris: tris.length, occluders,
   };
 }
 
@@ -396,6 +467,11 @@ for (const id of shapes) {
   for (const k of Object.keys(RELIEF_T)) {
     if (r.relief[k] < RELIEF_T[k]) bad.push(`RELIEF ${k} ${(r.relief[k] * 1000).toFixed(1)}mm`);
   }
+  if (r.tone.warmCool < TONE_T.warmCool) bad.push(`TONE warm/cool ${r.tone.warmCool.toFixed(3)}`);
+  if (r.tone.lipStep < TONE_T.lipStep) bad.push(`TONE lip ${r.tone.lipStep.toFixed(3)}`);
+  if (r.tone.wantsStubble && r.tone.stubble < TONE_T.stubble) {
+    bad.push(`TONE stubble ${r.tone.stubble.toFixed(3)}`);
+  }
 
   const hatTag = r.hat ? `hat=${r.hat}` : 'bare';
   console.log(`\n=== ${id} (${hatTag}) — ${r.tris} head tris ===`);
@@ -412,6 +488,9 @@ for (const id of shapes) {
     `  ->  w/h ${wr.toFixed(3)} (want ${SHAPE_T.wideMin}-${SHAPE_T.wideMax})  d/h ${dr.toFixed(3)} (want ${SHAPE_T.deepMin}-${SHAPE_T.deepMax})`);
   console.log(`  6 RELIEF nose ${(r.relief.nose * 1000).toFixed(1)}  brow ${(r.relief.brow * 1000).toFixed(1)}  lips ${(r.relief.lips * 1000).toFixed(1)} mm` +
     `  (want >= ${(RELIEF_T.nose * 1000).toFixed(1)} / ${(RELIEF_T.brow * 1000).toFixed(1)} / ${(RELIEF_T.lips * 1000).toFixed(1)})`);
+  console.log(`  7 TONE   face warm/cool ${r.tone.warmCool.toFixed(3)} (want >= ${TONE_T.warmCool})` +
+    `  lip R/G step ${r.tone.lipStep.toFixed(3)} (want >= ${TONE_T.lipStep})` +
+    `  jaw-brow stubble ${r.tone.stubble.toFixed(3)} (want ${r.tone.wantsStubble ? `>= ${TONE_T.stubble}` : 'n/a'})`);
   if (bad.length) {
     failures++;
     console.log(`  FAIL: ${bad.join(', ')}`);

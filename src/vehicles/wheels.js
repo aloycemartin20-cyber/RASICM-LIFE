@@ -13,8 +13,6 @@
 import * as THREE from 'three';
 import { mergeAll, transform, roundedBox, tubeBetween } from './geom.js';
 
-const SECTION_V = [0, 0.06, 0.16, 0.24, 0.76, 0.84, 0.94, 1];
-
 /**
  * @returns { rubber, rim, disc, caliper } geometry lists in wheel-local space.
  */
@@ -224,11 +222,60 @@ function tyre(r, halfW, rimR, seg, lod) {
   const GROOVES = [0.13, 0.38, 0.62, 0.87];
   const gHalf = 0.052;
   const gDepth = r * 0.036;
+  /**
+   * THE SIDEWALL, AND WHY 1.06 WAS NOT ONE.
+   *
+   * A tyre's widest point is its sidewall, not its tread: the carcass bows out
+   * between the bead and the shoulder, and that bow is the whole reason a wheel
+   * reads as rubber rather than as a black cylinder. The section here carried
+   * `1.06` of the nominal half-width against a tread half-width of `0.86`, so
+   * the sidewall stood 0.20 x halfW proud of the tread shoulder — on the 0.225 m
+   * sedan tyre that is 22.5 mm — and it was spent on a straight chamfer running
+   * from the bulge to the shoulder in ONE segment. A straight line has no
+   * highlight to move along it, so at 3 m the tyre had a visible crease and no
+   * sidewall, which is what the followup is about.
+   *
+   * `1.14` is a real passenger-car section: 0.28 x halfW proud of the tread,
+   * 40% more silhouette. MEASURED off the built geometry, the widest point now
+   * stands 31.5 mm (sedan), 39.2 mm (sports) and 44.8 mm (muscle) outside the
+   * tread shoulder, which at 3 m is three quarters of a degree — around a dozen
+   * pixels of silhouette at 1080p, where it used to be eight. The tyre grows by
+   * 9 mm per side on that sedan, far inside the arch clearance, so nothing
+   * pokes through bodywork.
+   *
+   * THE EXTRA ROW IS THE POINT, not the number. `1.14` on the old three-row
+   * section would only have made the crease bigger. Splitting the run into a
+   * maximum-width row low on the carcass (0.34 of the way up from the bead) and
+   * a second still-proud row high on it (0.72, at 1.09) makes the sidewall
+   * CONVEX and turns the shoulder into a radius rather than a corner — so the
+   * sky band travels across it as the wheel turns instead of snapping between
+   * two flat faces.
+   *
+   * AND THE EXTRA ROW IS LOD0 ONLY, WHICH THE PERF GATE INSISTED ON. Carried at
+   * every level it cost 2 rows of 8 beyond LOD0 — a quarter more tyre geometry
+   * on every car in the fleet, since LOD1 is where the traffic lives — and
+   * MEASURED on `tools/perfcheck.mjs --gate` that was day p50 18.0 -> 19.1 ms
+   * against a 19.2 budget, i.e. most of the remaining headroom spent on a
+   * shoulder radius nobody can see. Past 22 m the whole wheel is a few pixels
+   * and the radius subtends about 2 of them, against a dozen at 3 m, which is
+   * the distance the followup is written about. Same reasoning as the grooves
+   * above, same cut-off.
+   *
+   * The BULGE itself stays at every level: it is a change to an existing row's
+   * x, so it is free, and a silhouette that got narrower on the LOD swap would
+   * pop. Only the shoulder radius drops out, so LOD1 has exactly the 8 rows it
+   * always had.
+   *
+   * `v` keeps the crown band at 0.24..0.76 exactly, so the groove positions here
+   * and the four in `makeTyreMaps` still describe the same tyre.
+   */
+  const BULGE = 1.14;
   const sect = [
     { x: -halfW, r: rimR, v: 0 },
-    { x: -halfW * 1.06, r: rimR + (r - rimR) * 0.38, v: 0.06 },
-    { x: -halfW * 0.99, r: r * 0.975, v: 0.16 },
+    { x: -halfW * BULGE, r: rimR + (r - rimR) * 0.34, v: 0.05 },
   ];
+  if (lod === 0) sect.push({ x: -halfW * (BULGE - 0.05), r: rimR + (r - rimR) * 0.72, v: 0.11 });
+  sect.push({ x: -halfW * 0.99, r: r * 0.975, v: 0.16 });
   const crownAt = (t, rad) => sect.push({ x: -shoulder + 2 * shoulder * t, r: rad, v: 0.24 + t * 0.52 });
   crownAt(0, r);
   if (lod === 0) {
@@ -240,9 +287,10 @@ function tyre(r, halfW, rimR, seg, lod) {
     }
   }
   crownAt(1, r);
+  sect.push({ x: halfW * 0.99, r: r * 0.975, v: 0.84 });
+  if (lod === 0) sect.push({ x: halfW * (BULGE - 0.05), r: rimR + (r - rimR) * 0.72, v: 0.89 });
   sect.push(
-    { x: halfW * 0.99, r: r * 0.975, v: 0.84 },
-    { x: halfW * 1.06, r: rimR + (r - rimR) * 0.38, v: 0.94 },
+    { x: halfW * BULGE, r: rimR + (r - rimR) * 0.34, v: 0.95 },
     { x: halfW, r: rimR, v: 1 }
   );
 

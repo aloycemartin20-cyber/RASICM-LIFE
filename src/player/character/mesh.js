@@ -25,6 +25,127 @@
 import * as THREE from 'three';
 
 /* ====================================================================== */
+/* Identity                                                               */
+/* ====================================================================== */
+
+/**
+ * Per-brother identity: the FACE and the WARDROBE.
+ *
+ * `brothers.js` authors the physical scalars the skeleton needs (scale,
+ * shoulder, limb, jaw, brow, nose). Those alone give three men of different
+ * size wearing the same shirt with the same face at three magnifications, which
+ * is what the review called out. This table is the other half — the feature
+ * deltas that make a face somebody's, and the garment each man actually wears.
+ *
+ * Keyed by `build.id`. Callers that hand `buildCharacter()` a raw brothers.js
+ * build (`camtest.mjs`, `anim/aimposeprobe.mjs`) carry no id, so `hair` — which
+ * brothers.js authors one distinct value of per brother — is the fallback key.
+ * `character/index.js` sets `id` explicitly and it always wins.
+ *
+ * FACE scalars are multipliers on named gaussians in `buildHead()`; 0 removes
+ * the feature entirely, so "no bridge hump" is expressible and is not the same
+ * shape as "a small one". They are read as ANATOMY:
+ *
+ *   bridge      dorsal hump on the nose         cheekHollow  sunken cheek
+ *   alae        nostril-wing spread             fold         nasolabial crease
+ *   tipDrop     nose tip droops (+) / lifts (-) temple       temporal hollow
+ *   deepEye     how far the eye sits under the brow
+ *   furrow      the horizontal crease above the brow (age)
+ *   lip/mouthW  lip fullness and mouth width    cleft        chin cleft
+ *   jawSquare   flare at the gonial angle
+ */
+export const IDENTITY = {
+  carson: {
+    hairKey: 'crop',
+    // Eldest, weathered, off the water: heavy overhanging brow over deep-set
+    // eyes, a nose broken once and set wide, hollow wind-burnt cheeks with the
+    // folds to match, a thin mouth and a slab of a jaw.
+    face: {
+      bridge: 1.0, alae: 1.0, tipDrop: 0.9, cheekHollow: 1.0, fold: 1.0,
+      temple: 1.0, furrow: 1.0, cleft: 0.45, deepEye: 1.0, lip: 0.62,
+      mouthW: 1.08, jawSquare: 1.0, chinW: 1.0,
+    },
+    outfit: 'river',
+    sleeve: 'rolledLong',
+    cloth: 'canvas',
+    /** Garment thickness over the ribs, metres — see `torsoRX`. */
+    bulk: 0.015,
+    /** 0 young .. 1 weathered — drives the face atlas, not the geometry. */
+    age: 1.0,
+    /** Beard coverage: 0 clean, 1 a full jaw of stubble. */
+    beard: 0.85,
+  },
+  aidan: {
+    hairKey: 'sweep',
+    // Middle: the most regular face of the three. A long straight nose, a
+    // cleft chin, a level brow and enough cheek to read as well fed.
+    face: {
+      bridge: 0.50, alae: 0.75, tipDrop: 0.25, cheekHollow: 0.50, fold: 0.55,
+      temple: 0.3, furrow: 0.35, cleft: 1.0, deepEye: 0.62, lip: 1.0,
+      mouthW: 1.0, jawSquare: 0.85, chinW: 0.72,
+    },
+    outfit: 'shop',
+    sleeve: 'rolledShort',
+    cloth: 'chambray',
+    bulk: 0.004,
+    age: 0.45,
+    beard: 0.5,
+  },
+  dylan: {
+    hairKey: 'mop',
+    // Youngest: a short upturned nose, a narrow tapered jaw, a smooth forehead
+    // and eyes that sit forward rather than under a shelf.
+    face: {
+      bridge: 0.0, alae: 0.1, tipDrop: -0.9, cheekHollow: 0.0, fold: 0.05,
+      temple: 0.0, furrow: 0.0, cleft: 0.0, deepEye: 0.05, lip: 1.28,
+      mouthW: 0.90, jawSquare: 0.10, chinW: 0.18,
+    },
+    outfit: 'courier',
+    sleeve: 'cuffed',
+    cloth: 'ripstop',
+    bulk: 0.009,
+    age: 0.08,
+    beard: 0.16,
+  },
+};
+
+const BASE_IDENTITY = {
+  face: {
+    bridge: 0.4, alae: 0.5, tipDrop: 0.3, cheekHollow: 0.4, fold: 0.4,
+    temple: 0.3, furrow: 0.3, cleft: 0.4, deepEye: 0.5, lip: 0.9,
+    mouthW: 1.0, jawSquare: 0.6, chinW: 0.6,
+  },
+  outfit: 'shop',
+  sleeve: 'rolledShort',
+  cloth: 'chambray',
+  bulk: 0.006,
+  age: 0.4,
+  beard: 0.4,
+};
+
+const BY_HAIR = Object.fromEntries(
+  Object.entries(IDENTITY).map(([id, v]) => [v.hairKey, { ...v, id }])
+);
+
+/**
+ * The identity a given build resolves to. Never returns null.
+ *
+ * NEGATIVE CONTROL: `build.noIdentity` collapses every brother onto the shared
+ * base — one face, one garment, one bulk — leaving only the physical scalars
+ * `brothers.js` authors. `identityprobe.mjs` runs it and asserts the measured
+ * separation between the three men falls off a cliff, which is what proves the
+ * probe is reading this table and not the size difference underneath it.
+ */
+export function identityOf(build) {
+  if (build?.noIdentity) return { ...BASE_IDENTITY, id: 'base' };
+  const byId = build?.id ? IDENTITY[build.id] : null;
+  if (byId) return { ...byId, id: build.id };
+  const byHair = build?.hair ? BY_HAIR[build.hair] : null;
+  if (byHair) return byHair;
+  return { ...BASE_IDENTITY, id: 'base' };
+}
+
+/* ====================================================================== */
 /* Skeleton                                                               */
 /* ====================================================================== */
 
@@ -196,6 +317,10 @@ class BodyBuilder {
    * @param o.weight   (t) => [i0, w0, i1, w1]
    * @param o.shape    (angle, t) => scalar multiplier, default 1
    * @param o.axis     world direction rx points along at ring 0 (auto by default)
+   * @param o.uvOffU/V constant added to the uv. Only the head reads a NON-tiling
+   *                   atlas, and the ears are tubes: without an offset they land
+   *                   on the eye it is painted at u ~ 0.43 rather than on the
+   *                   plain skin the atlas keeps behind the hairline.
    */
   tube(o) {
     const mat = o.material | 0;
@@ -206,6 +331,8 @@ class BodyBuilder {
     const shape = o.shape ?? null;
     const uvV = o.uvV ?? 3.0;
     const uvU = o.uvU ?? 1;
+    const offU = o.uvOffU ?? 0;
+    const offV = o.uvOffV ?? 0;
     const path = o.path;
     const straight = path.length === 2;
 
@@ -285,7 +412,7 @@ class BodyBuilder {
         const x = c[0] + _b.x * rx * ca * m + _n.x * rz * sa * m;
         const y = c[1] + _b.y * rx * ca * m + _n.y * rz * sa * m;
         const z = c[2] + _b.z * rx * ca * m + _n.z * rz * sa * m;
-        this._vert(x, y, z, (j / radial) * uvU, vSum * uvV, w);
+        this._vert(x, y, z, (j / radial) * uvU + offU, vSum * uvV + offV, w);
       }
       this.seams.push(row, row + radial);
       if (i === 0) firstRow = row;
@@ -316,7 +443,14 @@ class BodyBuilder {
     }
     cx /= radial; cy /= radial; cz /= radial;
     const w = o.weight(t);
-    const centre = this._vert(cx, cy, cz, 0.5, 0.5, w);
+    // A cap on a TILING surface samples an arbitrary texel wherever it is put,
+    // so (0.5, 0.5) has always done; a cap on the head ATLAS does not, and 0.5
+    // there is the mouth. Only tubes that ask for an offset get the mapped
+    // centre, so no existing cap's texel moves.
+    const off = o.uvOffU !== undefined || o.uvOffV !== undefined;
+    const cu = off ? (o.uvOffU ?? 0) + 0.5 * (o.uvU ?? 1) : 0.5;
+    const cv = off ? (o.uvOffV ?? 0) + 0.5 * (o.uvV ?? 3.0) : 0.5;
+    const centre = this._vert(cx, cy, cz, cu, cv, w);
     for (let j = 0; j < radial; j++) {
       if (isStart) run.push(centre, row + j + 1, row + j);
       else run.push(centre, row + j, row + j + 1);
@@ -506,10 +640,132 @@ function prof(t, keys) {
   return keys[i][1] + (keys[i + 1][1] - keys[i][1]) * e;
 }
 
+/**
+ * C1 profile with SECANT tangents — Catmull-Rom on non-uniform knots.
+ *
+ * `prof()` above blends with a cosine, which has ZERO slope at every stop. On a
+ * curve that is meant to be a smooth taper that is a defect: the curve flattens
+ * at each knot and the CURVATURE has to reverse to get to the next one. On the
+ * skull's width/depth tables that shows as horizontal bands ringing the face —
+ * MEASURED as full-width rows in the laplacian of the emitted depth map at
+ * y = -0.011, -0.037 and -0.065, which are exactly the three stops. A secant
+ * tangent carries the slope through the knot and the bands go with it.
+ *
+ * Not a replacement for `prof()`: a limb radius WANTS a stop it settles at.
+ */
+function profSmooth(t, keys) {
+  const last = keys.length - 1;
+  if (t <= keys[0][0]) return keys[0][1];
+  if (t >= keys[last][0]) return keys[last][1];
+  let i = 0;
+  while (i < last && t > keys[i + 1][0]) i++;
+  const x0 = keys[i][0], x1 = keys[i + 1][0];
+  const y0 = keys[i][1], y1 = keys[i + 1][1];
+  const h = x1 - x0;
+  const s = (t - x0) / h;
+  const mL = i > 0 ? (y1 - keys[i - 1][1]) / (x1 - keys[i - 1][0]) : (y1 - y0) / h;
+  const mR = i + 2 <= last ? (keys[i + 2][1] - y0) / (keys[i + 2][0] - x0) : (y1 - y0) / h;
+  const s2 = s * s, s3 = s2 * s;
+  return (2 * s3 - 3 * s2 + 1) * y0 + (s3 - 2 * s2 + s) * h * mL
+    + (-2 * s3 + 3 * s2) * y1 + (s3 - s2) * h * mR;
+}
+
 /** Smooth 0..1 bump centred on `c` with half-width `w`. */
 function bump(x, c, w) {
   const d = (x - c) / w;
   return d <= -1 || d >= 1 ? 0 : Math.cos(d * Math.PI * 0.5) ** 2;
+}
+
+/* ====================================================================== */
+/* Torso shell — shared by the shirt tube and everything sewn onto it      */
+/* ====================================================================== */
+
+/**
+ * The torso is one swept tube, and every garment part (placket, zip, pocket,
+ * yoke seam, chest strap) has to sit a few millimetres PROUD of it. Those parts
+ * used to carry hand-copied z constants, which is how a pocket ends up half
+ * inside a chest on the one brother whose `chest` scalar moved. The profile
+ * lives here once and the garment reads the same functions the shirt is swept
+ * from, so a patch is always exactly `standoff` off the surface it is sewn to.
+ */
+function torsoPath(P, S) {
+  const hipY = P.hips[1], chestY = P.chest[1], neckY = P.neck[1];
+  return [
+    [0, hipY - 0.10 * S, 0.004 * S],
+    [0, hipY + 0.03 * S, 0.006 * S],
+    [0, lerp(hipY, chestY, 0.45), 0.004 * S],
+    [0, chestY, -0.002 * S],
+    [0, lerp(chestY, neckY, 0.62), -0.006 * S],
+    [0, neckY + 0.052 * S, -0.012 * S],
+  ];
+}
+
+/**
+ * `bulk` is the GARMENT's own thickness: a canvas work shirt over a base layer
+ * stands further off the ribs than a nylon shell does, and that difference is
+ * half of what makes the three brothers read apart in silhouette at 20 m. It
+ * only applies above the waist — a jacket does not thicken the hips.
+ */
+function torsoRX(t, build, ID) {
+  const sh = build.shoulder ?? 1;
+  const r = prof(t, [
+    [0.00, 0.138], [0.10, 0.150], [0.34, 0.132 * (build.waist ?? 1)], [0.52, 0.140],
+    [0.70, 0.156 * (build.chest ?? 1)], [0.80, 0.172 * sh], [0.88, 0.166 * sh],
+    [0.94, 0.132 * sh], [1.00, 0.062],
+  ]);
+  return r + (ID?.bulk ?? 0) * Math.min(1, Math.max(0, (t - 0.28) / 0.26)) * (1 - bump(t, 1.0, 0.14));
+}
+
+function torsoRZ(t, build, ID) {
+  const r = prof(t, [
+    [0.00, 0.098], [0.10, 0.106], [0.34, 0.094 * (build.waist ?? 1)], [0.52, 0.104],
+    [0.70, 0.118 * (build.chest ?? 1)], [0.80, 0.116], [0.88, 0.110],
+    [0.94, 0.090], [1.00, 0.056],
+  ]);
+  return r + (ID?.bulk ?? 0) * Math.min(1, Math.max(0, (t - 0.28) / 0.26)) * (1 - bump(t, 1.0, 0.14));
+}
+
+/**
+ * Flatten the front and back — a human torso is an oval, not a cylinder — and
+ * leave a shallow groove down the spine.
+ *
+ * MEASURED, not assumed. The previous version rode `max(0, sin(a))` and put the
+ * spine groove down the CHEST. A differential on the emitted hull at the
+ * groove's own centre height — same build, groove term on and off — moves the
+ * BACK by -5.33 mm and the front by 0.00 mm under `max(0, -sin(a))`, so this
+ * sweep's frame has `sin(a) = +1` at the front and the groove belongs on the
+ * negative lobe. Re-measure before flipping it back.
+ */
+function torsoShape(a, t) {
+  const front = Math.sin(a);
+  let m = 1 - 0.055 * Math.abs(front);
+  m -= 0.05 * Math.max(0, -front) * bump(t, 0.72, 0.4); // spine groove
+  return m;
+}
+
+/** Torso surface point (world) at path parameter t and sweep angle a. */
+const _tsC = [0, 0, 0];
+function torsoSurface(P, build, S, ID, t, a, out) {
+  crEval(torsoPath(P, S), t, _tsC);
+  const m = torsoShape(a, t);
+  const rx = torsoRX(t, build, ID) * S * m;
+  const rz = torsoRZ(t, build, ID) * S * m;
+  out[0] = _tsC[0] - Math.cos(a) * rx;
+  out[1] = _tsC[1];
+  out[2] = _tsC[2] - Math.sin(a) * rz;
+  return out;
+}
+
+/** The path parameter whose height is `y`. The sweep's y is monotone in t. */
+function torsoTOfY(P, S, y) {
+  const path = torsoPath(P, S);
+  let lo = 0, hi = 1;
+  for (let k = 0; k < 18; k++) {
+    const mid = (lo + hi) * 0.5;
+    crEval(path, mid, _tsC);
+    if (_tsC[1] < y) lo = mid; else hi = mid;
+  }
+  return (lo + hi) * 0.5;
 }
 
 /**
@@ -523,6 +779,7 @@ export function buildBody(build) {
   const G = build.limb ?? 1; // limb girth
   const CH = build.chest ?? 1;
   const WA = build.waist ?? 1;
+  const ID = identityOf(build);
   const B = new BodyBuilder(MAT_COUNT);
 
   const r2 = [0, 0];
@@ -532,49 +789,21 @@ export function buildBody(build) {
   // The shirt IS the torso: there is no naked body under it to see through,
   // and one surface means one silhouette without an inter-penetration seam.
   {
-    const hipY = P.hips[1], chestY = P.chest[1], neckY = P.neck[1];
-    const path = [
-      [0, hipY - 0.10 * S, 0.004 * S],
-      [0, hipY + 0.03 * S, 0.006 * S],
-      [0, lerp(hipY, chestY, 0.45), 0.004 * S],
-      [0, chestY, -0.002 * S],
-      [0, lerp(chestY, neckY, 0.62), -0.006 * S],
-      [0, neckY + 0.052 * S, -0.012 * S],
-    ];
+    const neckY = P.neck[1];
     B.tube({
       material: MAT.shirt,
-      path,
+      path: torsoPath(P, S),
       rings: 26,
       radial: 22,
       uvV: 11,
       uvU: 8,
       capStart: true,
       capEnd: true,
-      radius: (t) => {
-        // t: 0 hem -> 1 base of the neck. Measured half-widths for a 46 cm
-        // shoulder span once the deltoids (which belong to the ARM tube) are
-        // added on top at +-0.176.
-        const sh = build.shoulder ?? 1;
-        const rx = prof(t, [
-          [0.00, 0.138], [0.10, 0.150], [0.34, 0.132 * WA], [0.52, 0.140],
-          [0.70, 0.156 * CH], [0.80, 0.172 * sh], [0.88, 0.166 * sh],
-          [0.94, 0.132 * sh], [1.00, 0.062],
-        ]);
-        const rz = prof(t, [
-          [0.00, 0.098], [0.10, 0.106], [0.34, 0.094 * WA], [0.52, 0.104],
-          [0.70, 0.118 * CH], [0.80, 0.116], [0.88, 0.110],
-          [0.94, 0.090], [1.00, 0.056],
-        ]);
-        return mk(rx * S, rz * S);
-      },
-      // Flatten the front and back: a human torso is an oval, not a cylinder,
-      // and the spine leaves a shallow groove.
-      shape: (a, t) => {
-        const front = -Math.sin(a); // +1 at -Z
-        let m = 1 - 0.055 * Math.abs(front);
-        m -= 0.05 * Math.max(0, -front) * bump(t, 0.72, 0.4); // spine groove
-        return m;
-      },
+      // t: 0 hem -> 1 base of the neck. Measured half-widths for a 46 cm
+      // shoulder span once the deltoids (which belong to the ARM tube) are
+      // added on top at +-0.176.
+      radius: (t) => mk(torsoRX(t, build, ID) * S, torsoRZ(t, build, ID) * S),
+      shape: torsoShape,
       weight: chain([[0.0, 'hips'], [0.3, 'hips'], [0.5, 'spine'], [0.78, 'chest'], [1, 'chest']]),
     });
 
@@ -591,24 +820,11 @@ export function buildBody(build) {
       uvU: 7,
       radius: (t) => mk((0.074 + t * 0.020) * S, (0.066 + t * 0.020) * S),
       weight: chain([[0, 'chest'], [1, 'neck']]),
-      shape: (a) => 1 - 0.16 * Math.max(0, -Math.sin(a)),
+      // Opens at the THROAT. Same frame as the torso: sin(a) = +1 at the front.
+      shape: (a) => 1 - 0.16 * Math.max(0, Math.sin(a)),
     });
 
-    // Placket: the button strip down the front, a distinct raised ridge.
-    B.tube({
-      material: MAT.shirt,
-      path: [
-        [0, neckY - 0.02 * S, -0.084 * S],
-        [0, lerp(chestY, neckY, 0.35), -0.104 * S],
-        [0, lerp(hipY, chestY, 0.5), -0.098 * S],
-        [0, hipY - 0.06 * S, -0.092 * S],
-      ],
-      rings: 10,
-      radial: 8,
-      uvV: 9,
-      radius: () => mk(0.019 * S, 0.010 * S),
-      weight: chain([[0, 'chest'], [0.45, 'spine'], [1, 'hips']]),
-    });
+    buildGarment(B, P, build, S, ID);
   }
 
   /* ----------------------------------------------------------- belt ---- */
@@ -643,8 +859,13 @@ export function buildBody(build) {
   {
     const y0 = P.chest[1] + 0.048 * S;
     const y1 = P.head[1] + 0.012 * S;
+    // MAT.skin, not MAT.face. `face` now carries a NON-tiling atlas painted in
+    // the skull's own (theta, phi) — a tube swept up the neck cannot sample it
+    // (its v is arclength) and would drag the mouth up the throat. Both come
+    // out of `makeSkin` with the same base and shadow tones, so the only
+    // difference across the jawline is the tiling rate of the pore detail.
     B.tube({
-      material: MAT.face,
+      material: MAT.skin,
       path: [[0, y0, 0.010 * S], [0, lerp(y0, y1, 0.5), -0.002 * S], [0, y1 + 0.03 * S, -0.008 * S]],
       rings: 8,
       radial: 16,
@@ -673,10 +894,28 @@ export function buildBody(build) {
     const he = P['handEnd' + side];
 
     // Deltoid + upper arm, in skin (the sleeve covers its top half).
+    //
+    // THE CROWN IS LOWER AND NARROWER THAN IT WAS, and that is the fix for the
+    // "puffed shoulder" read. The crown used to stand 52 mm above the joint at
+    // r = 0.050, which is a ball, not a deltoid — and because the sleeve cap has
+    // to CLEAR the crown (see the sleeve below, and `shirtprobe.mjs`), every
+    // millimetre of crown was paid for twice: once in skin and again in the
+    // fabric domed over it. Dropping it to 36 mm at r = 0.042 lets the cap come
+    // down with it, and 0.042 * 2 + the acromion is still a real deltoid — the
+    // shoulder POINT now sits at the acromion where a human's does, instead of
+    // 16 mm above it.
+    //
+    // `build.sleeveShrink` reverts BOTH halves of the pre-fix shoulder — the
+    // tall crown here and the open sleeve below — because they are one defect
+    // and reverting only the sleeve understates it. Measured on the shirtcam
+    // control: crown+sleeve 1525 exposed pixels, sleeve alone 364. Both are
+    // decisively red against a zero gate, but the control is worth keeping at
+    // its full strength rather than at a quarter of it.
+    const preFix = build.sleeveShrink === true;
     B.tube({
       material: MAT.skin,
       path: [
-        [sh[0] - s * 0.012 * S, sh[1] + 0.052 * S, sh[2]],
+        [sh[0] - s * 0.012 * S, sh[1] + (preFix ? 0.052 : 0.036) * S, sh[2]],
         [sh[0], sh[1] - 0.02 * S, sh[2]],
         [lerp(sh[0], el[0], 0.55), lerp(sh[1], el[1], 0.55), lerp(sh[2], el[2], 0.55) + 0.004 * S],
         [el[0], el[1], el[2]],
@@ -687,8 +926,10 @@ export function buildBody(build) {
       uvU: 3,
       capStart: true,
       radius: (t) => {
-        const r = prof(t, [
+        const r = prof(t, preFix ? [
           [0.00, 0.050], [0.16, 0.055], [0.48, 0.047], [0.82, 0.039], [1.00, 0.037],
+        ] : [
+          [0.00, 0.042], [0.16, 0.050], [0.48, 0.046], [0.82, 0.039], [1.00, 0.037],
         ]) * G;
         return mk(r * S, (r * 1.03) * S);
       },
@@ -716,126 +957,9 @@ export function buildBody(build) {
       weight: chain([[0, 'forearm' + side], [0.86, 'forearm' + side], [1, 'hand' + side]]),
     });
 
-    // Hand: a palm block that tapers into fingers, plus a thumb.
-    B.tube({
-      material: MAT.skin,
-      path: [
-        [wr[0], wr[1], wr[2]],
-        [lerp(wr[0], he[0], 0.35), lerp(wr[1], he[1], 0.35), lerp(wr[2], he[2], 0.35) - 0.004 * S],
-        [lerp(wr[0], he[0], 0.78), lerp(wr[1], he[1], 0.78), lerp(wr[2], he[2], 0.78)],
-        [he[0], he[1], he[2] + 0.004 * S],
-      ],
-      rings: 12,
-      radial: 14,
-      uvV: 8,
-      uvU: 2,
-      capEnd: true,
-      radius: (t) => {
-        const taper = t > 0.80 ? Math.sqrt(Math.max(0, 1 - ((t - 0.80) / 0.20) ** 2)) : 1;
-        const rx = prof(t, [[0, 0.014], [0.3, 0.017], [1, 0.014]]) * G * taper;
-        const rz = prof(t, [[0, 0.031], [0.28, 0.044], [0.7, 0.040], [1, 0.032]]) * G * taper;
-        return mk(rx * S, rz * S);
-      },
-      // Knuckle side is fuller than the palm side.
-      shape: (a, t) => 1 + 0.06 * Math.max(0, Math.sin(a)) * bump(t, 0.55, 0.4),
-      weight: chain([[0, 'hand' + side], [0.25, 'hand' + side], [1, 'handEnd' + side]]),
-    });
+    buildHand(B, P, build, S, side, s);
 
-    // Thumb, angled forward and inward from the base of the palm.
-    B.tube({
-      material: MAT.skin,
-      path: [
-        [wr[0] - s * 0.006 * S, wr[1] - 0.018 * S, wr[2] - 0.026 * S],
-        [wr[0] - s * 0.016 * S, wr[1] - 0.05 * S, wr[2] - 0.044 * S],
-        [wr[0] - s * 0.02 * S, wr[1] - 0.078 * S, wr[2] - 0.05 * S],
-      ],
-      rings: 7,
-      radial: 9,
-      uvV: 8,
-      capEnd: true,
-      radius: (t) => {
-        const taper = t > 0.7 ? Math.sqrt(Math.max(0, 1 - ((t - 0.7) / 0.3) ** 2)) : 1;
-        return mk(0.0125 * G * S * taper, 0.0135 * G * S * taper);
-      },
-      weight: single('hand' + side),
-    });
-
-    // Short sleeve: a set-in garment shell. It CAPS over the top of the
-    // shoulder (the acromion / deltoid crown) and then falls to a rolled hem
-    // partway down the upper arm.
-    //
-    // WHY THE TOP IS CLOSED. The upper arm is drawn in skin, and its crown sits
-    // proud of the shoulder at sh.y + 0.052. The old sleeve started INBOARD and
-    // LOW (sh.x - 0.085, sh.y - 0.004), open at both ends, so it never domed
-    // over that crown: a ring of bare skin showed at the acromion where the
-    // sleeve met the torso, and it widened as the arm lifted because the torso
-    // (chest-weighted) receded from under the shoulder while the crown did not.
-    // Measured exposed superior-shoulder skin was ~10-15k mm2 at rest, ~30k
-    // raised. The cap is weighted 100% to the arm bone, exactly like the skin
-    // crown it covers, so the two are locked together: a cap that clears the
-    // crown in the bind pose clears it under EVERY arm rotation, not just rest.
-    // `src/player/character/shirtprobe.mjs` is the gate.
-    //
-    // The hem is still a rolled, OPEN edge partway down the upper arm, so the
-    // bare forearm-side of the arm still reads through it — only the TOP closed.
-    //
-    // NEGATIVE CONTROL for the gate: `build.sleeveShrink === true` reverts this
-    // to the pre-fix sleeve — inboard, low, open at the top — which re-opens the
-    // acromion gap. `shirtprobe.mjs` builds one pass with it set and asserts the
-    // exposed-skin count goes RED, proving the gate measures the emitted cap and
-    // not its own inputs. Same idiom as `debugIgnorePause` in the pause gates.
-    const sleeveShrink = build.sleeveShrink === true;
-    B.tube({
-      material: MAT.shirt,
-      path: sleeveShrink ? [
-        [sh[0] - s * 0.085 * S, sh[1] - 0.004 * S, sh[2] - 0.004 * S],
-        [sh[0] - s * 0.010 * S, sh[1] - 0.012 * S, sh[2]],
-        [lerp(sh[0], el[0], 0.40), lerp(sh[1], el[1], 0.40), lerp(sh[2], el[2], 0.40)],
-        [lerp(sh[0], el[0], 0.50), lerp(sh[1], el[1], 0.50), lerp(sh[2], el[2], 0.50)],
-      ] : [
-        // apex: a cap riding proud of the deltoid crown, centred over it (the
-        // skin crown sits at sh.x - 0.012, sh.y + 0.052) so it domes SYMMETRIC-
-        // ally over the top rather than swinging off the outboard side. The
-        // height matters: dropped to +0.065 the crown pokes back through at rest
-        // on the broadest brother (carson, shoulder 1.11) — measured 67 rays —
-        // so +0.076 is the margin the widest deltoid needs, not slack.
-        [sh[0] - s * 0.012 * S, sh[1] + 0.076 * S, sh[2] + 0.004 * S],
-        // superior shoulder, still tracking the arm axis so the whole crown is
-        // enclosed on the inboard side too
-        [sh[0] - s * 0.004 * S, sh[1] + 0.032 * S, sh[2] + 0.000 * S],
-        // onto the upper deltoid
-        [lerp(sh[0], el[0], 0.12), lerp(sh[1], el[1], 0.12), lerp(sh[2], el[2], 0.12)],
-        // deltoid belly
-        [lerp(sh[0], el[0], 0.34), lerp(sh[1], el[1], 0.34), lerp(sh[2], el[2], 0.34)],
-        // toward the hem
-        [lerp(sh[0], el[0], 0.46), lerp(sh[1], el[1], 0.46), lerp(sh[2], el[2], 0.46)],
-        // rolled hem, partway down the upper arm (open — the arm shows below it)
-        [lerp(sh[0], el[0], 0.52), lerp(sh[1], el[1], 0.52), lerp(sh[2], el[2], 0.52)],
-      ],
-      rings: sleeveShrink ? 14 : 20,
-      radial: 16,
-      uvV: 12,
-      uvU: 6,
-      // capStart closes the apex over the acromion; the hem (capEnd) stays open.
-      capStart: !sleeveShrink,
-      radius: sleeveShrink
-        ? (t) => {
-            const r = prof(t, [
-              [0.00, 0.052], [0.16, 0.064], [0.34, 0.062], [0.70, 0.053], [0.90, 0.050], [1.00, 0.054],
-            ]) * G;
-            return mk(r * S, r * 1.04 * S);
-          }
-        : (t) => {
-            // Generous through the cap so it clears the skin crown (r up to
-            // 0.055) with margin, tapering to the rolled hem.
-            const r = prof(t, [
-              [0.00, 0.034], [0.09, 0.060], [0.22, 0.070], [0.42, 0.065],
-              [0.70, 0.055], [0.90, 0.051], [1.00, 0.055],
-            ]) * G;
-            return mk(r * S, r * 1.04 * S);
-          },
-      weight: chain([[0, 'arm' + side], [0.1, 'arm' + side], [1, 'arm' + side]]),
-    });
+    buildSleeve(B, P, build, S, ID, side, s);
   }
 
   /* ------------------------------------------------------------ legs --- */
@@ -969,6 +1093,613 @@ export function buildBody(build) {
 }
 
 /* ====================================================================== */
+/* Wardrobe                                                               */
+/* ====================================================================== */
+
+/**
+ * Everything sewn onto the torso shell: the front closure, pockets, the yoke
+ * seam, and whatever one brother wears that the others do not.
+ *
+ * THREE GARMENTS, NOT THREE COLOURS. Recolouring one shirt is what made the
+ * three men read as one man in three palettes. The pieces here are chosen for
+ * what survives a 20 m silhouette:
+ *
+ *   river    (carson)  canvas work shirt — two flapped chest pockets, a yoke
+ *                      seam across the shoulders, a heavy hem band. Bulkiest.
+ *   shop     (aidan)   shop shirt — button placket, one pocket, a name patch
+ *                      in leather over the heart.
+ *   courier  (dylan)   zip shell — a full-length zip in dark rubber, a storm
+ *                      flap, and a crossbody strap that breaks the torso
+ *                      diagonally. The strap is the read at distance.
+ *
+ * Everything is placed against `torsoSurface()` rather than against copied
+ * constants, so a piece is always exactly `standoff` proud of the fabric it is
+ * sewn to on every brother, whatever his chest and waist scalars are.
+ */
+function buildGarment(B, P, build, S, ID) {
+  const r2 = [0, 0];
+  const mk = (rx, rz) => { r2[0] = rx; r2[1] = rz; return r2; };
+  const hipY = P.hips[1], chestY = P.chest[1], neckY = P.neck[1];
+  const p = [0, 0, 0];
+
+  /** A point `off` metres proud of the shirt at height `y`, angle `a`. */
+  const on = (y, a, off) => {
+    const t = torsoTOfY(P, S, y);
+    torsoSurface(P, build, S, ID, t, a, p);
+    const c = [0, 0, 0];
+    crEval(torsoPath(P, S), t, c);
+    const dx = p[0] - c[0], dz = p[2] - c[2];
+    const l = Math.hypot(dx, dz) || 1;
+    return [p[0] + (dx / l) * off, p[1], p[2] + (dz / l) * off];
+  };
+  const FRONT = Math.PI * 0.5; // measured: sin(a) = +1 on the chest
+
+  const torsoWeight = chain([
+    [0, 'hips'], [0.28, 'hips'], [0.5, 'spine'], [0.8, 'chest'], [1, 'chest'],
+  ]);
+
+  /* ---- front closure ---- */
+  if (ID.outfit === 'courier') {
+    // A zip, not a button placket: dark tape in MAT.sole against a purple
+    // shell is the highest-contrast line on any of the three.
+    B.tube({
+      material: MAT.sole,
+      path: [
+        on(neckY - 0.020 * S, FRONT, 0.004 * S),
+        on(lerp(chestY, neckY, 0.30), FRONT, 0.005 * S),
+        on(lerp(hipY, chestY, 0.5), FRONT, 0.005 * S),
+        on(hipY - 0.062 * S, FRONT, 0.004 * S),
+      ],
+      rings: 12,
+      radial: 6,
+      uvV: 22,
+      radius: () => mk(0.011 * S, 0.007 * S),
+      weight: torsoWeight,
+    });
+    // Storm flap: a wider, softer ridge behind the zip so the closure is two
+    // steps of relief rather than one welt stuck to a cylinder.
+    B.tube({
+      material: MAT.shirt,
+      path: [
+        on(neckY - 0.030 * S, FRONT, 0.001 * S),
+        on(lerp(hipY, chestY, 0.62), FRONT, 0.002 * S),
+        on(hipY - 0.050 * S, FRONT, 0.001 * S),
+      ],
+      rings: 10,
+      radial: 8,
+      uvV: 9,
+      radius: () => mk(0.030 * S, 0.008 * S),
+      weight: torsoWeight,
+    });
+  } else {
+    // Placket: the button strip down the front, a distinct raised ridge.
+    B.tube({
+      material: MAT.shirt,
+      path: [
+        on(neckY - 0.020 * S, FRONT, 0.004 * S),
+        on(lerp(chestY, neckY, 0.35), FRONT, 0.006 * S),
+        on(lerp(hipY, chestY, 0.5), FRONT, 0.006 * S),
+        on(hipY - 0.060 * S, FRONT, 0.004 * S),
+      ],
+      rings: 10,
+      radial: 8,
+      uvV: 9,
+      radius: () => mk(0.019 * S, 0.010 * S),
+      weight: torsoWeight,
+    });
+    // Buttons. Four discs is four specular highlights down the centre line,
+    // and they are the cheapest thing on the model that says "shirt".
+    for (let i = 0; i < 4; i++) {
+      const y = lerp(hipY + 0.02 * S, neckY - 0.075 * S, i / 3);
+      const a0 = on(y, FRONT, 0.010 * S);
+      const a1 = on(y, FRONT, 0.016 * S);
+      B.tube({
+        material: MAT.sole,
+        path: [a0, a1],
+        rings: 2,
+        radial: 6,
+        uvV: 6,
+        capStart: true,
+        capEnd: true,
+        radius: () => mk(0.007 * S, 0.007 * S),
+        weight: torsoWeight,
+      });
+    }
+  }
+
+  /* ---- chest pockets ---- */
+  const pocket = (side, y0, h, halfW, flap) => {
+    const a = FRONT + side * 0.42;
+    B.tube({
+      material: MAT.shirt,
+      path: [on(y0 - h, a, 0.001 * S), on(y0, a, 0.006 * S), on(y0 + h, a, 0.001 * S)],
+      rings: 6,
+      radial: 10,
+      uvV: 7,
+      uvU: 2,
+      capStart: true,
+      capEnd: true,
+      // Superellipse: a pocket is a rounded rectangle, and a circle in its
+      // place reads as a badge.
+      shape: (ang) => {
+        const c = Math.abs(Math.cos(ang)), s2 = Math.abs(Math.sin(ang));
+        return Math.pow(c ** 5 + s2 ** 5, -1 / 5);
+      },
+      radius: (t) => mk(halfW * (0.86 + 0.14 * Math.sin(t * Math.PI)) * S, 0.010 * S),
+      weight: torsoWeight,
+    });
+    if (!flap) return;
+    B.tube({
+      material: MAT.shirt,
+      path: [on(y0 + h * 0.55, a, 0.006 * S), on(y0 + h * 1.05, a, 0.013 * S)],
+      rings: 4,
+      radial: 10,
+      uvV: 12,
+      uvU: 2,
+      capStart: true,
+      capEnd: true,
+      shape: (ang) => {
+        const c = Math.abs(Math.cos(ang)), s2 = Math.abs(Math.sin(ang));
+        return Math.pow(c ** 5 + s2 ** 5, -1 / 5);
+      },
+      radius: () => mk(halfW * 1.06 * S, 0.006 * S),
+      weight: torsoWeight,
+    });
+  };
+
+  if (ID.outfit === 'river') {
+    pocket(1, lerp(chestY, neckY, 0.02), 0.046 * S, 0.044, true);
+    pocket(-1, lerp(chestY, neckY, 0.02), 0.046 * S, 0.044, true);
+  } else if (ID.outfit === 'shop') {
+    pocket(1, lerp(chestY, neckY, 0.02), 0.042 * S, 0.040, false);
+    // Name patch — an oval of leather over the heart. The one piece of the
+    // outfit that is a different MATERIAL, so it reads at any light level.
+    const a = FRONT - 0.42;
+    const y = lerp(chestY, neckY, 0.06);
+    B.tube({
+      material: MAT.leather,
+      path: [on(y, a, 0.003 * S), on(y, a, 0.008 * S)],
+      rings: 3,
+      radial: 12,
+      uvV: 4,
+      uvU: 2,
+      capStart: true,
+      capEnd: true,
+      axis: [0, 1, 0],
+      radius: () => mk(0.019 * S, 0.036 * S),
+      weight: torsoWeight,
+    });
+  }
+
+  /* ---- yoke seam / hem band ---- */
+  // A welt ring round the chest at the shoulder line. Real work shirts are cut
+  // with a yoke and the seam catches light across the whole back; without it
+  // the torso is one unbroken sweep from hem to collar.
+  if (ID.outfit !== 'courier') {
+    const yY = lerp(chestY, neckY, 0.72);
+    const tY = torsoTOfY(P, S, yY);
+    B.tube({
+      material: MAT.shirt,
+      path: [
+        [0, yY - 0.006 * S, 0],
+        [0, yY + 0.006 * S, 0],
+      ],
+      rings: 3,
+      radial: 22,
+      uvV: 26,
+      uvU: 5,
+      radius: () => mk(
+        (torsoRX(tY, build, ID) + 0.0026) * S,
+        (torsoRZ(tY, build, ID) + 0.0026) * S
+      ),
+      shape: torsoShape,
+      weight: single('chest'),
+    });
+  }
+
+  // Hem band: the shirt stops somewhere, and a doubled hem is what stops it.
+  {
+    const yH = hipY - 0.086 * S;
+    const tH = torsoTOfY(P, S, yH);
+    B.tube({
+      material: MAT.shirt,
+      path: [[0, yH - 0.012 * S, 0.004 * S], [0, yH + 0.010 * S, 0.004 * S]],
+      rings: 3,
+      radial: 22,
+      uvV: 22,
+      uvU: 5,
+      radius: () => mk(
+        (torsoRX(tH, build, ID) + 0.0032) * S,
+        (torsoRZ(tH, build, ID) + 0.0032) * S
+      ),
+      shape: torsoShape,
+      weight: single('hips'),
+    });
+  }
+
+  /* ---- courier strap ---- */
+  if (ID.outfit === 'courier') {
+    // Right shoulder to left hip. A diagonal is the only line on a human
+    // torso that cannot be mistaken for anatomy, which is exactly why it
+    // works as an identity read from behind and at distance.
+    const yTop = lerp(chestY, neckY, 0.78);
+    const yMid = lerp(hipY, chestY, 0.55);
+    const yLow = hipY - 0.010 * S;
+    B.tube({
+      material: MAT.leather,
+      path: [
+        on(yTop, FRONT + 1.05, 0.008 * S),
+        on(lerp(yMid, yTop, 0.55), FRONT + 0.55, 0.010 * S),
+        on(yMid, FRONT - 0.10, 0.010 * S),
+        on(yLow, FRONT - 0.66, 0.008 * S),
+      ],
+      rings: 14,
+      radial: 6,
+      uvV: 14,
+      uvU: 2,
+      capStart: true,
+      capEnd: true,
+      radius: () => mk(0.024 * S, 0.007 * S),
+      weight: chain([[0, 'chest'], [0.45, 'chest'], [0.8, 'spine'], [1, 'hips']]),
+    });
+    // The same strap over the back, so it is a loop and not a stuck-on sash.
+    B.tube({
+      material: MAT.leather,
+      path: [
+        on(yTop, FRONT + 1.05, 0.008 * S),
+        on(lerp(yMid, yTop, 0.5), FRONT + Math.PI * 0.72, 0.010 * S),
+        on(yMid, FRONT + Math.PI * 1.06, 0.010 * S),
+        on(yLow, FRONT - 0.66, 0.008 * S),
+      ],
+      rings: 14,
+      radial: 6,
+      uvV: 14,
+      uvU: 2,
+      capStart: true,
+      capEnd: true,
+      radius: () => mk(0.022 * S, 0.007 * S),
+      weight: chain([[0, 'chest'], [0.45, 'chest'], [0.8, 'spine'], [1, 'hips']]),
+    });
+  }
+}
+
+/**
+ * The sleeve — a set-in garment shell that CAPS over the top of the shoulder
+ * (the acromion / deltoid crown) and then runs as far down the arm as the
+ * brother's outfit says.
+ *
+ * WHY THE TOP IS CLOSED. The upper arm is drawn in skin and its crown sits
+ * proud of the joint. The pre-fix sleeve started INBOARD and LOW
+ * (sh.x - 0.085, sh.y - 0.004), open at both ends, so it never domed over that
+ * crown: a ring of bare skin showed at the acromion, and it widened as the arm
+ * lifted because the torso (chest-weighted) receded from under the shoulder
+ * while the crown did not. Measured exposed superior-shoulder skin before the
+ * fix: carson 15343 mm2 / aidan 10441 / dylan 4079 at rest, ~30k raised. The
+ * cap is weighted 100% to the arm bone, exactly like the skin crown it covers,
+ * so the two are locked together: a cap that clears the crown in the bind pose
+ * clears it under EVERY arm rotation. `shirtprobe.mjs` and `shirtcamprobe.mjs`
+ * are the gates.
+ *
+ * WHY THE CAP IS SMALLER THAN IT WAS. It used to apex 76 mm above the joint at
+ * r = 0.070 — a sphere sitting on a shoulder, which is the "puffed shoulder"
+ * the review named. That size was forced by the skin crown underneath, which
+ * has now come down to +36 mm / r 0.042 (see the deltoid tube), so the cap
+ * comes down with it. Coverage is unchanged because the CLEARANCE is unchanged;
+ * only the pair of radii moved, together.
+ *
+ * NEGATIVE CONTROL: `build.sleeveShrink === true` reverts this to the pre-fix
+ * sleeve — inboard, low, open at the top — which re-opens the acromion gap.
+ * Both shirt gates run it and assert they go RED.
+ */
+function buildSleeve(B, P, build, S, ID, side, s) {
+  const G = build.limb ?? 1;
+  const sh = P['arm' + side], el = P['forearm' + side], wr = P['hand' + side];
+  const r2 = [0, 0];
+  const mk = (rx, rz) => { r2[0] = rx; r2[1] = rz; return r2; };
+
+  /** p in [0,1] runs shoulder -> elbow, [1,2] elbow -> wrist. */
+  const at = (p) => (p <= 1
+    ? [lerp(sh[0], el[0], p), lerp(sh[1], el[1], p), lerp(sh[2], el[2], p)]
+    : [lerp(el[0], wr[0], p - 1), lerp(el[1], wr[1], p - 1), lerp(el[2], wr[2], p - 1)]);
+
+  if (build.sleeveShrink === true) {
+    B.tube({
+      material: MAT.shirt,
+      path: [
+        [sh[0] - s * 0.085 * S, sh[1] - 0.004 * S, sh[2] - 0.004 * S],
+        [sh[0] - s * 0.010 * S, sh[1] - 0.012 * S, sh[2]],
+        at(0.40), at(0.50),
+      ],
+      rings: 14,
+      radial: 16,
+      uvV: 12,
+      uvU: 6,
+      radius: (t) => {
+        const r = prof(t, [
+          [0.00, 0.052], [0.16, 0.064], [0.34, 0.062], [0.70, 0.053], [0.90, 0.050], [1.00, 0.054],
+        ]) * G;
+        return mk(r * S, r * 1.04 * S);
+      },
+      weight: chain([[0, 'arm' + side], [0.1, 'arm' + side], [1, 'arm' + side]]),
+    });
+    return;
+  }
+
+  // The cap, identical for all three outfits. Apex centred over the skin crown
+  // (sh.x - 0.012, sh.y + 0.036) so it domes symmetrically rather than swinging
+  // off the outboard side.
+  const CAP = [
+    [sh[0] - s * 0.012 * S, sh[1] + 0.056 * S, sh[2] + 0.004 * S],
+    [sh[0] - s * 0.004 * S, sh[1] + 0.024 * S, sh[2]],
+    at(0.12),
+  ];
+
+  /**
+   * [path, radius stops, weight stops, armhole seam t, hem t, hem radius].
+   * The radius stops are in the tube's own t, which `crEval` distributes
+   * uniformly over control-point index — so one stop per control point.
+   */
+  const V = {
+    rolledShort: {
+      path: [...CAP, at(0.30), at(0.44), at(0.52)],
+      rings: 22,
+      r: [[0.00, 0.030], [0.10, 0.050], [0.22, 0.058], [0.46, 0.056], [0.74, 0.052], [1.00, 0.050]],
+      w: [[0, 'arm' + side], [1, 'arm' + side]],
+      seam: 0.24,
+      roll: [at(0.48), at(0.60)],
+      rollR: [0.059, 0.053],
+      rollW: [[0, 'arm' + side], [1, 'arm' + side]],
+    },
+    rolledLong: {
+      // Rolled to just below the elbow: the forearms are the part of a river
+      // hand you are meant to notice.
+      path: [...CAP, at(0.34), at(0.62), at(0.90), at(1.10), at(1.34)],
+      // RINGS SCALE WITH PATH LENGTH. Twenty-two rings over a sleeve twice as
+      // long puts three rings across the cap instead of eight, and the straight
+      // chord between two coarse rings cuts INSIDE the deltoid it is meant to
+      // dome over — which is exactly how dylan's cuffed sleeve leaked 26 rays
+      // at rest while the identical cap on aidan leaked none.
+      rings: 30,
+      r: [[0.00, 0.030], [0.09, 0.050], [0.19, 0.058], [0.40, 0.058], [0.58, 0.055],
+        [0.74, 0.051], [0.88, 0.049], [1.00, 0.047]],
+      w: [[0, 'arm' + side], [0.66, 'arm' + side], [0.80, 'forearm' + side], [1, 'forearm' + side]],
+      seam: 0.17,
+      roll: [at(1.28), at(1.52)],
+      rollR: [0.055, 0.048],
+      rollW: [[0, 'forearm' + side], [1, 'forearm' + side]],
+    },
+    cuffed: {
+      path: [...CAP, at(0.38), at(0.70), at(0.96), at(1.34), at(1.72), at(1.96)],
+      rings: 34,
+      r: [[0.00, 0.032], [0.125, 0.056], [0.25, 0.056], [0.38, 0.053], [0.52, 0.050],
+        [0.66, 0.047], [0.80, 0.042], [0.92, 0.035], [1.00, 0.031]],
+      w: [[0, 'arm' + side], [0.55, 'arm' + side], [0.72, 'forearm' + side],
+        [0.95, 'forearm' + side], [1, 'hand' + side]],
+      seam: 0.15,
+      roll: [at(1.92), at(2.06)],
+      rollR: [0.033, 0.030],
+      rollW: [[0, 'forearm' + side], [0.6, 'hand' + side], [1, 'hand' + side]],
+    },
+  }[ID.sleeve] ?? null;
+
+  const v = V ?? {
+    path: [...CAP, at(0.30), at(0.44), at(0.52)],
+    rings: 22,
+    r: [[0.00, 0.030], [0.10, 0.050], [0.22, 0.058], [0.46, 0.056], [0.74, 0.052], [1.00, 0.050]],
+    w: [[0, 'arm' + side], [1, 'arm' + side]],
+    seam: 0.24,
+    roll: [at(0.48), at(0.60)],
+    rollR: [0.059, 0.053],
+    rollW: [[0, 'arm' + side], [1, 'arm' + side]],
+  };
+
+  B.tube({
+    material: MAT.shirt,
+    path: v.path,
+    rings: v.rings,
+    radial: 16,
+    uvV: 12,
+    uvU: 6,
+    // capStart closes the apex over the acromion; the hem stays open.
+    capStart: true,
+    // The armhole welt: 2.2 mm of relief where the sleeve is set into the
+    // body. It is what makes the shoulder read as a SEAM instead of a bulge,
+    // and it costs nothing — it is a term in a radius function.
+    radius: (t) => {
+      const r = (prof(t, v.r) + 0.0022 * bump(t, v.seam, 0.055)) * G;
+      return mk(r * S, r * 1.04 * S);
+    },
+    weight: chain(v.w),
+  });
+
+  // Rolled cuff / knit cuff: a short fatter band over the sleeve's own hem, so
+  // the opening is a doubled edge rather than a cut-off cylinder.
+  B.tube({
+    material: MAT.shirt,
+    path: v.roll,
+    rings: 5,
+    radial: 16,
+    uvV: 20,
+    uvU: 6,
+    capEnd: true,
+    radius: (t) => {
+      const k = prof(t, [[0, v.rollR[0]], [0.55, v.rollR[0] * 1.03], [1, v.rollR[1]]]) * G;
+      return mk(k * S, k * 1.04 * S);
+    },
+    weight: chain(v.rollW),
+  });
+}
+
+/**
+ * The hand. Five digits, because the player holds a weapon in frame for the
+ * whole game and a mitten with a thumb is the first thing a reviewer names.
+ *
+ * The rig has only `hand` and `handEnd`, so the fingers cannot be animated —
+ * they are authored in the RELAXED CURL a hand rests in, roughly 35 degrees of
+ * total flexion, which is also close enough to a grip that a weapon in the same
+ * hand does not read as being held by a plank. The curl is toward -X * side,
+ * the palm side of a hanging arm.
+ *
+ * NEGATIVE CONTROL: `build.mittHands === true` restores the pre-fix hand — one
+ * tapered tube and a thumb, no digits. `handprobe.mjs` asserts the digit count
+ * it recovers from the EMITTED geometry falls from 5 to 1 per hand.
+ */
+function buildHand(B, P, build, S, side, s) {
+  const G = build.limb ?? 1;
+  const wr = P['hand' + side], he = P['handEnd' + side];
+  const r2 = [0, 0];
+  const mk = (rx, rz) => { r2[0] = rx; r2[1] = rz; return r2; };
+  const W = chain([[0, 'hand' + side], [0.25, 'hand' + side], [1, 'handEnd' + side]]);
+
+  if (build.mittHands === true) {
+    B.tube({
+      material: MAT.skin,
+      path: [
+        [wr[0], wr[1], wr[2]],
+        [lerp(wr[0], he[0], 0.35), lerp(wr[1], he[1], 0.35), lerp(wr[2], he[2], 0.35) - 0.004 * S],
+        [lerp(wr[0], he[0], 0.78), lerp(wr[1], he[1], 0.78), lerp(wr[2], he[2], 0.78)],
+        [he[0], he[1], he[2] + 0.004 * S],
+      ],
+      rings: 12,
+      radial: 14,
+      uvV: 8,
+      uvU: 2,
+      capEnd: true,
+      radius: (t) => {
+        const taper = t > 0.80 ? Math.sqrt(Math.max(0, 1 - ((t - 0.80) / 0.20) ** 2)) : 1;
+        const rx = prof(t, [[0, 0.014], [0.3, 0.017], [1, 0.014]]) * G * taper;
+        const rz = prof(t, [[0, 0.031], [0.28, 0.044], [0.7, 0.040], [1, 0.032]]) * G * taper;
+        return mk(rx * S, rz * S);
+      },
+      shape: (a, t) => 1 + 0.06 * Math.max(0, Math.sin(a)) * bump(t, 0.55, 0.4),
+      weight: W,
+    });
+    B.tube({
+      material: MAT.skin,
+      path: [
+        [wr[0] - s * 0.006 * S, wr[1] - 0.018 * S, wr[2] - 0.026 * S],
+        [wr[0] - s * 0.016 * S, wr[1] - 0.05 * S, wr[2] - 0.044 * S],
+        [wr[0] - s * 0.02 * S, wr[1] - 0.078 * S, wr[2] - 0.05 * S],
+      ],
+      rings: 7,
+      radial: 9,
+      uvV: 8,
+      capEnd: true,
+      radius: (t) => {
+        const taper = t > 0.7 ? Math.sqrt(Math.max(0, 1 - ((t - 0.7) / 0.3) ** 2)) : 1;
+        return mk(0.0125 * G * S * taper, 0.0135 * G * S * taper);
+      },
+      weight: single('hand' + side),
+    });
+    return;
+  }
+
+  // Knuckle plane: the palm is 52% of wrist-to-fingertip, which is the human
+  // ratio and also where the fingers have to start for the hand to be as long
+  // as the skeleton says it is.
+  const K = [
+    lerp(wr[0], he[0], 0.52),
+    lerp(wr[1], he[1], 0.52),
+    lerp(wr[2], he[2], 0.52),
+  ];
+
+  // Palm: a flat block, thicker on the knuckle side (+X * s), with the thenar
+  // pad standing off the palm side.
+  B.tube({
+    material: MAT.skin,
+    path: [
+      [wr[0], wr[1], wr[2]],
+      [lerp(wr[0], K[0], 0.45), lerp(wr[1], K[1], 0.45), lerp(wr[2], K[2], 0.45) - 0.003 * S],
+      [K[0], K[1], K[2]],
+    ],
+    rings: 9,
+    radial: 14,
+    uvV: 8,
+    uvU: 2,
+    capEnd: true,
+    radius: (t) => {
+      const rx = prof(t, [[0, 0.0145], [0.35, 0.0180], [1, 0.0172]]) * G;
+      const rz = prof(t, [[0, 0.0300], [0.30, 0.0420], [1, 0.0400]]) * G;
+      return mk(rx * S, rz * S);
+    },
+    // cos(a) is +X in this sweep's frame; the knuckle ridge is on the back of
+    // the hand and the thenar pad on the palm side, so both are s-signed.
+    shape: (a, t) => 1
+      + 0.07 * Math.max(0, Math.cos(a) * s) * bump(t, 0.92, 0.35)
+      + 0.10 * Math.max(0, -Math.cos(a) * s) * bump(t, 0.30, 0.5) * Math.max(0, Math.sin(a)),
+    weight: W,
+  });
+
+  /**
+   * [name, z offset across the palm, length, base radius]. z is world: the arm
+   * hangs with the palm facing the thigh, so the fingers spread front-to-back
+   * and the index is the FORWARD one.
+   */
+  const FINGERS = [
+    ['index', -0.0300, 0.066, 0.0086],
+    ['middle', -0.0100, 0.070, 0.0088],
+    ['ring', 0.0100, 0.064, 0.0082],
+    ['little', 0.0295, 0.052, 0.0072],
+  ];
+
+  for (const [, z, len, rad] of FINGERS) {
+    const L = len * S;
+    const zz = z * S * G;
+    // Fan: the tips spread slightly wider than the knuckles, which is what a
+    // relaxed hand does and what stops four parallel rods reading as a comb.
+    const fan = z * 0.28;
+    const base = [K[0], K[1], K[2] + zz];
+    B.tube({
+      material: MAT.skin,
+      path: [
+        base,
+        [base[0] - s * 0.06 * L, base[1] - 0.40 * L, base[2] + fan * 0.30 * S],
+        [base[0] - s * 0.30 * L, base[1] - 0.71 * L, base[2] + fan * 0.75 * S],
+        [base[0] - s * 0.56 * L, base[1] - 0.86 * L, base[2] + fan * 1.00 * S],
+      ],
+      rings: 9,
+      radial: 7,
+      uvV: 16,
+      uvU: 2,
+      capStart: true,
+      radius: (t) => {
+        const tip = t > 0.86 ? Math.sqrt(Math.max(0, 1 - ((t - 0.86) / 0.14) ** 2)) : 1;
+        // Knuckle swellings at the two interphalangeal joints — a finger that
+        // tapers smoothly is a cone, not a finger.
+        const k = (prof(t, [[0, 1.0], [0.4, 0.90], [0.75, 0.84], [1, 0.80]])
+          + 0.06 * bump(t, 0.38, 0.13) + 0.05 * bump(t, 0.70, 0.13)) * rad * G;
+        return mk(k * tip * S, k * 1.06 * tip * S);
+      },
+      weight: chain([[0, 'hand' + side], [0.18, 'handEnd' + side], [1, 'handEnd' + side]]),
+    });
+  }
+
+  // Thumb: off the base of the palm, forward and across, with the metacarpal
+  // and the phalanx at different angles so it opposes the fingers.
+  B.tube({
+    material: MAT.skin,
+    path: [
+      [wr[0] - s * 0.004 * S, wr[1] - 0.014 * S, wr[2] - 0.020 * S],
+      [wr[0] - s * 0.014 * S, wr[1] - 0.040 * S, wr[2] - 0.044 * S],
+      [wr[0] - s * 0.026 * S, wr[1] - 0.062 * S, wr[2] - 0.052 * S],
+      [wr[0] - s * 0.038 * S, wr[1] - 0.074 * S, wr[2] - 0.048 * S],
+    ],
+    rings: 9,
+    radial: 8,
+    uvV: 14,
+    uvU: 2,
+    capStart: true,
+    radius: (t) => {
+      const tip = t > 0.84 ? Math.sqrt(Math.max(0, 1 - ((t - 0.84) / 0.16) ** 2)) : 1;
+      const k = (prof(t, [[0, 0.0142], [0.34, 0.0122], [0.66, 0.0110], [1, 0.0100]])
+        + 0.0007 * bump(t, 0.55, 0.16)) * G;
+      return mk(k * tip * S, k * 1.05 * tip * S);
+    },
+    weight: single('hand' + side),
+  });
+}
+
+/* ====================================================================== */
 /* Head                                                                   */
 /* ====================================================================== */
 
@@ -984,9 +1715,16 @@ export function buildBody(build) {
 function buildHead(B, P, build, S) {
   const hb = P.head; // head bone, bind space
   const hs = (build.headScale ?? 1) * S;
-  const jaw = build.jaw ?? 1;
-  const brow = build.brow ?? 1;
-  const nose = build.nose ?? 1;
+  const ID = identityOf(build);
+  const F = ID.face;
+  // `noIdentity` removes ALL per-brother facial authoring, not just this
+  // module's table — brothers.js's jaw/brow/nose scalars too. That makes the
+  // control's three faces literally the same shape, so `identityprobe.mjs`
+  // gate 1 has a zero to measure against instead of a residual.
+  const flat = build.noIdentity === true;
+  const jaw = flat ? 1 : (build.jaw ?? 1);
+  const brow = flat ? 1 : (build.brow ?? 1);
+  const nose = flat ? 1 : (build.nose ?? 1);
 
   // Skull centre relative to the head bone.
   const c = [hb[0], hb[1] + 0.096 * hs, hb[2] + 0.004 * hs];
@@ -1002,6 +1740,13 @@ function buildHead(B, P, build, S) {
    * a third-person camera actually sits, what reads is the SILHOUETTE (brow,
    * nose wedge, jaw, chin) and the VALUE (dark sockets, dark hair) — not
    * micro-anatomy. Everything that did not contribute to one of those is gone.
+   *
+   * THE IDENTITY BLOCK BELOW is what makes the three heads three men rather
+   * than one head at three magnifications. Every entry is scaled by a named
+   * `IDENTITY.face` term, and every one of those terms reaches ZERO on at least
+   * one brother — a feature that is merely smaller on Dylan than on Carson
+   * reads as the same face slightly resized, which is the failure this is here
+   * to fix. `identityprobe.mjs` measures the separation on the emitted surface.
    */
   const feats = [
     // cranium: occiput out at the back, temples in, forehead flattened
@@ -1021,9 +1766,26 @@ function buildHead(B, P, build, S) {
     [0.0305, 0.022, -0.056, 0.022, 0.009, 0.022, 0, 0.7, -1, 0.014],
     [-0.0305, 0.022, -0.056, 0.022, 0.009, 0.022, 0, 0.7, -1, 0.014],
 
-    // cheekbone
-    [0.046, -0.012, -0.042, 0.021, 0.018, 0.030, 0.7, 0.2, -1, 0.010],
-    [-0.046, -0.012, -0.042, 0.021, 0.018, 0.030, -0.7, 0.2, -1, 0.010],
+    // CHEEKBONE — and the reason it is this soft. It used to push 10 mm
+    // forward through a 18 mm-tall gaussian sitting 40 mm above an equally
+    // hard mandible push; the VALLEY between the two ran right round the lower
+    // face and met under the nose, and every brother had a permanent grin
+    // carved into him. Rendered from the front it was the single most
+    // disfiguring thing on the model. Taller, softer, less forward.
+    [0.046, -0.014, -0.040, 0.022, 0.027, 0.032, 0.75, 0.15, -0.8, 0.0075],
+    [-0.046, -0.014, -0.040, 0.022, 0.027, 0.032, -0.75, 0.15, -0.8, 0.0075],
+
+    // MAXILLA. A broad, shallow forward mass filling the band between the
+    // cheek and the mouth. MEASURED: a laplacian map of the emitted depth
+    // showed a concave line running the FULL WIDTH of the face at y = -0.046,
+    // because every forward push in this list sat either above it (brow,
+    // cheekbone, nose) or below it (lips, mandible) and nothing filled the
+    // gap. From the front that valley reads as a fixed grin, and it was on all
+    // three brothers and survived removing every identity gaussian — which is
+    // how it was finally traced, after two wrong guesses at the atlas.
+    [0, -0.044, -0.052, 0.042, 0.022, 0.030, 0, 0, -1, 0.009],
+    [0.030, -0.040, -0.046, 0.026, 0.022, 0.026, 0.25, 0, -1, 0.006],
+    [-0.030, -0.040, -0.046, 0.026, 0.022, 0.026, -0.25, 0, -1, 0.006],
 
     // NOSE: a narrow wedge from between the brows to a projecting tip
     [0, 0.018, -0.070, 0.008, 0.017, 0.020, 0, 0, -1, 0.011 * nose],
@@ -1033,20 +1795,72 @@ function buildHead(B, P, build, S) {
     [0.014, -0.032, -0.064, 0.008, 0.009, 0.017, 0.85, -0.2, -0.9, 0.011 * nose],
     [-0.014, -0.032, -0.064, 0.008, 0.009, 0.017, -0.85, -0.2, -0.9, 0.011 * nose],
 
-    // mouth: two lips and the seam between them
-    [0, -0.055, -0.063, 0.018, 0.007, 0.019, 0, 0.3, -1, 0.012],
-    [0, -0.067, -0.061, 0.017, 0.008, 0.019, 0, -0.3, -1, 0.012],
-    [0, -0.061, -0.065, 0.021, 0.0035, 0.017, 0, 0, 1, 0.010],
+    // Mouth: two lips and the seam between them. The pair used to stand 16 mm
+    // proud between them, which with the muzzle-shaped valley round it read as
+    // a snout; the LINE between the lips does the work now and it is painted
+    // in the atlas as well as cut here.
+    [0, -0.055, -0.063, 0.018 * F.mouthW, 0.008, 0.019, 0, 0.3, -1, 0.0055 + 0.0045 * F.lip],
+    [0, -0.067, -0.061, 0.017 * F.mouthW, 0.009, 0.019, 0, -0.3, -1, 0.0045 + 0.0055 * F.lip],
+    [0, -0.061, -0.065, 0.021 * F.mouthW, 0.0035, 0.017, 0, 0, 1, 0.008],
 
     // chin pad, with the crease above it. Pushed FORWARD only — an earlier
     // downward component turned the chin into a beak.
-    [0, -0.074, -0.056, 0.014, 0.006, 0.015, 0, 0, 1, 0.007],
-    [0, -0.084, -0.048, 0.022, 0.016, 0.024, 0, 0, -1, 0.014 * jaw],
+    [0, -0.074, -0.056, 0.016, 0.008, 0.015, 0, 0, 1, 0.005],
+    [0, -0.084, -0.048, 0.024, 0.020, 0.024, 0, 0, -1, 0.016 * jaw],
+    // Mental protuberance: the flat front plane of the mandible, carrying the
+    // chin and the jaw forward together instead of leaving the chin as a knob
+    // on the end of a slope.
+    [0, -0.068, -0.050, 0.034, 0.024, 0.026, 0, 0, -1, 0.011],
 
-    // mandible line, then the tuck under it into the neck
-    [0.048, -0.052, -0.008, 0.026, 0.022, 0.032, 1, -0.2, 0, 0.011 * jaw],
-    [-0.048, -0.052, -0.008, 0.026, 0.022, 0.032, -1, -0.2, 0, 0.011 * jaw],
+    // Mandible line, then the tuck under it into the neck. Softened in y for
+    // the same reason as the cheekbone: this is the lower lip of that valley.
+    [0.048, -0.054, -0.008, 0.026, 0.030, 0.032, 1, -0.2, 0, 0.0085 * jaw],
+    [-0.048, -0.054, -0.008, 0.026, 0.030, 0.032, -1, -0.2, 0, 0.0085 * jaw],
     [0, -0.086, 0.024, 0.046, 0.024, 0.040, 0, 1, 0, 0.011],
+
+    /* ---------------------------------------------------- identity ----
+     * AMPLITUDES ARE SMALL AND THAT IS THE LESSON. The first pass of this
+     * block ran at roughly twice these numbers and stacked `jawSquare` and
+     * `chinW` straight on top of the mandible and chin-pad gaussians that were
+     * already there. Rendered, all three brothers came out as lumpy
+     * caricatures with a square shelf where the jaw angle should be — the
+     * exact failure the note above this list records from the 34-gaussian
+     * version. What separates three faces is WHICH features exist, not how far
+     * each one is pushed: `bridge` at 9.5 mm on carson and 0 on dylan reads as
+     * two different noses; the same pair at 19 mm reads as two deformities.
+     * `identityprobe.mjs` gate 1 says the separation survived the climb-down. */
+    // Dorsal hump. Carson's nose was broken once; Dylan's line is dead
+    // straight, so `bridge` is 0 on him and the gaussian vanishes entirely.
+    [0, 0.000, -0.0755, 0.007, 0.013, 0.015, 0, 0.15, -1, 0.0095 * F.bridge],
+    // Nostril wings: the difference between a wide working nose and a narrow
+    // one is 3 mm of ala, and it is the most legible 3 mm on the whole head.
+    [0.0165, -0.0325, -0.0605, 0.0075, 0.0085, 0.015, 1, -0.15, -0.35, 0.0075 * F.alae],
+    [-0.0165, -0.0325, -0.0605, 0.0075, 0.0085, 0.015, -1, -0.15, -0.35, 0.0075 * F.alae],
+    // Tip: droops on the eldest, lifts on the youngest. Signed, so one term
+    // authors both directions.
+    [0, -0.031, -0.0775, 0.009, 0.008, 0.014, 0, -1, -0.25, 0.0095 * F.tipDrop],
+    // Deep-set eyes: pull the whole socket floor back under the brow.
+    [0.0305, 0.006, -0.062, 0.020, 0.016, 0.020, 0, 0, 1, 0.0075 * F.deepEye],
+    [-0.0305, 0.006, -0.062, 0.020, 0.016, 0.020, 0, 0, 1, 0.0075 * F.deepEye],
+    // Hollow cheek under the zygomatic — weather and years, not weight.
+    [0.043, -0.034, -0.050, 0.019, 0.020, 0.024, -0.75, 0, 1, 0.0085 * F.cheekHollow],
+    [-0.043, -0.034, -0.050, 0.019, 0.020, 0.024, 0.75, 0, 1, 0.0085 * F.cheekHollow],
+    // Nasolabial fold: a crease from the ala down past the mouth corner.
+    [0.021, -0.049, -0.062, 0.007, 0.014, 0.013, -0.5, 0, 1, 0.0055 * F.fold],
+    [-0.021, -0.049, -0.062, 0.007, 0.014, 0.013, 0.5, 0, 1, 0.0055 * F.fold],
+    // Temporal hollow above the cheekbone — the first thing a face loses.
+    [0.052, 0.036, -0.032, 0.017, 0.021, 0.021, -1, 0, 0, 0.0055 * F.temple],
+    [-0.052, 0.036, -0.032, 0.017, 0.021, 0.021, 1, 0, 0, 0.0055 * F.temple],
+    // Brow furrow: one horizontal crease above the ridge.
+    [0, 0.048, -0.062, 0.028, 0.005, 0.016, 0, 0, 1, 0.004 * F.furrow],
+    // Chin cleft.
+    [0, -0.082, -0.053, 0.0045, 0.009, 0.012, 0, 0, 1, 0.006 * F.cleft],
+    // Gonial flare — the corner of the jaw, square or tapered.
+    [0.044, -0.070, 0.020, 0.017, 0.014, 0.020, 0.8, -0.6, 0.1, 0.0065 * F.jawSquare],
+    [-0.044, -0.070, 0.020, 0.017, 0.014, 0.020, -0.8, -0.6, 0.1, 0.0065 * F.jawSquare],
+    // Chin width: a slab of a chin on the eldest, a point on the youngest.
+    [0.016, -0.081, -0.048, 0.010, 0.012, 0.015, 0.85, 0, -0.4, 0.0050 * F.chinW],
+    [-0.016, -0.081, -0.048, 0.010, 0.012, 0.015, -0.85, 0, -0.4, 0.0050 * F.chinW],
   ];
 
   const headW = single('head');
@@ -1057,19 +1871,34 @@ function buildHead(B, P, build, S) {
    * at the cheekbones, tapering hard into the chin, and shallower at the crown.
    */
   const WIDTH = [
-    [-1.00, 0.26], [-0.82, 0.46], [-0.60, 0.68], [-0.34, 0.87],
+    [-1.00, 0.28], [-0.82, 0.50], [-0.60, 0.74], [-0.34, 0.90],
     [-0.10, 0.98], [0.14, 1.00], [0.42, 0.97], [0.72, 0.86], [1.00, 0.52],
   ];
+  /**
+   * THE LOWER HALF OF THIS CURVE IS WHY THE FACE USED TO GRIN. Profiled on the
+   * emitted surface, aidan's face fell from z = -0.073 at the cheekbone to
+   * -0.020 at the jaw — 53 mm of recession over 54 mm of height, a 45-degree
+   * undercut — and the mouth then stood proud out of the middle of it. The
+   * boundary between the receding plane and the mouth mound is a hard curved
+   * crease sweeping from the nostrils out to the cheeks, and from the front
+   * that reads, unmistakably, as a fixed smile. It was on all three brothers
+   * and it survived every change to the identity block, which is how it was
+   * found: removing every identity gaussian left it exactly where it was.
+   *
+   * A real head is nearly as deep at the chin as at the brow. These numbers
+   * carry the mandible forward so the lower face is a plane the mouth sits IN
+   * rather than a slope the mouth sits ON.
+   */
   const DEPTH = [
-    [-1.00, 0.44], [-0.82, 0.62], [-0.60, 0.78], [-0.34, 0.90],
-    [-0.10, 0.98], [0.14, 1.00], [0.42, 0.98], [0.72, 0.90], [1.00, 0.58],
+    [-1.00, 0.48], [-0.82, 0.67], [-0.60, 0.82], [-0.34, 0.925],
+    [-0.10, 0.985], [0.14, 1.00], [0.42, 0.98], [0.72, 0.90], [1.00, 0.58],
   ];
 
   const applyFeatures = (dx, dy, dz, p) => {
     // Vertical profile. `jaw` pulls the lower half in or out per brother.
     const yn = Math.max(-1, Math.min(1, (p[1] - c[1]) / r[1]));
-    let w = prof(yn, WIDTH);
-    let d = prof(yn, DEPTH);
+    let w = profSmooth(yn, WIDTH);
+    let d = profSmooth(yn, DEPTH);
     if (yn < 0) {
       const t = -yn;
       w *= 1 + (jaw - 1) * t * 0.9;
@@ -1142,14 +1971,31 @@ function buildHead(B, P, build, S) {
     p[2] = c[2] + ez * need;
   };
 
+  /**
+   * THE HEAD IS THE ONE SURFACE IN THE GAME WITH A UNIQUE UV. Everything else
+   * tiles a detail map; a face cannot, because a mouth is not a repeating
+   * pattern. uvU = uvV = 1 makes the ellipsoid's own (phi, theta) the atlas
+   * `makeFaceAtlas()` paints into: u = 0.5 is dead ahead and v runs crown (0) to
+   * chin (~0.79), so lips, sockets, beard and creases land where the geometry
+   * put them. That is what the review meant by "a flat untextured face" — not
+   * that there was no texture, but that the texture could not know where
+   * anything was. Gate 6 of `headprobe.mjs` measures the agreement between the
+   * emitted uv and the painted landmark, and fails the atlas if it drifts.
+   */
   B.ellipsoid({
     material: MAT.face,
     center: c,
     radius: r,
-    lat: 42,
-    lon: 52,
-    uvU: 2.6,
-    uvV: 2.6,
+    // 54 x 56, up from 42 x 52. The skull's rows are ~8 mm apart at 42 and the
+    // lower face's curvature changes faster than that: carson's `jaw` of 1.1
+    // multiplies the width profile in the bottom half and the tessellation
+    // reads as horizontal ripples across his chin in a 640 px headshot. +1680
+    // triangles on the one mesh in the game that is on screen every frame and
+    // photographed at 0.75 m.
+    lat: 54,
+    lon: 56,
+    uvU: 1,
+    uvV: 1,
     weight: headW,
     deform: applyFeatures,
   });
@@ -1167,7 +2013,14 @@ function buildHead(B, P, build, S) {
       ],
       rings: 10,
       radial: 8,
-      uvV: 14,
+      // The ears are TUBES on a head whose material now carries a non-tiling
+      // atlas, so they need parking: u 0.03..0.09 / v 0.10..0.32 is the plain
+      // skin the atlas keeps behind the hairline. Without the offset a helix
+      // samples across the painted eye.
+      uvU: 0.13,
+      uvV: 0.34,
+      uvOffU: 0.02,
+      uvOffV: 0.06,
       capStart: true,
       capEnd: true,
       radius: (t) => {
@@ -1185,7 +2038,10 @@ function buildHead(B, P, build, S) {
       ],
       rings: 5,
       radial: 8,
-      uvV: 14,
+      uvU: 0.11,
+      uvV: 0.26,
+      uvOffU: 0.03,
+      uvOffV: 0.10,
       capStart: true,
       capEnd: true,
       radius: (t) => {
@@ -1203,8 +2059,15 @@ function buildHead(B, P, build, S) {
   for (const s of [1, -1]) {
     B.ellipsoid({
       material: MAT.eye,
-      center: [c[0] + s * EYE_X, c[1] + EYE_Y, c[2] - 0.0672 * hs],
-      radius: [0.0122 * hs, 0.0122 * hs, 0.0122 * hs],
+      // 11.6 mm radius sunk to -0.0650, from 12.2 mm at -0.0672. The eyeball
+      // is the right size either way; what changed is how much of it the lids
+      // leave showing, and the old pair read as googly at every bearing.
+      // `headprobe.mjs` gate 2 is the floor and it is CLOSE: at -0.0638 the
+      // gate went red on dylan and only dylan, because `deepEye` is 0.05 on
+      // him and his socket floor therefore sits furthest forward of the three.
+      // The shallowest socket sets this number.
+      center: [c[0] + s * EYE_X, c[1] + EYE_Y, c[2] - 0.0650 * hs],
+      radius: [0.0116 * hs, 0.0116 * hs, 0.0116 * hs],
       lat: 12,
       lon: 16,
       uvU: 1,

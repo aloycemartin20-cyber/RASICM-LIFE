@@ -21,25 +21,42 @@ runtime.
 
 ## What it took to build
 
-| | |
-|---|---|
-| Wall-clock span | **51.3 hours** |
-| Agents run | **996** — 812 in orchestrated workflows, 184 standalone |
-| Workflows | **15** |
-| Tokens, excluding cache reads | **264.2 M** |
-| Tokens, including cache reads | **9.94 B** |
-| Output tokens | **28.8 M** |
-| Tool calls | **35,772** |
-| Model round-trips | **57,804** |
+Two campaigns, two models, one method. The **original build** ("GTA Five-level
+game in ThreeJS", Claude Opus 4.8) raised the city from an empty repo; the
+**quality & content campaign** (Claude Fable 5) took it from "systems that run"
+to "a game you can play through" — every mission completable, a regression pass
+driven by real play reports, then characters, grounding, foliage, road paint and
+vehicle materials. All figures are deduplicated per real API call, read from the
+sessions' own transcripts ([`METRICS.md`](METRICS.md) has the full accounting
+and the corrections to the earlier published numbers).
 
-Which produced **180,426 lines** of runtime source across 19 subsystems, plus
-**10,801 lines** of automated gates — roughly one line of test harness for every
-eleven lines of game.
+| | original build | quality & content campaign |
+|---|---|---|
+| When | Jul 26 – Aug 6, 2026 | Aug 10 – 12, 2026¹ |
+| Wall-clock span | **243.2 h** | **25.2 h** |
+| Agents run | **1,007** | **63** |
+| Workflows | **32** | **12** |
+| Model round-trips | **38,289** | **8,533** |
+| Output tokens | **29.1 M** | **5.6 M** |
+| Tokens, excluding cache reads | **166.3 M** | **47.3 M** |
+| Tokens, including cache reads | **7.44 B** | **1.96 B** |
+| Tool calls | **43,758** | **9,631** |
 
-**61% of all tool calls were `Bash`**, at about five per `Edit`. That ratio is the
-whole method: almost every one of them was a measurement — booting the game
-headless, driving real key presses, casting rays at the emitted geometry, diffing
-before against after. Full breakdown in [`METRICS.md`](METRICS.md).
+¹ snapshot mid-campaign, 2026-08-12T00:31Z.
+
+Which has produced **209,609 lines** of runtime source across 19 subsystems,
+plus **79,764 lines** of automated gates — the original shipped one line of
+test harness for every eleven lines of game; the campaigns drove that to one
+for every 2.4, because every fix landed with a probe that can fail and a
+negative control that proves the probe can catch it.
+
+In both campaigns roughly **60% of all tool calls were `Bash`**, at four-plus
+per `Edit`. That ratio is the whole method: almost every one of them was a
+measurement — booting the game headless, driving real key presses, casting rays
+at the emitted geometry, diffing before against after. The orchestrator itself
+wrote under 5% of the output tokens; delegated agents did the work, and the
+main loop's job was deciding what to delegate and refusing results that did
+not hold up.
 
 ## The game
 

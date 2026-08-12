@@ -103,8 +103,8 @@
  * soak"). It is a `soak` member.
  */
 import { chromium } from 'playwright';
-import { spawn } from 'node:child_process';
-import { existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import { spawn, execSync } from 'node:child_process';
+import { existsSync, writeFileSync, mkdirSync, statSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import net from 'node:net';
 
@@ -179,8 +179,24 @@ async function freePort() {
 }
 
 async function startPreview(dir) {
-  if (!existsSync(resolve(dir, 'dist/index.html'))) {
-    throw new Error(`${dir} has no dist/ — run \`npm run build\` in it first`);
+  // A STALE dist/ MEASURES A BUILD THAT IS NOT THIS TREE. This harness once
+  // graded a 13.5-hour-old bundle red while the working tree was green, and a
+  // whole wave of agents chased the ghost. Rebuild whenever any source file is
+  // newer than the bundle; the ~4 s build is nothing against a wrong verdict.
+  const distHtml = resolve(dir, 'dist/index.html');
+  const stale = !existsSync(distHtml) || (() => {
+    const built = statSync(distHtml).mtimeMs;
+    const newer = execSync(
+      `find src index.html vite.config.js -newer dist/index.html -print -quit`,
+      { cwd: dir, encoding: 'utf8' }
+    ).trim();
+    return newer.length > 0 || built === 0;
+  })();
+  if (stale) {
+    execSync('npx vite build', { cwd: dir, stdio: 'ignore' });
+  }
+  if (!existsSync(distHtml)) {
+    throw new Error(`${dir} has no dist/ and the rebuild failed — run \`npm run build\` in it`);
   }
   const port = await freePort();
   const bin = resolve(dir, 'node_modules/.bin/vite');

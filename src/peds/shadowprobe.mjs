@@ -10,8 +10,9 @@
  * material constant, an opacity or a blend factor — hard rule 12. It:
  *
  *   1. freezes one frame (the harness's own lockstep + `time.scale = 0`),
- *   2. photographs it three times, changing ONLY the blend mode between shots
- *      via `peds.ground.setMode`: `off`, `lerp` (the historical defect) and
+ *   2. photographs it four times, changing ONLY the blend mode between shots
+ *      via `peds.ground.setMode`: `off`, `off` AGAIN (the measured noise floor
+ *      every threshold below is set from), `lerp` (the historical defect) and
  *      `multiply` (the fix),
  *   3. derives the shadow's FOOTPRINT from the difference between arms rather
  *      than from where the code says it put the quads, and
@@ -24,13 +25,16 @@
  * ARCHITECTURE.md rule 12. Instead the mask is "every pixel that moved when the
  * pool was switched on", which is a fact about the framebuffer.
  *
- * WHAT INPUT WOULD MAKE THIS FAIL: any blend that raises a pixel it touches.
- * `--mode=lerp` is the negative control and it goes red, loudly.
+ * WHAT INPUT WOULD MAKE THIS FAIL: any blend that raises a pixel it touches by
+ * more than two identical captures of one arm differ by. The `lerp` arm is that
+ * input, taken on every run rather than behind a flag, and it goes red loudly —
+ * 17-77% of the footprint raised against a floor of +8 to +13.
  *
  * Usage:
- *   node src/peds/shadowprobe.mjs                       # driving, both TODs
+ *   node src/peds/shadowprobe.mjs                    # street + crowd, both TODs
  *   node src/peds/shadowprobe.mjs --shot=crowd --time=12
- *   node src/peds/shadowprobe.mjs --shot=driving --time=21.35 --keep=/tmp/arms
+ *   node src/peds/shadowprobe.mjs --nostage          # staging ablation, see STAGE
+ *   node src/peds/shadowprobe.mjs --time=21.35 --keep=/tmp/arms
  */
 import { chromium } from 'playwright';
 import { spawn } from 'node:child_process';
@@ -65,18 +69,59 @@ const CONDITIONS = [
 ];
 
 /**
- * The default pair. `driving` is the frame the defect was measured on;
- * `character` is a second, independent scene whose road either side
- * of the subject is homogeneous, so the "is the mark brighter than the road
- * beside it" comparison there is clean rather than straddling a kerb.
+ * ────────────────────────────────────────────────────────────────────────────
+ * THIS PROBE STAGES ITS OWN SCENE. IT DOES NOT BORROW A CAMERA.
+ * ────────────────────────────────────────────────────────────────────────────
+ * It used to run on `driving` and `character` and reported 4/4 UNMEASURED —
+ * "NO CONDITION PRODUCED A MEASURABLE FOOTPRINT" — for its whole life. That was
+ * never a fact about the shadow pool. It was a fact about the FRAMING:
  *
- * NOT `crowd` and NOT `combat`, both of which look like obvious choices and
- * are useless: `crowd` frames exactly one pedestrian and his feet are below
- * the bottom of the frame, and `combat`'s nearest subjects are 17 m away
- * behind a foreground prop. Both report UNMEASURED, which is correct and is
- * why that state exists.
+ *   - `driving` is shot over a car bonnet, and the pedestrians it can see are
+ *     on the pavement past it, at 30 m and edge-on;
+ *   - `character` composes an over-the-shoulder on a brother AT THE SHUTTER
+ *     (`actorFrame` in `src/dev/shots.js`), so what fills the frame is a torso;
+ *   - both cameras sit at eye height and look level, which is the worst
+ *     possible attitude for a GROUND decal — a 0.6 m blob seen from 2.2 m up at
+ *     30 m projects to about one pixel of height.
+ *
+ * Neither camera is owned by this file, both were changed by other agents mid
+ * wave, and a gate whose subject can walk out of frame is not a gate. So the
+ * scene is composed here: `peds.debugStage('crowd')` puts ~34 pedestrians in a
+ * 4.5-30 m band in front of whatever camera the shot set, WITH bodies and with
+ * their poses settled. The nearest of those is 4.5-8 m away, which is where a
+ * contact mark is tens of thousands of pixels rather than tens.
+ *
+ * Two things were wrong and both are fixed here, so neither should be given the
+ * other's credit: the FRAMING (this staging) and the CANDIDATE PICK (see the
+ * note by `MIN_PX`, which took the first crop over the floor rather than the
+ * best one). Ablated one at a time on this build: staged 4/4 conditions
+ * measured at 1265-9766 px of footprint, unstaged 3/4.
+ *
+ * The base scene still matters for the RECEIVER — the probe reports the mark
+ * against the open road either side of it, so the ground has to be ordinary
+ * road and pavement rather than a plaza or a wharf. `street` and `crowd` are
+ * both ordinary, and they are two different districts on two different road
+ * kinds, so agreement between them is worth something.
  */
-const SHOTS = args.shot ? [String(args.shot)] : ['driving', 'character'];
+const SHOTS = args.shot ? [String(args.shot)] : ['street', 'crowd'];
+
+/**
+ * `--nostage` is the ABLATION for the staging, not the gate's negative control.
+ *
+ * Said plainly because it is easy to overclaim here: the gate's negative
+ * control is and remains the `lerp` ARM, which restores the historical blend on
+ * the same frozen frame and goes red at 17-77% of the footprint raised against a
+ * measured noise floor. That is what proves this file can fail.
+ *
+ * `--nostage` keeps the same two base shots and skips only `debugStage`, which
+ * is what isolates the staging's contribution. MEASURED: staged 4/4 conditions,
+ * footprints 1265-9766 px; unstaged 3/4, with `street @ midday` falling under
+ * the 200 px floor and reporting UNMEASURED. So the staging is worth roughly the
+ * difference between a gate that measures and one that sometimes does not — the
+ * honest claim, and less than the 4/4-to-0/4 swing the old default suggested,
+ * because the candidate fix below is doing part of the work.
+ */
+const STAGE = !args.nostage;
 const TIMES = args.time !== undefined
   ? [{ id: String(args.time), time: Number(args.time), weather: String(args.weather ?? 'overcast') }]
   : CONDITIONS;
@@ -187,6 +232,32 @@ async function run(shot, cond) {
     sky?.setWeather?.(w, { immediate: true });
   }, { t: cond.time, w: cond.weather });
 
+  /*
+   * COMPOSE THE SUBJECT. See the note on `SHOTS`.
+   *
+   * After `__APPLY_SHOT__` (which sets the camera) and before the settle, so
+   * the streaming wait, the TAA convergence and the exposure adaptation below
+   * all run on the scene that is actually photographed. `debugStage` gives
+   * every staged pedestrian a body and runs 30 steps of its own pose settle, so
+   * the shutter cannot catch the crowd mid-blend.
+   */
+  let stagedInfo = null;
+  if (STAGE) {
+    stagedInfo = await page.evaluate(() => {
+      const peds = window.__ENGINE__.ctx.peek('peds');
+      if (!peds?.debugStage) return { error: 'no peds.debugStage' };
+      peds.debugStage('crowd');
+      let active = 0;
+      let withBody = 0;
+      for (const p of peds.peds) {
+        if (!p.active) continue;
+        active++;
+        if (p.body) withBody++;
+      }
+      return { active, withBody };
+    });
+  }
+
   for (let f = 0; f < 1200; f++) {
     if (await page.evaluate(() => window.__SETTLED__?.() === true)) break;
     await pump(20);
@@ -288,13 +359,27 @@ async function run(shot, cond) {
   }, { w: W, h: H });
 
   if (!roi || roi.error) {
-    results.push({ shot, cond: cond.id, error: roi?.error ?? 'no peds subsystem' });
+    results.push({ shot, cond: cond.id, staged: stagedInfo, error: roi?.error ?? 'no peds subsystem' });
     return;
   }
 
-  /* ---- three arms of the same frozen frame ---- */
+  /*
+   * FOUR arms, and the second one is the NOISE FLOOR.
+   *
+   * `repeat` is `off` again — same mode, same TAA reset, same convergence, same
+   * shutter. Two captures that differ only by having been taken twice bound
+   * what this harness can resolve, and every threshold below is set from that
+   * rather than from a number somebody liked. Without it the probe was calling
+   * a handful of pixels "raised" at +2.8/255 on the `street` midday crop, which
+   * is a claim about the blend that the measurement could not actually support:
+   * each arm re-converges TAA from a reset, and a high-contrast edge does not
+   * land on the same subpixel twice.
+   *
+   * This is `src/render/aoprobe.mjs` group 0's discipline applied here — the
+   * floor is measured, not assumed.
+   */
   const arms = {};
-  for (const mode of ['off', 'lerp', 'multiply']) {
+  for (const [name, mode] of [['off', 'off'], ['repeat', 'off'], ['lerp', 'lerp'], ['multiply', 'multiply']]) {
     await page.evaluate((m) => {
       const g = window.__ENGINE__.ctx.peek('peds').ground;
       g.setMode(m);
@@ -303,10 +388,10 @@ async function run(shot, cond) {
     }, mode);
     await pump(CONVERGE);
     const buf = await page.screenshot({ type: 'png' });
-    arms[mode] = PNG.sync.read(buf);
+    arms[name] = PNG.sync.read(buf);
     if (KEEP) {
       mkdirSync(KEEP, { recursive: true });
-      writeFileSync(join(KEEP, `${shot}-${cond.id}-${mode}.png`), buf);
+      writeFileSync(join(KEEP, `${shot}-${cond.id}-${name}.png`), buf);
     }
   }
   // leave the page in the shipped mode
@@ -322,9 +407,18 @@ async function run(shot, cond) {
    */
   const MIN_PX = 200;
   let out = null;
+  /*
+   * EVERY candidate, and keep the LARGEST footprint — not the first one over
+   * the floor. The candidates are sorted nearest-first, and "nearest" is not
+   * "biggest": a ped 4.6 m away can be half behind a parked car while the one
+   * at 12.9 m stands in the open. Taking the first acceptable crop measured a
+   * 408 px mark on `street` when an 8652 px one was in the same three frames,
+   * and a footprint twenty times larger is twenty times the evidence for the
+   * same three screenshots — the arms are whole-frame, so this costs nothing
+   * but the arithmetic.
+   */
   for (const cand of roi.candidates) {
     const m = measure(shot, cond, cand, roi.instances, arms, frozen);
-    if (m.footprintPx >= MIN_PX) { out = m; break; }
     if (!out || m.footprintPx > out.footprintPx) out = m;
   }
   if (out.footprintPx < MIN_PX) {
@@ -332,6 +426,7 @@ async function run(shot, cond) {
       'the pool is on screen but occluded, or too small at this range';
   }
   out.tried = roi.candidates.length;
+  out.staged = stagedInfo;
   results.push(out);
 }
 
@@ -340,7 +435,7 @@ async function run(shot, cond) {
 /* ------------------------------------------------------------------ */
 
 function measure(shot, cond, roi, instances, arms, frozen) {
-  const off = arms.off, lerp = arms.lerp, mul = arms.multiply;
+  const off = arms.off, lerp = arms.lerp, mul = arms.multiply, rep = arms.repeat;
   const rw = roi.x1 - roi.x0, rh = roi.y1 - roi.y0;
   const idx = (x, y) => (y * off.width + x) * 4;
 
@@ -396,7 +491,44 @@ function measure(shot, cond, roi, instances, arms, frozen) {
     shot, cond: cond.id, hour: frozen.hour, roi, instances,
     footprintPx: blob.length, arms: {},
   };
-  for (const [name, png] of [['off', off], ['lerp', lerp], ['multiply', mul]]) {
+  /**
+   * Exposure drift for one arm, measured on the reference strips either side of
+   * the mark — pixels the pool cannot reach. See the note by its use below.
+   */
+  const driftOf = (png) => {
+    let s = 0;
+    let n = 0;
+    for (const src of [left, right]) {
+      for (const i of src) {
+        s += lum(png.data[i], png.data[i + 1], png.data[i + 2]) -
+             lum(off.data[i], off.data[i + 1], off.data[i + 2]);
+        n++;
+      }
+    }
+    return n ? s / n : 0;
+  };
+
+  /*
+   * The bar a raise has to clear: whatever two identical captures of the SAME
+   * arm differ by over this very footprint, floored at the 1/255 the report has
+   * always used. Computed before the arms are walked so every arm is judged
+   * against the same, measured number — and through the SAME drift correction
+   * the arms get, or the floor would be measured in different units from the
+   * thing it is bounding and the repeat arm would score raised pixels against
+   * its own maximum.
+   */
+  let floorT = 1;
+  if (rep) {
+    const rd = driftOf(rep);
+    for (const i of blob) {
+      const d = lum(rep.data[i], rep.data[i + 1], rep.data[i + 2]) -
+                lum(off.data[i], off.data[i + 1], off.data[i + 2]) - rd;
+      if (d > floorT) floorT = d;
+    }
+  }
+  out.noiseFloor = +floorT.toFixed(2);
+  for (const [name, png] of [['off', off], ['repeat', rep], ['lerp', lerp], ['multiply', mul]]) {
+    if (!png) continue;
     const b = stats(png, blob), l = stats(png, left), r = stats(png, right);
     if (!b || !l || !r) { out.arms[name] = { error: 'empty footprint' }; continue; }
     // The framing that matters: the mark against the open road either side of it,
@@ -415,11 +547,36 @@ function measure(shot, cond, roi, instances, arms, frozen) {
      * 1/255 of slack, because TAA resolves a frozen frame to within well under
      * that (repeat captures of one shot land at RMSE ~3e-05).
      */
+    /**
+     * ...MEASURED AGAINST THE FRAME'S OWN EXPOSURE, or it is not a measurement
+     * of the blend.
+     *
+     * The three arms are one frozen frame differing only in the blend, but the
+     * renderer's AUTO-EXPOSURE meters the frame it is given: darkening a few
+     * thousand pixels lowers the metered key, the adaptation opens up, and
+     * every OTHER pixel in the frame comes back brighter. That drift lands
+     * inside the footprint too, and it is not the shadow.
+     *
+     * MEASURED on `street` at midday — the reference road either side of the
+     * mark, which the pool never touches, still moved +0.128 linear between the
+     * `off` and `multiply` arms, and the raw count called 1.2% of the footprint
+     * "raised" on a max of +2/255 with it.
+     *
+     * So the drift is measured where the pool cannot reach — the same left and
+     * right strips the report already prints — and subtracted. What is left is
+     * the only thing this gate is entitled to assert: did the BLEND raise this
+     * pixel, over and above what the whole frame did. The negative control is
+     * unaffected and stays loud (lerp raises the footprint by +5 to +11 against
+     * drifts of a tenth), which is the check that this is a correction and not
+     * an excuse.
+     */
+    const drift = driftOf(png);
+
     let raised = 0, worst = 0;
     for (const i of blob) {
       const d = lum(png.data[i], png.data[i + 1], png.data[i + 2]) -
-                lum(off.data[i], off.data[i + 1], off.data[i + 2]);
-      if (d > 1) raised++;
+                lum(off.data[i], off.data[i + 1], off.data[i + 2]) - drift;
+      if (d > floorT) raised++;
       if (d > worst) worst = d;
     }
     out.arms[name] = {
@@ -427,6 +584,7 @@ function measure(shot, cond, roi, instances, arms, frozen) {
       side: +side.toFixed(3),
       ratio: +(b.linear / side).toFixed(3),
       delta: +(b.linear - stats(off, blob).linear).toFixed(3),
+      drift: +drift.toFixed(3),
       raised, raisedPct: +((100 * raised) / blob.length).toFixed(1),
       worst: +worst.toFixed(1),
     };
@@ -497,20 +655,23 @@ for (const r of results) {
   console.log(
     `  ${r.shot} @ ${r.cond} (hour ${Number(r.hour).toFixed(2)}) — subject ${r.roi.dist} m away, ` +
     `crop ${r.roi.x0},${r.roi.y0}..${r.roi.x1},${r.roi.y1}, ` +
-    `${r.instances.body} body + ${r.instances.feet} foot instances, footprint ${r.footprintPx} px`
+    `${r.instances.body} body + ${r.instances.feet} foot instances, footprint ${r.footprintPx} px` +
+    (r.staged ? `, staged ${r.staged.active} peds (${r.staged.withBody} with bodies)` : ', BORROWED framing')
   );
-  console.log(`    ${pad('arm', 10)}${pad('under', 9)}${pad('left', 9)}${pad('right', 9)}${pad('vs OFF', 9)}${pad('raised', 15)}verdict`);
-  for (const k of ['off', 'lerp', 'multiply']) {
+  console.log(`    ${pad('arm', 10)}${pad('under', 9)}${pad('left', 9)}${pad('right', 9)}${pad('vs OFF', 9)}${pad('drift', 8)}${pad('raised', 15)}verdict`);
+  for (const k of ['off', 'repeat', 'lerp', 'multiply']) {
     const a = r.arms[k];
     if (!a || a.error) { console.log(`    ${pad(k, 10)}${a?.error ?? '-'}`); continue; }
     const brightens = a.raisedPct > 0.5;
     const verdict = k === 'off' ? 'reference (pool switched off)'
+      : k === 'repeat' ? `noise floor — same arm twice, bar set to +${r.noiseFloor}`
       : brightens ? 'BRIGHTENS — a shadow that lights the road' : 'darkens only';
     if (k === 'multiply' && brightens) fails++;
     if (k === 'lerp' && !brightens) fails++;   // negative control must go red
     console.log(
       `    ${pad(k, 10)}${pad(a.under.linear, 9)}${pad(a.left.linear, 9)}${pad(a.right.linear, 9)}` +
       `${pad((a.delta > 0 ? '+' : '') + a.delta, 9)}` +
+      `${pad((a.drift > 0 ? '+' : '') + a.drift, 8)}` +
       `${pad(`${a.raisedPct}% (max +${a.worst})`, 15)}${verdict}`
     );
   }

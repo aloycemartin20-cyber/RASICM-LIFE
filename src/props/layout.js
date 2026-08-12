@@ -36,6 +36,81 @@ const _wv = new THREE.Vector3();
 const KERB_LANE = 0.62;
 
 /**
+ * THE STREET SPECIES, IN ONE PLACE.
+ *
+ * `kit_green.js` registers `tree_<id>_<v>_wood` and `tree_<id>_<v>_leaf<n>`
+ * for every id in its own `SPECIES`, and this file decides which of them get
+ * planted. The list was written out by hand at three separate call sites —
+ * street verge, park scatter and waste ground — each with its own `* 4 ... % 4`
+ * beside it, so adding a species meant finding four numbers in three places and
+ * the city silently kept planting the old four if you missed one.
+ *
+ * ADDING A SPECIES IS TWO EDITS, AND THEY ARE IN TWO FILES ON PURPOSE.
+ * `ProtoLibrary.proto` builds eagerly, so a `SPECIES` entry in `kit_green.js`
+ * costs its trunk and canopy geometry the moment it exists whether anything
+ * plants it or not — and naming a species here that the kit never registered
+ * puts an id into `B.put` that resolves to nothing. The two lists have to move
+ * together; this one is the half that is allowed to be short.
+ *
+ * `young` is not here. It is the replacement sapling every planting scheme has
+ * a few of, chosen by its own hash below, not a species anybody plants a street
+ * with.
+ */
+export const STREET_SPECIES = ['plane', 'maple', 'locust', 'pear'];
+
+/**
+ * The leaf materials `kit_green.js` registers per species, in its own order:
+ * three greens and then the autumn variants. `layout` needs the split because
+ * it chooses green or turned per tree — see `_leafIndex`.
+ *
+ * GREENS is the count of leading green entries in that list; everything from
+ * there on is a turning tree. Both numbers are stated here rather than derived
+ * because the kit's array is not exported, and a wrong count plants a
+ * mid-October canopy in July rather than crashing, which is the kind of bug
+ * that ships.
+ */
+const LEAF_GREENS = 3;
+/**
+ * The autumn surfaces beyond the kit's own single `leaf_autumn` at index 3.
+ * See the long note in `palette.js`: they differ by SEASON, not just tint, so
+ * a street of turning trees is a planting at three different stages rather
+ * than one orange asset instanced.
+ *
+ * REGISTERED FROM HERE, WHICH IS NOT WHERE THEY BELONG. The right home is
+ * `kit_green.js`'s own `LEAVES`, which is the file that owns the canopy; this
+ * builder does not own that file. `ProtoLibrary.proto` takes a prebuilt
+ * `opts.geo`, and the kit already shares ONE canopy mesh across all four of its
+ * leaf materials, so re-using `leaf0`'s geometry costs no triangles, no bake
+ * and no draw call that the fourth variant did not already cost — only the two
+ * extra materials and their bakes.
+ */
+const LEAF_AUTUMN_EXTRA = ['leaf_autumn_b', 'leaf_autumn_c'];
+
+/**
+ * A/B hatch for the above, same shape as `kit_green.js`'s `?owLegacyCanopy=1`
+ * and `world/roadmesh.js`'s `legacyPave`. `?oneautumn=1`, or `OW_ONE_AUTUMN=1`
+ * for the headless harnesses, registers no extra variants — so every turning
+ * tree in the city is the one `leaf_autumn` again. It is the negative control
+ * for the turning-tree assertions in `src/props/foliageprobe.mjs` and is never
+ * reachable in normal play.
+ */
+let _oneAutumn = null;
+function oneAutumn() {
+  if (_oneAutumn !== null) return _oneAutumn;
+  _oneAutumn = false;
+  try {
+    if (typeof location !== 'undefined' && new URLSearchParams(location.search).get('oneautumn') === '1') {
+      _oneAutumn = true;
+    }
+  } catch { /* no location */ }
+  try {
+    if (typeof process !== 'undefined' && process?.env?.OW_ONE_AUTUMN === '1') _oneAutumn = true;
+  } catch { /* no process */ }
+  if (_oneAutumn) console.warn('[props] LEGACY autumn — one turning-leaf surface for the whole city');
+  return _oneAutumn;
+}
+
+/**
  * Footprint radius assumed when asking "is this piece of furniture in the road?"
  *
  * Deliberately one modest number rather than a per-prototype measurement: the
@@ -130,6 +205,72 @@ export class Layout {
     this._poles = [];
     this._edges = [];
     this.trolleyDistricts = new Set(['downtown', 'strip', 'point']);
+    /** How many extra turning-leaf materials took. See `_registerAutumn`. */
+    this._autumnExtra = this._registerAutumn();
+  }
+
+  /**
+   * Paint the kit's existing canopy mesh in the extra autumn surfaces.
+   *
+   * Discovered off the library rather than enumerated: every `..._leaf0` the
+   * kit registered names a species and a canopy variant that exists, so this
+   * cannot fall out of step with `kit_green.js`'s own `SPECIES` table, and it
+   * registers nothing for a species the kit never built. `protos` is read into
+   * an array before anything is added to it — `proto` writes to the same Map.
+   *
+   * Returns the number of extra variants registered, and everything downstream
+   * indexes off that return value, so if the kit's proto names ever change
+   * shape this plants ordinary orange trees instead of putting an id into
+   * `B.put` that silently resolves to no tree at all.
+   */
+  _registerAutumn() {
+    const lib = this.lib;
+    if (oneAutumn()) return 0;
+    if (!lib?.protos || typeof lib.proto !== 'function') return 0;
+    const bases = [];
+    for (const [id, p] of lib.protos) {
+      const m = /^tree_(.+)_(\d+)_leaf0$/.exec(id);
+      if (m && p.geo) bases.push([m[1], m[2], p]);
+    }
+    if (!bases.length) return 0;
+    let added = 0;
+    for (let k = 0; k < LEAF_AUTUMN_EXTRA.length; k++) {
+      // The kit's own `leaf_autumn` sits at LEAF_GREENS; these follow it.
+      const idx = LEAF_GREENS + 1 + k;
+      for (const [sp, v, p] of bases) {
+        lib.proto(`tree_${sp}_${v}_leaf${idx}`, null, LEAF_AUTUMN_EXTRA[k], {
+          geo: p.geo,
+          shared: true,
+          castShadow: p.castShadow,
+          receiveShadow: p.receiveShadow,
+          noShadow: p.noShadow,
+          noPrepass: p.noPrepass,
+          renderOrder: p.renderOrder,
+        });
+      }
+      added++;
+    }
+    return added;
+  }
+
+  /**
+   * Which leaf material a tree wears, from one hash and its chance of having
+   * turned. Greens are `0 .. LEAF_GREENS-1`; turning trees run from
+   * `LEAF_GREENS` through however many `_registerAutumn` got.
+   *
+   * ONE HASH, TWO DECISIONS. `h` picks the season and then its own position
+   * INSIDE whichever band it landed in picks the variant — both sub-ranges are
+   * uniform, and drawing a second hash would only make the caller pass another
+   * salt. The alternative, cycling the variants by instance index, is the
+   * defect the street planting note below already names.
+   */
+  _leafIndex(h, aut) {
+    const turned = 1 + this._autumnExtra;
+    if (h < aut) {
+      return LEAF_GREENS + Math.min(turned - 1, Math.floor((h / Math.max(1e-6, aut)) * turned));
+    }
+    const g = (h - aut) / Math.max(1e-6, 1 - aut);
+    return Math.min(LEAF_GREENS - 1, Math.floor(g * LEAF_GREENS));
   }
 
   /* ================================================================== */
@@ -378,9 +519,10 @@ export class Layout {
      * Four street species, not three. A boulevard of forty trees showed each
      * crown seven times; the callery pear is columnar and half the width of a
      * plane, so it also breaks the SKYLINE of a run of trees, which is what the
-     * eye actually counts.
+     * eye actually counts. The list is `STREET_SPECIES` — one place, three
+     * call sites.
      */
-    const SP = ['plane', 'maple', 'locust', 'pear'];
+    const SP = STREET_SPECIES;
     let i = 0;
     for (let s = s0 + pitch * (0.3 + hash3i(seed, 3, 1) * 0.5); s < s1; s += pitch, i++) {
       const h = hash3i(seed, i, 21);
@@ -413,7 +555,9 @@ export class Layout {
        */
       const aut = sp === 'maple' ? 0.34 : sp === 'locust' ? 0.10 : 0.03;
       const lh = hash3i(seed, i, 25);
-      const li = lod !== 0 ? 0 : lh < aut ? 3 : Math.floor((lh - aut) / (1 - aut) * 3) % 3;
+      // The far tier is one shared canopy in one green; a season it resolves to
+      // twenty pixels of is not worth a second material.
+      const li = lod !== 0 ? 0 : this._leafIndex(lh, aut);
       const yaw = hash3i(seed, i, 26) * TAU;
       const sc = 0.74 + hash3i(seed, i, 27) * 0.58;
       const scz = sc * (0.9 + hash3i(seed, i, 28) * 0.2);
@@ -1553,9 +1697,12 @@ export class Layout {
       const sc = 0.85 + hash3i(seed, i, 5) * 0.6;
       const mask = [0.5 + h0, 0.5 + h1 * 0.8, 0.7];
       if (h2 < 0.42 && this._headroom(x, y, z, 9 * sc)) {
-        const sp = ['plane', 'maple', 'locust', 'pear'][Math.floor(hash3i(seed, i, 16) * 4) % 4];
+        const sp = STREET_SPECIES[Math.floor(hash3i(seed, i, 16) * STREET_SPECIES.length) % STREET_SPECIES.length];
         const v = lod !== 0 ? 'far' : Math.floor(hash3i(seed, i, 17) * 4) % 4;
-        const li = lod !== 0 ? 0 : Math.floor(hash3i(seed, i, 6) * 4) % 4;
+        // A park keeps the quarter-turned mix the uniform draw over four leaf
+        // materials used to give it, now spread over whichever turning
+        // variants exist instead of landing on one orange.
+        const li = lod !== 0 ? 0 : this._leafIndex(hash3i(seed, i, 6), 0.25);
         const M = trs(new THREE.Matrix4(), x, y, z, yaw, sc, sc * (0.9 + h1 * 0.3), sc,
           (h0 - 0.5) * 0.09, (h1 - 0.5) * 0.09);
         B.put(`tree_${sp}_${v}_wood`, M, mask);
@@ -1766,11 +1913,16 @@ export class Layout {
       else if (r < 0.72) B.put('weed_tuft', trs(new THREE.Matrix4(), x, y, z, yaw, sc, sc, sc), mask);
       else if (r < 0.90) B.put('scrub_clump', trs(new THREE.Matrix4(), x, y, z, yaw, sc, sc, sc), mask);
       else if (this._headroom(x, y, z, 9 * sc)) {
-        const sp = ['plane', 'maple', 'locust', 'pear'][Math.floor(hash3i(seed, i, 7) * 4) % 4];
+        const sp = STREET_SPECIES[Math.floor(hash3i(seed, i, 7) * STREET_SPECIES.length) % STREET_SPECIES.length];
         const v = Math.floor(hash3i(seed, i, 8) * 4) % 4;
         const M = trs(new THREE.Matrix4(), x, y, z, yaw, sc, sc, sc, (hash3i(seed, i, 6) - 0.5) * 0.12);
         B.put(`tree_${sp}_${v}_wood`, M, mask);
-        B.put(`tree_${sp}_${v}_leaf${(i + 2) % 4}`, M, mask);
+        // `(i + 2) % 4` walked the leaf materials in lockstep with the scatter
+        // index — a period-four cycle down a strip of waste ground, which is
+        // the same defect the street planting note above calls out. Self-sown
+        // scrub trees are the most stressed in the city and turn earliest, so
+        // this ground carries more autumn than a watered verge does.
+        B.put(`tree_${sp}_${v}_leaf${this._leafIndex(hash3i(seed, i, 9), 0.30)}`, M, mask);
       } else {
         B.put('scrub_clump', trs(new THREE.Matrix4(), x, y, z, yaw, sc, sc, sc), mask);
       }

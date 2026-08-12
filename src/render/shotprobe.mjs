@@ -139,6 +139,30 @@ try {
     // only way to answer "why is this pool not on screen" without guessing.
     const r = await page.evaluate(`(() => { try { return JSON.stringify(${args.eval}); } catch (e) { return 'ERR ' + e.message; } })()`);
     console.log(r);
+    /**
+     * THE SHUTTER MUST FALL AFTER THE MUTATION, NOT BEFORE IT.
+     *
+     * `--eval` used to run and then hand straight to `page.screenshot()`, and
+     * nothing rendered in between: the PNG was the frame drawn by the last
+     * `pump` above, i.e. the state BEFORE the expression ran. Every `--eval`
+     * A/B this hatch has ever taken photographed the control arm twice.
+     *
+     * MEASURED on `street`: an arm that lifts the ped shadow pool 0.35 m and an
+     * arm that switches AO off entirely came back byte-identical to each other
+     * at all four sample rects (14.731 / 35.005 / 24.099 / 37.087 linear x255),
+     * and differed from a no-eval capture only by the uniform ~0.7% an extra
+     * frame of exposure adaptation costs. Two mutations that share nothing
+     * cannot agree to three decimals; what they shared was that neither was in
+     * the picture.
+     *
+     * TAA is reset as well, because a mutation the accumulator has never seen
+     * arrives as a ghost otherwise.
+     */
+    await page.evaluate(() => {
+      const taa = window.__ENGINE__?.ctx?.peek('render')?.taa;
+      if (taa) { taa.index = 0; taa.reset?.(); }
+    });
+    await pump(Number(args.evalsettle ?? 24));
   }
   if (!args.noshot) {
     mkdirSync(dirname(OUT), { recursive: true });

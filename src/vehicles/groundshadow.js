@@ -51,6 +51,31 @@
  * body; a car on its roof should not have a wheel patch at all. Both fall out
  * of driving the pool off the wheels' real contact points instead of off the
  * body transform.
+ *
+ * ────────────────────────────────────────────────────────────────────────────
+ * THIS POOL WAS ONCE REPORTED AS CONTRIBUTING NOTHING. IT WAS NOT.
+ * ────────────────────────────────────────────────────────────────────────────
+ * `src/render/aoprobe.mjs` group 3 read a 0.002-0.012 linear whole-band delta
+ * against this pool, with the wrong SIGN, and that was taken as "the pool is
+ * invisible". Two separate things were true and neither was the one assumed:
+ *
+ *   - The BURIAL was real and is measured and swept below. It is not what the
+ *     probe was reading, because the probe's number never had the resolution
+ *     to see it either way.
+ *
+ *   - The whole-band mean the probe asserted on is a measurement of the
+ *     renderer's AUTO-EXPOSURE, not of this pool. Darkening a few thousand
+ *     pixels lowers the metered key, the adaptation opens up, and all two
+ *     million other pixels come back brighter. MEASURED on `car`: this pool
+ *     moves 10 778 band pixels and darkens them by 1.20 linear, while the
+ *     508 000 pixels it cannot reach BRIGHTEN by 0.077 — and 0.077 x 508 000
+ *     buries 1.20 x 10 778. The band mean went the wrong way while the shadow
+ *     was doing its whole job.
+ *
+ * The probe now measures the footprint against the frame's own exposure, which
+ * is the discipline `src/peds/shadowprobe.mjs` already arrived at for the ped
+ * pool. Do not go looking for a strength bug here on the strength of a
+ * whole-frame average again.
  */
 
 import * as THREE from 'three';
@@ -94,6 +119,94 @@ function occlusionTexture(size, n, power, edge) {
   t.needsUpdate = true;
   return t;
 }
+
+/**
+ * ────────────────────────────────────────────────────────────────────────────
+ * THE DRAWN-VS-COLLIDER BIAS, SWEPT ON THIS POOL'S OWN QUADS
+ * ────────────────────────────────────────────────────────────────────────────
+ * Same disease as `src/peds/crowdfx.js`, and read its note first: the wheels
+ * stand on the STREAMED COLLISION mesh, which `roadmesh` builds at 11 m rows
+ * and 9 columns, while the visible carriageway is emitted at 2.7 m rows with
+ * camber, wheel ruts and `roadWob` on top. The collider is consistently the
+ * LOWER of the pair, so a decal placed at the collider's answer depth-tests out.
+ *
+ * MEASURED the same way the ped pool was — a vertical ray against the EMITTED
+ * VERTICES of every visible mesh under each quad, never `heightAt` and never
+ * the collider (rule 12) — over 132 quads from six emitted frames (`driving`,
+ * `car`, `street`, `cockpit`, `chase`, `crowd`), with the ORIGINAL fixed lifts
+ * (body +0.016, tyre +0.012) in place:
+ *
+ *              quads   buried   median gap   p10 gap
+ *   all         132      79      -0.003 m    -0.039 m
+ *   body         80      47
+ *   tyre         52      32
+ *
+ * SIXTY PERCENT of the fleet's contact marks were under the road.
+ *
+ * THE BODY QUAD NEEDS MORE LIFT THAN THE TYRE QUAD, and that is not a taste
+ * call. A tyre patch is placed at that wheel's OWN contact point, so its
+ * estimate is sampled where it is drawn: the collider-vs-drawn disagreement
+ * under a tyre quad is a median 7-31 mm. The body quad is placed at the car's
+ * CENTRE off the MEAN of four contacts taken at the corners of a 4.7 m box —
+ * and on a cambered carriageway the centre is the crown, which is the highest
+ * part of the section the mean cannot see. Under a body quad the disagreement
+ * is a median 21-54 mm and a p10 of 111 mm on `street`.
+ *
+ * It is also the cheap one to lift. The cost of a lift is paid at grazing
+ * angles: `eps` metres off the deck seen at 13 degrees of depression displaces
+ * the mark by `eps / tan(13°)` ≈ 4.3 x eps. The body blob is ~2.4 x 5.0 m, so
+ * 55 mm displaces it by 4% of its own length; the tyre patch is 0.31 x 0.53 m,
+ * where the same lift would move it by two thirds of its width — and the tyre
+ * patch is THE mark that says the wheel is bearing weight. So they get
+ * different epsilons, sized to what each one can afford.
+ *
+ * SWEPT offline on those 132 quads, re-solving `_contactY` for each candidate
+ * (cap, body eps, tyre eps) against the drawn surface measured under each:
+ *
+ *    cap    body   tyre   buried (body/tyre)   p10 gap   worst float   mean lift
+ *   0.000   0.016  0.012   79  (47/80, 32/52)   -0.039      0.354        0.014
+ *   0.100   0.030  0.030    6  ( 5/80,  1/52)   +0.016      0.368        0.056
+ *   0.100   0.045  0.030    4  ( 3/80,  1/52)   +0.021      0.383        0.065
+ *   0.100   0.055  0.030    3  ( 2/80,  1/52)   +0.021      0.393        0.071
+ *   0.100   0.070  0.030    2  ( 1/80,  1/52)   +0.021      0.408        0.080
+ *   0.125   0.055  0.030    2  ( 1/80,  1/52)   +0.021      0.393        0.072
+ *   0.150   0.055  0.030    2  ( 1/80,  1/52)   +0.021      0.393        0.072
+ *
+ * The CAP is 0.10 and stays there. It is the ceiling on how far the drawn
+ * estimate may raise a quad above the ground the car is standing on, and it
+ * exists because `walkableHeightAt` reads junction pads and kerb stones up to
+ * +0.20 m high. Its knee is in the same place as the ped pool's: at body eps
+ * 0.030 the buried count runs 31 / 10 / 8 / 6 / 6 / 5 / 5 across caps
+ * 0.000 / 0.045 / 0.075 / 0.100 / 0.125 / 0.150 / 0.300, and the mean lift is
+ * flat past 0.10 (0.071 -> 0.072). The ONE quad 0.125 would buy back is a car
+ * on `street` parked over a pad the estimator reads 166 mm high — precisely the
+ * over-read the cap is there to refuse. Chasing it with a bigger cap is trading
+ * the clamp's whole job for one distant quad.
+ *
+ * VERIFIED on the shipped values by re-measuring the same six frames against
+ * the EMITTED INSTANCE TRANSFORMS rather than against what `add` was handed —
+ * the pool's own `instanceMatrix`, so the check does not depend on any
+ * instrumentation inside this file and cannot agree with it by construction:
+ *
+ *              quads   buried   median gap   p10 gap
+ *   driving      18       2       +0.047     -0.004
+ *   car          15       0       +0.037     +0.021
+ *   street       22       1       +0.055     +0.034
+ *   cockpit      28       0       +0.043     +0.021
+ *   chase        24       0       +0.047     +0.023
+ *   crowd        25       0       +0.060     +0.021
+ *
+ * 79 of 132 buried before, 3 of 132 after. Everything still buried is reported
+ * rather than papered over: all three are past 36 m and all three are cars
+ * sitting over surfaces `walkableHeightAt` does not model.
+ *
+ * This closed a real defect and it is NOT what `src/render/aoprobe.mjs` group 3
+ * was reading — see the note at the top of this file. Both were true; only one
+ * of them was ever measured.
+ */
+const CAR_SURFACE_LIFT_CAP = 0.10;
+const CAR_BODY_EPS = 0.055;
+const CAR_TYRE_EPS = 0.030;
 
 class Pool {
   constructor(cap, tex, opacity, order) {
@@ -214,6 +327,32 @@ export class VehicleGroundShadows {
     this.group.add(this.body.mesh, this.tyre.mesh);
     /** Preallocated: hard rule 5 — nothing allocates inside `add`. */
     this._c = new THREE.Vector3();
+    this._world = null;
+  }
+
+  /** `vehicles` hands the world in once it is up; harnesses may never. */
+  bindWorld(w) {
+    this._world = w ?? null;
+  }
+
+  /**
+   * The height to draw a contact mark at, given the ground the wheels resolved.
+   *
+   * `raw` is the COLLIDER's answer and is the floor — `walkableHeightAt` reads
+   * a metre low over rail ballast and building plinths, and a mark below the
+   * car's own tyres is worse than the burial it replaces. `CAR_SURFACE_LIFT_CAP`
+   * is the ceiling. `eps` is per-pool: see the sweep above for why the body and
+   * the tyre cannot share one.
+   *
+   * `raw` doubles as `walkableHeightAt`'s deck hint, so a car on a river
+   * crossing resolves against the bridge and not the riverbed.
+   */
+  _contactY(x, z, raw, eps) {
+    const w = this._world;
+    if (!w?.walkableHeightAt) return raw + eps;
+    const g = w.walkableHeightAt(x, z, raw);
+    if (!Number.isFinite(g) || g <= raw) return raw + eps;
+    return Math.min(g, raw + CAR_SURFACE_LIFT_CAP) + eps;
   }
 
   begin() {
@@ -269,7 +408,7 @@ export class VehicleGroundShadows {
      * part anyone ever sees.
      */
     this.body.put(
-      v.position.x, gy + 0.016, v.position.z, yaw,
+      v.position.x, this._contactY(v.position.x, v.position.z, gy, CAR_BODY_EPS), v.position.z, yaw,
       half.x * 2.60, half.z * 2.24, fade
     );
 
@@ -281,7 +420,7 @@ export class VehicleGroundShadows {
       // is roughly 1.6 x longer than it is wide, and it is the long axis that
       // makes the wheel look like it is standing on the road.
       this.tyre.put(
-        w.contact.x, w.contact.y + 0.012, w.contact.z, yaw,
+        w.contact.x, this._contactY(w.contact.x, w.contact.z, w.contact.y, CAR_TYRE_EPS), w.contact.z, yaw,
         r * 0.90, r * 1.55, 1
       );
     }

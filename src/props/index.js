@@ -217,6 +217,16 @@ export class PropSystem {
    * double yellows, zebra crossings, stop bars, gully gratings, manhole covers
    * and cut-and-fill patches; whatever is left over is ours. This reads the
    * live palette rather than trusting a copy of it.
+   *
+   * WORLD NOW OWNS THE LANE ARROWS. `road_arrow` and `road_arrow_turn` are in
+   * `roadmesh.js`'s own `MARK_PALETTE`, so the two `free()` calls below return
+   * FALSE and this layer draws no arrows at all. That is deliberate and it is
+   * not a regression to be undone: an arrow belongs on the junction approach
+   * `world` measures, laid along the lane `world` already knows the width and
+   * inset of, and props had to guess all three. Nothing here needs changing to
+   * bring them back — put them back in `roadmesh.js` or take them out of its
+   * palette, and this layer picks them up again on the next boot. Adding a
+   * second arrow emitter here would simply draw both.
    */
   _probeWorldDecals() {
     const used = new Set();

@@ -51,7 +51,7 @@
  */
 
 import * as THREE from 'three';
-import { makeOutfit } from './wardrobe.js';
+import { makeOutfit, COLOURS } from './wardrobe.js';
 import { Ped, STATE } from './ped.js';
 
 /* ==================================================================== */
@@ -213,6 +213,29 @@ function lin(hex, gain = 1) {
  * brightness while the hue still tells them apart. A physical ceiling keeps a
  * pale hue from blowing out — no dyed garment reflects past ~0.55 on a channel.
  */
+/**
+ * THE CEILING IS THE WARDROBE'S OWN, NOT A NUMBER PICKED HERE.
+ *
+ * The ceiling used to be a flat 0.55, and 0.55 is not a garment. It is above
+ * every dyed cloth `wardrobe.js` authors, and the brothers were the only people
+ * in the city allowed to reach it — which is precisely why they read as
+ * fluorescent next to a crowd built from the chart.
+ *
+ * The `shell*` block in `wardrobe.C` is the right reference band: those are the
+ * technical/rain-shell swatches, the most chromatic cloth the wardrobe will put
+ * on anybody, and the brothers wear a quilted coat, a work shirt and a courier's
+ * hoodie. Their peak channel is 0.352 (`shellYellow`'s red). Derived rather than
+ * copied, so re-cutting the chart re-cuts the brothers with it.
+ *
+ * MEASURED, brightest channel before -> after: Carson 0.182 -> 0.238, Aidan
+ * 0.468 -> 0.304, DYLAN 0.550 -> 0.260. Dylan was sitting ON the old ceiling.
+ */
+const CLOTH_CEIL = Math.max(
+  ...Object.entries(COLOURS)
+    .filter(([n]) => n.startsWith('shell'))
+    .map(([, s]) => Math.max(s[0], s[1], s[2]))
+);
+
 function cloth(hex, lumTarget = 0.16, desat = 0.16) {
   const c = lin(hex);
   const y = c[0] * 0.2126 + c[1] * 0.7152 + c[2] * 0.0722;
@@ -221,7 +244,8 @@ function cloth(hex, lumTarget = 0.16, desat = 0.16) {
   const yOut = out[0] * 0.2126 + out[1] * 0.7152 + out[2] * 0.0722;
   let k = lumTarget / Math.max(1e-6, yOut);
   const max = Math.max(out[0], out[1], out[2]);
-  if (max * k > 0.55) k = 0.55 / max; // physical ceiling on the brightest channel
+  // Physical ceiling on the brightest channel — see `CLOTH_CEIL`.
+  if (max * k > CLOTH_CEIL) k = CLOTH_CEIL / max;
   for (let i = 0; i < 3; i++) out[i] = Math.max(0.014, out[i] * k);
   return out;
 }
@@ -231,27 +255,60 @@ function cloth(hex, lumTarget = 0.16, desat = 0.16) {
  * the man: Carson in a river hand's quilted coat, Aidan in the body shop's
  * work shirt and jeans, Dylan in a courier's hoodie. Heights follow the build
  * column in DESIGN.md — heaviest/slowest, middle, lightest/fastest.
+ *
+ * ────────────────────────────────────────────────────────────────────────────
+ * THE `lumTarget` / `desat` PAIRS ARE CUT AGAINST `crowdprobe` GATE 6 SWATCH.
+ * ────────────────────────────────────────────────────────────────────────────
+ * Four blind critic frames named the brothers' colour — Dylan's violet loudest —
+ * as the thing that does not belong in a rustbelt street. That gate already
+ * exists and already says so: SWATCH asks whether an emitted garment is within
+ * `pick`'s own jitter (0.26 relative, per channel) of ANY colour the wardrobe
+ * authors, and it is the standard the whole crowd is held to. The brothers were
+ * never run through it, because `_outfit` overwrites the palette AFTER the
+ * wardrobe draw. Five of their six signature slots failed it.
+ *
+ * MEASURED, swatch distance before -> after (bar 0.26, lower is more like cloth
+ * somebody actually dyed):
+ *
+ *   carson shirt   0.329 -> 0.234      aidan shirt   0.489 -> 0.238
+ *   carson accent  0.319 -> 0.117      aidan accent  0.248 -> 0.237
+ *   DYLAN  shirt   0.628 -> 0.238      dylan accent  0.360 -> 0.239
+ *
+ * HUE IS PRESERVED TO WITHIN 2 DEGREES ON ALL SIX. That is the whole point and
+ * it is why the pairs were solved rather than hand-picked: `desat` pulls a
+ * colour toward its OWN luminance, which drops saturation and leaves hue
+ * untouched, so the brothers stay tellable apart at fifty metres — teal, orange,
+ * violet — while none of them is a pigment the city cannot make. Dylan moves
+ * furthest because he was furthest out: (0.153, 0.055, 0.550) -> (0.139, 0.109,
+ * 0.260), saturation 0.90 -> 0.58, hue 251.9 degrees unchanged.
+ *
+ * WHY NOT SOLVE THEM ONTO THE CHART EXACTLY. Nothing in `COLOURS` is violet, so
+ * minimising distance alone walks Dylan to `navy` at 0.060 luminance — the
+ * black-hoodie failure the note above `cloth` was written about. The pairs
+ * therefore MAXIMISE saturation subject to clearing the gate, holding luminance
+ * within 0.05 of what each brother already had, rather than chasing the nearest
+ * swatch. Dylan lands nearest `denim`, which is the right answer for a courier.
  */
 export const BROTHERS = {
   carson: {
     id: 'carson', name: 'Carson', shape: 'puffaM', height: 1.855, bulk: 1.06,
     colour: '#2ea6a0', accent: '#7bf0d8', run: 6.4,
-    skin: lin('#f0cdae', 0.42), hair: lin('#3b2a1c'), shirt: cloth('#1f6f6a', 0.150),
-    pants: lin('#26303c'), accentRgb: cloth('#7bf0d8', 0.220, 0.30), hat: lin('#26303c', 1.4),
+    skin: lin('#f0cdae', 0.42), hair: lin('#3b2a1c'), shirt: cloth('#1f6f6a', 0.198, 0.20),
+    pants: lin('#26303c'), accentRgb: cloth('#7bf0d8', 0.194, 0.10), hat: lin('#26303c', 1.4),
     hp: 158, gait: { strideK: 0.94, armSwing: 0.62, bounce: 0.72, sway: 0.62, lean: 1.2, stoop: 1.6 },
   },
   aidan: {
     id: 'aidan', name: 'Aidan', shape: 'jacketM', height: 1.795, bulk: 1.0,
     colour: '#ff6a12', accent: '#ffc93c', run: 6.9,
-    skin: lin('#f4d4b6', 0.42), hair: lin('#8a5a2a', 0.85), shirt: cloth('#c2410c', 0.150),
-    pants: lin('#1f2733'), accentRgb: cloth('#ffc93c', 0.230, 0.26), hat: lin('#1f2733', 1.4),
+    skin: lin('#f4d4b6', 0.42), hair: lin('#8a5a2a', 0.85), shirt: cloth('#c2410c', 0.108, 0.28),
+    pants: lin('#1f2733'), accentRgb: cloth('#ffc93c', 0.186, 0.10), hat: lin('#1f2733', 1.4),
     hp: 140, gait: { strideK: 1.02, armSwing: 0.95, bounce: 0.9, sway: 0.8, lean: 2.0, stoop: 0.4 },
   },
   dylan: {
     id: 'dylan', name: 'Dylan', shape: 'hoodieM', height: 1.735, bulk: 0.95,
     colour: '#c07cff', accent: '#5fd0ff', run: 7.9,
-    skin: lin('#eec9a8', 0.42), hair: lin('#221812'), shirt: cloth('#7c3aed', 0.140, 0.26),
-    pants: lin('#1a1f2b'), accentRgb: cloth('#5fd0ff', 0.210, 0.30), hat: lin('#1a1f2b', 1.4),
+    skin: lin('#eec9a8', 0.42), hair: lin('#221812'), shirt: cloth('#7c3aed', 0.126, 0.80),
+    pants: lin('#1a1f2b'), accentRgb: cloth('#5fd0ff', 0.164, 0.17), hat: lin('#1a1f2b', 1.4),
     hp: 124, gait: { strideK: 1.12, armSwing: 1.25, bounce: 1.12, sway: 0.95, lean: 3.0, stoop: -0.8 },
   },
 };

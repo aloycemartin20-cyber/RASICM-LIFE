@@ -243,6 +243,9 @@ void main() {
  *   r.addLight(light, opts)   register a punctual light for distance culling
  *   r.requestEnvMap()         the PMREM environment currently in use
  *   r.setEnvMap(tex)          install a new PMREM (sky subsystem)
+ *   r.bindEnvMaterials(list)  keep a live material list's OWN envMapIntensity
+ *                             alive against three's scene-environment override
+ *                             (car paint, glass, chrome — see the method)
  *   r.patchMaterials(root)    force-inject shadows/AO/SSR into new materials
  *                             (happens automatically within a frame anyway)
  *   r.setExposureBias(ev)     +1 EV = one stop darker
@@ -544,6 +547,11 @@ export class RenderSystem {
     this.envTarget = env.target;
     this.envEquirect = env.equirect;
     this.envMap = this.envTarget.texture;
+    // Live material lists whose own `envMapIntensity` must survive three's
+    // scene-environment override. See `bindEnvMaterials`.
+    this._envLists = [];
+    this._envBound = undefined;
+    this._envBoundCount = -1;
     if (!ctx.scene.environment) ctx.scene.environment = this.envMap;
     if (!ctx.scene.background) ctx.scene.background = this.envEquirect;
     ctx.viewScene.environment = ctx.scene.environment;
@@ -1206,6 +1214,10 @@ export class RenderSystem {
     this._noAoFix = /[?&]owNoAoFix=1/.test(location.search);
     this._noAoReach = /[?&]owNoAoReach=1/.test(location.search);
     this._noEmissiveSpill = /[?&]owNoEmissiveSpill=1/.test(location.search);
+    // See `bindEnvMaterials`. Parsed here with the others because the vehicle
+    // subsystem registers during its own construction, which is before any
+    // later hatch parsing would have run.
+    this._noEnvBind = /[?&]owNoEnvBind=1/.test(location.search);
 
     this._applySettings();
 
@@ -1875,6 +1887,98 @@ export class RenderSystem {
     this.ctx.scene.environment = texture;
     this.ctx.viewScene.environment = texture;
     this.envMap = texture;
+  }
+
+  /**
+   * ──────────────────────────────────────────────────────────────────────────
+   * MATERIALS THAT MUST HONOUR THEIR OWN `envMapIntensity`
+   * ──────────────────────────────────────────────────────────────────────────
+   * `scene.environment` lights every lit material in the game, and for most of
+   * them one global level is the right answer. It is NOT the right answer for a
+   * material whose whole look is how much environment it returns — car paint,
+   * automotive glass, chrome — and until this existed those materials could not
+   * express it, because three throws the number away.
+   *
+   * THE MECHANISM, quoted from three r180 `WebGLRenderer.setProgram()`:
+   *
+   *     if ( material.isMeshStandardMaterial && material.envMap === null &&
+   *          scene.environment !== null ) {
+   *       m_uniforms.envMapIntensity.value = scene.environmentIntensity;
+   *     }
+   *
+   * ...and the only place the material's own value is ever written is inside
+   * `if ( material.envMap )` in `refreshUniformsStandard`. So a material that
+   * relies on `scene.environment` has its `envMapIntensity` OVERWRITTEN with the
+   * scene's global 1.0 every single frame, silently. Nothing warns, the map is
+   * sampled, reflections appear — they are just all at the same strength, and
+   * every value authored on that slot anywhere in the codebase is dead.
+   *
+   * MEASURED on the shipped `car` frame before this landed: the beauty car's
+   * bonnet read 228.3/127.1/115.6, and driving the paint's `envMapIntensity`
+   * from 0.755 to 0 and then to 8 moved it to 228.2/130.2/119.0 and
+   * 228.2/130.3/119.1 — the same pixel either side of a 0-to-8 sweep. That is
+   * `paint.js`'s ablation note ("`envMapIntensity` DOES NOTHING in this
+   * renderer") reproduced exactly, and this is why.
+   *
+   * THE FIX IS A REBINDING, NOT A NEW ENVIRONMENT. The registered materials get
+   * `material.envMap` pointed at the very texture `scene.environment` already
+   * holds, which takes them out of the override's `envMap === null` branch. It
+   * is free in both senses that matter:
+   *
+   *   - NO RECOMPILE. three resolves the sampler as
+   *     `cubeuvmaps.get( material.envMap || environment )` and both operands are
+   *     now the same texture, so `parameters.envMap` is unchanged, the program
+   *     cache key is unchanged, and `uniforms.envMap.value` is unchanged.
+   *     Only `envMapIntensity` changes hands.
+   *   - NO EXTRA GPU WORK. There is no second environment and no second PMREM:
+   *     the sky already bakes its equirect and convolves it once per env step
+   *     (`sky/index.js` `_stepEnv`), and this samples that same result.
+   *
+   * `list` is held LIVE rather than copied — a material cache fills in lazily as
+   * body colours and glass tints are first asked for, so the bind re-runs when
+   * the array grows. Both triggers are integer compares on the frame path.
+   */
+  bindEnvMaterials(list) {
+    // `?owNoEnvBind=1` refuses every registration, which puts the whole engine
+    // back on `scene.environmentIntensity` for materials that carry their own
+    // level. Kept for the reason `owNoCascadeCull` and `owNoAoFix` above are:
+    // it is the hatch `tools/perfcheck.mjs --ab='.|owNoEnvBind=1,.'` needs to
+    // measure this change in ONE build a single page load apart, which is the
+    // only arm pairing that file will call a measurement of the code.
+    if (this._noEnvBind) return;
+    if (!Array.isArray(list) || this._envLists.includes(list)) return;
+    this._envLists.push(list);
+    // Force the next sync to write, whatever the counts happen to say.
+    this._envBound = undefined;
+  }
+
+  /**
+   * Point every registered material at the live environment.
+   *
+   * Runs on the frame path, so it must cost nothing when nothing has changed:
+   * the guard is the environment's identity plus the total material count, and
+   * both only move when the sky republishes its PMREM or a new body colour is
+   * mixed. Assigning the same texture again is skipped per material as well, so
+   * a growth of one does not rewrite the other forty.
+   */
+  _syncEnvMaterials() {
+    const lists = this._envLists;
+    if (lists.length === 0) return;
+    const env = this.ctx.scene.environment;
+    let n = 0;
+    for (let i = 0; i < lists.length; i++) n += lists[i].length;
+    if (env === this._envBound && n === this._envBoundCount) return;
+    this._envBound = env;
+    this._envBoundCount = n;
+    for (let i = 0; i < lists.length; i++) {
+      const l = lists[i];
+      for (let j = 0; j < l.length; j++) {
+        const m = l[j];
+        // `isLit` is the same predicate the patcher uses: anything else has no
+        // `envMapIntensity` to protect and no envMap slot worth writing.
+        if (m && m.envMap !== env && MaterialPatcher.isLit(m)) m.envMap = env;
+      }
+    }
   }
 
   /** Force every lit material in a subtree to be patched immediately. */
@@ -3337,6 +3441,12 @@ export class RenderSystem {
       ctx.viewScene.environment = ctx.scene.environment;
       this._assignedViewEnv = ctx.scene.environment;
     }
+    // ...and re-point the materials that carry their own env level at whatever
+    // the environment now is. Here rather than in `setEnvMap` because the
+    // environment can also arrive by direct assignment (the adopt branch two
+    // lines up), and a bind that only ran on one of the two paths would be
+    // correct exactly as often as it was not.
+    this._syncEnvMaterials();
 
     // ---- unjittered matrices for velocity + reprojection ------------------
     this._invVP.copy(this._currVP).invert();

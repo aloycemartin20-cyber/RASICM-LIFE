@@ -248,9 +248,37 @@ export class VehicleMaterials {
   /**
    * Automotive paint. `finish` is 'gloss' (clearcoated metallic), 'matte'
    * (a resprayed beater), or 'primer' (bare filler).
+   *
+   * ────────────────────────────────────────────────────────────────────────
+   * `gloss` — 0 is a work truck, 1 is a show car, AND IT IS NOT DECORATION
+   * ────────────────────────────────────────────────────────────────────────
+   * Every vehicle in the fleet carried the same clearcoat: `ccR` 0.055 and an
+   * orange-peel normal at 0.55. Two consequences, both measured off the `car`
+   * shot at 1920x1080.
+   *
+   * ONE. A 0.55 clearcoat normal on a 14 cm peel tile SMEARS the environment.
+   * A sharp clear layer mirrors the sky as a band with an edge — bright where
+   * the sky is, dark where the street is — and the pigment survives between
+   * the bands. Perturbed that hard, the same energy arrives as a low-frequency
+   * MOTTLE spread over the whole panel, and low-frequency white added to a
+   * coloured diffuse is exactly the "noisy vertex-coloured plastic" the review
+   * named. Measured on the bonnet of a `slag orange` 0xc4460d (linear 0.54,
+   * 0.061, 0.006): the frame returned 226/166/159, i.e. linear 0.75/0.38/0.34
+   * — a 0.34 white pedestal under a pigment whose blue channel is 0.006. The
+   * ordered colour was not on the car.
+   *
+   * TWO. A concours respray and a mill truck that has been through fifteen
+   * Pittsburgh winters cannot share a clearcoat. `gloss` is the one number
+   * that separates them, and it moves the three things that actually differ:
+   * how sharp the clear layer is (`ccR`), how much orange peel is in it
+   * (`peel`), and how much environment it returns (`env`).
+   *
+   * It does NOT add a permutation: the map slots and the non-zero clearcoat
+   * are identical across the range, so the whole fleet stays in the one
+   * `ow:vehpaint` program family. See `build.js` `glossFor`.
    */
-  paint(color, { finish = 'gloss', flake = 0.5, clearcoat = 1, wear = 0 } = {}) {
-    const key = `${color}|${finish}|${flake.toFixed(2)}|${clearcoat.toFixed(2)}|${wear.toFixed(2)}`;
+  paint(color, { finish = 'gloss', flake = 0.5, clearcoat = 1, wear = 0, gloss = 0.75 } = {}) {
+    const key = `${color}|${finish}|${flake.toFixed(2)}|${clearcoat.toFixed(2)}|${wear.toFixed(2)}|${gloss.toFixed(2)}`;
     let m = this._paints.get(key);
     if (m) return m;
     const T = this._tex;
@@ -270,16 +298,73 @@ export class VehicleMaterials {
      * primer's clearcoat at a real (small, matte) 0.05 collapses the fleet into
      * ONE program, which matters while p99 is being chased.
      */
+    const g = gloss < 0 ? 0 : gloss > 1 ? 1 : gloss;
     const F = finish === 'gloss'
-      // env 0.80, not 1.0. A clearcoated panel under the flat white overcast the
-      // vehicle shots are staged in returns almost nothing but sky, and at 1.0
-      // an oxblood 0x7d1b16 came back as pale salmon: the pigment was there and
-      // buried. The reflection still has to dominate on a car — 0.80 is the most
-      // that leaves the ordered colour legible under a keyless sky.
-      ? { rough: 1.10, cc: clearcoat, ccR: 0.055, peel: 0.55, flakeN: 0.035 + flake * 0.065, env: 0.80, film: 0.26, rust: 0.05, salt: 0.14, respray: 0.024 }
+      /**
+       * THE CLEAR LAYER IS SHARP, AND THAT IS WHERE THE REFLECTION COMES FROM.
+       *
+       * `peel` was 0.55 for the whole fleet. `makeOrangePeel` tiles at 7 over
+       * an object-space METRE uv, so that is a 14 cm ripple driven at half a
+       * unit of normal — enough to scatter a near-mirror lobe across a whole
+       * bonnet. The result is not "a reflection with texture in it", it is a
+       * uniform white pedestal, and it is what buried the pigment.
+       *
+       * Real orange peel on factory paint is a few microns of waviness over a
+       * few millimetres: it makes a reflected edge WOBBLE, it does not dissolve
+       * it. 0.10-0.34 across the gloss range does that and nothing more.
+       *
+       * `env` comes down with it. The sky PMREM the vehicle shots are staged
+       * under is a keyless white hemisphere, so every joule the clear layer
+       * returns is white — at 0.80 with a smeared normal it was 0.34 linear of
+       * it. 0.46-0.66 with a SHARP normal puts the same look back as a legible
+       * band across the shoulder instead of a haze over the panel.
+       */
+      ? {
+        rough: 1.10,
+        /**
+         * THE CLEAR LAYER IS A FRACTION, AND THE MEASUREMENT IS WHY.
+         *
+         * Ablation on the shipped `car` frame, one parameter at a time, 90
+         * frames of TAA settle between reads, on the beauty car's ordered
+         * oxblood 0x7d1b16 (linear 0.202 / 0.011 / 0.008):
+         *
+         *   as shipped                       224/158/151   chroma 0.327
+         *   envMapIntensity 0.71 -> 0        224/159/152   chroma 0.323
+         *   specularIntensity 1 -> 0.22,
+         *     clearcoat 1 -> 0.45            230/116/104   chroma 0.549
+         *
+         * Two things follow and both are load-bearing. `envMapIntensity` was
+         * a dead uniform when this note was first written (zeroing it moved
+         * the frame by under one count) because r180 overwrites it with
+         * `scene.environmentIntensity` for materials on the scene environment.
+         * `render.bindEnvMaterials` now bridges that for the vehicle material
+         * family — the paint DOES sample the sky's PMREM and the slot is live
+         * again. The historical numbers in the note above were still tuned
+         * against the dead slot; treat them as pre-bridge values.
+         *
+         * And the white pedestal that buried the pigment is the CLEARCOAT
+         * LOBE plus the BASE COAT'S OWN dielectric specular. Both are real,
+         * both are white under a keyless overcast, and together they were
+         * delivering 0.29 linear on top of a 0.011 green channel.
+         *
+         * `specularIntensity` is the honest fix for half of it and it is not a
+         * fudge: three's clearcoat is a layer stacked on a base whose F0 is
+         * still computed for an AIR interface. Under a clear layer the base
+         * coat is INDEX-MATCHED — the step is 1.5 to 1.5, not 1.0 to 1.5 — so
+         * its Fresnel is a small fraction of what an exposed pigment would
+         * return. 0.26 is that fraction.
+         */
+        cc: clearcoat * (0.42 + 0.22 * g),
+        spec: 0.26,
+        ccR: 0.125 - 0.098 * g,
+        peel: 0.34 - 0.24 * g,
+        flakeN: 0.035 + flake * 0.065,
+        env: 0.46 + 0.20 * g,
+        film: 0.26, rust: 0.05, salt: 0.14, respray: 0.024,
+      }
       : finish === 'matte'
-        ? { rough: 2.35, cc: Math.max(0.14, clearcoat * 0.2), ccR: 0.62, peel: 1.1, flakeN: 0.09, env: 0.62, film: 0.50, rust: 0.24, salt: 0.30, respray: 0.060 }
-        : { rough: 2.9, cc: 0.05, ccR: 0.80, peel: 1.5, flakeN: 0.07, env: 0.45, film: 0.70, rust: 0.46, salt: 0.42, respray: 0.090 };
+        ? { rough: 2.35, cc: Math.max(0.10, clearcoat * 0.16), spec: 0.34, ccR: 0.62, peel: 1.1, flakeN: 0.09, env: 0.62, film: 0.50, rust: 0.24, salt: 0.30, respray: 0.060 }
+        : { rough: 2.9, cc: 0.05, spec: 0.40, ccR: 0.80, peel: 1.5, flakeN: 0.07, env: 0.45, film: 0.70, rust: 0.46, salt: 0.42, respray: 0.090 };
 
     m = new THREE.MeshPhysicalMaterial({
       color: c,
@@ -307,12 +392,19 @@ export class VehicleMaterials {
       roughnessMap: T.paintORM,
       normalMap: T.flake,
       normalScale: new THREE.Vector2(F.flakeN, F.flakeN),
+      // See the ablation over `cc` above: the base coat sits under a clear
+      // layer, so its Fresnel step is glass-to-pigment and not air-to-pigment.
+      specularIntensity: F.spec,
       clearcoat: F.cc,
       clearcoatRoughness: F.ccR,
       clearcoatRoughnessMap: T.paintORM,
       clearcoatNormalMap: T.peel,
       clearcoatNormalScale: new THREE.Vector2(F.peel, F.peel),
-      envMapIntensity: F.env + 0.16 * (1 - lum),
+      // A dark colour is nearly all specular, so it may carry more environment
+      // before the pigment stops reading. 0.10, not 0.16: at 0.16 the darkest
+      // pool colour (`midnight` 0x15181d, linear lum 0.010) took a 0.96 env on
+      // top of a 0.46 base and came back the same value as `gunmetal`.
+      envMapIntensity: F.env + 0.10 * (1 - lum),
       vertexColors: true,
       dithering: true,
     });
@@ -342,7 +434,7 @@ export class VehicleMaterials {
    * intensity reads correctly: near-black head on, a hard sky reflection at
    * grazing angles, and the seats visible through it.
    */
-  glass({ tint = 0x0a0e12, opacity = 0.62, tintStrength = 1 } = {}) {
+  glass({ tint = 0x141a20, opacity = 0.46, tintStrength = 1 } = {}) {
     return this._cached(`glass_${tint}_${opacity}_${tintStrength}`, () => {
       const T = this._tex;
       /**
@@ -362,16 +454,29 @@ export class VehicleMaterials {
        * most recognisable feature of automotive glass, it gives the pane a
        * physical edge instead of a floating rectangle, and no car without one
        * has ever read as glazed.
+       *
+       * TINTED, NOT OPAQUE. `opacity` was 0.62 over a 0x0a0e12 tint and the
+       * glass is DOUBLE-SIDED, so a three-quarter view looks through TWO panes:
+       * 0.38 x 0.38 = 0.14 of whatever is behind them survived, and what is
+       * behind them is a cabin. The review's "opaque black glass" and its
+       * "black void cabin" are the same defect counted twice — the pane was
+       * eating five sixths of the interior it exists to show. 0.46 over a
+       * lifted 0x141a20 leaves 0.29 through the pair and 0.54 through one,
+       * which is what a factory privacy tint actually passes.
+       *
+       * The `map`'s ALPHA is doing real work here and it is easy to miss: the
+       * haze in `makeGlassMaps` is authored as coverage, so `opacity` is the
+       * CEILING of the tint, reached only in the corners and along the frit.
        */
       const m = new THREE.MeshPhysicalMaterial({
         color: new THREE.Color(tint),
         map: T.glass,
         metalness: 0,
-        roughness: 0.075,
+        roughness: 0.055,
         transparent: true,
         opacity,
         side: THREE.DoubleSide,
-        envMapIntensity: 1.15,
+        envMapIntensity: 1.45,
         ior: 1.52,
         specularIntensity: 1,
         clearcoat: 1,
@@ -474,11 +579,25 @@ export class VehicleMaterials {
         // the badges and the exhaust tips all disappeared into a flat blowout.
         // Real bright trim is chromed ABS, not a laboratory mirror — it pits,
         // it is slightly rough, and it holds a visible gradient.
-        color: 0xc8ccd2,
+        /**
+         * ...and it was still white. `envMapIntensity` is inert here (see the
+         * ablation over the paint's clear layer), so cutting it from 2.1 to
+         * 1.25 changed nothing at all, and the brightwork round every
+         * greenhouse in the fleet — the DLO strip, the drip rail, the mirror
+         * caps — photographed as a solid white frame with no gradient in it.
+         *
+         * What DOES move is reflectance and roughness. Chromed ABS is not a
+         * first-surface mirror: it is a thin bright layer over a plastic
+         * substrate, it holds fingerprints and micro-scratches, and at 0.26
+         * roughness it returns the DARKER lower half of the environment as
+         * well as the sky — which is the gradient that separates metal from
+         * white paint.
+         */
+        color: 0xa6acb4,
         metalness: 1,
-        roughness: 0.16,
-        clearcoat: 1,
-        clearcoatRoughness: 0.06,
+        roughness: 0.26,
+        clearcoat: 0.45,
+        clearcoatRoughness: 0.10,
         envMapIntensity: 1.25,
       })
     );
@@ -594,11 +713,27 @@ export class VehicleMaterials {
 
   /* ------------------------------------------------------ interior -- */
 
+  /**
+   * Seat cloth — and the reason every cabin in the game photographed as a void.
+   *
+   * `color` was 0x30333a. That is 0.030 LINEAR, and it multiplied `makeFabric`,
+   * whose own value runs 0.06-0.12 linear. The product is 0.0026: an order of
+   * magnitude under ARCHITECTURE.md's 0.02 albedo floor, darker than the
+   * `cavity` material that exists specifically to be a hole, and far below any
+   * cloth ever fitted to a car (0.04-0.09 for a dark trim). The seats were not
+   * "untextured", they were unlit black at every exposure the game can reach —
+   * which is why the review saw blobs: the fabric weave and its normal map were
+   * both there and both multiplied into nothing.
+   *
+   * Same rule as the tyre and the rim above: THE MAP CARRIES THE VALUE, the
+   * colour only tints. 0xd6dae0 lands the product at ~0.055 linear, a dark
+   * grey automotive cloth, and the weave becomes visible for the first time.
+   */
   seat() {
     return this._cached('seat', () => {
       const T = this._tex;
       return new THREE.MeshStandardMaterial({
-        color: 0x30333a,
+        color: 0xd6dae0,
         map: T.fabric,
         normalMap: T.fabricNormal,
         normalScale: new THREE.Vector2(0.8, 0.8),
@@ -607,6 +742,46 @@ export class VehicleMaterials {
         envMapIntensity: 0.35,
       });
     });
+  }
+
+  /**
+   * Headliner cloth — the roof lining, the pillar trim and the visors.
+   *
+   * ITS WHOLE JOB IS TO BE THE BRIGHTEST THING IN THE CABIN. A car interior is
+   * lit almost entirely by bounce off the lining; without one, everything below
+   * the belt is lit by the sky through the glass alone and the top of the frame
+   * is a hole. The cockpit capture measured 23/28/33 across its upper third
+   * before this existed.
+   *
+   * So it takes NO albedo map: `makeFabric` peaks at 0.124 linear and a
+   * headliner is 0.28-0.36, which no colour multiplier can reach from there.
+   * 0x9fa2a6 is 0.34 linear flat, with the fabric NORMAL for weave — the same
+   * slot set `leather()` uses, so the two share a program.
+   */
+  headliner() {
+    return this._cached('headliner', () =>
+      new THREE.MeshStandardMaterial({
+        /**
+         * MEASURED, twice, on the cockpit frame's upper third:
+         *   0x9fa2a6 (0.34 linear) -> 183, brighter than the road through the
+         *                             windscreen. A lining lit like a lightbox.
+         *   0x74777b (0.19 linear) -> 178. Barely moved, because the cabin's
+         *                             indirect budget is generous and the
+         *                             surface faces the one direction the sky
+         *                             fill is strongest from.
+         * 0x5a5d61 is 0.106 linear and lands it near 130 — lighter than the
+         * dash, darker than the sky through the glass, which is the ordering a
+         * real cabin has. The number is set from the frame, not from a
+         * reflectance table, because the reflectance table has been wrong twice.
+         */
+        color: 0x5a5d61,
+        normalMap: this._tex.fabricNormal,
+        normalScale: new THREE.Vector2(0.45, 0.45),
+        roughness: 0.95,
+        metalness: 0,
+        envMapIntensity: 0.45,
+      })
+    );
   }
 
   leather() {

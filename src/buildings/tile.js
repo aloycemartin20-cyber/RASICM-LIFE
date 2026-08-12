@@ -26,6 +26,29 @@ const UNIT_BOX = new THREE.BoxGeometry(1, 1, 1);
  * instead of becoming their own InstancedMesh. See build().
  */
 const MERGE_BELOW = 48;
+/**
+ * Ground-junction AO bake. See `TileBuilder._bakeGroundAo`.
+ *
+ * `AO_HEIGHT` is a SKIRTING HEIGHT, not a guess: a metre and a bit is the
+ * scale of the ambient shadow a wall throws onto the ground it stands on under
+ * an overcast sky, and it is the height at which a shopfront's own plinth
+ * stops being read as part of the ground. Past ~2 m the term stops looking
+ * like a junction and starts looking like soot on the lower storey, which is
+ * the same failure mode `render`'s `aoRadius` hits at 4 m.
+ */
+const AO_CELL = 2.0;
+const AO_GRID_MAX = 128;
+const AO_HEIGHT = 1.25;
+const AO_STRENGTH = 0.7;
+/** How much of the term an UP-facing face keeps. A plinth top is not a corner. */
+const AO_UPFACE_CUT = 0.8;
+/**
+ * Instances get less than merged geometry, and deliberately: the mask is
+ * constant over the whole prototype, so a 3 m lamp column would carry its
+ * base's occlusion all the way to the lantern. The value is what a small
+ * object (a bin, a bollard, a hydrant) can take without going flat.
+ */
+const AO_INSTANCE_SCALE = 0.55;
 const _m = new THREE.Matrix4();
 const _v = new THREE.Vector3();
 const INVISIBLE = new THREE.MeshBasicMaterial({ visible: false });
@@ -104,6 +127,14 @@ export class ProtoLibrary {
 }
 
 export class TileBuilder {
+  /**
+   * `?owNoTileAo=1` — the negative control for the ground-junction bake. Read
+   * once at module scope so the per-tile path costs one property read; benches
+   * and the node-only probes boot with no `location` at all.
+   */
+  static noGroundAo =
+    typeof location !== 'undefined' && /[?&]owNoTileAo=1/.test(location.search);
+
   constructor(lib, name = 'tile') {
     this.lib = lib;
     this.name = name;
@@ -112,7 +143,7 @@ export class TileBuilder {
     this._inst = new Map(); // proto id -> { m: Matrix4[], c: masks[] }
     this._collide = new Map(); // surface tag -> Accum
     this.lights = [];
-    this.stats = { tris: 0, instTris: 0, instances: 0, draws: 0, keptOut: 0 };
+    this.stats = { tris: 0, instTris: 0, instances: 0, draws: 0, keptOut: 0, groundAo: 0 };
     /** See `setKeepOut` and `BuildingSystem._keepOutFor`. */
     this._keepOut = null;
   }
@@ -284,6 +315,164 @@ export class TileBuilder {
     return this;
   }
 
+  // --------------------------------------------------------- ground AO ---
+  /**
+   * ──────────────────────────────────────────────────────────────────────────
+   * THE WALL/GROUND JUNCTION, BAKED INTO THE VERTEX AO MASK
+   * ──────────────────────────────────────────────────────────────────────────
+   * Two blind critic panels reported the same defect off `detail.png`: "no
+   * visible AO at wall/ground junctions", buildings meeting the pavement as
+   * two butted planes with no corner between them.
+   *
+   * MEASURED on `detail.png` before this existed, a 12 px column stepped down
+   * through the retaining wall onto the plaza it stands on (linear x255): the
+   * wall face reads 13.1-14.4 all the way to the seam and the plaza reads
+   * 44-47 from 20 px out to the bottom of the frame. There is a transition
+   * because the two surfaces are different materials, and there is no corner:
+   * neither side darkens toward the other.
+   *
+   * Why the screen-space passes cannot close it. GTAO's radius is 2.6 m, sized
+   * for architecture, and it does resolve this seam — measured 0.55 visibility
+   * at a wall/pavement junction. But its march ceiling is a FRACTION OF THE
+   * RENDER HEIGHT, so the metres it reaches shrink with distance and the seam
+   * fades out exactly as a street recedes; and `render/contact.js` multiplies
+   * onto the SUN term only, which under the overcast both review shots are
+   * lit by is worth nothing at all. A bake has neither property: it is in the
+   * geometry, so it is resolution-independent, distance-independent, weather-
+   * independent and free at runtime.
+   *
+   * WHERE THE GROUND COMES FROM, and why it is not `world.heightAt`. Rule 12:
+   * the ground is read off the EMITTED GEOMETRY — a coarse grid of the minimum
+   * vertex Y this tile actually produced in each cell, dilated 3x3 — never off
+   * the terrain field the placement arithmetic used. A plinth course sunk into
+   * a slope, a stoop, a loading dock and a landmark hand-placed 40 cm proud of
+   * the terrain are all things the placement input does not know about and the
+   * emitted vertices do. It also keeps `buildings` from re-deriving a fact
+   * `world` owns (the spatial form of rule 12), because it is not asking
+   * `world` anything.
+   *
+   * The orientation weight is what stops this reading as dirt: an UP-facing
+   * face at ground level is a plinth top or a pavement slab, not a corner, and
+   * darkening it produces a grey band across the ground rather than a junction.
+   * Vertical and down-facing geometry gets the full term.
+   *
+   * `?owNoTileAo=1` is the negative control — see `src/render/aoprobe.mjs`.
+   */
+  _bakeGroundAo() {
+    if (TileBuilder.noGroundAo) return;
+    const buckets = [];
+    for (const a of this._static.values()) if (!a.empty) buckets.push(a);
+    for (const a of this._detail.values()) if (!a.empty) buckets.push(a);
+    if (buckets.length === 0 && this._inst.size === 0) return;
+
+    let x0 = Infinity;
+    let z0 = Infinity;
+    let x1 = -Infinity;
+    let z1 = -Infinity;
+    for (const a of buckets) {
+      const p = a.pos;
+      for (let i = 0; i < p.length; i += 3) {
+        if (p[i] < x0) x0 = p[i];
+        if (p[i] > x1) x1 = p[i];
+        if (p[i + 2] < z0) z0 = p[i + 2];
+        if (p[i + 2] > z1) z1 = p[i + 2];
+      }
+    }
+    if (!Number.isFinite(x0)) return;
+
+    // The grid is bounded as well as sized: a landmark whose pieces sprawl
+    // across a whole district must not allocate a million cells.
+    const nx = Math.min(AO_GRID_MAX, Math.max(1, Math.ceil((x1 - x0) / AO_CELL) + 1));
+    const nz = Math.min(AO_GRID_MAX, Math.max(1, Math.ceil((z1 - z0) / AO_CELL) + 1));
+    const sx = nx > 1 ? (x1 - x0) / (nx - 1) : AO_CELL;
+    const sz = nz > 1 ? (z1 - z0) / (nz - 1) : AO_CELL;
+    const raw = new Float32Array(nx * nz).fill(Infinity);
+    const cellOf = (x, z) => {
+      const i = Math.min(nx - 1, Math.max(0, Math.round((x - x0) / sx)));
+      const k = Math.min(nz - 1, Math.max(0, Math.round((z - z0) / sz)));
+      return k * nx + i;
+    };
+
+    for (const a of buckets) {
+      const p = a.pos;
+      for (let i = 0; i < p.length; i += 3) {
+        const c = cellOf(p[i], p[i + 2]);
+        if (p[i + 1] < raw[c]) raw[c] = p[i + 1];
+      }
+    }
+    // 3x3 minimum. A wall standing at the top of a kerb has its own base a few
+    // centimetres above the pavement in the next cell; without the dilation
+    // that step is read as height and the junction loses its darkening on the
+    // one side of the building that is uphill.
+    const gnd = new Float32Array(nx * nz);
+    for (let k = 0; k < nz; k++) {
+      for (let i = 0; i < nx; i++) {
+        let m = Infinity;
+        for (let dk = -1; dk <= 1; dk++) {
+          const kk = k + dk;
+          if (kk < 0 || kk >= nz) continue;
+          for (let di = -1; di <= 1; di++) {
+            const ii = i + di;
+            if (ii < 0 || ii >= nx) continue;
+            const v = raw[kk * nx + ii];
+            if (v < m) m = v;
+          }
+        }
+        gnd[k * nx + i] = m;
+      }
+    }
+
+    let touched = 0;
+    for (const a of buckets) {
+      const p = a.pos;
+      const n = a.nrm;
+      const col = a.col;
+      for (let i = 0, v = 0; i < p.length; i += 3, v += 3) {
+        const g = gnd[cellOf(p[i], p[i + 2])];
+        if (!Number.isFinite(g)) continue;
+        const h = p[i + 1] - g;
+        if (h < -0.05 || h > AO_HEIGHT) continue;
+        let t = 1 - Math.max(0, h) / AO_HEIGHT;
+        t *= t;
+        const w = 1 - Math.max(0, n[v + 1]) * AO_UPFACE_CUT;
+        const ao = AO_STRENGTH * t * w;
+        if (ao > col[v + 2]) {
+          col[v + 2] = ao > 1 ? 1 : ao;
+          touched++;
+        }
+      }
+    }
+
+    /**
+     * Instanced placements carry the same term as a PER-INSTANCE mask rather
+     * than per vertex — the prototype geometry is shared by the whole city, so
+     * a bin that stands on this pavement cannot be allowed to darken the same
+     * bin on a roof three tiles away. `place()` already carries a masks slot
+     * for exactly this reason (no two windows in a street are equally dirty).
+     */
+    for (const [id, e] of this._inst) {
+      const proto = this.lib.protos.get(id);
+      if (!proto || e.m.length === 0) continue;
+      for (let i = 0; i < e.m.length; i++) {
+        const el = e.m[i].elements;
+        const g = gnd[cellOf(el[12], el[14])];
+        if (!Number.isFinite(g)) continue;
+        const h = el[13] - g;
+        if (h < -0.05 || h > AO_HEIGHT) continue;
+        let t = 1 - Math.max(0, h) / AO_HEIGHT;
+        t *= t;
+        const ao = AO_STRENGTH * AO_INSTANCE_SCALE * t;
+        const mk = e.c[i] ?? [0, 0, 0];
+        if (ao > mk[2]) {
+          mk[2] = ao > 1 ? 1 : ao;
+          e.c[i] = mk;
+          touched++;
+        }
+      }
+    }
+    this.stats.groundAo = touched;
+  }
+
   // ----------------------------------------------------------- finalize ---
   /**
    * Build the meshes into a Group. Nothing is added to the scene here — the
@@ -355,6 +544,8 @@ export class TileBuilder {
       }
       e.m.length = 0;
     }
+
+    this._bakeGroundAo();
 
     /**
      * `noShadow` is set for the DETAIL bucket, and it is not a saving — it is a

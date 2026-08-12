@@ -4,8 +4,9 @@
  *
  * Renders nothing. It takes the geometry `buildBody()` actually emits, fires a
  * ray at the head from every direction on a Fibonacci sphere and asks what the
- * NEAREST surface is, then checks four things that have each been shipped
- * broken at least once:
+ * NEAREST surface is, then checks six things — the first five have each been
+ * shipped broken at least once, and the sixth guards a class of defect that
+ * nothing in the pipeline could previously see at all:
  *
  *   1 SCALP     no bare skin anywhere on the cranium, measured against an
  *               anatomical target hairline held in THIS file — deliberately not
@@ -26,6 +27,17 @@
  *               moved by a RIGID transform, which cannot change what occludes
  *               what. If this ever fails, 1-4 stop covering every pose and the
  *               head has to be re-checked per animation state.
+ *   6 ATLAS     the face texture is painted where the face IS. The head is the
+ *               one surface in the game with a non-tiling uv, so a mouth is
+ *               drawn at one coordinate and has to land on the mouth; nothing
+ *               else in the pipeline can tell if it does not. For each
+ *               anatomical landmark this interpolates the uv across the emitted
+ *               triangle the landmark falls in and compares it against the uv
+ *               `textures.js` paints the feature at. The two come from
+ *               independent sources — one is the geometry after 30 mm of
+ *               feature displacement, the other is an authored table — so
+ *               agreement is a measurement and not a restatement. A shifted
+ *               atlas is run as a mandatory negative control.
  *
  * Why a ray probe and not screenshots: a screenshot only proves the angles you
  * remembered to shoot. This proves all of them at once, and because the whole
@@ -36,8 +48,10 @@
  *   node src/player/character/headprobe.mjs           # gate, exits non-zero
  *   node src/player/character/headprobe.mjs --map     # + an ASCII sphere map
  *   node src/player/character/headprobe.mjs --dirs=60000
+ *   node src/player/character/headprobe.mjs --atlas   # + per-landmark uv drift
  */
 import { buildBody, MAT, BONE_INDEX } from './mesh.js';
+import { FACE_POINTS, FACE_LANDMARKS } from './textures.js';
 import { BROTHERS } from '../brothers.js';
 
 const args = Object.fromEntries(
@@ -301,10 +315,95 @@ function run(id) {
     }
   }
 
-  return { id, spec, samples, scalp, buried, brows, browRays, earHits, hairHits, skinHits, tris, loose, headVerts };
+  /* ---- 6: the face atlas is registered to the face ----
+   * The skull group only: ears are tubes in the same material and are parked
+   * on a different part of the atlas on purpose.
+   *
+   * BARYCENTRIC, NOT NEAREST-VERTEX. The skull is a 42 x 52 grid, so its
+   * vertices quantise v to 0.0238 and u to 0.0192 — a nearest-vertex reading
+   * carries up to half of that as noise, which is most of a 0.020 tolerance
+   * and is not a property of the atlas at all. (Measured before this changed:
+   * carson's brow read 0.0212 of v drift and aidan's -0.0026, from the same
+   * geometry and the same paint, purely because the two landed on different
+   * rows.) Interpolating the uv across the triangle the landmark falls in
+   * removes the grid entirely and leaves only the real displacement. */
+  const pos = geometry.attributes.position.array;
+  const uvA = geometry.attributes.uv.array;
+  const atlas = [];
+  for (const [name, [ax, ay]] of Object.entries(FACE_POINTS)) {
+    let bestZ = Infinity, bu = 0, bv = 0, found = false;
+    for (const g of geometry.groups) {
+      if (g.materialIndex !== MAT.face) continue;
+      for (let i = g.start; i < g.start + g.count; i += 3) {
+        const a = idx[i], b = idx[i + 1], k = idx[i + 2];
+        const xs = [], ys = [], zs = [];
+        for (const v of [a, b, k]) {
+          xs.push((pos[v * 3] - c[0]) / hs);
+          ys.push((pos[v * 3 + 1] - c[1]) / hs);
+          zs.push((pos[v * 3 + 2] - c[2]) / hs);
+        }
+        if (zs[0] > -0.020 && zs[1] > -0.020 && zs[2] > -0.020) continue;
+        const area = (xs[1] - xs[0]) * (ys[2] - ys[0]) - (xs[2] - xs[0]) * (ys[1] - ys[0]);
+        if (Math.abs(area) < 1e-12) continue;
+        const w0 = ((xs[1] - ax) * (ys[2] - ay) - (xs[2] - ax) * (ys[1] - ay)) / area;
+        const w1 = ((xs[2] - ax) * (ys[0] - ay) - (xs[0] - ax) * (ys[2] - ay)) / area;
+        const w2 = 1 - w0 - w1;
+        if (w0 < -1e-9 || w1 < -1e-9 || w2 < -1e-9) continue;
+        const z = w0 * zs[0] + w1 * zs[1] + w2 * zs[2];
+        if (z >= bestZ) continue;
+        bestZ = z;
+        found = true;
+        // The u seam runs down the back of the head, so no triangle on the
+        // front of the face straddles it and a plain blend is safe here.
+        bu = w0 * uvA[a * 2] + w1 * uvA[b * 2] + w2 * uvA[k * 2];
+        bv = w0 * uvA[a * 2 + 1] + w1 * uvA[b * 2 + 1] + w2 * uvA[k * 2 + 1];
+      }
+    }
+    const want = FACE_LANDMARKS[name];
+    atlas.push({ name, found, du: found ? bu - want[0] : 9, dv: found ? bv - want[1] : 9 });
+  }
+
+  return {
+    id, spec, samples, scalp, buried, brows, browRays, earHits, hairHits,
+    skinHits, tris, loose, headVerts, atlas,
+  };
 }
 
 const FACE_RAY_NAMES = 'eyes,bridge,noseTip,cheeks';
+
+/**
+ * How far a painted landmark may sit from the geometry it belongs to, in atlas
+ * units, as [du, dv]. 0.018 of u is 8 mm across a 143 mm skull and 0.018 of v
+ * is 6 mm down it — under the height of a lip, which is what the tolerance has
+ * to beat for "the mouth is painted on the mouth" to mean anything.
+ *
+ * PER LANDMARK AND PER AXIS, because the tolerance a feature actually has is
+ * the one PERPENDICULAR to it: the mouth is a horizontal band, so v is the
+ * axis that matters and it is held tighter.
+ *
+ * MEASURED residual, all three brothers, worst of the three: noseTip 0.0006,
+ * chin 0.0027, nostril 0.0032, eye 0.0018, cheek 0.0024, mouth 0.0018 — and
+ * brow 0.0099 of v, which is not noise. The brow-ridge gaussian pushes the
+ * surface UP, so the vertex that ends at the eyebrow tube's height carries a v
+ * that much larger than `faceUV` of the anatomical point; `textures.js` paints
+ * the brow arc with exactly that `RIDGE` offset applied. If the ridge is ever
+ * re-authored, this residual moves, the painter's fixed offset stops matching,
+ * and 0.018 is what catches it.
+ *
+ * The jaw was a landmark here and is not any more: the mandible and
+ * `jawSquare` gaussians move the SURFACE at a given x by 15-20 mm without
+ * moving that surface's parameter, so it read 0.027-0.046 on the three
+ * brothers and fell off the front of dylan's face entirely. It was never
+ * painted against — the beard's outer boundary is authored in atlas space, not
+ * from that point — so a landmark that only ever needed a 0.046 tolerance was
+ * dropped rather than kept as the one number the whole table had to obey.
+ */
+const ATLAS_TOL = { mouth: [0.018, 0.014] };
+const ATLAS_TOL_DEFAULT = [0.018, 0.018];
+/** The control shift: ten times the worst measured residual. */
+const ATLAS_SHIFT = 0.18;
+const tolOf = (name) => ATLAS_TOL[name] ?? ATLAS_TOL_DEFAULT;
+
 
 let failures = 0;
 for (const id of ['carson', 'aidan', 'dylan']) {
@@ -318,6 +417,12 @@ for (const id of ['carson', 'aidan', 'dylan']) {
   if (r.brows.R < browMin || r.brows.L < browMin) bad.push(`BROWS ${r.brows.R}+${r.brows.L}`);
   if (r.earHits.L < earMin || r.earHits.R < earMin) bad.push(`EARS ${r.earHits.L}+${r.earHits.R}`);
   if (r.loose > 0) bad.push(`RIGID ${r.loose}`);
+  const offAtlas = r.atlas.filter((a) => Math.abs(a.du) > tolOf(a.name)[0] || Math.abs(a.dv) > tolOf(a.name)[1]);
+  if (offAtlas.length) bad.push(`ATLAS ${offAtlas.map((a) => a.name).join('/')}`);
+  // Reported as a FRACTION of each landmark's own tolerance, so one number
+  // covers a table that does not use one number.
+  const worst = r.atlas.reduce(
+    (m, a) => Math.max(m, Math.abs(a.du) / tolOf(a.name)[0], Math.abs(a.dv) / tolOf(a.name)[1]), 0);
 
   console.log(`\n=== ${id} (${r.spec.build.hair}) — ${NDIR} rays, ${r.tris.length} head tris ===`);
   console.log(`  nearest surface: hair ${r.hairHits}  skin ${r.skinHits}  ear ${ears}`);
@@ -326,6 +431,12 @@ for (const id of ['carson', 'aidan', 'dylan']) {
   console.log(`  3 BROWS frontal rays landing on eyebrow hair   : R ${r.brows.R} L ${r.brows.L} of ${r.browRays}  (want >= ${browMin} each)`);
   console.log(`  4 EARS  rays whose nearest surface is an ear   : R ${r.earHits.R} L ${r.earHits.L}  (want >= ${earMin} each)`);
   console.log(`  5 RIGID head verts not 100% on the head bone   : ${r.loose} of ${r.headVerts}  (want 0)`);
+  console.log(`  6 ATLAS worst painted-vs-geometry uv drift     : ${(worst * 100).toFixed(0)}% of tolerance over ${r.atlas.length} landmarks  (want <= 100%)`);
+  if (args.atlas) {
+    for (const a of r.atlas) {
+      console.log(`      ${a.name.padEnd(9)} du ${a.du >= 0 ? ' ' : ''}${a.du.toFixed(4)}  dv ${a.dv >= 0 ? ' ' : ''}${a.dv.toFixed(4)}`);
+    }
+  }
   if (bad.length) {
     failures++;
     console.log(`  FAIL: ${bad.join(', ')}`);
@@ -338,5 +449,22 @@ for (const id of ['carson', 'aidan', 'dylan']) {
   }
   if (args.map) console.log(asciiMap(r.samples));
 }
-console.log(`\n${failures ? `FAIL (${failures}/3 brothers)` : 'PASS (3/3 brothers)'}`);
+
+/* ---- gate 6's negative control ----
+ * Shift every painted landmark and confirm the check goes red. Without this,
+ * gate 6 would pass on an atlas that had drifted the same way the geometry
+ * did — or on a run where the comparison silently stopped happening. */
+{
+  const r = run('aidan');
+  const shifted = r.atlas.filter(
+    (a) => Math.abs(a.du + ATLAS_SHIFT) > tolOf(a.name)[0] || Math.abs(a.dv + ATLAS_SHIFT) > tolOf(a.name)[1]
+  );
+  const ok = shifted.length === r.atlas.length;
+  if (!ok) failures++;
+  console.log(`\n=== negative control: atlas shifted by ${ATLAS_SHIFT} ===`);
+  console.log(`  landmarks that go out of tolerance: ${shifted.length} of ${r.atlas.length}  (want all)`);
+  console.log(ok ? '  PASS (gate 6 detects a misregistered atlas)' : '  FAIL: gate 6 does not detect the shift');
+}
+
+console.log(`\n${failures ? `FAIL (${failures} check${failures > 1 ? 's' : ''})` : 'PASS (3/3 brothers, atlas control red)'}`);
 process.exit(failures ? 1 : 0);

@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { Accum } from './util.js';
 import { vnoise } from './terrain.js';
-import { ROAD_KIND, roadHalfWidth, SECTOR, clamp01, lerp, smoothstep } from './plan.js';
+import { ROAD_KIND, roadHalfWidth, SECTOR, clamp01, lerp, smoothstep, DISTRICT_BY_ID } from './plan.js';
 
 /**
  * WORLD — the road surface.
@@ -44,6 +44,107 @@ const KERB_W = 0.33;
  * a city block.
  */
 const PAD_RMAX = 1.7;
+
+/**
+ * THE JUNCTION PAD IS AS DEEP AS THE KERB CORNER NEEDS AND NOT ONE METRE MORE.
+ *
+ * The pad radius decides where the straight carriageway run STOPS, and the
+ * marking pass can only lay a stroke on the run plus a short reach into the
+ * junction box (`_paint`). So an over-generous pad is not a cosmetic choice
+ * about junction shape — it is bare tarmac. MEASURED over the whole city with
+ * the shipped blanket factor (`hw * 1.3` at a junction, `hw * 1.05` everywhere
+ * else): only 60.4 % of arterial length and 39.7 % of highway length lay
+ * between its own two insets, and a 40 m arterial block spent ~20 m as pad.
+ *
+ * The blanket factor is wrong in BOTH directions, which is why it had to go:
+ *
+ *   at a real junction it is too SMALL. The corner between two arms only
+ *   exists while their mouths clear each other, `atan(hwA/R) + atan(hwB/R) <
+ *   phi`; below that `_junction` mitres them together and emits no kerb at
+ *   all. MEASURED: at 3-arm nodes 82 % of the city is already under that
+ *   requirement, at 5- and 6-arm nodes 100 % of it — the arms there are 5-30
+ *   degrees apart and no radius saves them. There is nothing to reclaim.
+ *
+ *   at a plain continuation node it is enormously too big. Two arms 180
+ *   degrees apart need NO pad — their kerb lines are parallel and never cross
+ *   — yet they were given 1.05 x the half width anyway, ~3.8 m at the median
+ *   and 8.0 m at p95, at both ends of every polyline vertex in the city. The
+ *   median 2-arm node in this city deflects by 0 degrees and the p05 by 47.
+ *
+ * So the pad is now the requirement itself at 2-arm nodes and untouched
+ * everywhere else — see `padNeed`. `_padR` is never allowed to GROW: a bigger
+ * pad changes junction shape, mitring and collision, and none of that is what
+ * this is for.
+ */
+
+/**
+ * Angular room the kerb corner is entitled to between the two mouths it joins.
+ *
+ * Not a taste number: `_junction` samples a corner at `ceil(span / 0.075)`
+ * segments with a floor of 4, so 4 x 0.075 is the span at which the corner
+ * stops being a knife edge and starts being a fillet the sampler can resolve.
+ */
+const FILLET_ARC = 0.30;
+
+/**
+ * The shallowest pad allowed once `padNeed` has had its say — one kerb stone.
+ * `_kerb` lays the run at a 1.55 m step, so a pad thinner than this is thinner
+ * than the single stone that has to turn the bend inside it, and the kerb line
+ * would have to break the deflection across a joint instead of a stone.
+ */
+const PAD_MIN = 1.55;
+
+/**
+ * The smallest pad radius at which a kerb corner of `FILLET_ARC` still fits
+ * between two arms `phi` apart, half-widths `hwA` and `hwB`.
+ *
+ * Analytic, like the pad boundary it serves. The mouths meet the corner at
+ * `atan(hw/R)` either side, so the corner survives while
+ *
+ *     atan(hwA/R) + atan(hwB/R)  <=  phi - FILLET_ARC  =:  w
+ *
+ * and the left side falls monotonically in R, so the bound is an equality at
+ * the answer. Taking the tangent of both sides with `tA = hwA/R`, `tB = hwB/R`
+ * and `T = tan(w)`,
+ *
+ *     (tA + tB) / (1 - tA tB) = T   ->   T R^2 - (hwA + hwB) R - T hwA hwB = 0
+ *
+ * whose positive root is the radius. The quadratic is written out per sign of
+ * `T` rather than as one formula because the two roots swap: `w < 90` degrees
+ * gives `T > 0` and wants the larger root, `w > 90` gives `T < 0` and wants
+ * `(D - S) / -2T`, which tends to 0 as `w` tends to 180 — a straight-through
+ * node asking for no pad, which is the correct answer and the whole point.
+ */
+function padNeed(hwA, hwB, phi) {
+  const w = phi - FILLET_ARC;
+  if (w <= 0) return Infinity; // sharper than a fillet: keep whatever it had
+  const S = hwA + hwB;
+  const T = Math.tan(w);
+  const D = Math.sqrt(S * S + 4 * T * T * hwA * hwB);
+  return T > 0 ? (S + D) / (2 * T) : (D - S) / (-2 * T);
+}
+
+/**
+ * A/B hatch for the pad above, same shape as `legacyPave` and `legacyCap`.
+ * `?fatpads=1`, or `OW_FAT_PADS=1` headless, puts the blanket 1.05/1.3 factor
+ * back. It is the negative control for the marked-length assertion in
+ * `src/world/paintprobe.mjs` and is never reachable in normal play.
+ */
+let _legacyPadR = null;
+function legacyPadR() {
+  if (_legacyPadR !== null) return _legacyPadR;
+  _legacyPadR = false;
+  try {
+    if (typeof location !== 'undefined' && new URLSearchParams(location.search).get('fatpads') === '1') {
+      _legacyPadR = true;
+    }
+  } catch { /* no location */ }
+  try {
+    if (typeof process !== 'undefined' && process?.env?.OW_FAT_PADS === '1') _legacyPadR = true;
+  } catch { /* no process */ }
+  if (_legacyPadR) console.warn('[world] LEGACY junction pads — blanket 1.05/1.3x half width, pre-fix');
+  return _legacyPadR;
+}
 
 /**
  * Height of the kerb IN THE COLLISION WORLD, which is not the height of the
@@ -118,6 +219,106 @@ const DROP_MUL = 0.4;
 const SKIRT_LIP = 0.02;
 /** Deepest the skirt may reach below the carriageway. Matches the road sink. */
 const SKIRT_MAX = 0.6;
+
+/* ---------------------------------------------------------------- paint --
+ *
+ * THE MARKING PALETTE LIVES HERE, not in `world/palette.js`, for one reason
+ * that is worth stating: the alphaTest is a property of HOW THE QUAD IS CUT,
+ * and the quads are cut in this file. `materials.get` keys its texture bake on
+ * the bake parameters alone, so overriding `three.alphaTest` costs one extra
+ * material and not one byte of texture memory — which matters, because the
+ * mill already has the atlas over its soft cap.
+ *
+ * `props._probeWorldDecals` reads `world.roadMesh.palette` and stands down on
+ * every surface it finds there, so putting the arrows in this table MOVES them
+ * out of the prop decal layer instead of drawing them twice.
+ *
+ * MEASURED, both arms, at the street shot: 687 MiB in 76 surface sets, byte for
+ * byte identical, with the same nine marking bakes resident either way. The
+ * whole `road_line*` family is baked whichever layer draws it, so this costs
+ * nothing and saves nothing — and the mill's 47 MiB over the soft cap is
+ * exactly where it was.
+ */
+
+/**
+ * Deliberately far below the 0.42 the library ships. There is no MSAA in this
+ * renderer and the mip chain averages the cutout, so a high cut is a
+ * DISTANCE FUNCTION that erases thin paint — see `_paint`. `props` runs
+ * foliage at 0.21 for the same reason and against the same mip chain.
+ */
+const PAINT_CUT = 0.18;
+
+/**
+ * `?owPaintLegacy=1` lays the markings exactly as they shipped: quads showing
+ * the whole 0..1 glyph window, dashes as one ribbon with the duty cycle in the
+ * texture, and the library's own 0.42 cut. A fix you cannot un-apply is a fix
+ * you cannot prove — `src/world/paintprobe.mjs` runs this arm as its control,
+ * and the same argument as `--nodedup` in `src/world/probe.mjs`.
+ */
+const LEGACY_PAINT =
+  typeof location !== 'undefined' && /[?&]owPaintLegacy=1/.test(location.search);
+
+const CUT = LEGACY_PAINT ? 0.42 : PAINT_CUT;
+
+const MARK_PALETTE = {
+  line_white: { name: 'road_line', surface: 'asphalt', opts: { three: { alphaTest: CUT } } },
+  line_dash: { name: 'road_line_dash', surface: 'asphalt', opts: { three: { alphaTest: CUT } } },
+  line_yellow: { name: 'road_line_double', surface: 'asphalt', opts: { three: { alphaTest: CUT } } },
+  mark_cross: { name: 'road_crossing', surface: 'asphalt', opts: { three: { alphaTest: CUT } } },
+  mark_stop: { name: 'road_stopbar', surface: 'asphalt', opts: { three: { alphaTest: CUT } } },
+};
+// The control arm must leave the arrows where they shipped — in `props` — or
+// the A/B is measuring two changes at once.
+if (!LEGACY_PAINT) {
+  MARK_PALETTE.mark_arrow = { name: 'road_arrow', surface: 'asphalt', opts: { three: { alphaTest: CUT } } };
+  MARK_PALETTE.mark_arrow_turn = { name: 'road_arrow_turn', surface: 'asphalt', opts: { three: { alphaTest: CUT } } };
+}
+
+/**
+ * UV WINDOWS — the band of each glyph a quad is allowed to show.
+ *
+ * Every one of these is the painted stroke plus about a tenth of its width of
+ * margin, and that margin is not slack: the glyph's own edge softening is
+ * `SOFT` = 0.006 in uv, and the wear term eats inward from the stroke edge, so
+ * a window flush with the stroke would clip the thinning that makes the paint
+ * look laid rather than drawn.
+ *
+ *   solid line   stroke u 0.36..0.64, window 0.34..0.66  -> 0.88 coverage
+ *   double       strokes 0.22..0.40 and 0.60..0.78, window 0.20..0.80 -> 0.60
+ *   stop bar     band v 0.34..0.66, window 0.30..0.70    -> 0.80
+ *   arrow        shaft and head over u 0.30..0.70        -> 0.34, and this is
+ *                the one glyph that cannot be made dense, which is precisely
+ *                why the cut had to come down as well as the window in
+ */
+const FULL = [0, 1];
+const U_LINE = LEGACY_PAINT ? FULL : [0.34, 0.66];
+const U_DBL = LEGACY_PAINT ? FULL : [0.20, 0.80];
+const U_ARROW = LEGACY_PAINT ? FULL : [0.26, 0.74];
+const U_STOP = LEGACY_PAINT ? FULL : [0.30, 0.70];
+
+/** Stroke widths in metres. A US urban lane line is 4 in; an edge line 6 in. */
+const LINE_W = LEGACY_PAINT ? 0.5 : 0.13;
+const EDGE_W = LEGACY_PAINT ? 0.5 : 0.16;
+/** Two 10 cm yellows with a 10 cm gap, spread over the double glyph's window. */
+const DBL_W = LEGACY_PAINT ? 0.62 : 0.32;
+/** 3 m mark, 9 m gap. */
+const DASH_ON = 3.0;
+const DASH_OFF = 9.0;
+/** Painted depth of a stop bar, and the arrow's footprint. */
+const STOP_W = LEGACY_PAINT ? 1.6 : 0.62;
+const ARROW_W = 1.15;
+const ARROW_L = 3.4;
+/** How far the paint sits above the wearing course. Matches the old ribbon. */
+const PAINT_LIFT = 0.011;
+/** Metres of road per uv unit along a stroke: sets the wear grain, not a dash. */
+const PAINT_V = 9;
+
+/** Order-independent 0..1. Paint must not depend on which way you drove in. */
+function h2(a, b) {
+  let n = (Math.imul(a | 0, 374761393) + Math.imul(b | 0, 668265263)) | 0;
+  n = Math.imul(n ^ (n >>> 13), 1274126177);
+  return ((n ^ (n >>> 16)) >>> 0) / 4294967296;
+}
 
 /** 0..1 easing of the kerb height `d` metres from a junction mouth. */
 function kerbDrop(d, drop) {
@@ -337,9 +538,12 @@ export class RoadMeshBuilder {
     this.graph = graph;
     this.terrain = terrain;
     this.materials = materials;
-    this.palette = palette;
+    // The marking entries override the library's, and `props` reads this table
+    // to decide which glyphs it must NOT draw — see MARK_PALETTE.
+    this.palette = { ...palette, ...MARK_PALETTE };
     this.rng = rng;
     this._padR = new Float32Array(graph.nodes.length);
+    const fat = legacyPadR();
     for (let i = 0; i < graph.nodes.length; i++) {
       const n = graph.nodes[i];
       let r = 3;
@@ -347,7 +551,7 @@ export class RoadMeshBuilder {
         const e = graph.edges[eid];
         r = Math.max(r, roadHalfWidth(e.kind, e.lanes) * (n.links.length > 2 ? 1.3 : 1.05));
       }
-      this._padR[i] = r;
+      this._padR[i] = fat ? r : Math.min(r, this._padNeed(n));
     }
     this._buildLaneIndex();
     // Which sector owns which edge / node.
@@ -503,6 +707,45 @@ export class RoadMeshBuilder {
   hasWork(sx, sz) {
     const k = sectorKey(sx, sz);
     return this._edgesBySector.has(k) || this._nodesBySector.has(k);
+  }
+
+  /**
+   * The deepest pad any of this node's kerb corners asks for. `Infinity` means
+   * "no opinion" — the blanket radius stands.
+   *
+   * ONLY PLAIN CONTINUATION NODES ARE TIGHTENED, and the test is deliberately
+   * strict: exactly two links, both of them road. Three things hang off that.
+   *
+   *   A dead end has ONE arm, whose corner sweeps the full turn; `PAD_RMAX`
+   *   turns that into a turning head, and a turning head is a real feature
+   *   whose size is nobody's business but `PAD_RMAX`'s.
+   *
+   *   A junction has its own reasons for the radius it was given — the
+   *   crossing, the stop bar and the kerb return all live inside it — and the
+   *   MEASUREMENT says there is nothing there to reclaim anyway.
+   *
+   *   A node where a rail line crosses a road has two road arms and three
+   *   links. `_junction` skips rail, but the level crossing is paved by the
+   *   rail builder, so this is not the place to start moving its edges.
+   */
+  _padNeed(n) {
+    const g = this.graph;
+    if (n.links.length !== 2) return Infinity;
+    const eA = g.edges[n.links[0]];
+    const eB = g.edges[n.links[1]];
+    if (eA.rail || eB.rail) return Infinity;
+    const dir = (e) => {
+      const o = g.nodes[e.a === n.id ? e.b : e.a];
+      return Math.atan2(o.z - n.z, o.x - n.x);
+    };
+    // The two arms cut the turn into two corners; the tighter one is the one
+    // that has to hold a fillet, and it is the only one that can bind.
+    let phi = dir(eB) - dir(eA);
+    while (phi <= 1e-6) phi += Math.PI * 2;
+    const hwA = roadHalfWidth(eA.kind, eA.lanes);
+    const hwB = roadHalfWidth(eB.kind, eB.lanes);
+    const need = padNeed(hwA, hwB, Math.min(phi, Math.PI * 2 - phi));
+    return Math.max(PAD_MIN, need);
   }
 
   /**
@@ -841,8 +1084,9 @@ class SectorBuild {
     const nlA = na.links.length;
     const nlB = nb.links.length;
     if (SW > 0) {
-      if (nlA > 2) this._crossing(e, pt, hw, s0, +1);
-      if (nlB > 2) this._crossing(e, pt, hw, s1, -1);
+      const arterial = kind.paint === 'arterial' || kind.paint === 'highway';
+      if (nlA > 2) this._crossing(e, pt, hw, s0, +1, kind, arterial || nlA > 3);
+      if (nlB > 2) this._crossing(e, pt, hw, s1, -1, kind, arterial || nlB > 3);
     }
 
     // ---- gullies, manholes, patches -------------------------------------
@@ -1439,47 +1683,206 @@ class SectorBuild {
   /* ----------------------------------------------------------- paint -- */
 
   /**
-   * Road markings.
+   * ROAD PAINT.
    *
-   * The `road_line*` surfaces are alpha-masked decals that already contain the
-   * glyph (solid / 3 m dash / double), the bead grit, the thinning at the edges
-   * and — the point of the whole family — the wear-through where the wheel line
-   * crosses them. So one quad per line is the RIGHT amount of geometry: the
-   * dashes, the erosion and the junction scrub all come out of the surface, and
-   * they vary along the road instead of repeating per dash.
+   * WHY THE CITY HAD NO LANE MARKINGS AT ALL, which is what two critic panels
+   * scored and what the frames show: the glyph occupies the middle 28 % of the
+   * `road_line` bake and the quad showed the whole 0..1 window, so the mip
+   * chain — which averages ALPHA, not only colour — converged on 0.28 coverage
+   * against an `alphaTest` of 0.42. Every longitudinal marking in the city was
+   * therefore discarded outright at the first mip that mattered, and a DASHED
+   * line, at 0.28 x 0.25 duty, never had a chance at any range. The one family
+   * that survived was the crossing, whose bars cover 0.46 of their window —
+   * which is exactly why a zebra was the only paint anybody could photograph.
+   *
+   * Three changes, and all three are geometry decisions rather than texture
+   * ones, because a texture cannot win an argument with a mip chain:
+   *
+   *   the quad IS the stroke   `u` runs over the painted band and a hair either
+   *                            side, so the average the mip chain arrives at is
+   *                            ~0.88 for a line and ~0.60 for a double, both
+   *                            clear of any sane cut
+   *   dashes are QUADS         one quad per 3 m mark instead of one long ribbon
+   *                            with the duty cycle in the texture. It is FEWER
+   *                            triangles than the ribbon it replaces (2 per
+   *                            12 m against 5.3) and a gap cannot be averaged
+   *                            shut
+   *   the cut comes down       `PAINT_CUT`, the same argument `props` makes for
+   *                            foliage in `kit_green.js`: there is no MSAA in
+   *                            this renderer, so a low alphaTest is the only
+   *                            lever that keeps a thin cutout alive under mips
+   *
+   * Colour is US practice and it is also the Steel City read: YELLOW separates
+   * opposing traffic, white separates lanes running the same way. A city of
+   * white centre lines is the tell that nobody looked at a photograph.
+   *
+   * Wear is in the GEOMETRY too. The surface's own scrub is real and stays, but
+   * it is averaged away by the same mip chain that used to eat the line, so the
+   * wear a driver actually sees — dashes missing, dashes short, whole stretches
+   * blacked out and never re-laid — is emitted per dash and keyed off the
+   * district's wealth. A Steel Row street has not been painted since the works
+   * closed; a downtown arterial is re-laid every other year.
    */
   _paint(e, pt, hw, kind, s0, s1, L) {
     if (kind.paint === 'none') return;
+    /**
+     * PAINT DOES NOT STOP WHERE THE CARRIAGEWAY MESH DOES.
+     *
+     * `s0`/`s1` are the JUNCTION PAD boundary — where the straight run hands
+     * over to the node builder — and the pad radius runs to 1.3x the road's own
+     * half width, so on a 4-lane arterial it is 9.9 m at each end of a 40 m
+     * block. MEASURED over the whole city: only 60 % of arterial length and
+     * 40 % of highway length lies between the two insets. Painting the run and
+     * nothing else therefore leaves a marked stretch with a bare twenty metres
+     * at each end of it, and driving down one you see the line START about
+     * eight metres in front of the bonnet and stop again before the lights.
+     *
+     * A real centre line runs from one stop bar to the next; the only thing it
+     * stops for is the junction BOX, which is about as wide as the road that
+     * crosses it. So the paint is laid over the approach as well, up to one
+     * carriageway half-width of the node. `pt()` is linear in `s`, so
+     * extrapolating a few metres past the run lands on the pad within a
+     * centimetre of its own surface.
+     */
+    // The junction BOX is as wide as the widest road through the node, which
+    // is what `_padR` is built from (x1.3 for the fillets). Paint stops at the
+    // crossing road's kerb line and not a metre earlier.
+    const boxA = this.o._padR[e.a] / 1.3 + 0.5;
+    const boxB = this.o._padR[e.b] / 1.3 + 0.5;
+    const pA = Math.max(0.4, Math.min(s0, boxA));
+    const pB = Math.min(L - 0.4, Math.max(s1, L - boxB));
+    if (pB - pA < 2.5) return;
+    s0 = pA;
+    s1 = pB;
     const fw = e.forward;
     const lw = e.laneWidth;
-    const LINE = 0.5; // quad width; the glyph occupies the middle 28 %
-    const DBL = 0.62;
+    const age = this._age(e);
+    const highway = kind.paint === 'highway';
+    const arterial = kind.paint === 'arterial';
+    // One carriageway of a divided road, or a one-way downtown block: no
+    // opposing traffic, so nothing on it is yellow except the median edge.
+    const single = e.oneway || fw === e.lanes;
 
-    if (e.oneway || fw === e.lanes) {
-      for (let k = 1; k < fw; k++) this._stripe(pt, s0, s1, (k - fw / 2) * lw, LINE, 'line_dash', 48);
-    } else if (kind.paint === 'highway') {
-      this._stripe(pt, s0, s1, -hw + 0.65, LINE, 'line_yellow', 9);
-      this._stripe(pt, s0, s1, hw - 0.65, LINE, 'line_white', 9);
-      for (let k = 1; k < fw; k++) {
-        this._stripe(pt, s0, s1, k * lw, LINE, 'line_dash', 48);
-        this._stripe(pt, s0, s1, -k * lw, LINE, 'line_dash', 48);
+    if (single) {
+      for (let k = 1; k < fw; k++) this._dashed(pt, s0, s1, (k - fw / 2) * lw, e, age, k);
+      if (highway) {
+        this._solid(pt, s0, s1, -hw + 0.55, DBL_W, 'line_yellow', U_DBL);
+        this._solid(pt, s0, s1, hw - 0.55, EDGE_W, 'line_white', U_LINE);
       }
     } else {
-      const arterial = kind.paint === 'arterial';
-      if (arterial || this.rng.float() < 0.62) {
-        this._stripe(pt, s0, s1, 0, arterial ? DBL : LINE, arterial ? 'line_yellow' : 'line_dash', arterial ? 9 : 48);
+      this._solid(pt, s0, s1, 0, DBL_W, 'line_yellow', U_DBL);
+      for (let k = 1; k < fw; k++) this._dashed(pt, s0, s1, k * lw, e, age, k);
+      for (let k = 1; k < e.lanes - fw; k++) this._dashed(pt, s0, s1, -k * lw, e, age, k + 8);
+      if (highway || arterial) {
+        const off = hw - (highway ? 0.55 : 0.40);
+        this._solid(pt, s0, s1, off, EDGE_W, 'line_white', U_LINE);
+        this._solid(pt, s0, s1, -off, EDGE_W, 'line_white', U_LINE);
       }
-      if (arterial) {
-        this._stripe(pt, s0, s1, -hw + 0.4, LINE, 'line_white', 9);
-        this._stripe(pt, s0, s1, hw - 0.4, LINE, 'line_white', 9);
+    }
+
+    /**
+     * A stretch of centre line blacked out and never re-laid. A resurfacing
+     * gang lays a band of fresh binder over the old paint and the marking crew
+     * never comes back — it is one of the loudest age cues on an American back
+     * street, and it costs nothing here because `road_patch` is already a mesh
+     * in every sector.
+     */
+    if (!single && age > 0.42 && s1 - s0 > 16) {
+      const n = Math.floor(h2(e.id, 71) * 2 + age * 1.3);
+      for (let i = 0; i < n; i++) {
+        const c = lerp(s0 + 5, s1 - 5, h2(e.id, 73 + i * 5));
+        const len = 3.5 + h2(e.id, 74 + i * 5) * 7;
+        this._blackout(pt, c - len * 0.5, c + len * 0.5, 0, DBL_W + 0.22);
       }
-      for (let k = 1; k < fw; k++) this._stripe(pt, s0, s1, k * lw, LINE, 'line_dash', 48);
-      for (let k = 1; k < e.lanes - fw; k++) this._stripe(pt, s0, s1, -k * lw, LINE, 'line_dash', 48);
     }
   }
 
-  /** One painted ribbon lying on the cambered surface. u across, v along. */
-  _stripe(pt, sA, sB, offset, width, key, vMetres) {
+  /**
+   * How tired the paint on this edge is, 0 fresh .. 1 derelict.
+   *
+   * Marking maintenance follows the money and the traffic count, so this reads
+   * the district's own `wealth` rather than a per-edge random draw: a block
+   * comes out consistent with its neighbours, which is what makes it read as a
+   * district rather than as noise. Deliberately NOT off `this.rng` — that is
+   * consumed in sector build order, so the same street would be painted
+   * differently depending on which way the player drove into it.
+   */
+  _age(e) {
+    const d = e.district ? DISTRICT_BY_ID[e.district] : null;
+    const wealth = d ? d.wealth : 0.42;
+    // an arterial is swept, gritted and re-lined; a side street is not
+    const rank = e.kind === 'highway' ? 0.45 : e.kind === 'arterial' ? 0.66 : 1;
+    return clamp01((1.06 - wealth) * rank + (h2(e.id, 17) - 0.5) * 0.26);
+  }
+
+  /**
+   * One continuous painted stroke lying on the cambered surface.
+   *
+   * `U` is the window of the glyph the quad shows — see the note above; the
+   * quad is the width of the STROKE, so the alpha the mip chain converges to is
+   * the glyph's coverage inside its own window and not its coverage over half a
+   * metre of mostly-empty bake.
+   */
+  _solid(pt, sA, sB, offset, width, key, U) {
+    if (sB - sA < 0.8) return;
+    const a = this._a(key);
+    const half = width * 0.5;
+    const segs = Math.max(1, Math.ceil((sB - sA) / 6));
+    const P = { x: 0, y: 0, z: 0 };
+    let pl = -1;
+    let pr = -1;
+    for (let i = 0; i <= segs; i++) {
+      const s = lerp(sA, sB, i / segs);
+      const v = s / PAINT_V;
+      pt(s, offset - half, P);
+      const l = a.vert(P.x, P.y + PAINT_LIFT, P.z, 0, 1, 0, U[0], v, 0.1, 0.4, 0.02);
+      pt(s, offset + half, P);
+      const r = a.vert(P.x, P.y + PAINT_LIFT, P.z, 0, 1, 0, U[1], v, 0.1, 0.4, 0.02);
+      if (pl >= 0) a.faceQuad(pl, l, r, pr, 0, 1, 0);
+      pl = l;
+      pr = r;
+    }
+  }
+
+  /**
+   * A broken lane line: one quad per 3 m mark on a 12 m cycle.
+   *
+   * Every mark takes its own window of the bake, so no two are the same stroke
+   * — which is what the ribbon it replaced could never do, because a ribbon
+   * repeats the same 48 m of texture down the whole road.
+   */
+  _dashed(pt, sA, sB, offset, e, age, band) {
+    if (LEGACY_PAINT) {
+      // As shipped: one ribbon, the duty cycle in the texture, 48 m per uv unit.
+      this._ribbon(pt, sA, sB, offset, LINE_W, 'line_dash', 48);
+      return;
+    }
+    const a = this._a('line_white');
+    const half = LINE_W * 0.5;
+    const P = { x: 0, y: 0, z: 0 };
+    const seed = (e.id * 131 + band * 7919) | 0;
+    let n = 0;
+    for (let s = sA + DASH_OFF * 0.5; s + 1.2 < sB; s += DASH_ON + DASH_OFF, n++) {
+      // paint that has been driven off: this is the wear a mip chain cannot eat
+      if (h2(seed, n * 3 + 1) < age * 0.40) continue;
+      const e1 = Math.min(sB - 0.2, s + DASH_ON * (1 - 0.34 * age * h2(seed, n * 3 + 2)));
+      if (e1 - s < 0.8) continue;
+      const v0 = h2(seed, n * 3 + 3) * (1 - DASH_ON / PAINT_V);
+      const v1 = v0 + (e1 - s) / PAINT_V;
+      pt(s, offset - half, P);
+      const q0 = a.vert(P.x, P.y + PAINT_LIFT, P.z, 0, 1, 0, U_LINE[0], v0, 0.1, 0.4, 0.02);
+      pt(s, offset + half, P);
+      const q1 = a.vert(P.x, P.y + PAINT_LIFT, P.z, 0, 1, 0, U_LINE[1], v0, 0.1, 0.4, 0.02);
+      pt(e1, offset + half, P);
+      const q2 = a.vert(P.x, P.y + PAINT_LIFT, P.z, 0, 1, 0, U_LINE[1], v1, 0.1, 0.4, 0.02);
+      pt(e1, offset - half, P);
+      const q3 = a.vert(P.x, P.y + PAINT_LIFT, P.z, 0, 1, 0, U_LINE[0], v1, 0.1, 0.4, 0.02);
+      a.faceQuad(q0, q1, q2, q3, 0, 1, 0);
+    }
+  }
+
+  /** The shipped ribbon, kept for the `owPaintLegacy` control arm only. */
+  _ribbon(pt, sA, sB, offset, width, key, vMetres) {
     if (sB - sA < 1.2) return;
     const a = this._a(key);
     const half = width * 0.5;
@@ -1491,45 +1894,113 @@ class SectorBuild {
       const s = lerp(sA, sB, i / segs);
       const v = s / vMetres;
       pt(s, offset - half, P);
-      const l = a.vert(P.x, P.y + 0.011, P.z, 0, 1, 0, 0, v, 0.1, 0.4, 0.02);
+      const l = a.vert(P.x, P.y + PAINT_LIFT, P.z, 0, 1, 0, 0, v, 0.1, 0.4, 0.02);
       pt(s, offset + half, P);
-      const r = a.vert(P.x, P.y + 0.011, P.z, 0, 1, 0, 1, v, 0.1, 0.4, 0.02);
+      const r = a.vert(P.x, P.y + PAINT_LIFT, P.z, 0, 1, 0, 1, v, 0.1, 0.4, 0.02);
       if (pl >= 0) a.faceQuad(pl, l, r, pr, 0, 1, 0);
       pl = l;
       pr = r;
     }
   }
 
+  /** A band of fresh binder laid over old markings and never re-painted. */
+  _blackout(pt, sA, sB, offset, width) {
+    const a = this._a('road_patch');
+    const half = width * 0.5;
+    const P = { x: 0, y: 0, z: 0 };
+    const q = [];
+    for (const [s, o] of [[sA, -half], [sA, half], [sB, half], [sB, -half]]) {
+      pt(s, offset + o, P);
+      q.push(a.vert(P.x, P.y + 0.008, P.z, 0, 1, 0, o, s * 0.5, 0.3, 0.6, 0.08));
+    }
+    a.faceQuad(q[0], q[1], q[2], q[3], 0, 1, 0);
+  }
+
   /**
-   * Junction approach: a continental crossing then the stop bar, in that order
-   * out from the junction, which is how they are actually laid.
+   * Junction approach: crossing, stop bar, lane arrows, in that order out from
+   * the junction, which is how they are actually laid.
+   *
+   * The stop bar is now unconditional. It is the one marking whose ABSENCE a
+   * driver reads as a defect rather than as age — a signalised junction with
+   * nothing to stop at is a junction nobody laid out — and it is 4 triangles.
    */
-  _crossing(e, pt, hw, sEnd, sign) {
-    const rng = this.rng;
-    if (rng.float() < 0.32) return;
-    const inner = hw - 0.3;
-    if (rng.float() < 0.62) {
-      // 5 bars per uv unit at a 1 m pitch: a 4 m crossing is v 0 .. 0.8
-      const depth = rng.range(3.2, 4.4);
-      this._mark(pt, sEnd + sign * 0.6, sEnd + sign * (0.6 + depth), -inner, inner, 'mark_cross', depth / 5);
-      const s = sEnd + sign * (0.6 + depth + 0.8);
-      const from = sign > 0 ? -inner : 0.25;
-      const to = sign > 0 ? -0.25 : inner;
-      this._mark(pt, s, s + sign * 1.6, from, to, 'mark_stop', 1);
-    } else {
-      const s = sEnd + sign * 1.6;
-      const from = sign > 0 ? -inner : 0.25;
-      const to = sign > 0 ? -0.25 : inner;
-      this._mark(pt, s, s + sign * 1.6, from, to, 'mark_stop', 1);
+  _crossing(e, pt, hw, sEnd, sign, kind, busy) {
+    const age = this._age(e);
+    const inner = hw - 0.35;
+    const seed = (e.id * 977 + (sign > 0 ? 3 : 5)) | 0;
+    let s = sEnd + sign * 0.8;
+    // A crossing is painted where people are expected to cross: every arm of a
+    // signalised or multi-arm junction, and about half the arms of a plain
+    // street corner. Marking all four arms of a 37 m residential grid is as
+    // wrong as marking none of them.
+    if (h2(seed, 21) > (busy ? 0.06 : 0.34) + age * 0.26) {
+      // 5 bars per uv unit at a 1 m pitch: a 4 m crossing spans v 0 .. 0.8
+      const depth = 2.9 + h2(seed, 22) * 1.5;
+      const v0 = h2(seed, 23);
+      this._mark(pt, s, s + sign * depth, -inner, inner, 'mark_cross',
+        [0.02, 0.98], [v0, v0 + depth / 5]);
+      s += sign * (depth + 0.9);
+    }
+    const from = sign > 0 ? -inner : 0.28;
+    const to = sign > 0 ? -0.28 : inner;
+    this._mark(pt, s, s + sign * STOP_W, from, to, 'mark_stop', [0.02, 0.98], U_STOP);
+
+    /**
+     * Lane arrows, arterials and highways only. `props._probeWorldDecals` reads
+     * this builder's palette and stands down on any glyph it finds there, so
+     * adding `road_arrow` here MOVES the arrows rather than doubling them —
+     * which is the point: a prop decal only exists on the near LOD tile, and an
+     * arrow you can only see from twenty metres is not wayfinding.
+     */
+    if (LEGACY_PAINT) return;
+    if (kind.paint !== 'arterial' && kind.paint !== 'highway') return;
+    const lanes = sign > 0 ? e.lanes - e.forward : e.forward;
+    if (lanes < 1) return;
+    const tip = s + sign * (STOP_W + 2.2);
+    for (let k = 0; k < lanes && k < 4; k++) {
+      if (h2(seed, 30 + k) < 0.18 + age * 0.32) continue;
+      const o = (k + 0.5) * e.laneWidth * (sign > 0 ? -1 : 1);
+      // the kerbside lane turns off; the arrow's barb points at its own kerb
+      const turn = k === lanes - 1 && lanes > 1 && h2(seed, 40 + k) < 0.62;
+      this._arrow(pt, tip + sign * ARROW_L, tip, o, sign > 0,
+        turn ? 'mark_arrow_turn' : 'mark_arrow');
     }
   }
 
-  /** A marking whose u runs ACROSS the carriageway (crossings, stop bars). */
-  _mark(pt, sA, sB, oA, oB, key, vSpan) {
+  /**
+   * One lane arrow, tail to tip, pointing the way the traffic in that lane is
+   * going. `mirror` flips u so a turn barb strikes toward the kerb on both
+   * sides of the road rather than always to texture-left.
+   */
+  _arrow(pt, sTail, sTip, offset, mirror, key) {
+    const a = this._a(key);
+    const half = ARROW_W * 0.5;
+    const P = { x: 0, y: 0, z: 0 };
+    const uL = mirror ? U_ARROW[1] : U_ARROW[0];
+    const uR = mirror ? U_ARROW[0] : U_ARROW[1];
+    const q = [];
+    for (const [s, o, u, v] of [
+      [sTail, -half, uL, 0.03], [sTail, half, uR, 0.03],
+      [sTip, half, uR, 0.99], [sTip, -half, uL, 0.99],
+    ]) {
+      pt(s, offset + o, P);
+      q.push(a.vert(P.x, P.y + PAINT_LIFT, P.z, 0, 1, 0, u, v, 0.1, 0.4, 0.02));
+    }
+    a.faceQuad(q[0], q[1], q[2], q[3], 0, 1, 0);
+  }
+
+  /**
+   * A marking whose u runs ACROSS the carriageway (crossings, stop bars).
+   *
+   * `U` and `V` are the glyph windows. The stop bar's own band is v 0.34..0.66,
+   * so a quad that showed 0..1 mipped to 0.32 coverage and vanished at range
+   * exactly as the lane lines did; the quad is now the bar.
+   */
+  _mark(pt, sA, sB, oA, oB, key, U, V) {
     const a = this._a(key);
     const P = { x: 0, y: 0, z: 0 };
-    const cols = Math.max(2, Math.ceil(Math.abs(oB - oA) / 2.2));
-    const rows = Math.max(1, Math.ceil(Math.abs(sB - sA) / 2.2));
+    const cols = Math.max(2, Math.ceil(Math.abs(oB - oA) / 2.6));
+    const rows = Math.max(1, Math.ceil(Math.abs(sB - sA) / 2.6));
     const grid = [];
     for (let j = 0; j <= rows; j++) {
       const s = lerp(sA, sB, j / rows);
@@ -1537,7 +2008,8 @@ class SectorBuild {
       for (let i = 0; i <= cols; i++) {
         const o = lerp(oA, oB, i / cols);
         pt(s, o, P);
-        row.push(a.vert(P.x, P.y + 0.011, P.z, 0, 1, 0, i / cols, (j / rows) * vSpan, 0.1, 0.4, 0.02));
+        row.push(a.vert(P.x, P.y + PAINT_LIFT, P.z, 0, 1, 0,
+          lerp(U[0], U[1], i / cols), lerp(V[0], V[1], j / rows), 0.1, 0.4, 0.02));
       }
       grid.push(row);
       if (j > 0) {

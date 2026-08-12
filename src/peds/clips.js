@@ -156,19 +156,55 @@ const WALK = {
   kneeBase: 5, knee: 50, kneeStance: 7,
   ankle: 13, ankleBias: 2.5, toe: 17,
   sway: 0.016, bob: 0.016, bobBias: -0.014,
-  pelvisYaw: 4.6, pelvisRoll: 3.4,
+  pelvisYaw: 4.6, pelvisRoll: 3.4, rollPhase: 1.2,
   lean: 2.2, spineYaw: 4.2,
   arm: 17, armBase: -2, elbow: 13, elbowSwing: 9,
   clav: 2.0, headBob: 1.4,
 };
 
+/**
+ * `rollPhase` — WHERE IN THE STEP THE PELVIS ROLLS, and it is not one number.
+ *
+ * The pelvis rolls toward the leg carrying the weight, and at 1.4 m/s the
+ * weight transfers a long way after heel strike while at 5.6 m/s it is almost
+ * instantaneous. One shared offset therefore has the roll peaking in the wrong
+ * half of a run's stance, and a pelvis rolling the wrong way over a planted
+ * foot drags the ankle sideways. Measured on the emitted skeleton
+ * (`gaitprobe.mjs`), moving jog and run from the walk's 1.2 to 2.8:
+ *
+ *   run slide   0.799 -> 0.507     run stance duty  0.50 -> 0.43
+ *   jog slide   0.424 -> 0.397     run foot clearance  0.218 -> 0.256 m
+ *
+ * The stance duty is the interesting one: it is the first movement this rig
+ * has ever made TOWARD a flight phase (authored 0.32), and it came from the
+ * roll rather than from the leg. The walk keeps 1.2 because 2.8 costs it
+ * 0.495 -> 0.511 — the clips are in genuinely different regimes.
+ */
+/**
+ * `kneeStance` IS A SLIDE TAX, and jog and run were paying it at 20 and 30.
+ *
+ * It is an extra knee flexion lobe centred on mid-stance, on top of `kneeBase`.
+ * A flexing knee shortens the leg, and a shortening leg under a hip that is
+ * sweeping linearly moves the ANKLE — which is the definition of foot slide,
+ * because the sole is on the pavement at the time. Measured on the emitted
+ * skeleton (`gaitprobe.mjs`), taking run from 30 to 12 and jog from 20 to 10:
+ *
+ *   run slide  1.104 -> 0.799     run stance duty  0.52 -> 0.50
+ *   jog slide  0.443 -> 0.424     reach still inside 4% of what the stride needs
+ *
+ * The shock-absorption bend it was standing in for is still there — `kneeBase`
+ * carries 18 degrees on a run — and the vertical is carried by `bob`, which is
+ * where a runner's compliance actually reads from at a distance. The residual
+ * is still the missing flight phase (stance duty 0.50 against the authored
+ * 0.32), which is a whole run cycle's worth of work and is not this.
+ */
 const JOG = {
   duty: DUTY.jog,
   thigh: 33, thighBias: 3, twist: 2,
-  kneeBase: 12, knee: 82, kneeStance: 20,
+  kneeBase: 12, knee: 82, kneeStance: 10,
   ankle: 19, ankleBias: 4, toe: 24,
   sway: 0.020, bob: 0.030, bobBias: -0.028,
-  pelvisYaw: 6.4, pelvisRoll: 4.6,
+  pelvisYaw: 6.4, pelvisRoll: 4.6, rollPhase: 2.8,
   lean: 7.5, spineYaw: 6.0,
   arm: 34, armBase: -6, elbow: 58, elbowSwing: 18,
   clav: 3.2, headBob: 2.2,
@@ -177,10 +213,10 @@ const JOG = {
 const RUN = {
   duty: DUTY.run,
   thigh: 44, thighBias: 6, twist: 2.4,
-  kneeBase: 18, knee: 104, kneeStance: 30,
+  kneeBase: 18, knee: 104, kneeStance: 12,
   ankle: 24, ankleBias: 5, toe: 30,
   sway: 0.024, bob: 0.044, bobBias: -0.040,
-  pelvisYaw: 8.2, pelvisRoll: 5.6,
+  pelvisYaw: 8.2, pelvisRoll: 5.6, rollPhase: 2.8,
   lean: 15, spineYaw: 7.6,
   arm: 46, armBase: -10, elbow: 80, elbowSwing: 22,
   clav: 4.4, headBob: 3.0,
@@ -223,11 +259,11 @@ function gaitClip(P, ph, K, g) {
 
   // pelvis: two vertical bobs per stride, rolling toward the stance leg
   P.hip(K.sway * (g.sway ?? 1) * sin(t), K.bobBias + K.bob * (g.bounce ?? 1) * cos(2 * t), 0);
-  P.d('Hips', -1 + (g.stoop ?? 0) * 0.25, K.pelvisYaw * sin(t), K.pelvisRoll * (g.roll ?? 1) * sin(t + 1.2));
+  P.d('Hips', -1 + (g.stoop ?? 0) * 0.25, K.pelvisYaw * sin(t), K.pelvisRoll * (g.roll ?? 1) * sin(t + K.rollPhase));
 
   const lean = K.lean + (g.lean ?? 0);
   const stoop = g.stoop ?? 0;
-  P.d('Spine', lean * 0.34 + stoop * 0.32, -K.spineYaw * 0.42 * sin(t), -K.pelvisRoll * 0.34 * sin(t + 1.2));
+  P.d('Spine', lean * 0.34 + stoop * 0.32, -K.spineYaw * 0.42 * sin(t), -K.pelvisRoll * 0.34 * sin(t + K.rollPhase));
   P.d('Spine1', lean * 0.34 + stoop * 0.34, -K.spineYaw * 0.72 * sin(t), 0);
   P.d('Spine2', lean * 0.30 + stoop * 0.30, -K.spineYaw * sin(t), 0);
   P.d('Neck', -lean * 0.45 - stoop * 0.55, K.spineYaw * 0.55 * sin(t), 0);
@@ -289,6 +325,214 @@ export function idle(P, ph, g) {
   P.d('UpperArmL', -1.5 - (g.armBias ?? 0) * 0.4, 0, -3.5);
   P.d('ForearmR', 9, 0, 0);
   P.d('ForearmL', 9, 0, 0);
+}
+
+/**
+ * FOUR MORE STANDS, and why a crowd needed them.
+ *
+ * A pedestrian who is not walking played ONE clip — `idle` — modulated by a
+ * per-person phase and rate. That is a genuinely good weight-shift loop, and
+ * it is also why a still frame of a bus stop reads as a row of clones: the
+ * phase offset changes WHEN each of them shifts their weight, never WHAT they
+ * are doing with their body. Two people in the same frame at different phases
+ * of the same loop still have the same stance, the same shoulder line and the
+ * same arms.
+ *
+ * These four differ in the things a still frame photographs — stance width,
+ * where the weight sits, what the arms are doing, the line of the spine — and
+ * `animator.js` assigns one per pedestrian off their own gait record, so it is
+ * fixed for that person rather than cycling under the viewer. `poseprobe.mjs`
+ * gate STANDS measures the spread between them on the emitted skeleton.
+ *
+ * They are BASES, not layers: `pocketsAdd`, `foldedAdd`, `phoneAdd` and the
+ * rest still ride on top, and the limit table in `animator.js` bounds the sum.
+ */
+
+/** Feet wide, weight square, thumbs at the belt — the working stand. */
+export function idleWide(P, ph, g) {
+  const t = ph * TAU;
+  const breath = sin(t * 0.85);
+  const shift = sin(t * 0.17 + (g.phase ?? 0) * 6.2) * 0.5;
+  const micro = sin(t * 1.4 + 0.9) * 0.4;
+
+  P.hip(0.012 * shift, -0.014 + 0.003 * breath, 0.004);
+  P.d('Hips', -2.0 + (g.stoop ?? 0) * 0.3, 1.0 * shift, 1.6 * shift);
+  P.d('Spine', 0.4 + 0.4 * breath + (g.stoop ?? 0) * 0.3, -0.6 * shift, -1.0 * shift);
+  P.d('Spine1', -1.4 + 0.8 * breath + (g.stoop ?? 0) * 0.3, -0.4 * shift, -0.6 * shift);
+  P.d('Spine2', -2.6 + 1.1 * breath, 0.8 * shift, 0.4 * shift);
+  P.d('Neck', 2.4 - 0.4 * breath - (g.stoop ?? 0) * 0.6, 1.2 * micro, 0);
+  P.d('Head', -1.4, 2.2 * micro, 0.4 * shift);
+
+  /**
+   * WIDE IS EXPENSIVE, AND THE COST IS FOOT SLIDE.
+   *
+   * A stand whose feet sit far from where the walk leaves them pays for the
+   * difference every time a pedestrian stops: the 0.22 s clip crossfade drags
+   * the sole across the pavement while the stance lock is still holding it,
+   * and `streetprobe.mjs` reads that as slide on a PLANTED foot. Measured in
+   * the running game, four stands with a 7.5-degree abduction took the combat
+   * scene's slide ratio from 0.96 to 1.23 against a 1.20 ratchet; at 4.0 the
+   * stance still reads wide-legged from across the street and the ratio comes
+   * back. The other three stands stay inside a couple of degrees of the walk's
+   * own footprint for the same reason, and carry their character in the
+   * pelvis, the spine and the shoulder line instead.
+   */
+  P.d('UpLegR', -2.0, 3.0, -4.0);
+  P.d('LegR', -3.5, 0, 0);
+  P.d('FootR', 2.5, -2.0, -(g.splay ?? 1.5) * 0.9 - 1.5);
+  P.d('UpLegL', -2.0, -3.0, 4.0);
+  P.d('LegL', -3.5, 0, 0);
+  P.d('FootL', 2.5, 2.0, (g.splay ?? 1.5) * 0.9 + 1.5);
+
+  const drop = g.shoulderDrop ?? 0;
+  P.d('ClavicleR', -4.0 + 0.5 * breath, 0, 3.0 + drop);
+  P.d('ClavicleL', -3.8 + 0.5 * breath, 0, -3.0 + drop);
+  P.d('UpperArmR', 3 + (g.armBias ?? 0) * 0.3, 0, 10);
+  P.d('UpperArmL', 3 - (g.armBias ?? 0) * 0.3, 0, -10);
+  P.d('ForearmR', 17, 0, -6);
+  P.d('ForearmL', 17, 0, 6);
+  P.d('HandR', -6, 0, 0);
+  P.d('HandL', -6, 0, 0);
+}
+
+/** Slouched over one hip, shoulders rolled forward, chin down. */
+export function idleSlouch(P, ph, g) {
+  const t = ph * TAU;
+  const breath = sin(t * 0.95);
+  const shift = sin(t * 0.13 + (g.phase ?? 0) * 4.1);
+  const micro = sin(t * 2.1 + 1.7) * 0.3;
+  const w = shift > 0 ? 1 : -1;
+
+  /**
+   * The lateral channels ride `shift` (a sine), not `sign(shift)`. Two
+   * reasons, and the second is the expensive one: a signed step is a POP —
+   * the pelvis teleports 40 mm the frame the sine crosses zero — and it also
+   * holds the spine's yaw and roll at FULL magnitude the whole time, which
+   * stacks with `punch` and `hurt` and pushed a hand 277 mm across the chest
+   * (`poseprobe.mjs` gate MIDLINE). The slouch is a sagittal pose; its
+   * signature is the rounded back and the dropped head, not a hip thrown out
+   * at a constant 7.5 degrees.
+   */
+  P.hip(0.030 * shift, -0.026 + 0.003 * breath, -0.008);
+  P.d('Hips', 2.5 + (g.stoop ?? 0) * 0.4, 2.0 * shift, 4.0 * shift);
+  P.d('Spine', 4.0 + 0.4 * breath + (g.stoop ?? 0) * 0.5, -1.4 * shift, -2.4 * shift);
+  P.d('Spine1', 5.5 + 0.6 * breath + (g.stoop ?? 0) * 0.5, -1.0 * shift, -1.4 * shift);
+  P.d('Spine2', 2.0 + 0.8 * breath, 1.4 * shift, 0.6 * shift);
+  P.d('Neck', -3.0 - (g.stoop ?? 0) * 0.5, 1.0 * shift + micro, 0);
+  P.d('Head', -8.0, 2.0 * micro, 0.6 * shift);
+
+  // one leg straight and loaded, the other crossed slightly in front
+  const R = w > 0 ? 1 : 0.2, L = w > 0 ? 0.2 : 1;
+  P.d('UpLegR', -1.0 - 5 * L, 3.0 - 2.0 * L, -1.0 - 4.5 * L);
+  P.d('LegR', -2 - 13 * L, 0, 0);
+  P.d('FootR', 2 + 5 * L, -1.0, -(g.splay ?? 1.5) * 0.3);
+  P.d('UpLegL', -1.0 - 5 * R, -3.0 + 2.0 * R, 1.0 + 4.5 * R);
+  P.d('LegL', -2 - 13 * R, 0, 0);
+  P.d('FootL', 2 + 5 * R, 1.0, (g.splay ?? 1.5) * 0.3);
+
+  // rolled shoulders: the whole reason this reads different at 20 m
+  const drop = g.shoulderDrop ?? 0;
+  /**
+   * The forward shoulder roll is capped and the arm left unextended, and both
+   * numbers are a CLIFF rather than a taste: measured on
+   * the emitted skeleton, `clavicleX 7 / upperArm -4` puts a hand 276 mm past
+   * the spine once `umbrella + hurt + punch` are summed on top, and 6 / -2
+   * puts it at 0. The two-bone elbow solve flips over between them. See
+   * `poseprobe.mjs` gate MIDLINE.
+   */
+  P.d('ClavicleR', 3.0 + 0.5 * breath, 3.0, -1.0 + drop);
+  P.d('ClavicleL', 2.8 + 0.5 * breath, -3.0, 1.0 + drop);
+  P.d('UpperArmR', (g.armBias ?? 0) * 0.5, 0, 1.0);
+  P.d('UpperArmL', -(g.armBias ?? 0) * 0.5, 0, -1.0);
+  P.d('ForearmR', 13, 0, 0);
+  P.d('ForearmL', 11, 0, 0);
+}
+
+/** Weight back on the heels, chest open, one hand at the opposite elbow. */
+export function idleOpen(P, ph, g) {
+  const t = ph * TAU;
+  const breath = sin(t * 0.8);
+  const shift = sin(t * 0.19 + (g.phase ?? 0) * 5.0);
+  const micro = sin(t * 1.9 + 0.2) * 0.35;
+  const w = shift > 0 ? 1 : -1;
+  const k = Math.abs(shift);
+
+  P.hip(0.024 * shift, -0.010 - 0.005 * k + 0.003 * breath, -0.014);
+  P.d('Hips', -5.5 + (g.stoop ?? 0) * 0.2, 1.6 * shift, 3.0 * shift);
+  P.d('Spine', -2.5 + 0.5 * breath + (g.stoop ?? 0) * 0.3, -1.0 * shift, -1.8 * shift);
+  P.d('Spine1', -3.0 + 0.7 * breath + (g.stoop ?? 0) * 0.3, -0.7 * shift, -1.0 * shift);
+  P.d('Spine2', -4.5 + 1.0 * breath, 1.2 * shift, 0.5 * shift);
+  P.d('Neck', 4.5 - 0.4 * breath - (g.stoop ?? 0) * 0.6, 1.0 * shift + micro * 2, 0);
+  P.d('Head', 1.0, 3.0 * micro, 0.5 * shift);
+
+  const R = w > 0 ? 1 : 0.4, L = w > 0 ? 0.4 : 1;
+  P.d('UpLegR', -4.0 - 2 * L, 2.0, -3.0 - 2 * L);
+  P.d('LegR', -1.5 - 6 * L, 0, 0);
+  P.d('FootR', -1.5 + 2 * L, -2.0, -(g.splay ?? 1.5) * 0.7);
+  P.d('UpLegL', -4.0 - 2 * R, -2.0, 3.0 + 2 * R);
+  P.d('LegL', -1.5 - 6 * R, 0, 0);
+  P.d('FootL', -1.5 + 2 * R, 2.0, (g.splay ?? 1.5) * 0.7);
+
+  // one forearm across the belly, the other hand holding its elbow
+  const drop = g.shoulderDrop ?? 0;
+  const s = (g.armBias ?? 0) >= 0 ? 1 : -1;
+  P.d('ClavicleR', -6.0 + 0.6 * breath, 0, 4.0 + drop);
+  P.d('ClavicleL', -5.5 + 0.6 * breath, 0, -4.0 + drop);
+  P.d('UpperArmR', (s > 0 ? 17 : 8), 0, 11);
+  P.d('UpperArmL', (s > 0 ? 8 : 17), 0, -11);
+  P.d('ForearmR', (s > 0 ? 34 : 16), 0, -7);
+  P.d('ForearmL', (s > 0 ? 16 : 34), 0, 7);
+  P.d('HandR', -4, 0, 0);
+  P.d('HandL', -4, 0, 0);
+}
+
+/**
+ * GUARDED — the combat stand.
+ *
+ * Nothing here had a fighting pose at all: an armed ped, a hostile at
+ * stand-off and every bystander in `combat` played the same relaxed
+ * weight-shift, arms hanging, which is the "T-ish fist pose mid-fight" note.
+ * A guard is not an idle with the arms raised; it is a different BASE — the
+ * feet stagger into a boxer's stance, the weight drops onto the back leg, the
+ * shoulders come up and forward, the chin tucks behind the lead shoulder, and
+ * both forearms carry a weight in front of the chest rather than hanging.
+ *
+ * `g.armBias` picks the lead side, so the crowd is not all southpaws.
+ */
+export function guard(P, ph, g) {
+  const t = ph * TAU;
+  const breath = sin(t * 1.35);
+  const sway = sin(t * 0.61 + (g.phase ?? 0) * 6.2);
+  const bob = sin(t * 1.9 + 0.4);
+  const lead = (g.armBias ?? 0) >= 0 ? 1 : -1;   // +1 = left foot and hand lead
+  const F = lead > 0 ? 'L' : 'R';                 // lead limb
+  const B = lead > 0 ? 'R' : 'L';                 // rear limb
+
+  P.hip(0.018 * lead + 0.010 * sway, -0.052 + 0.004 * bob, 0.020);
+  P.d('Hips', 6.0, -14 * lead, 2.0 * sway);
+  P.d('Spine', 4.5 + 0.4 * breath, -8 * lead, -1.5 * sway);
+  P.d('Spine1', 3.5 + 0.5 * breath, -6 * lead, -1.0 * sway);
+  P.d('Spine2', 2.0 + 0.6 * breath, -5 * lead, 0.5 * sway);
+  P.d('Neck', -4.0, 6 * lead, 0);
+  P.d('Head', -3.0, 9 * lead + 1.5 * sway, 0);
+
+  // staggered stance: lead leg forward and light, rear leg back and loaded
+  P.d(`UpLeg${F}`, 20, -6 * lead, 5 * lead);
+  P.d(`Leg${F}`, -26, 0, 0);
+  P.d(`Foot${F}`, 6, -3 * lead, 0);
+  P.d(`UpLeg${B}`, -16, -10 * lead, -7 * lead);
+  P.d(`Leg${B}`, -24, 0, 0);
+  P.d(`Foot${B}`, 14, -6 * lead, 0);
+
+  // both hands up and IN, carrying the weapon in front of the sternum
+  P.d(`Clavicle${F}`, -16, 4, 10 * lead);
+  P.d(`Clavicle${B}`, -13, -2, 8 * lead);
+  P.d(`UpperArm${F}`, 54 + 3 * bob, 12, 26 * -lead);
+  P.d(`Forearm${F}`, 88, 0, 12 * -lead);
+  P.d(`Hand${F}`, -12, 0, 0);
+  P.d(`UpperArm${B}`, 46 + 3 * bob, -14, 30 * lead);
+  P.d(`Forearm${B}`, 98, 0, 14 * lead);
+  P.d(`Hand${B}`, -14, 0, 0);
 }
 
 /** Waiting at a crossing: squarer stance, weight forward, glancing at traffic. */
@@ -822,4 +1066,15 @@ export function hurtAdd(P, w, ph) {
   P.d('LegR', -14 * w, 0, 0);
 }
 
-export const CLIPS = { idle, walk, jog, run, wait, lean, cower, sit };
+export const CLIPS = {
+  idle, walk, jog, run, wait, lean, cower, sit,
+  idleWide, idleSlouch, idleOpen, guard,
+};
+
+/**
+ * The standing rotation. `animator.js` resolves a request for `idle` into one
+ * of these per pedestrian; `lean` and `wait` stay OUT of it because `ped.js`
+ * asks for those by name when the world says so (a wall to lean on, a kerb to
+ * wait at) and a random draw would put a man leaning on air.
+ */
+export const STANDS = Object.freeze(['idle', 'idleWide', 'idleSlouch', 'idleOpen']);

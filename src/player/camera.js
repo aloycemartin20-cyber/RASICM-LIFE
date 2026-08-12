@@ -224,6 +224,8 @@ export class CameraRig {
     this._viewDur = VIEW_TIME.min;
     this._viewFrom = { dist: 1, height: 1, lateral: 1, near: 0 };
     this._bonnet = new THREE.Vector3();
+    /** True when the fourth view sits in a cabin. See `_resolveFrame`. */
+    this._interiorEye = false;
 
     this._chasePos = new THREE.Vector3();
     this._chaseQuat = new THREE.Quaternion();
@@ -420,6 +422,24 @@ export class CameraRig {
     }
     this._frame = EXTRA_FRAMES[this.frameClass] ??
       CHASE.classFrame[this.frameClass] ?? CHASE.classFrame.car;
+    /**
+     * DOES THIS THING HAVE A CABIN TO SIT IN. Resolved here, with the frame,
+     * so the fourth-view pivot never has to test a string per frame.
+     *
+     * `vehicles/build.js` builds `buildInterior` — a dash across a cowl, a
+     * headliner under a roofline, door cards against a sill — for `kind: 'car'`
+     * and for nothing else; bikes, boats, aircraft, trams and the tank all take
+     * the empty interior. So that is exactly the set that gets an eye point in
+     * a cabin, and everything else keeps the bonnet mount it has always had.
+     *
+     * The style fields the construction needs must all be present, or a spec
+     * that publishes a partial style would put the lens at NaN.
+     */
+    const st = v?.spec?.kind === 'car' ? v.spec.style : null;
+    this._interiorEye = !!st &&
+      Number.isFinite(st.groundY) && Number.isFinite(st.sillY) &&
+      Number.isFinite(st.beltY) && Number.isFinite(st.roofY) &&
+      Number.isFinite(st.hwMax) && Number.isFinite(st.cowlZ);
     return this.frameClass;
   }
 
@@ -1192,15 +1212,61 @@ export class CameraRig {
     const py = this._vehPos.y + CHASE.heightBase + Math.max(0, tall - 1.4) * CHASE.heightSizeGain;
     this._tmp.set(px, py, pz);
     if (nb > 0.002) {
-      // The bonnet: on the car's centreline, just above and behind the nose, so
-      // the wings are in frame and the bodywork is not clipping the near plane.
+      /**
+       * ────────────────────────────────────────────────────────────────────
+       * THE FOURTH VIEW IN A CAR IS THE DRIVER'S SEAT, NOT THE BONNET
+       * ────────────────────────────────────────────────────────────────────
+       * `bonnetUp` x half-height puts the lens ON TOP OF the bodywork looking
+       * forward over it: a hood-cam. That is a real camera in a racing game and
+       * it is the wrong one for a game with a modelled cabin, because it never
+       * shows the cabin — the dash, the wheel and the glass are all behind the
+       * lens, and the near plane sits a few centimetres off a painted panel.
+       *
+       * A car that HAS a cabin gets an eye point in it. The construction is the
+       * one `vehicles` uses for the seated driver's head, restated here rather
+       * than imported (hard rule 2): the head sits in the GLASS and under the
+       * HEADLINER, not at a fixed fraction of the body.
+       *
+       *   floor = groundY + max(0.10, sillY - 0.16)      the pan he sits over
+       *   hip   = floor + 0.22
+       *   head  = max( hip + 0.42,
+       *                min( beltY + 0.20, roofY - 0.30, floor + 1.05 ) )
+       *
+       * ...offset to the DRIVER'S SIDE. A body facing +Z has its right along
+       * -X, so the car's left — Pittsburgh's driver side — is +X, the same
+       * constant `vehicles/index.js` calls `DRIVER_SIDE` and `interior.js`
+       * calls `WHEEL_SIDE`. Sitting on the centreline is the tell that a first
+       * person camera was never sat in.
+       *
+       * Z is the seat, forward of the headrest by 10 cm so the eye is where the
+       * eye is rather than where the head bone is: too far back and a 65 degree
+       * lens is nine tenths steering wheel, which is the failure `vehicles`
+       * wrote its own note about.
+       *
+       * Everything without a cabin — bikes, boats, aircraft, the tank — keeps
+       * the bonnet mount, which is the right camera for a machine you sit ON.
+       */
       const half = v.spec?.half;
       const hz = half?.z ?? size * 0.5;
       const hy = half?.y ?? tall * 0.5;
-      // +Z is the nose (see `_vehFwd` above) — this used to sit on the BOOT.
-      this._bonnet.set(0, hy * CHASE.bonnetUp, hz * CHASE.bonnetFore)
-        .applyQuaternion(this._vehQuat)
-        .add(this._vehPos);
+      const st = this._interiorEye ? v.spec.style : null;
+      if (st) {
+        const floorY = st.groundY + Math.max(0.10, st.sillY - 0.16);
+        const hip = floorY + 0.22;
+        const head = Math.max(
+          hip + 0.42,
+          Math.min(st.beltY + 0.20, st.roofY - 0.30, floorY + 1.05)
+        );
+        this._bonnet.set(
+          st.hwMax * 0.82 * 0.46,
+          head - (v.spec.comY ?? 0),
+          st.cowlZ - 0.85
+        );
+      } else {
+        // +Z is the nose (see `_vehFwd` above) — this used to sit on the BOOT.
+        this._bonnet.set(0, hy * CHASE.bonnetUp, hz * CHASE.bonnetFore);
+      }
+      this._bonnet.applyQuaternion(this._vehQuat).add(this._vehPos);
       this._tmp.lerp(this._bonnet, nb);
     }
     const followTau = CHASE.followTau * (flight ? FLIGHT.followGain : 1);

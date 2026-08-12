@@ -647,6 +647,14 @@ export class CharacterBuilder {
    * entry toward the shared grime and dust colours. A city crowd wants dirty
    * hems, greasy cuffs and dusty shoulders exactly as much as a soldier does,
    * but it must not have them baked to one colour.
+   *
+   * A part may also carry `tone(x, y, z, nx, ny, nz, out)`, which writes a
+   * RATIO into `out` — [rMul, gMul, bMul, grimeAdd]. It is the only way a
+   * surface here can be a different hue from its own palette entry, and it
+   * exists for the face: skin is ONE palette slot, so a lip, a flushed cheek,
+   * an orbital shadow and three days of stubble have to be ratios of it or
+   * they cost either a slot or a texture. Being ratios also keeps them
+   * correct across all eight skin tones instead of being authored against one.
    */
   _shade(order, pos, nrm, col, tint) {
     const occ = this.occluders;
@@ -660,6 +668,7 @@ export class CharacterBuilder {
       const grimeAmt = part.grime ?? 0.5;
       const dirtAmt = part.dirt ?? 0.35;
       const dustAmt = part.dust ?? 0.16;
+      const tone = part.tone ?? null;
       for (let i = 0; i < n; i++) {
         const vi = vo + i;
         const x = pos[vi * 3], y = pos[vi * 3 + 1], z = pos[vi * 3 + 2];
@@ -696,21 +705,30 @@ export class CharacterBuilder {
         const fine = 1 + 0.03 * nz.fbm3(x * 41, y * 41, z * 41, 2);
 
         const m = ao * mottle * fine * shade;
-        col[vi * 3] = m;
-        col[vi * 3 + 1] = m * (1 + 0.012 * nz.fbm3(x * 6 + 21, y * 6, z * 6, 2));
-        col[vi * 3 + 2] = m * (1 - 0.014 * nz.fbm3(x * 6 - 13, y * 6, z * 6, 2));
+        let tr = 1, tg = 1, tb = 1, tGrime = 0;
+        if (tone) {
+          _tone[0] = 1; _tone[1] = 1; _tone[2] = 1; _tone[3] = 0;
+          tone(x, y, z, nx, ny, nz3, _tone);
+          tr = _tone[0]; tg = _tone[1]; tb = _tone[2]; tGrime = _tone[3];
+        }
+        col[vi * 3] = m * tr;
+        col[vi * 3 + 1] = m * tg * (1 + 0.012 * nz.fbm3(x * 6 + 21, y * 6, z * 6, 2));
+        col[vi * 3 + 2] = m * tb * (1 - 0.014 * nz.fbm3(x * 6 - 13, y * 6, z * 6, 2));
 
         // These two channels REPAINT the palette entry, so they are capped
         // well below 1. The first pass let them saturate and every dirty hem,
         // every shoe and every pair of trousers came out the same grey-brown
         // regardless of what colour the person was actually wearing.
         tint[vi * 3] = slot;
-        tint[vi * 3 + 1] = Math.min(0.58, grime * 0.50 + dirt * 0.42);
+        tint[vi * 3 + 1] = Math.min(0.58, grime * 0.50 + dirt * 0.42 + tGrime);
         tint[vi * 3 + 2] = Math.min(0.42, dust * 0.48 + wear * 0.52);
       }
     }
   }
 }
+
+/** Scratch for the per-part `tone` callback — build time, but rule 5 anyway. */
+const _tone = [1, 1, 1, 0];
 
 let closestX = 0, closestY = 0, closestZ = 0;
 export function segDist(px, py, pz, a, b) {

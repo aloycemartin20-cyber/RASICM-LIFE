@@ -428,7 +428,7 @@ export function buildCarBody(spec, lod = 0) {
 
   const out = {
     paint: [], trim: [], chrome: [], cavity: [], glass: [], lamps: {},
-    plate: [], livery: [], grilleMesh: [], disc: [], surface, perSeg,
+    plate: [], livery: [], grilleMesh: [], disc: [], liner: [], surface, perSeg,
     anchors: {}, doors: [],
   };
   const lamp = (k, g) => (out.lamps[k] = out.lamps[k] ?? []).push(g);
@@ -511,7 +511,7 @@ export function buildCarBody(spec, lod = 0) {
       })
     );
     /**
-     * Headliner: the inside of the cabin, so the shell is not see-through.
+     * The inside of the cabin, so the shell is not see-through.
      *
      * IT USED TO RUN TO `zCowl`, WHICH IS ACROSS THE WINDSCREEN. The screen is
      * a CUT in the shell, but this patch is a separate inset copy of the surface
@@ -525,11 +525,37 @@ export function buildCarBody(spec, lod = 0) {
      * Stopping at the windscreen header leaves the aperture clear. The band
      * between the header and the cowl is the dash area, and `buildInterior`
      * fills it with the dash roll, the binnacle hood and the centre stack.
+     *
+     * ────────────────────────────────────────────────────────────────────────
+     * AND IT IS TWO MATERIALS, NOT ONE — THIS IS THE "BLACK VOID CABIN"
+     * ────────────────────────────────────────────────────────────────────────
+     * The whole patch was `cavity`: 0x050607, the material whose stated job is
+     * to be a HOLE, behind grilles and inside arches. So the entire lining of
+     * every cabin in the game — the roof, the pillars, the reveals — was drawn
+     * at an albedo of 0.0015. Measured from the driver's seat, the top third of
+     * the cockpit frame came back at 23/28/33, and a review called it exactly
+     * what it was.
+     *
+     * The roof half of it is a HEADLINER (see `paint.js` `headliner()`) and the
+     * flank half is not. Above the roof edge you are looking at lined trim,
+     * which is the brightest surface in a real cabin and the source of most of
+     * its bounce; below it you are looking through the side glass at whatever
+     * is on the far side, and a dark reveal is what stops that reading as a
+     * grey wall behind the windows. Same geometry, same vertex count, split at
+     * `CP.ROOF_EDGE` — the column where the roof stops and the glass begins.
      */
     if (lod < 2) {
+      const zL0 = Math.min(sideZ0, zBack) - 0.05;
+      const zL1 = zWs + 0.02;
+      out.liner.push(
+        loftPatch(surface, {
+          c0: 0, c1: C(CP.ROOF_EDGE), z0: zL0, z1: zL1,
+          inset: 0.052, zSamples: 10, flip: true,
+        })
+      );
       out.cavity.push(
         loftPatch(surface, {
-          c0: 0, c1: C(CP.BELT), z0: Math.min(sideZ0, zBack) - 0.05, z1: zWs + 0.02,
+          c0: C(CP.ROOF_EDGE), c1: C(CP.BELT), z0: zL0, z1: zL1,
           inset: 0.055, zSamples: 10, flip: true,
         })
       );
@@ -1309,9 +1335,24 @@ function buildRear(spec, surface, out, C, lod) {
  * albedo around 0.055, and a panel gap is a cavity at 0.01 with almost no
  * environment reaching it.
  */
-/** 9 mm across, 3 mm deep — a real panel gap, measured off a real car. */
-const GAP_W = 0.009;
-const GAP_D = 0.003;
+/**
+ * 14 mm across, 4 mm deep.
+ *
+ * `groove()`'s own doc gives 10-16 mm as the real range and this sat at the
+ * bottom of it, at 9 mm, which is correct for a modern car built to a European
+ * tolerance and WRONG for what it has to survive: the beauty shot photographs a
+ * 4.6 m car across about 800 pixels, i.e. 174 px/m, so a 9 mm gap is 1.6 pixels
+ * — under the width the AA filter can hold, and the reason a reviewer looking
+ * at a frame with real shutlines in it still reported "no door cut lines". The
+ * gap also has to read against a body that is now saturated rather than
+ * washed out, which raises the contrast it needs, not lowers it.
+ *
+ * 14 mm is 2.4 pixels at the same distance and is a 1970s American panel gap,
+ * which is what this fleet actually is. It costs nothing: the groove is four
+ * columns either way.
+ */
+const GAP_W = 0.014;
+const GAP_D = 0.004;
 
 function buildShutlines(spec, surface, out, C) {
   const s = spec.style;

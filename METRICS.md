@@ -161,3 +161,52 @@ is broken everything looks fine.**
 
 *Generated from session transcripts. Token figures are the sum of per-message
 usage across 938 agent transcripts plus the orchestrator's own.*
+
+---
+
+## Corrections (2026-08-12), and the second campaign
+
+A re-tally of the same transcripts found two defects in the figures above, so
+this section is the corrected record. Method: one row per **real API call**,
+deduplicated by `message.id` — the original tally summed one row per *streamed
+chunk*, which repeats the usage block and double-counts long responses
+(round-trips −46%, tokens-excl-cache −49% under dedup). Separately, the
+"996 agents" split counted 92 standalone agents twice (`.jsonl` + `.meta.json`)
+and mis-derived the workflow count; the true figure for the 51.3 h window is
+**923** (831 workflow + 92 standalone). Tool calls and agent counts are
+convention-invariant; every per-tool row above reproduces exactly.
+
+The original session also did not stop at the 51.3 h window this file was
+written inside: it ran **Jul 26 – Aug 6** (aircraft, airfields, the AFB
+assault, the trolley, the incline). Full-arc figures below are final; the
+campaign column is a mid-session snapshot (2026-08-12T00:31Z).
+
+| deduped, per real API call | original build (full arc) | quality & content campaign |
+|---|---|---|
+| Model | claude-opus-4-8 | claude-fable-5 |
+| Wall-clock | 243.17 h | 25.21 h |
+| Agents / workflows | 1,007 / 32 | 63 / 12 |
+| Round-trips | 38,289 | 8,533 |
+| Output tokens | 29,075,698 | 5,598,210 |
+| Cache creation | 136,786,435 | 41,581,281 |
+| Cache reads | 7,274,909,612 | 1,909,946,446 |
+| Tokens excl. cache reads | 166,269,597 | 47,293,900 |
+| Tokens incl. cache reads | 7,441,179,209 | 1,957,240,346 |
+| Tool calls | 43,758 | 9,631 |
+
+Campaign split, main / subagents: round-trips 730 / 14,232 per-line; output
+tokens 774,816 / 5,410,531; tool calls **336 / 9,295** — the orchestrator is
+3.5% of tool calls and under 5% of output, so the original's qualitative claim
+("almost everything was done by delegated agents") survives every correction.
+Campaign top tools: Bash 6,077 · Read 1,611 · Edit 1,522 · Write 154 ·
+StructuredOutput 100 — Bash at 63%, four per Edit: the measurement discipline
+held.
+
+What the campaign spent it on: the five-wave quality pass (all 24 chapters
+completable, mission AI on the road graph, wayfinding, instruments, voiced
+dialogue, a perf gate), a regression wave answering the owner's play report,
+an adversarial review that fixed or refuted 34 findings, and content wave C1
+(crowd characters, the three brothers, contact grounding, foliage + road
+paint, vehicle materials and interiors). Gate code grew from 10,801 to
+**79,764 lines** (66 → 150 probe files) — one gate line per 2.4 lines of
+runtime, from 1 per 11.

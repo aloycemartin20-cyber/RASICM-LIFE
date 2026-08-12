@@ -28,6 +28,18 @@
  *                colours" turned into a number.
  *   5 HUE        colour spread, so the answer to 4 cannot be "make them all
  *                different shades of the same brown".
+ *   6 SWATCH     every emitted top garment is a colour someone AUTHORED. The
+ *                wardrobe's bright note used to be manufactured by multiplying
+ *                whatever family colour had just been drawn by 2.1-4.2x, which
+ *                scales chroma with value and produced garments no dye can
+ *                make — `plum` came out (0.344, 0.202, 0.370), a fluorescent
+ *                violet, and that is the "random saturated primaries" note.
+ *                The swatch table in `wardrobe.js` is a DIFFERENT artefact
+ *                from the archetype family lists this measures against, so
+ *                this is not the picker checking its own list: it asks whether
+ *                the emitted reflectance is within `pick`'s own jitter of any
+ *                authored cloth at all. `--legacypalette` puts the multiply
+ *                back and the gate must go red.
  *
  * Why not a screenshot: a screenshot only proves the peds that happened to
  * spawn in front of that camera at that hour. This walks every archetype and
@@ -35,9 +47,10 @@
  *
  *   node src/peds/crowdprobe.mjs
  *   node src/peds/crowdprobe.mjs --n=400 --verbose
+ *   node src/peds/crowdprobe.mjs --legacypalette   # NEGATIVE CONTROL, must fail
  */
 import { Rng } from '../core/rng.js';
-import { makeOutfit, ARCHETYPES, SHAPES, SHAPE_IDS } from './wardrobe.js';
+import { makeOutfit, ARCHETYPES, SHAPES, SHAPE_IDS, COLOURS, PALETTE_LEGACY } from './wardrobe.js';
 import { buildOutfit } from './builder.js';
 import { PedMaterials, GRIME, PALE, MATERIAL_SLOTS } from './materials.js';
 
@@ -48,6 +61,32 @@ const args = Object.fromEntries(
   })
 );
 const N = Number(args.n ?? 240);
+PALETTE_LEGACY.brightScale = !!args.legacypalette;
+
+/**
+ * How far an emitted garment may sit from the nearest authored swatch, as a
+ * per-channel relative distance. `pick()` jitters value by up to +/-16% and
+ * hue by +/-5.6% of that, so a legitimate draw lands inside ~0.20; 0.26 leaves
+ * room for the widest jitter any archetype asks for without admitting a colour
+ * that is not on the chart. Hi-vis is included in the chart, so a safety vest
+ * passes on its own swatch rather than on an exemption.
+ */
+const SWATCH_T = 0.26;
+const SWATCHES = Object.values(COLOURS);
+
+/** Distance from a linear RGB to the nearest authored swatch. */
+function swatchDistance(c) {
+  let best = Infinity;
+  for (const s of SWATCHES) {
+    let d = 0;
+    for (let i = 0; i < 3; i++) {
+      const e = Math.abs(c[i] - s[i]) / Math.max(0.02, s[i], c[i]);
+      if (e > d) d = e;
+    }
+    if (d < best) best = d;
+  }
+  return best;
+}
 
 /* ------------------------------------------------------------------ */
 /* Targets                                                             */
@@ -268,7 +307,12 @@ for (let i = 0; i < Math.min(tops.length, 120); i++) {
   }
 }
 
+const swatch = people.map((p) => ({ d: swatchDistance(p.outfit.palette[2]), p }));
+swatch.sort((a, b) => b.d - a.d);
+
 const R = {
+  swatchMax: swatch[0].d,
+  swatchP95: swatch[Math.floor(swatch.length * 0.05)].d,
   albedoP05: pct(alb, 0.05),
   albedoP50: pct(alb, 0.5),
   albedoP95: pct(alb, 0.95),
@@ -300,6 +344,12 @@ for (const [k, v] of Object.entries(R.cv)) {
 }
 console.log(`  5 HUE      median pairwise chroma distance between tops`);
 console.log(`               ${R.hueSpread.toFixed(4)}   (want >= ${T.hueSpreadMin})`);
+console.log(`  6 SWATCH   worst emitted top vs the nearest authored cloth`);
+console.log(`               max ${R.swatchMax.toFixed(3)}  p95 ${R.swatchP95.toFixed(3)}   (want max <= ${SWATCH_T})`);
+console.log(
+  `               worst: ${swatch[0].p.arch} ${swatch[0].p.outfit.shape} ` +
+    `[${swatch[0].p.outfit.palette[2].map((v) => v.toFixed(3)).join(', ')}]`
+);
 
 if (args.verbose) {
   const worst = [...people].sort((a, b) => a.albedo - b.albedo).slice(0, 10);
@@ -334,6 +384,7 @@ if (R.garmentMin < T.garmentMin) bad.push(`GARMENT ${R.garmentMin.toFixed(4)}`);
 if (R.contrastP50 < T.contrastMin) bad.push(`CONTRAST ${R.contrastP50.toFixed(3)}`);
 for (const [k, v] of Object.entries(R.cv)) if (v < T.cvMin) bad.push(`VARIETY ${k} ${v.toFixed(4)}`);
 if (R.hueSpread < T.hueSpreadMin) bad.push(`HUE ${R.hueSpread.toFixed(4)}`);
+if (R.swatchMax > SWATCH_T) bad.push(`SWATCH ${R.swatchMax.toFixed(3)}`);
 
 console.log('');
 if (bad.length) {

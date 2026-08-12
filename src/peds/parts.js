@@ -137,15 +137,68 @@ export function torsoFrontZ(y, p = {}) {
   return hz + zo + 0.012 * t;
 }
 
-export function torsoShell(nz, p = {}) {
+/**
+ * THE shell section at height `y`, for the options the shell was built with.
+ *
+ * Factored out of `torsoShell` rather than copied, because the hem band, the
+ * waistband and the placket all have to sit on the SAME surface the shell
+ * emits: a band derived from its own re-guess of the section is a band that
+ * floats off a puffa and cuts into a nipped waist. Writes [hx, hz, zo, corner].
+ */
+export function shellSection(y, p, out) {
   const hem = p.hem ?? 0.80;
   const bulk = p.bulk ?? 1;
   const flare = p.flare ?? 1;
   const bust = p.bust ?? 0;
   const belly = p.belly ?? 0;
   const shoulder = p.shoulder ?? 1;
-  const thick = p.thick ?? 0.0;      // garment thickness over the body
-  const waistIn = p.waist ?? 1;      // < 1 = nipped waist
+  const thick = p.thick ?? 0.0;
+  const waistIn = p.waist ?? 1;
+
+  const b = (y - 0.86) / (1.44 - 0.86);
+  torsoAt(b, _sec);
+  let hx = _sec[0];
+  let hz = _sec[1];
+  const zo0 = _sec[2];
+  const corner = _sec[3];
+  // the shoulder yoke is where a garment's cut shows: a suit squares it, a
+  // puffa rounds it, a woman's coat narrows it
+  const yoke = smoothstep(0.72, 0.94, b);
+  hx *= 1 + (shoulder - 1) * yoke;
+  // hem: below the natural waist a coat HANGS, it does not follow the body
+  if (y < 0.94) {
+    const d = clamp01((0.94 - y) / Math.max(0.03, 0.94 - hem));
+    hx += d * d * 0.034 * flare;
+    hz += d * d * 0.026 * flare;
+  }
+  const waistK = Math.exp(-((b - 0.30) ** 2) / 0.030);
+  hx *= 1 - (1 - waistIn) * waistK;
+  hz *= 1 - (1 - waistIn) * waistK * 0.8;
+  if (bust > 0) {
+    const k = Math.exp(-((b - 0.60) ** 2) / 0.012);
+    hz += bust * 0.034 * k;
+    hx += bust * 0.007 * k;
+  }
+  if (belly > 0) {
+    const k = Math.exp(-((b - 0.26) ** 2) / 0.045);
+    hz += belly * 0.048 * k;
+    hx += belly * 0.030 * k;
+  }
+  // above the shoulder line the shell closes onto the neck and the thickness
+  // has to go with it or a coat grows a barrel collar
+  const close = smoothstep(0.90, 1.03, b);
+  const th = thick * (1 - close * 0.75);
+  out[0] = hx * bulk + th;
+  out[1] = hz * bulk + th;
+  out[2] = zo0;
+  out[3] = corner;
+  return out;
+}
+
+const _shs = [0, 0, 0, 0];
+
+export function torsoShell(nz, p = {}) {
+  const hem = p.hem ?? 0.80;
 
   const S = [];
   const top = 1.475;
@@ -153,42 +206,8 @@ export function torsoShell(nz, p = {}) {
   for (let i = 0; i < rows; i++) {
     const t = i / (rows - 1);
     const y = hem + (top - hem) * t;
-    const b = (y - 0.86) / (1.44 - 0.86);
-    torsoAt(b, _sec);
-    let hx = _sec[0];
-    let hz = _sec[1];
-    const zo0 = _sec[2];
-    const corner = _sec[3];
-    // the shoulder yoke is where a garment's cut shows: a suit squares it, a
-    // puffa rounds it, a woman's coat narrows it
-    const yoke = smoothstep(0.72, 0.94, b);
-    hx *= 1 + (shoulder - 1) * yoke;
-    // hem: below the natural waist a coat HANGS, it does not follow the body
-    if (y < 0.94) {
-      const d = clamp01((0.94 - y) / Math.max(0.03, 0.94 - hem));
-      hx += d * d * 0.034 * flare;
-      hz += d * d * 0.026 * flare;
-    }
-    const waistK = Math.exp(-((b - 0.30) ** 2) / 0.030);
-    hx *= 1 - (1 - waistIn) * waistK;
-    hz *= 1 - (1 - waistIn) * waistK * 0.8;
-    if (bust > 0) {
-      const k = Math.exp(-((b - 0.60) ** 2) / 0.012);
-      hz += bust * 0.034 * k;
-      hx += bust * 0.007 * k;
-    }
-    if (belly > 0) {
-      const k = Math.exp(-((b - 0.26) ** 2) / 0.045);
-      hz += belly * 0.048 * k;
-      hx += belly * 0.030 * k;
-    }
-    // above the shoulder line the shell closes onto the neck and the thickness
-    // has to go with it or a coat grows a barrel collar
-    const close = smoothstep(0.90, 1.03, b);
-    const th = thick * (1 - close * 0.75);
-    hx = hx * bulk + th;
-    hz = hz * bulk + th;
-    S.push([y, hx, hz, zo0, corner]);
+    shellSection(y, p, _shs);
+    S.push([y, _shs[0], _shs[1], _shs[2], _shs[3]]);
   }
 
   const seg = p.seg ?? 24;
@@ -769,6 +788,142 @@ export function mouthLine(base) {
   return m;
 }
 
+/* ================================================================== */
+/* Face colour                                                        */
+/* ================================================================== */
+
+/**
+ * THE FACE COLOUR FIELD — the half of a face that is not geometry.
+ *
+ * The skull, the nose, the sockets and the lips have been real geometry here
+ * for a while, and the faces still read as decals at conversational distance,
+ * because every one of those surfaces was the SAME FLAT COLOUR: one palette
+ * slot, one tiling skin bake, and a modulation whose whole dynamic range is
+ * pores. A real face is a colour map before it is a mesh — the vermilion is a
+ * different hue from the chin, the malar flush is warmer than the forehead,
+ * the orbit is darker and cooler than the cheek under it, and a man who
+ * shaved on Tuesday has a quarter of his face two stops down.
+ *
+ * None of that can be a texture: the skin bake is a shared tiling map with no
+ * face in its UV layout, and a per-ped face atlas is 20 silhouettes x 512 px
+ * of texture memory this project does not have. So it is a RATIO baked into
+ * the vertex colour — free at runtime, correct across all eight skin tones
+ * because it multiplies whatever tone the palette carries, and measurable on
+ * the emitted attribute (`faceprobe.mjs` gate 7 TONE).
+ *
+ * `stubble` is beard shadow, `age` adds pallor and deepens the nasolabial and
+ * tear-trough folds. Both come off the SILHOUETTE, so they vary across the
+ * wardrobe rather than across one man's face.
+ *
+ * Returns a callback in the `CharacterBuilder` part `tone` contract:
+ * (x, y, z, nx, ny, nz, out) -> out = [rMul, gMul, bMul, grimeAdd].
+ */
+/**
+ * NEGATIVE CONTROL for `faceprobe.mjs` gate 7 TONE. `--flatface` returns the
+ * face to one flat skin value — which is what shipped — and the gate must go
+ * red on all three of its measurements.
+ */
+export const TONE_LEGACY = { flat: false };
+
+export function faceTone(base, p = {}) {
+  if (TONE_LEGACY.flat) return null;
+  const bx = base[0], by = base[1], bz = base[2];
+  const stubble = p.stubble ?? 0;
+  const age = p.age ?? 0;
+  const lip = p.lip ?? 0;
+  const ear = p.ear ?? 0;
+  const G = (v, s) => Math.exp(-(v * v) / s);
+  return (X, Y, Z, nx, ny, nz3, out) => {
+    const x = X - bx, y = Y - by, z = Z - bz;
+    const ax = Math.abs(x);
+    const front = clamp01(z / 0.070);
+
+    // malar flush: the warmest, reddest part of a face, over the cheekbone
+    const malar = G(ax - 0.050, 0.0011) * G(y - 0.066, 0.00075) * front;
+    // the nose takes the same flush plus a brighter, oilier tip
+    const nose = G(ax, 0.00075) * G(y - 0.072, 0.00090) * front;
+    // orbit: the tear trough and the shaded upper lid, cooler as well as darker
+    const orbit = G(ax - 0.033, 0.00048) * G(y - 0.0925, 0.00035) * front;
+    // forehead: paler and flatter in hue, and the highest-value part of a face
+    const brow = clamp01((y - 0.108) / 0.055) * front;
+    // nasolabial fold and the shadow under the cheek, both deepened by age
+    const fold = G(ax - 0.030, 0.00060) * G(y - 0.048, 0.00060) * front;
+    // under the jaw and behind it: a face is never lit from below
+    const under = clamp01((0.012 - y) / 0.045) * clamp01(-ny * 1.4);
+
+    let r = 1, g = 1, b = 1;
+    r += malar * 0.085 + nose * 0.055 + brow * 0.005 - orbit * 0.030;
+    g += -malar * 0.030 - nose * 0.012 + brow * 0.012 - orbit * 0.040;
+    b += -malar * 0.048 - nose * 0.030 + brow * 0.026 - orbit * 0.018;
+
+    // vermilion: the ONE region of a face whose hue is not skin's
+    if (lip > 0) {
+      r += lip * 0.155;
+      g -= lip * 0.115;
+      b -= lip * 0.085;
+    }
+    // an ear is thin enough to pass light: warmer than the cheek beside it
+    if (ear > 0) {
+      r += ear * 0.115;
+      g -= ear * 0.035;
+      b -= ear * 0.060;
+    }
+
+    const value =
+      1 - orbit * 0.11 - fold * (0.045 + 0.075 * age) - under * 0.10 +
+      brow * 0.035 - age * 0.02;
+    r *= value; g *= value; b *= value;
+    /**
+     * AGE IS NOT ONLY PALLOR. An old face loses saturation over the plane of
+     * the cheek and GAINS it over the nose and the malar crest — broken
+     * capillaries — so an age term that only desaturates flattens the very
+     * thing it is meant to characterise. Measured on the emitted attribute:
+     * the flat desaturation alone put `oldM` and `oldF` at a warm/cool spread
+     * of 1.099 against `faceprobe.mjs` gate 7's 1.10 floor, i.e. it made the
+     * two oldest faces in the wardrobe the two flattest.
+     */
+    if (age > 0) {
+      const mean = (r + g + b) / 3;
+      const k = age * 0.16;
+      r += (mean - r) * k; g += (mean - g) * k; b += (mean - b) * k;
+      const cap = age * (malar * 0.6 + nose);
+      r += cap * 0.075;
+      g -= cap * 0.030;
+      b -= cap * 0.035;
+    }
+
+    /**
+     * BEARD SHADOW rides the grime channel, not the colour, because grime
+     * blends toward one shared dark brown — which is what a shaved follicle
+     * IS, at any skin tone, and it therefore cannot make a pale man's stubble
+     * look like a tan and a dark man's look like dust.
+     */
+    let shadow = 0;
+    if (stubble > 0) {
+      /**
+       * THE BEARD LINE IS NOT A HORIZONTAL. A flat cut at one height reads as
+       * a chinstrap — it was one, in the first frame this shipped in — because
+       * a real beard line rises from the chin to the sideburn in front of the
+       * ear, roughly 55 mm of climb over the width of a jaw, and it is a soft
+       * edge, not a step. It also has to STOP under the jaw: the neck part
+       * shares this field and everything below y = 0 was reading as full
+       * stubble, i.e. a shaded throat.
+       */
+      const line = 0.048 + 0.058 * smoothstep(0.020, 0.078, ax);
+      const jaw =
+        smoothstep(line + 0.014, line - 0.026, y) *
+        smoothstep(-0.030, 0.004, y) *
+        (1 - G(y - 0.036, 0.00030) * G(ax, 0.0013));      // not on the lips
+      const tache = G(y - 0.049, 0.00016) * G(ax, 0.0011) * front;
+      shadow = stubble * Math.min(1, jaw * (0.45 + 0.55 * front) + tache * 0.9);
+      const d = 1 - shadow * 0.10;
+      r *= d; g *= d; b *= d;
+    }
+
+    out[0] = r; out[1] = g; out[2] = b;
+    out[3] = shadow * 0.24;
+  };
+}
 
 export function neck(nz, base, r = 1) {
   const m = limbTube(
@@ -1223,6 +1378,77 @@ export function collar(nz, p = {}) {
   return m;
 }
 
+/**
+ * FINISHED EDGES — what separates a garment from a lofted tube.
+ *
+ * A coat's silhouette at 15 m is three horizontals: the collar, the cuff and
+ * the HEM. Two of those were geometry here and the third was a cut edge, which
+ * is why a shell read as a cylinder that stopped. A real hem is a folded band
+ * 15-30 mm deep standing a couple of millimetres proud of the panel above it,
+ * and it catches a light edge on its own crown from every angle — so it is the
+ * cheapest strong garment cue in the file: one closed ring, 22 segments.
+ *
+ * All three ride `shellSection`, so they cannot drift off the shell.
+ */
+export function hemBand(nz, p = {}) {
+  const y = p.hem ?? 0.80;
+  const seg = p.seg ?? 22;
+  const depth = p.depth ?? 0.024;
+  const out = 0.0035 + (p.thick ?? 0.008) * 0.35;
+  const rings = [];
+  for (let i = 0; i < 4; i++) {
+    const t = i / 3;
+    const yy = y + depth * t;
+    shellSection(Math.max(y, yy), p, _shs);
+    // the band rolls under at its own bottom edge rather than ending flat
+    const roll = Math.sin(t * Math.PI) * 0.6 + t * 0.4;
+    const k = out * (0.35 + roll);
+    rings.push({
+      pts: superEllipse(_shs[0] + k, _shs[1] + k, _shs[3], seg),
+      o: [0, yy, _shs[2]],
+    });
+  }
+  const m = loft(rings, { capStart: true, capEnd: false });
+  computeNormals(m);
+  displace(m, (x, yy, z) => nz.fbm3(x * 26, yy * 30, z * 26, 2) * 0.0022);
+  return m;
+}
+
+/** Trouser waistband: the horizontal every pair of legs was missing. */
+export function waistBand(nz, y = 0.968, hipW = 1, bulk = 1) {
+  const seg = 20;
+  const rx = 0.152 * hipW * bulk, rz = 0.108 * bulk;
+  const rings = [
+    [y - 0.001, 1.000], [y + 0.010, 1.018], [y + 0.026, 1.020], [y + 0.034, 1.002],
+  ].map(([yy, k]) => ({ pts: superEllipse(rx * k, rz * k, 2.7, seg), o: [0, yy, -0.006] }));
+  const m = loft(rings, { capStart: false, capEnd: false });
+  computeNormals(m);
+  displace(m, (x, yy, z) => nz.fbm3(x * 34, yy * 34, z * 34, 2) * 0.0016);
+  return m;
+}
+
+/**
+ * The button placket: the doubled strip of cloth a front opening is cut into.
+ * Two of them, one either side of centre, so the OPENING is a shadow line
+ * between two raised edges rather than a row of discs on a smooth chest.
+ */
+export function placket(nz, y0, y1, frontZ, width = 0.030) {
+  const out = emptyMesh();
+  for (const side of [-1, 1]) {
+    const pts = [];
+    for (let i = 0; i <= 6; i++) {
+      const t = i / 6;
+      const y = y0 + (y1 - y0) * t;
+      pts.push([side * width * 0.5, y, frontZ(y) + 0.0028]);
+    }
+    const m = ribbon(pts, width, 0.0075, { seg: 6, up: [0, 0, 1] });
+    computeNormals(m);
+    appendMesh(out, m);
+  }
+  displace(out, (x, y, z) => nz.fbm3(x * 40, y * 26, z * 40, 2) * 0.0012);
+  return out;
+}
+
 export function tie() {
   const out = emptyMesh();
   const knot = boxRound(0.017, 0.020, 0.012, { n: 3.4, seg: 12, rows: 5, roundY: 0.5 });
@@ -1335,13 +1561,58 @@ export function hiVisBands(p = {}) {
 /* ================================================================== */
 
 /**
- * A relaxed human hand — palm, four separately modelled fingers with two
- * phalanges each, and an opposed thumb. The "hands are mittens" note is the
- * cheapest thing to fail and the most obvious at 2 m, so the fingers are real
- * tapered tubes with knuckle swells, splayed slightly and curled by `curl`.
+ * HAND ANTHROPOMETRY, and why the last one read as a mitten.
+ *
+ * The previous hand DID emit four separate finger tubes, and they were still a
+ * mitten, because the numbers made them one solid block: metacarpal pitch
+ * 17.5 mm with finger radii of 9.6-10.2 mm, so every adjacent pair
+ * INTERPENETRATED by 2.3 mm and the four tubes welded into a paddle with four
+ * faint ridges on it. Nothing downstream could recover the fingers, and no
+ * screenshot of a fist could tell you why.
+ *
+ * These are the measured numbers instead (adult male, at the 1.75 m reference):
+ *
+ *   hand breadth across the metacarpal heads   82 - 89 mm
+ *   MCP pitch, index->little                   20.6, 20.6, 19.4 mm
+ *   proximal phalanx diameter                  17.5 - 19.0 mm
+ *   inter-finger gap, relaxed hand              1.5 - 4  mm
+ *
+ * so the pitch has to EXCEED the pair's radii, and the emitted gap is what
+ * `poseprobe.mjs` gate FINGERS measures — on the emitted vertices, per finger
+ * pair, in the plane across the hand. The knuckle line is an ARC (the middle
+ * metacarpal is the longest, the little the shortest) and the curl rises from
+ * index to little, which is what a relaxed hand actually does and what stops
+ * four parallel sausages reading as a rake.
  *
  * `down` is the direction the fingers point, `palmN` the palm's outward normal.
+ * `opts.lod > 0` swaps the four tubes for one grooved finger block: at the
+ * range where a hand is twelve pixels across, the GROOVES are the whole read
+ * and four separate tubes cost 132 triangles to say the same thing.
  */
+/** MCP pitch, base offset along the hand, length, radius and curl, per finger. */
+const FINGERS_NEW = [
+  //  pitch    MCP along D   length   radius    curl
+  [-1.50, 0.0790, 0.0760, 0.00905, 0.86],   // index
+  [-0.50, 0.0845, 0.0825, 0.00935, 1.00],   // middle
+  [0.50, 0.0815, 0.0770, 0.00885, 1.10],    // ring
+  [1.50, 0.0725, 0.0605, 0.00760, 1.22],    // little
+];
+/** What shipped: one flat knuckle line, one curl, and radii wider than the pitch. */
+const FINGERS_OLD = [
+  [-1.50, 0.0840, 0.0780, 0.00980, 1.0],
+  [-0.50, 0.0840, 0.0840, 0.01020, 1.0],
+  [0.50, 0.0840, 0.0790, 0.00960, 1.0],
+  [1.50, 0.0840, 0.0620, 0.00820, 1.0],
+];
+/**
+ * NEGATIVE CONTROL for `poseprobe.mjs` gate FINGERS. `--legacyhand` restores
+ * the shipped 17.5 mm pitch against 19.6 mm of finger, which is the geometry
+ * that welded four tubes into a mitten; the gate must go red on it.
+ */
+export const HAND_LEGACY = { on: false };
+const fingerTable = () => (HAND_LEGACY.on ? FINGERS_OLD : FINGERS_NEW);
+const pitchOf = () => (HAND_LEGACY.on ? 0.0175 : 0.0206);
+
 export function hand(nz, wrist, down, palmN, side, opts = {}) {
   const out = emptyMesh();
   const W = new THREE.Vector3(...wrist);
@@ -1350,13 +1621,17 @@ export function hand(nz, wrist, down, palmN, side, opts = {}) {
   const S = new THREE.Vector3().crossVectors(D, N).normalize(); // across the hand
   const curl = opts.curl ?? 0.5;
   const k = opts.scale ?? 1;
+  const lod = opts.lod ?? 0;
+  const thumbSide = -side;
+  const FINGERS = fingerTable();
+  const MCP_PITCH = pitchOf();
 
   // ---- palm: a tapered slab, wider at the knuckles than at the wrist
   const palmRings = [];
   const nP = 6;
   for (let i = 0; i < nP; i++) {
     const t = i / (nP - 1);
-    const hx = (0.021 + t * 0.019) * k;   // across
+    const hx = (0.021 + t * 0.020) * k;   // across
     const hz = (0.017 - t * 0.005) * k;   // through
     palmRings.push({
       pts: superEllipse(hx, hz, 3.0, 14),
@@ -1370,52 +1645,114 @@ export function hand(nz, wrist, down, palmN, side, opts = {}) {
   }
   const palm = loft(palmRings, { capStart: true, capEnd: false });
   computeNormals(palm);
-  // thenar eminence: the pad at the base of the thumb
-  const thumbSide = -side;
-  displace(palm, (x, y, z, nx, ny, nz3) => {
-    const q = new THREE.Vector3(x - W.x, y - W.y, z - W.z);
-    const alongS = q.dot(S) * thumbSide;
-    const alongD = q.dot(D);
+  // thenar eminence, the knuckle ridge, and the interdigital clefts that let
+  // the finger mass separate at its BASE rather than only at the tips
+  displace(palm, (x, y, z) => {
+    const qx = x - W.x, qy = y - W.y, qz = z - W.z;
+    const alongS = (qx * S.x + qy * S.y + qz * S.z) * thumbSide;
+    const alongD = qx * D.x + qy * D.y + qz * D.z;
+    const alongN = qx * N.x + qy * N.y + qz * N.z;
     const pad = Math.exp(-((alongS - 0.016 * k) ** 2) / (0.0004 * k * k)) *
       Math.exp(-((alongD - 0.030 * k) ** 2) / (0.0012 * k * k));
-    return pad * 0.008 * k + nz.fbm3(x * 90, y * 90, z * 90, 2) * 0.0009;
+    // knuckles: four swells on the DORSUM only (alongN < 0 is the back)
+    let knuck = 0, cleft = 0;
+    const dorsal = Math.max(0, -alongN / (0.014 * k));
+    for (let f = 0; f < 4; f++) {
+      const cx = FINGERS[f][0] * MCP_PITCH * k * side;
+      const cd = FINGERS[f][1] * k;
+      const s = alongS * thumbSide;   // back to unsigned across-hand
+      knuck += Math.exp(-((s - cx) ** 2) / (0.000055 * k * k)) *
+        Math.exp(-((alongD - cd) ** 2) / (0.00022 * k * k));
+      if (f < 3) {
+        const gx = (FINGERS[f][0] + FINGERS[f + 1][0]) * 0.5 * MCP_PITCH * k * side;
+        cleft += Math.exp(-((s - gx) ** 2) / (0.000018 * k * k)) *
+          Math.exp(-((alongD - 0.079 * k) ** 2) / (0.00030 * k * k));
+      }
+    }
+    const relief = HAND_LEGACY.on ? 0 : 1;
+    return (
+      pad * 0.008 * k +
+      Math.min(1, knuck) * dorsal * 0.0034 * k * relief -
+      Math.min(1, cleft) * 0.0055 * k * relief +
+      nz.fbm3(x * 90, y * 90, z * 90, 2) * 0.0009
+    );
   });
   computeNormals(palm);
   appendMesh(out, palm);
 
-  // ---- fingers
-  const lens = [0.078, 0.084, 0.079, 0.062].map((v) => v * k);
-  const rads = [0.0098, 0.0102, 0.0096, 0.0082].map((v) => v * k);
-  for (let f = 0; f < 4; f++) {
-    const across = (f - 1.5) * 0.0175 * k * side;
+  /** Centre-line of one finger, `f` indexing FINGERS. `at` overrides the pitch. */
+  const spine = (f, nSeg, at = null) => {
+    const [pitch, mcp, L, , cK] = FINGERS[f];
+    const across = (at ?? pitch) * MCP_PITCH * k * side;
     const base = W.clone()
-      .addScaledVector(D, 0.084 * k)
+      .addScaledVector(D, mcp * k)
       .addScaledVector(S, across)
       .addScaledVector(N, -0.001 * k);
+    const c = curl * cK;
     const pts = [];
-    const nSeg = 5;
-    const L = lens[f];
-    // curl: the fingers roll around an axis parallel to S
     for (let i = 0; i <= nSeg; i++) {
       const u = i / nSeg;
-      const ang = curl * (0.55 + u * 1.25);
+      const ang = c * (0.55 + u * 1.25);
+      // splay: the tips spread ~6% wider than the knuckles on a relaxed hand
       const p = base.clone()
-        .addScaledVector(D, Math.cos(ang) * L * u)
-        .addScaledVector(N, -Math.sin(ang) * L * u * 0.85)
-        .addScaledVector(S, across * u * 0.28);
+        .addScaledVector(D, Math.cos(ang) * L * k * u)
+        .addScaledVector(N, -Math.sin(ang) * L * k * u * 0.85)
+        .addScaledVector(S, across * u * 0.075);
       pts.push([p.x, p.y, p.z]);
     }
-    const fin = tube(
-      pts,
+    return pts;
+  };
+
+  if (lod === 0) {
+    for (let f = 0; f < 4; f++) {
+      const r0 = FINGERS[f][3] * k;
+      const fin = tube(
+        spine(f, 5),
+        (u) => {
+          const knuckle =
+            1 + 0.16 * Math.exp(-((u - 0.36) ** 2) / 0.012) +
+            0.12 * Math.exp(-((u - 0.72) ** 2) / 0.010);
+          // the distal phalanx flattens toward the pad rather than staying round
+          const r = r0 * (1 - u * 0.30) * knuckle;
+          return ellipseProfile(r, r * (0.92 - 0.10 * u), 8);
+        },
+        // `up` = the palm normal, so the distal flattening is the PAD, not a
+        // random face of the ellipse.
+        { capStart: false, capEnd: true, up: [N.x, N.y, N.z] }
+      );
+      computeNormals(fin);
+      appendMesh(out, fin);
+    }
+  } else {
+    /**
+     * FAR TIER — one block, three grooves. Built on the MIDDLE finger's spine
+     * with the block's half-width covering the emitted MCP span, so the
+     * silhouette matches the near tier's outline to within a millimetre and
+     * only the separation is cheapened.
+     */
+    const half = (1.5 * MCP_PITCH + FINGERS[0][3]) * k;
+    const sig = 0.0000075 * k * k;
+    const blk = tube(
+      spine(1, 4, 0),
       (u) => {
-        const knuckle = 1 + 0.16 * Math.exp(-((u - 0.36) ** 2) / 0.012) + 0.12 * Math.exp(-((u - 0.72) ** 2) / 0.010);
-        const r = rads[f] * (1 - u * 0.30) * knuckle;
-        return ellipseProfile(r, r * 0.92, 8);
+        const r = FINGERS[1][3] * k * (1 - u * 0.24);
+        const w = half * (1 - u * 0.10);
+        const pts = superEllipse(w, r * 0.94, 2.6, 14);
+        // three grooves down the block on the inter-finger lines. `up` is the
+        // palm normal, so pts[i][0] is across the hand and pts[i][1] through it.
+        for (const p of pts) {
+          let g = 0;
+          for (let s3 = -1; s3 <= 1; s3++) {
+            g = Math.max(g, Math.exp(-((p[0] - s3 * MCP_PITCH * k) ** 2) / sig));
+          }
+          p[1] *= 1 - 0.44 * g;
+        }
+        return pts;
       },
-      { capStart: false, capEnd: true }
+      { capStart: false, capEnd: true, up: [N.x, N.y, N.z] }
     );
-    computeNormals(fin);
-    appendMesh(out, fin);
+    computeNormals(blk);
+    appendMesh(out, blk);
   }
 
   // ---- thumb: out of the side of the palm and forward
@@ -1429,13 +1766,13 @@ export function hand(nz, wrist, down, palmN, side, opts = {}) {
       const u = i / 4;
       const p = base.clone()
         .addScaledVector(D, u * 0.052 * k)
-        .addScaledVector(S, thumbSide * u * 0.020 * k)
+        .addScaledVector(S, thumbSide * u * 0.026 * k)
         .addScaledVector(N, -Math.sin(u * curl * 1.3) * 0.026 * k);
       pts.push([p.x, p.y, p.z]);
     }
     const th = tube(pts, (u) => {
       const r = 0.0118 * k * (1 - u * 0.26) * (1 + 0.15 * Math.exp(-((u - 0.55) ** 2) / 0.02));
-      return ellipseProfile(r, r * 0.9, 8);
+      return ellipseProfile(r, r * (0.90 - 0.08 * u), 8);
     }, { capStart: true, capEnd: true });
     computeNormals(th);
     appendMesh(out, th);

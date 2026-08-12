@@ -203,11 +203,18 @@ class ShadowPool {
     this.n = 0;
   }
 
-  /** Place one quad flat on the ground at `yaw`, half-extents rx/rz. */
+  /**
+   * Place one quad flat on the ground at `yaw`, half-extents rx/rz.
+   *
+   * `y` IS THE FINAL HEIGHT — this used to add a fixed +0.014 of its own, which
+   * is the whole reason the pool was invisible. See `GroundShadows._contactY`:
+   * the lift has to be measured against the DRAWN surface, and only `addPed`
+   * knows which surface that is.
+   */
   put(x, y, z, yaw, rx, rz, fade) {
     if (this.n >= this.cap || fade <= 0.01) return;
     _sq.setFromAxisAngle(_sup, yaw).multiply(_sflat);
-    _spos.set(x, y + 0.014, z);
+    _spos.set(x, y, z);
     _sscale.set(rx * 2, rz * 2, 1);
     _sm.compose(_spos, _sq, _sscale);
     this.mesh.setMatrixAt(this.n, _sm);
@@ -239,6 +246,121 @@ class ShadowPool {
     this.tex.dispose();
   }
 }
+
+/**
+ * ────────────────────────────────────────────────────────────────────────────
+ * A CONTACT MARK HAS TO BE LIFTED AGAINST THE SURFACE THAT IS DRAWN, NOT
+ * AGAINST THE ONE THE ACTOR IS STANDING ON.
+ * ────────────────────────────────────────────────────────────────────────────
+ * This pool was populated, visible, in the scene, correctly blended — and
+ * contributed ONE PIXEL of 2 073 600 on `street` at 1920x1080. It was not a
+ * blend fault and not a strength fault: every quad was UNDER THE ROAD.
+ *
+ * `Ped.position.y` comes from `PedSystem.groundAt`, which is a physics raycast
+ * against the STREAMED COLLISION mesh. `roadmesh` builds that collider on its
+ * own coarse cross section (11 m rows, 9 columns) while the visible carriageway
+ * is emitted at 2.7 m rows with camber, wheel ruts and `roadWob` on top, and
+ * the footway is a separate surface again. The two do not agree, and the
+ * collider is consistently the LOWER of the pair.
+ *
+ * MEASURED, by intersecting a vertical ray with the EMITTED VERTICES of every
+ * visible mesh under each quad (never `heightAt`, never the collider — the
+ * discipline `src/render/aoprobe.mjs` and the `tile.js` ground bake both use),
+ * with the pool's old +0.014 lift in place:
+ *
+ *              quads   buried   median gap   p10 gap    worst
+ *   street       67      58      -0.020 m   -0.075 m   -0.240 m
+ *   crowd        61      53      -0.019 m   -0.049 m   -0.099 m
+ *   night        35      27      -0.032 m   -0.113 m   -0.303 m
+ *
+ * so the DRAWN ground stands a median 34 mm above the collider the ped is
+ * pinned to, against a 14 mm lift. The quads depth-tested out, every frame,
+ * everywhere.
+ *
+ * `world.walkableHeightAt` is the fix because it is the one published function
+ * that reproduces the profile `roadmesh` actually BUILDS rather than the one it
+ * collides with. Measured as `walkableHeightAt - drawn surface` at the same
+ * quads: terrain 0.000 m, carriageway +0.008, footway +0.003 median. It is not
+ * right everywhere — junction pads and kerb stones read up to +0.20 m high, and
+ * rail ballast, sleepers and building plinths are surfaces it does not model at
+ * all and can read a metre low — which is exactly why the two clamps below
+ * exist rather than a bare substitution.
+ *
+ * WHY NOT A BIGGER CONSTANT. Clearing the p10 burial with a fixed lift needs
+ * ~0.11 m, and a 0.11 m lift is a shadow that has visibly come away from the
+ * shoe at any grazing angle. The point of a contact mark is that it is IN
+ * contact. Lift against the surface, and cap the lift.
+ */
+
+/**
+ * Ceiling on how far the drawn-surface estimate may raise a quad above the
+ * ground the actor is standing on, metres.
+ *
+ * It exists because `walkableHeightAt` reads junction pads and kerb stones up
+ * to +0.20 m high, and an uncapped substitution would float a blob by that
+ * much. It is 0.10 because that is what the sweep says, not because 0.10 is a
+ * round number — SWEPT on the emitted frame, recording `raw`, `walkableHeightAt`
+ * and the drawn surface under all 92 (`street`) and 110 (`crowd`) quads of one
+ * frame and re-solving this formula offline for each candidate:
+ *
+ *     cap     buried        p10 gap          worst float      mean lift
+ *   0.000    73 / 86    -0.055 / -0.063    0.648 / 0.176    0.016 / 0.016
+ *   0.045    27 / 24    -0.041 / -0.039    0.648 / 0.176    0.045 / 0.049
+ *   0.075    20 / 15    -0.029 / -0.014    0.648 / 0.176    0.051 / 0.055
+ *   0.100    18 / 13    -0.019 / -0.003    0.648 / 0.176    0.053 / 0.057
+ *   0.150    17 / 12    -0.018 / -0.001    0.648 / 0.182    0.055 / 0.058
+ *   0.200    16 / 12    -0.018 / -0.001    0.648 / 0.199    0.057 / 0.058
+ *
+ * Two things that argument turned on. The WORST FLOAT does not move at all
+ * between 0.000 and 0.120 — it is not this clamp's doing, it is a quad whose
+ * ped is standing on a kerb over a surface half a metre lower, so raising the
+ * cap to 0.10 buys burial back for nothing. And the MEAN LIFT is flat past
+ * 0.075 (+2 mm to 0.10), because the clamp only binds on the handful of pads
+ * that read high; the median contact mark is lifted 34 mm either way.
+ *
+ * Past 0.12 the returns stop and `crowd`'s worst float starts to climb, which
+ * is where a pad over-read does begin to escape. Everything still buried at
+ * 0.10 is rail ballast, sleepers and building plinths — surfaces
+ * `walkableHeightAt` does not model at all — and is reported by
+ * `src/peds/shadowprobe.mjs` rather than papered over.
+ */
+const SURFACE_LIFT_CAP = 0.10;
+
+/**
+ * The decal epsilon over the resolved surface, metres.
+ *
+ * This is the offset applied when the surface estimate is BELIEVED, and it is
+ * also the whole offset in the fallback case where `walkableHeightAt` declines
+ * to lift at all — which is a quarter of the quads in a `street` frame, and
+ * where the collider-vs-drawn bias is still there and still unmeasured. So it
+ * has to carry two jobs:
+ *
+ *   - clear `roadmesh`'s own road paint, drawn at `PAINT_LIFT` = 0.011 above
+ *     the carriageway that `walkableHeightAt` models (MEASURED at -0.011 to
+ *     -0.014 on `road_mark_cross`), and
+ *   - cover the median collider-vs-drawn disagreement on the fallback path.
+ *
+ * SWEPT at cap 0.10 on the same emitted frames:
+ *
+ *     eps     buried (street / crowd)   p10 gap (street / crowd)
+ *   0.016           18 / 13               -0.019 / -0.003
+ *   0.026           13 / 10               -0.009 / +0.007
+ *   0.030           12 /  9               -0.005 / +0.011
+ *   0.035           10 /  9               -0.000 / +0.016
+ *
+ * 0.030 and not 0.016 because of ONE case the pixels found and the summary
+ * statistics hid: the pedestrian 8.5 m from the `street` camera — the nearest
+ * one whose feet are actually in frame, and therefore the only contact mark in
+ * that shot big enough to see — took the no-lift branch and sat 9.7 mm under a
+ * footway that stands 25.7 mm proud of his collider. At 0.016 his mark was
+ * invisible; the entire A/B signal in that frame came from peds at 40 m.
+ *
+ * 0.030 and not 0.035 because this is a LIFT and it is paid for at grazing
+ * angles: a mark 30 mm off the deck seen at 13 degrees of depression is
+ * displaced 130 mm from the sole, and the blob is only 760 mm across. The sweep
+ * flattens on `crowd` past 0.030 anyway.
+ */
+const SURFACE_EPS = 0.030;
 
 export class GroundShadows {
   constructor(parent, capacity = 48) {
@@ -288,6 +410,37 @@ export class GroundShadows {
     this.mode = 'multiply';
     /** Preallocated contact record; `PedAnimator.footContact` fills it. */
     this._c = { x: 0, y: 0, z: 0, above: 0, planted: false, lock: 0, hit: false };
+    /**
+     * Resolved from the first pedestrian rather than taken as a constructor
+     * argument: `peds/index.js` owns the call site and builds this pool with
+     * `(parent, capacity)`, which is not this file's to change.
+     *
+     * Stays null in the ped preview harness, which has no world at all — and
+     * `_contactY` degrades to the old fixed offset there, which is right,
+     * because that harness stands its actors on a flat plane where the collider
+     * and the drawn surface are the same thing.
+     */
+    this._world = null;
+  }
+
+  /**
+   * The height to draw a contact mark at, given the ground the actor resolved.
+   *
+   * `raw` is the collider height and is the floor: `walkableHeightAt` can read
+   * a metre low over rail ballast and building plinths, and a mark BELOW the
+   * actor's own feet is worse than the bug this replaces. `SURFACE_LIFT_CAP`
+   * is the ceiling, for the junction pads and kerb stones it reads high on.
+   * The whole argument, and the measurements that set both, are above.
+   */
+  _contactY(x, z, raw) {
+    const w = this._world;
+    if (!w) return raw + SURFACE_EPS;
+    // `raw` is passed as the height hint so a bridge deck overhead is rejected
+    // and a deck underfoot is not — see `walkableHeightAt`'s own note. Without
+    // it, a ped on a river crossing resolves against the riverbed.
+    const g = w.walkableHeightAt(x, z, raw);
+    if (!Number.isFinite(g) || g <= raw) return raw + SURFACE_EPS;
+    return Math.min(g, raw + SURFACE_LIFT_CAP) + SURFACE_EPS;
   }
 
   /** 'multiply' (correct), 'lerp' (the historical defect), 'off'. */
@@ -322,6 +475,19 @@ export class GroundShadows {
     const s = ped.scale ?? 1;
     const an = ped.animator;
     const skinned = an && ped.body && ped.lod <= 1;
+    // Latched once a world that can answer exists. The retry is deliberate and
+    // costs one null compare: `peds` is constructed before `world.init()` has
+    // necessarily run, so the first pedestrians of a session can arrive before
+    // there is a road graph to ask, and latching `null` permanently would
+    // disable the lift for the whole session. The capability is checked HERE
+    // rather than per call because `_contactY` runs a few hundred times a frame
+    // and must not carry a `typeof` (rule 5) — and because a harness that
+    // registers a partial world should degrade to the fixed offset rather than
+    // throw inside the draw path.
+    if (this._world === null && ped.sys) {
+      const w = ped.sys.world;
+      this._world = w && typeof w.walkableHeightAt === 'function' ? w : null;
+    }
 
     /* ---- feet first: they also tell the body blob how airborne it is ---- */
     let minAbove = 0;
@@ -342,8 +508,11 @@ export class GroundShadows {
         // (what this did before) leaves a small hard dot hanging under a foot
         // that is 20 cm in the air, which reads as a smear of dirt.
         const spread = 1 + 0.55 * (1 - contact);
+        // Resolved per FOOT, not once per body: a man with one foot up on a
+        // kerb has 0.152 m between his two soles, which is twice the whole
+        // lift budget, and the foot patch is the mark that has to be exact.
         this.feet.put(
-          c.x, c.y, c.z, ped.yaw,
+          c.x, this._contactY(c.x, c.z, c.y), c.z, ped.yaw,
           0.115 * s * spread, 0.155 * s * spread,
           contact * contact
         );
@@ -357,7 +526,7 @@ export class GroundShadows {
     // so this is 1 for the entire crowd on a normal street.
     const onGround = 1 - Math.min(1, Math.max(0, (minAbove - 0.12) / 0.55));
     if (onGround > 0.02) {
-      this.body.put(p.x, p.y, p.z, ped.yaw, 0.38 * s, 0.30 * s, onGround);
+      this.body.put(p.x, this._contactY(p.x, p.z, p.y), p.z, ped.yaw, 0.38 * s, 0.30 * s, onGround);
     }
   }
 
