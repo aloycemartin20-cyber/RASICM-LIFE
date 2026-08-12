@@ -75,8 +75,8 @@ const SET = [
   ['mkt_heli', 'Skywatch over downtown', 'The news helicopter banking across the Triangle at dusk.'],
   ['mkt_flight', 'Over the three rivers', 'A twin at two hundred metres, with the confluence and its bridges below the wing.'],
   ['mkt_afb', 'Ridgeline AFB', 'The flightline at golden hour — jets on the apron, armour behind them, hangars beyond.'],
-  ['mkt_tanks', 'Armour on the apron', 'A Bulwark column in the dawn haze, at gun height.'],
-  ['mkt_boat', 'A Riverjack on the Monongahela', 'Last light on the water, the Golden Triangle astern.'],
+  ['mkt_tanks', 'Armour on the apron', 'A Bulwark on the flightline in the dawn haze, at gun height.'],
+  ['mkt_boat', 'A Riverjack on the Monongahela', 'Late afternoon on the water, the Golden Triangle astern.'],
   ['mkt_fountain', 'The Point fountain', 'Where the Allegheny and the Monongahela become the Ohio.'],
 
   /*

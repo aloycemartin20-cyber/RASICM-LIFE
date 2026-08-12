@@ -63,3 +63,57 @@ byte-identical images.
 ![A Golden Triangle avenue](hero.png)
 
 *Clear afternoon light, at street level.*
+
+### Three stars, in the rain
+
+![Three stars, in the rain](chase.png)
+
+*A pursuit stacked up a downtown avenue at 21:20, every lightbar doubled by wet asphalt.*
+
+### The brothers’ own cars
+
+![The brothers’ own cars](boyzcars.png)
+
+*Carson’s 4Runner, Aidan’s pickup and Dylan’s Kessel, together outside the DeCarlo Body Shop.*
+
+### Skywatch over downtown
+
+![Skywatch over downtown](heli.png)
+
+*The news helicopter banking across the Triangle at dusk.*
+
+### Over the three rivers
+
+![Over the three rivers](flight.png)
+
+*A twin at two hundred metres, with the confluence and its bridges below the wing.*
+
+### Ridgeline AFB
+
+![Ridgeline AFB](afb.png)
+
+*The flightline at golden hour — jets on the apron, armour behind them, hangars beyond.*
+
+### Armour on the apron
+
+![Armour on the apron](tanks.png)
+
+*A Bulwark on the flightline in the dawn haze, at gun height.*
+
+### A Riverjack on the Monongahela
+
+![A Riverjack on the Monongahela](boat.png)
+
+*Late afternoon on the water, the Golden Triangle astern.*
+
+### The Point fountain
+
+![The Point fountain](fountain.png)
+
+*Where the Allegheny and the Monongahela become the Ohio.*
+
+### Butler Street at lighting-up time
+
+![Butler Street at lighting-up time](butler.png)
+
+*Aidan outside his own body shop, its sign lit — every word in this city is geometry, not a texture.*

@@ -1263,13 +1263,47 @@ function stageKinematic(e, { type = 'plane', at, yaw = 0, pitch = 0, roll = 0, p
  * `false` asked and skipped, `true` ran — for `tools/screenshots.mjs` to report.
  * `spool_control` (scratch) stubs the method in and out to prove those three
  * states are distinguishable.
+ *
+ * ---------------------------------------------------------------------------
+ * `shutterDt` — THE SHUTTER IS AN EXPOSURE, AND A REAL RATE OVER-EXPOSES IT
+ * ---------------------------------------------------------------------------
+ * A gallery pass read `mkt_heli` as "no main rotor blades, only a gold mast
+ * stub". The blades were there the whole time. MEASURED at the shutter through
+ * `vehicles`' own handles: the staged Skywatch is 15.6 m from the lens at LOD0,
+ * its `rotor_y` pivot carries a 108-triangle blade mesh with `visible: true`,
+ * and `debugSpool` had run (`spool: true` in the capture's render info). The
+ * "gold stub" is the chrome mast, which is opaque; the four blades were not.
+ *
+ * WHY. `capture.mjs` freezes the sim and then converges TAA over a FIXED 32
+ * frames — those 32 frames ARE the exposure, and this is what fills them. A
+ * 0.22 m chord at ~3 m radius is 4.2 degrees of arc, so four blades cover 4.7%
+ * of the disc on any one frame; at the class's real 40 rad/s and a 1/60 step
+ * the disc turns 3.4 REVOLUTIONS across the exposure, every phase is
+ * independent, and each pixel of the disc therefore accumulates blade in about
+ * one frame in twenty. The disc resolves at roughly 5% opacity, which at
+ * gallery size is nothing.
+ *
+ * The fix is the exposure, not the mesh. A blade smeared over a sweep S reads
+ * at about (blade arc / S), so S near 20 degrees puts the disc at ~20% — a
+ * blurred arc that reads as TURNING, which is the whole point of spooling it,
+ * without the frozen cross that a static pose gives. 20 degrees over 32 frames
+ * at 40 rad/s is `dt` of about 1/3600.
+ *
+ * `debugSpool`'s `dt` is published as "seconds of blade phase to advance"
+ * precisely so a harness stepping at its own cadence can ask for its own rate,
+ * so this is that door and not a reach into `vehicles`. DEFAULTS to 1/60, so
+ * every shot that does not ask is bit-for-bit what it was — `mkt_flight`'s
+ * twin, whose 1.9 m props sweep a far smaller disc, is deliberately left alone.
  */
-function spoolStaged(e, v) {
+function spoolStaged(e, v, { shutterDt = 1 / 60 } = {}) {
   const veh = e.ctx.peek('vehicles');
   e.__shotSpool = false;
   if (!v || typeof veh?.debugSpool !== 'function') return false;
+  // Read by `tickStagedSpool`, which is the call that actually fills the
+  // exposure — this one only proves the door is there.
+  v._shotSpoolDt = shutterDt;
   try {
-    veh.debugSpool(v, 1);
+    veh.debugSpool(v, 1, shutterDt);
   } catch {
     return false;
   }
@@ -1294,6 +1328,11 @@ function spoolStaged(e, v) {
  * those frames resolves as a sharp cross. Turning through them is what puts a
  * BLURRED disc in the photograph, which is what a rotor looks like.
  *
+ * HOW FAR it turns through them is the shot's to choose, because those 32
+ * frames are an exposure and 1/60 of a second of a 382 rpm disc over-exposes it
+ * to invisibility — see `shutterDt` in `spoolStaged`, which is where the
+ * measurement is. Absent that, the rate is exactly what it always was.
+ *
  * Costs nothing when nothing is staged, and `debugSpool` returns null for the
  * kinds that have no rotor (the staged Riverjack), so the boat shot pays one
  * property read.
@@ -1304,7 +1343,7 @@ function tickStagedSpool(engine) {
   const veh = engine.ctx.peek('vehicles');
   if (typeof veh?.debugSpool !== 'function') return;
   for (let i = 0; i < list.length; i++) {
-    try { veh.debugSpool(list[i], 1, 1 / 60); } catch { /* never take the capture down */ }
+    try { veh.debugSpool(list[i], 1, list[i]._shotSpoolDt ?? 1 / 60); } catch { /* never take the capture down */ }
   }
 }
 
@@ -1458,6 +1497,31 @@ function frameRow(e, list, { back = 40, side = -40, eye = 4.5, aim = 1, aimUp = 
  * `world.heightAt` + its own `comY` and then CHOCKED — brake and handbrake,
  * exactly like `debugPose('beauty')`, because a capture settles for twenty
  * seconds and a forecourt has camber on it.
+ *
+ * ---------------------------------------------------------------------------
+ * `paint` — THE COLOUR IS THE SHOT'S, BECAUSE THE POOL ROLL IS NOT ONE COLOUR
+ * ---------------------------------------------------------------------------
+ * A gallery pass read this frame as "two of the three are white — the
+ * one-colour-each promise collapses", and "the left car's paint renders mottled
+ * like frost". Both are `_choosePaint` doing exactly what it is written to do,
+ * and neither is a defect in `vehicles`:
+ *
+ *   COLOUR.  The hero pools are single-entry (`specs.js`: `runnerwhite`,
+ *            `rangerred`, `k5grey`) so the HUE is fixed — but the tone roll is
+ *            not, and `k5 grey` (0x767c84) rolled light sits a few percent off
+ *            `runner white` (0xdedcd6) under one sky. Two of them then read as
+ *            the same car in different sizes, which is precisely what the pass
+ *            reported. The pool cannot fix that: grey and white ARE close.
+ *   WEAR.    `PAINT_WEARS` is [0, 0.5] and a non-fleet spawn rolls it, so a
+ *            staged hero car had a 50% chance of the 0.5 mask — road film plus
+ *            rust bloom over a near-white body, which is the frost.
+ *
+ * `spawn` already takes `{ paint, finish, flake, wear }` and `_choosePaint`
+ * short-circuits the whole roll when `paint` is given (wear defaults to 0 on
+ * that path, which is the neutral mask this frame wants). So the shot names the
+ * colour. That is the marketing set's job — it is the same call `debugPose`
+ * makes for its beauty paint — and it does NOT change what these cars look like
+ * in play, where the catalogue pools still own them.
  */
 function stageCars(e, hub, cars) {
   const veh = e.ctx.peek('vehicles');
@@ -1470,7 +1534,15 @@ function stageCars(e, hub, cars) {
     const z = hub.z + c.dz;
     const comY = veh.specOf?.(c.type)?.comY ?? 0.6;
     const gy = w.heightAt(x, z) ?? 0;
-    const v = veh.spawn(c.type, _vec.set(x, gy + comY + 0.05, z), c.yaw, { plate: c.plate });
+    const v = veh.spawn(c.type, _vec.set(x, gy + comY + 0.05, z), c.yaw, {
+      plate: c.plate,
+      // Undefined falls straight through to the pool roll, so a caller that
+      // does not care about colour is unaffected.
+      paint: c.paint,
+      finish: c.paint !== undefined ? 'gloss' : undefined,
+      flake: c.flake,
+      wear: 0,
+    });
     if (!v) continue;
     v._staged = true;
     v.engineOn = false;
@@ -1492,12 +1564,36 @@ function releaseStagedCars(e) {
 }
 
 /**
+ * ONE COLOUR EACH, AND IT IS THE BROTHER'S OWN. `ui/data.js` gives every
+ * DeCarlo a colour that the boot card, his HUD and his own car's brake calipers
+ * (`specs.js`: `caliper` is Carson's teal, Aidan's amber, Dylan's cyan accent)
+ * are already painted in, so the three cars standing together is the one frame
+ * in the set that can say who they belong to without a caption. Carson teal,
+ * Aidan orange, Dylan violet — read off `BOYZ` and darkened into paint that a
+ * real car could be ordered in, because the UI values are screen colours and a
+ * body panel at 0xff6a12 reads as a traffic cone.
+ *
+ * Named here rather than imported: `shots.js` is a dev harness and a hard
+ * import of `ui/data.js` for three numbers would make the capture path depend
+ * on the UI module graph. The tie is documented instead, in both directions.
+ */
+const BOYZ_PAINT = {
+  /** Carson `#2ea6a0` — deep teal, the river brother. */
+  carson: { paint: 0x17605c, flake: 0.30 },
+  /** Aidan `#ff6a12` — burnt orange, the body man's own respray. */
+  aidan: { paint: 0xb8480f, flake: 0.42 },
+  /** Dylan `#c07cff` — violet, the one that is unmistakably his. */
+  dylan: { paint: 0x472a7c, flake: 0.55 },
+};
+
+/**
  * The brothers' cars at the DeCarlo Body Shop, framed from the cars.
  *
  * The hub is placed off the camera the shot's `onRoad` block has already
  * snapped to the street outside the shop, so the group stands on the forecourt
  * whatever the generator did with that lot — the same reason `onRoad` exists at
- * all. The lens then goes back to a low three-quarter on the hub.
+ * all. The lens then goes back to a low three-quarter on the hub, and each car
+ * is spawned in its owner's colour (`BOYZ_PAINT` above, `stageCars`' `paint`).
  */
 function frameBoyzCars(e, {
   ahead = 15, offset = 0, spread = 3.9, splay = 0.5, depth = 1.9,
@@ -1517,9 +1613,9 @@ function frameBoyzCars(e, {
   // BACKWARD vector: atan2(-fx, -fz).
   const face = Math.atan2(-fx, -fz);
   const cars = stageCars(e, hub, [
-    { type: 'suv', plate: 'DCB 001', dx: -rx * spread, dz: -rz * spread, yaw: face - splay },
-    { type: 'pickup', plate: 'DCB 002', dx: fx * depth, dz: fz * depth, yaw: face },
-    { type: 'kessel', plate: 'DCB 003', dx: rx * spread, dz: rz * spread, yaw: face + splay },
+    { type: 'suv', plate: 'DCB 001', dx: -rx * spread, dz: -rz * spread, yaw: face - splay, ...BOYZ_PAINT.carson },
+    { type: 'pickup', plate: 'DCB 002', dx: fx * depth, dz: fz * depth, yaw: face, ...BOYZ_PAINT.aidan },
+    { type: 'kessel', plate: 'DCB 003', dx: rx * spread, dz: rz * spread, yaw: face + splay, ...BOYZ_PAINT.dylan },
   ]);
   if (!cars.length) return false;
   // Three-quarter, low, off the hub — and off to the side the arc opens
@@ -1818,12 +1914,41 @@ const MARKETING_SHOTS = {
     doc: 'A police helicopter searchlight sweeping a street at night — the wanted system as a photograph.',
   },
   mkt_point: {
-    // Also reuses the review 'point' framing — an elevated look down the
-    // confluence. My authored version at river level was pointed at the
-    // underside of a bridge deck.
-    pos: [-672, 250, 356], look: [-600, 0, -30], fov: 56, time: 6.9,
-    weather: 'fog', viewmodel: false, hud: false, marketing: true,
-    doc: 'The Point at dawn, where three rivers meet — the confluence and the Golden Triangle beyond.',
+    /**
+     * RE-COMPOSED FROM DOWNSTREAM, AND THE FOG IS GONE. Both are answers to a
+     * gallery pass that read the old frame as "a thick haze volume swallows the
+     * middle of the frame, so the confluence the caption promises is not
+     * legible", with "a shelf of detached blue building slabs floating" in the
+     * top-right corner.
+     *
+     * THE FOG WAS PINNED, not weather the hour brought. The shot declared
+     * `weather: 'fog'` at 06:54 and `__APPLY_SHOT__` snaps that state
+     * immediately — so the frame was a dawn haze volume laid over a 400 m
+     * sightline, and the confluence sat inside it. `dawnfog`, the review shot
+     * that is ABOUT fog, pins no weather at all and takes what the sky's own
+     * clock gives it; this one now does the same and pins `clear`, because a
+     * shot whose single job is "where three rivers meet" cannot also be the
+     * volumetrics test.
+     *
+     * THE VIEWPOINT IS FROM THE OHIO, LOOKING BACK UP THE CONFLUENCE. The old
+     * pose was 250 m up over the south-west bank looking north-east, which put
+     * the Point ACROSS the frame (so the wedge reads as a coastline) and left
+     * the far North Shore in the top-right corner, which is where the detached
+     * far-LOD slabs live. Standing downstream at 115 m — 400 m off the tip,
+     * `world/plan.js` puts the fountain at (-452, 46) and `preview.js` the
+     * confluence at (-600, 40) — puts the Ohio in the near field, the fountain
+     * and its plaza dead centre, a bridge over each incoming channel, and the
+     * Golden Triangle standing behind the whole thing. MEASURED at 1280x720:
+     * the frame's top edge sits just above the tallest tower, so the corner the
+     * pass complained about is not in the picture, and what horizon does remain
+     * is behind the skyline and reads as aerial perspective.
+     *
+     * The detached far-LOD slabs themselves are NOT fixed here — they are a
+     * `buildings`/LOD defect and are filed as one. This frames around them.
+     */
+    pos: [-880, 115, 45], look: [-470, 22, 45], fov: 48, time: 18.9,
+    weather: 'clear', viewmodel: false, hud: false, marketing: true,
+    doc: 'The Point from over the Ohio at golden hour, where three rivers meet — the Allegheny and the Monongahela closing on the fountain from either side of the plaza, a bridge on each, and the Golden Triangle behind it. Clear, because the confluence has to be legible; this set already has three frames of weather.',
   },
   mkt_kessel: {
     // Dylan's car, asked for by name. Framed like a press shot: three-quarter
@@ -1887,12 +2012,27 @@ const MARKETING_SHOTS = {
     weather: 'scattered', viewmodel: false, hud: false, marketing: true, stagesKinematic: true,
     apply: (e) => {
       const v = stageKinematic(e, { type: 'newsheli', at: [-380, 205, -70], yaw: 0.834, pitch: -0.04, roll: 0.15 });
-      // A banked helicopter with a parked disc is a model on a stand. See
-      // `spoolStaged`.
-      spoolStaged(e, v);
-      frameAircraft(e, v, { dist: 14, up: 3.4, side: 6, aimAhead: 80, aimY: -25 });
+      /**
+       * A banked helicopter with a parked disc is a model on a stand — and one
+       * spun at its REAL rate over the shutter's 32-frame exposure is a
+       * helicopter with no blades at all, which is how a gallery pass read this
+       * frame. `spoolStaged`'s `shutterDt` note has the measurement; 1/3600
+       * sweeps the disc about 20 degrees across the exposure, which is a
+       * blurred arc rather than either a cross or a wash.
+       */
+      spoolStaged(e, v, { shutterDt: 1 / 3600 });
+      /**
+       * LENS ON THE DISC'S OWN LEVEL (`up: 0.6`, was 3.4). A blade is a thin
+       * dark shape at ~20% opacity, and over the dark city it stays invisible
+       * whatever the spool rate does — MEASURED side by side at 1280x720, same
+       * `shutterDt`, camera 3.4 m above the machine versus level with it. The
+       * disc has to be read against the SKY, so the lens sits on the rotor's
+       * plane and the aim drops further (`aimY: -30`) to keep the rivers, the
+       * bridges and the Triangle underneath it.
+       */
+      frameAircraft(e, v, { dist: 15, up: 0.6, side: 6, aimAhead: 80, aimY: -30 });
     },
-    doc: 'The Skywatch news helicopter over downtown at dusk, banking toward the Triangle — a rotor blurred into a real disc, skyline behind. Deliberately not the police searchlight: this is the city at height, not the wanted system.',
+    doc: 'The Skywatch news helicopter over downtown at dusk, banking toward the Triangle — the lens on the rotor plane so the disc reads as a turning blur against the sky, with the Mon, its bridges and the skyline under it. Deliberately not the police searchlight: this is the city at height, not the wanted system.',
   },
   mkt_tanks: {
     pos: [-330, 10, -1330], look: [-520, 12, -1300], fov: 60, time: 6.9, ground: true,
@@ -1904,7 +2044,7 @@ const MARKETING_SHOTS = {
     doc: 'A Bulwark on the Ridgeline apron at dawn, lens at gun height and eight metres off its front quarter — the barrel rakes the frame, the next tank in the row sits under it, the hangar band is behind. Low and close because armour photographed from standing height is a shed.',
   },
   mkt_boyzcars: {
-    pos: [632, 6, -464], look: [644, 5, -492], fov: 58, time: 18.3, ground: true,
+    pos: [632, 6, -464], look: [644, 5, -492], fov: 54, time: 18.3, ground: true,
     onRoad: { near: [632, -464], eye: 1.6, aheadM: 26 },
     clearTraffic: 30, weather: 'clear', viewmodel: false, hud: false, marketing: true, stagesCars: true,
     /*
@@ -1918,8 +2058,22 @@ const MARKETING_SHOTS = {
      */
     noCrowd: true,
     shutter: (e) => e.ctx.peek('peds')?.debugStage?.('none'),
-    apply: (e) => frameBoyzCars(e, { ahead: 24, offset: 2.5, spread: 3.5, splay: 0.5, depth: 1.8, dist: 9.8, eye: 1.45, swing: -0.2, aimY: 0.95 }),
-    doc: `The three brothers' own cars together at the DeCarlo Body Shop in late light — Carson's white 4Runner-style SUV, Aidan's red pickup and Dylan's grey Kessel fastback. Hero classes that never appear in traffic, so this is the only frame in the set that can have all three in it.`,
+    /**
+     * CLOSER AND AIMED HIGHER (`dist` 9.8 -> 8.8, `aimY` 0.95 -> 1.8, `fov` 58
+     * -> 54). The old lens was near level with its own aim, so the frame's
+     * bottom edge fell on tarmac 2.8 m in front of the camera and the near 46%
+     * of the picture was empty forecourt — the exact "featureless flat ground
+     * plane" the marketing rules at the top of this block exist to forbid.
+     * Tilting the lens up moves the bottom edge OUT along the road (MEASURED at
+     * 1280x720: the empty band goes from 46% of frame height to 32%, with the
+     * shopfronts and the trees behind the cars filling what it gave up), and
+     * the shorter lens puts the three of them across the frame instead of
+     * leaving room either side.
+     *
+     * The colours are `frameBoyzCars`/`BOYZ_PAINT`, not the pool roll.
+     */
+    apply: (e) => frameBoyzCars(e, { ahead: 24, offset: 2.5, spread: 3.5, splay: 0.5, depth: 1.8, dist: 8.8, eye: 1.72, swing: -0.24, aimY: 1.8 }),
+    doc: `The three brothers' own cars together at the DeCarlo Body Shop in late light — Carson's teal SUV, Aidan's burnt-orange pickup and Dylan's violet Kessel fastback, each in its owner's own colour from the character set. Hero classes that never appear in traffic, so this is the only frame in the set that can have all three in it.`,
   },
   mkt_chase: {
     // Same anchor as the review `pursuit` shot, which was MEASURED as the one
@@ -1933,16 +2087,44 @@ const MARKETING_SHOTS = {
     doc: 'A three-star pursuit in the rain — the fleeing car in the near field and four lit lightbars stacked up the avenue behind it. Wet asphalt doubles every strobe.',
   },
   mkt_boat: {
-    pos: [-150, 6, 300], look: [-240, 20, 90], fov: 52, time: 19.2,
+    /**
+     * 16:36, NOT 19:12 — THE HOUR IS WHAT MODELS THE HULL.
+     *
+     * A gallery pass read the old frame as "the Riverjack is a near-black
+     * silhouette cropped by the bottom edge". Both halves were the same
+     * mistake, and the light half is not fixable by exposure. This composition
+     * hangs on the Golden Triangle being BEHIND the boat, and downtown is north
+     * of this reach of the Monongahela, so the lens necessarily looks north —
+     * MEASURED off `sky.sunDirection` across the clock, the sun is at azimuth
+     * -105 degrees and 8 degrees up at 19:12, i.e. low, ahead and to the left,
+     * with the camera-facing side of the hull in its own shadow and the sun
+     * itself in the corner of the frame dragging the exposure down. There is no
+     * evening hour that front-lights a north-facing subject.
+     *
+     * At 16:36 the sun is 35 degrees up and behind the lens's left shoulder:
+     * the deck, the seats, the console and the port sheer are all lit, the hull
+     * keeps a shadow side so it still reads as a solid, and the city's south
+     * faces — the ones we can see — are lit rather than rimmed. Warm enough to
+     * belong in this set; three other frames already own last light.
+     *
+     * AND THE FRAME IS OFF THE STERN QUARTER, FROM ABOVE. `aimPast: 55, aimY:
+     * 11` aimed 55 m past the boat and 11 m up — the lens was pointed at the
+     * skyline and the boat was whatever happened to be under the bottom edge.
+     * Aiming 5 m past it from 3.3 m up puts the whole hull inside the frame
+     * with water all round it and enough down-angle to read the deck, which is
+     * the thing that says this is a boat you get into.
+     *
+     * Mid-channel on the Monongahela: the river's own published polyline runs
+     * (-32, 344) -> (-336, 184), and this is a point on it, 200 m off the
+     * Golden Triangle. Nose turned up-river toward the confluence.
+     */
+    pos: [-150, 6, 300], look: [-240, 20, 90], fov: 52, time: 16.6,
     weather: 'scattered', viewmodel: false, hud: false, marketing: true, stagesKinematic: true,
-    // Mid-channel on the Monongahela: the river's own published polyline runs
-    // (-32, 344) -> (-336, 184), and this is a point on it, 200 m off the
-    // Golden Triangle. Nose turned up-river toward the confluence.
     apply: (e) => frameBoat(e, {
       at: [-191, 0.2, 260], yaw: -1.35, toward: [-236, 60],
-      dist: 9.5, eye: 2.1, side: 2.5, aimPast: 55, aimY: 11,
+      dist: 9.2, eye: 3.3, side: -6, aimPast: 5, aimY: 1.6,
     }),
-    doc: 'A Riverjack mid-channel on the Monongahela at last light, the Golden Triangle silhouetted 200 m off its bow — the water half of the game, and Carson’s half of the story.',
+    doc: 'A Riverjack mid-channel on the Monongahela in late-afternoon light, a three-quarter from above the stern with the Golden Triangle 200 m off its bow — the hull modelled rather than silhouetted, the deck readable. The water half of the game, and Carson’s half of the story.',
   },
   /* ---- wave three: what the city SAYS ---- */
 
