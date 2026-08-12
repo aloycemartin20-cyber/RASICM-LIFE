@@ -59,6 +59,37 @@ const SET = [
   ['mkt_point', 'The Point', 'Where three rivers meet.'],
   ['mkt_kessel', "Dylan's Kessel GT", 'A front-drive fastback — the fast brother\u2019s own car.'],
   ['mkt_hero', 'A Golden Triangle avenue', 'Clear afternoon light, at street level.'],
+
+  /*
+   * WAVE TWO — THE VERBS.
+   *
+   * The nine above photograph PLACES, and a critic reading them back could
+   * not have told you what you do in this game. These eight are the verbs:
+   * fly, chase, drive, fight, and go out on the water. Appended rather than
+   * interleaved so the gallery reads as two deliberate movements — the city,
+   * then what happens in it — and so the order of the original set, which was
+   * an editorial decision, is left alone.
+   */
+  ['mkt_chase', 'Three stars, in the rain', 'A pursuit stacked up a downtown avenue at 21:20, every lightbar doubled by wet asphalt.'],
+  ['mkt_boyzcars', "The brothers’ own cars", 'Carson’s 4Runner, Aidan’s pickup and Dylan’s Kessel, together outside the DeCarlo Body Shop.'],
+  ['mkt_heli', 'Skywatch over downtown', 'The news helicopter banking across the Triangle at dusk.'],
+  ['mkt_flight', 'Over the three rivers', 'A twin at two hundred metres, with the confluence and its bridges below the wing.'],
+  ['mkt_afb', 'Ridgeline AFB', 'The flightline at golden hour — jets on the apron, armour behind them, hangars beyond.'],
+  ['mkt_tanks', 'Armour on the apron', 'A Bulwark column in the dawn haze, at gun height.'],
+  ['mkt_boat', 'A Riverjack on the Monongahela', 'Last light on the water, the Golden Triangle astern.'],
+  ['mkt_fountain', 'The Point fountain', 'Where the Allegheny and the Monongahela become the Ohio.'],
+
+  /*
+   * WAVE THREE — WHAT THE CITY SAYS.
+   *
+   * The seventeen above are places and verbs, and a critic panel reading them
+   * back found the same gap twice: "a signless, empty world". The signage
+   * system answers it — shop names in real stroke type, channel letters, blade
+   * signs, neon, lamp banners, street plates — and not one frame in the set was
+   * standing close enough to a shopfront to show it. This one is, and it is on
+   * the street the middle brother's whole arc is fought over.
+   */
+  ['mkt_butler', 'Butler Street at lighting-up time', 'Aidan outside his own body shop, its sign lit — every word in this city is geometry, not a texture.'],
 ];
 
 const only = args.only ? String(args.only).split(',').map((s) => s.trim()) : null;
@@ -68,11 +99,17 @@ mkdirSync(OUT, { recursive: true });
 
 const done = [];
 const failed = [];
+/**
+ * Shots that ASKED for a rotor and did not get one — see `spool` below.
+ * Reported at the end rather than per shot, because it is a property of the
+ * tree the set was captured from, not of any one frame.
+ */
+const unspooled = [];
 for (const [id, title, caption] of shots) {
   const out = join(OUT, `${id.replace(/^mkt_/, '')}.png`);
   process.stdout.write(`  ${id} ... `);
   try {
-    execFileSync(
+    const stdout = execFileSync(
       process.execPath,
       [join(ROOT, 'tools/capture.mjs'), `--shot=${id}`, `--out=${out}`, `--w=${W}`, `--h=${H}`],
       { stdio: 'pipe', cwd: ROOT }
@@ -82,7 +119,30 @@ for (const [id, title, caption] of shots) {
     // is the cheapest possible check that the shutter caught a real image, and
     // it has caught a black frame in this project before.
     if (kb < 80) throw new Error(`suspiciously small (${kb} KB) — probably a blank frame`);
-    console.log(`ok (${kb} KB)`);
+    /**
+     * DID THE ROTOR TURN?
+     *
+     * The two aircraft frames stage a KINEMATIC machine, which is never handed
+     * to `stepPlane` / `stepHeli`, so the governor never spools and the blades
+     * are a hand-set pose (`shots.js:stageKinematic`). They now ask
+     * `vehicles.debugSpool` for a real one and carry on without it if that door
+     * is not on this tree yet — `shots.js:spoolStaged` — and the answer rides
+     * out on the capture's own render info: `null` this shot never asked,
+     * `false` it asked and was skipped, `true` it ran.
+     *
+     * POLLED HERE, once per capture, because it is a per-tree fact that a
+     * marketing frame can ship silently wrong: a helicopter photographed with a
+     * parked disc is a model on a stand, and nothing else in this pipeline
+     * would say so.
+     */
+    let spool = null;
+    try {
+      spool = JSON.parse(String(stdout))?.info?.spool ?? null;
+    } catch {
+      // capture printed something unparseable; the PNG is still the deliverable
+    }
+    if (spool === false) unspooled.push(id);
+    console.log(`ok (${kb} KB)${spool === true ? ' · rotor spooled' : ''}${spool === false ? ' · rotor POSED (vehicles.debugSpool absent)' : ''}`);
     done.push([id, title, caption, `${id.replace(/^mkt_/, '')}.png`]);
   } catch (e) {
     console.log('FAILED');
@@ -113,6 +173,12 @@ if (failed.length) {
 writeFileSync(join(OUT, 'README.md'), md.join('\n'));
 
 console.log(`\n${done.length}/${shots.length} captured into ${OUT}`);
+if (unspooled.length) {
+  console.log(
+    `note: ${unspooled.join(', ')} asked for a spooled rotor and got the hand-set pose — ` +
+    '`vehicles.debugSpool` is not on this tree. Re-run when it lands.'
+  );
+}
 if (failed.length) {
   console.error('\nfailed:');
   for (const [id, why] of failed) console.error(`  ${id}  ${why}`);

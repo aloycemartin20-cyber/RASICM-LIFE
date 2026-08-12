@@ -23,6 +23,57 @@ import {
  *   ghost sign  the half-century-old painted advert on a brick gable
  */
 
+/**
+ * ────────────────────────────────────────────────────────────────────────────
+ * `?owNoSigns=` — THE NEGATIVE CONTROL FOR WHAT THIS LAYER COSTS AT NIGHT
+ * ────────────────────────────────────────────────────────────────────────────
+ * A night frame is FILL, not triangles: neon runs 3.0-3.8 emissive against a
+ * bloom threshold, and every word carries an additive halo card behind it, so
+ * a downtown block pays for the signage layer in overdraw and in bloom-taps
+ * rather than in vertex work. None of that could be measured, because there
+ * was no way to build the city WITHOUT it — and reverting the layer shifts the
+ * RNG stream, which moves every building in Steel City and measures a
+ * different picture.
+ *
+ * So the hatch does not remove a prototype, an instance, a material or a draw
+ * call. It collapses the named family's GEOMETRY to zero area, which leaves
+ * everything the layout decided identical and takes away exactly the fill.
+ * `perfcheck --ab='.|owNoSigns=halo,.'` then reports one number: the frame
+ * cost of the halo cards. Same convention as `?owNoFacadeKit=1`.
+ *
+ *   halo   the additive card behind every neon word
+ *   neon   the bent-tube words themselves (the hot emitters)
+ *   glow   `shop_glow`, the lit plane behind a shop window
+ *   1      all three
+ *
+ * `=1` ALSO TRIPS `layout.js`'s OWN `owNoSigns=1` kill switch, which stops the
+ * type layer being EMITTED at all (`Layout._type` / `_neonWord`). That is a
+ * superset, not a conflict: `=1` is "what does the whole signage layer cost",
+ * and the named values are "what does this one family's fill cost", which is
+ * the question the layout switch cannot answer because it removes the
+ * instances and the draw calls along with the pixels.
+ *
+ * WHAT IT MEASURED, and it is a negative result worth keeping. The gated
+ * `night` scene has almost no signage IN IT: counted off the live frame after
+ * `__SETTLED__`, one `neon_amber` mesh (1 instance, 64 tris), ZERO halo meshes,
+ * one `window_glow` (12 tris) and three `shop_lit` (150 tris), against 2369
+ * draw calls and 9.4 M triangles in the frame. Neon emissive and halo overdraw
+ * cannot be the night frame's cost, because at the place the budget is measured
+ * there is nothing of either to draw.
+ */
+const NO_SIGNS = (() => {
+  if (typeof location === 'undefined') return '';
+  const m = /[?&]owNoSigns=([^&]*)/.exec(location.search);
+  return m ? decodeURIComponent(m[1]) : '';
+})();
+const signOff = (part) => NO_SIGNS === '1' || NO_SIGNS.split(',').includes(part);
+/**
+ * Zero area, not zero vertices: an empty geometry would change the draw-call
+ * count and the instancing, and then the delta would be about bookkeeping
+ * instead of about fill.
+ */
+const flatten = (g) => (g.scale(1e-4, 1e-4, 1e-4), g);
+
 function P(K, id, factory, surface, opts) {
   K.proto(id, factory, surface, opts);
   return id;
@@ -166,7 +217,14 @@ export function registerFascia(K) {
    * The lit part of a blade sign is the LETTERING, not the board. A solid
    * emissive card the size of the panel is a blank coloured rectangle by day and
    * a blown slab by night — a critic logged exactly that, twice. So: a neon
-   * border and a short word, on both faces, over the dark panel.
+   * border on both faces, over the dark panel.
+   *
+   * THE THREE ABSTRACT GLYPHS INSIDE THE BORDER ARE GONE, and their removal is
+   * the point of this edit rather than a tidy-up. They were `glyphStrokes`
+   * shapes — letter-like, deliberately meaningless — sitting exactly where the
+   * word goes. `layout._frontage` now paints a REAL word out of `SIGN_WORDS.blade`
+   * on both faces of this panel (HOTEL, LOANS, BARBER), and two sets of letters
+   * in one 0.42 x 0.60 m field is not a blade sign, it is a smear.
    */
   for (const key of ['neon_amber', 'neon_teal', 'neon_red', 'neon_white', 'neon_violet']) {
     P(K, `blade_face_${key}`, () => {
@@ -176,13 +234,7 @@ export function registerFascia(K) {
         tube(pts.map(([u, v]) => ({ x, y: -0.12 + v, z: 0.42 + u })), R, 4), null,
       ]);
       for (const x of [-0.036, 0.036]) {
-        mk([[-0.34, -0.30], [0.34, -0.30], [0.34, 0.30], [-0.34, 0.30], [-0.34, -0.30]], x);
-        for (let i = 0; i < 3; i++) {
-          const k = Math.floor(hash3i(2311, i, key.length) * 8);
-          for (const st of glyphStrokes(k)) {
-            mk(st.map(([gx, gy]) => [-0.21 + i * 0.21 + gx * 0.92, gy * 0.86]), x);
-          }
-        }
+        mk([[-0.36, -0.32], [0.36, -0.32], [0.36, 0.32], [-0.36, 0.32], [-0.36, -0.32]], x);
       }
       return combine(parts, 'bladeface');
     }, key, { castShadow: false, noShadow: true });
@@ -626,7 +678,7 @@ export function registerCommerce(K) {
       a.add(t, m);
       t.dispose();
     }
-    return a.build();
+    return signOff('glow') ? flatten(a.build()) : a.build();
   }, 'window_glow', { castShadow: false, noShadow: true, noPrepass: true });
 }
 
@@ -738,45 +790,778 @@ export function registerPaint(K) {
   }, 'ghost', { castShadow: false, noShadow: true });
 
   /**
-   * The advert itself: a headline in real letterforms over two rules of body
-   * copy, in its OWN surface so it is not the same colour as the field it sits
-   * on. Unit-square like the field, so the layout stretches both together.
+   * `ghost_letters` WAS HERE AND IS GONE. It was a unit-square block of
+   * abstract bars — a headline of paired rectangles over two rules of body
+   * copy — stretched with the field, and it is what a critic read as a stain
+   * rather than a sign. `layout` now paints REAL words on the gable out of
+   * `SIGN_WORDS.ghost` at uniform scale, weathered by a noise field in the
+   * sign's own space (see the GHOST SIGN block in `layout._lotDressing`).
+   *
+   * Deleting it rather than leaving it registered is deliberate: `proto`
+   * builds eagerly, so a prototype nothing places is geometry the whole city
+   * pays for and never draws.
    */
-  P(K, 'ghost_letters', () => {
-    const a = new Accum('ghostletters');
-    const m = new THREE.Matrix4();
-    const put = (x, y, w, h, mask) => {
-      const g = new THREE.PlaneGeometry(w, h);
-      m.setPosition(x, y, 0.006);
-      a.add(g, m, null, mask);
-      g.dispose();
-    };
-    // headline: block letterforms with counters knocked out of them
-    const N = 5;
-    for (let i = 0; i < N; i++) {
-      const h0 = hash3i(981, i, 1);
-      const cx = -0.30 + (i + 0.5) * (0.60 / N);
-      const gw = (0.60 / N) * 0.62;
-      const wear = 0.20 + 0.55 * h0;
-      put(cx - gw * 0.34, 0.27, gw * 0.30, 0.20, [wear, 0.4, 0.05]);
-      put(cx + gw * 0.34, 0.27, gw * 0.30, 0.20, [wear, 0.4, 0.05]);
-      put(cx, 0.27 + (h0 < 0.5 ? 0.075 : -0.005), gw, 0.048, [wear, 0.4, 0.05]);
-    }
-    // two rules of body copy — words, with the gaps a line of type has
-    for (let row = 0; row < 2; row++) {
-      let x = -0.30;
-      let i = 0;
-      while (x < 0.28 && i < 12) {
-        const h0 = hash3i(983, row * 17 + i, 2);
-        const w = 0.04 + h0 * 0.085;
-        put(x + w * 0.5, 0.03 - row * 0.17, w, row === 0 ? 0.062 : 0.045,
-          [0.25 + 0.5 * h0, 0.45, 0.05]);
-        x += w + 0.022 + h0 * 0.02;
-        i++;
+}
+
+/* ====================================================================== */
+/* STEEL CITY TYPE — the letterforms, the words, and the signs that carry  */
+/* them.                                                                   */
+/* ====================================================================== */
+
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * WHY THIS IS GEOMETRY AND NOT A TEXTURE ATLAS.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * The obvious way to put readable words on a city is to bake type into a canvas
+ * atlas and sample it off a quad. It was rejected on two measurements, not on
+ * taste:
+ *
+ *  1. TEXTURE BUDGET. One 1024 RGBA atlas with its mip chain is 5.33 MiB, and
+ *     the city is currently 47 MiB OVER its 640 MiB soft cap. Stroke geometry
+ *     costs zero: every ink below resolves onto the `metal_painted` bake that
+ *     `pole_dark` already made resident, because `materials._bakeKey` does not
+ *     include `tint` (see the LETTERING block in `palette.js`).
+ *
+ *  2. THE BATCHER CAN INSTANCE IT. A word is a PROTOTYPE keyed by its own
+ *     string, so the fourteen `BUTLER STREET` blades in a tile are fourteen
+ *     matrices against one geometry — where an atlas quad would have needed a
+ *     per-instance UV rect, which `ProtoLibrary` has no channel for
+ *     (`instanceColor` is spoken for by the weathering mask triple).
+ *
+ * What it costs is triangles: a capital is 3.4 stroke segments on average and a
+ * segment is one quad, so `DECARLO BODY SHOP` is 118 triangles. That is a fifth
+ * of the fascia board it sits on.
+ *
+ * THE FONT. A stroke grotesque on a unit em: baseline at y = 0, CAP HEIGHT at
+ * y = 1, and x running 0..1 across the glyph's own advance. It is not a
+ * typeface — there are no optical corrections and the joints are square — but
+ * it is KERNED (per-glyph advances, not a monospace grid), which is the
+ * difference between a sign you can read at 30 m and a row of blocks. Round
+ * letters are polygons: an O at eight segments is a letter at street distance
+ * and a circle is not worth twice that on every shopfront in the city.
+ */
+
+/** Sample an ellipse inscribed in the unit box, `n` segments, closed. */
+function ell(n = 9, x0 = 0, y0 = 0, x1 = 1, y1 = 1) {
+  const cx = (x0 + x1) / 2;
+  const cy = (y0 + y1) / 2;
+  const rx = (x1 - x0) / 2;
+  const ry = (y1 - y0) / 2;
+  const p = [];
+  for (let i = 0; i <= n; i++) {
+    const a = (i / n) * TAU + Math.PI / 2;
+    p.push([cx + Math.cos(a) * rx, cy + Math.sin(a) * ry]);
+  }
+  return p;
+}
+
+/**
+ * The alphabet. `[advance, ...polylines]`, polyline points in the unit box.
+ *
+ * Advances are real width classes — I/J narrow, M/W wide, the rest around
+ * 0.62 — because a monospace grid is what made the previous pass's "lettering"
+ * read as a bar code. Descenders (the comma, the Q tail) go below y = 0 on
+ * purpose; `buildTextGeo` measures the extremes rather than assuming [0, 1].
+ */
+const GLYPHS = {
+  A: [0.66, [[0, 0], [0.5, 1], [1, 0]], [[0.17, 0.34], [0.83, 0.34]]],
+  B: [0.64, [[0, 0], [0, 1], [0.68, 1], [0.95, 0.8], [0.7, 0.55], [0, 0.55]],
+    [[0.7, 0.55], [1, 0.3], [0.74, 0], [0, 0]]],
+  C: [0.64, [[1, 0.78], [0.72, 0.98], [0.26, 1], [0.02, 0.72], [0, 0.28], [0.24, 0.02],
+    [0.7, 0], [1, 0.22]]],
+  D: [0.65, [[0, 0], [0, 1], [0.55, 1], [0.93, 0.72], [0.93, 0.28], [0.55, 0], [0, 0]]],
+  E: [0.58, [[1, 1], [0, 1], [0, 0], [1, 0]], [[0, 0.52], [0.8, 0.52]]],
+  F: [0.55, [[1, 1], [0, 1], [0, 0]], [[0, 0.54], [0.78, 0.54]]],
+  G: [0.68, [[1, 0.78], [0.72, 0.98], [0.26, 1], [0.02, 0.72], [0, 0.28], [0.24, 0.02],
+    [0.72, 0], [1, 0.24], [1, 0.46], [0.56, 0.46]]],
+  H: [0.66, [[0, 0], [0, 1]], [[1, 0], [1, 1]], [[0, 0.52], [1, 0.52]]],
+  I: [0.22, [[0.5, 0], [0.5, 1]]],
+  J: [0.50, [[0.9, 1], [0.9, 0.26], [0.66, 0.02], [0.26, 0], [0, 0.22]]],
+  K: [0.63, [[0, 0], [0, 1]], [[0.98, 1], [0.04, 0.44]], [[0.3, 0.6], [1, 0]]],
+  L: [0.53, [[0, 1], [0, 0], [0.94, 0]]],
+  M: [0.82, [[0, 0], [0, 1], [0.5, 0.32], [1, 1], [1, 0]]],
+  N: [0.68, [[0, 0], [0, 1], [1, 0], [1, 1]]],
+  O: [0.72, ell(9)],
+  P: [0.60, [[0, 0], [0, 1], [0.7, 1], [0.97, 0.77], [0.7, 0.52], [0, 0.52]]],
+  Q: [0.74, ell(9), [[0.58, 0.24], [1, -0.1]]],
+  R: [0.63, [[0, 0], [0, 1], [0.7, 1], [0.97, 0.77], [0.7, 0.52], [0, 0.52]],
+    [[0.5, 0.52], [1, 0]]],
+  S: [0.61, [[0.98, 0.8], [0.7, 1], [0.22, 0.98], [0.02, 0.76], [0.24, 0.57], [0.76, 0.45],
+    [0.98, 0.24], [0.76, 0.02], [0.26, 0], [0, 0.18]]],
+  T: [0.60, [[0, 1], [1, 1]], [[0.5, 1], [0.5, 0]]],
+  U: [0.66, [[0, 1], [0, 0.26], [0.26, 0], [0.74, 0], [1, 0.26], [1, 1]]],
+  V: [0.64, [[0, 1], [0.5, 0], [1, 1]]],
+  W: [0.90, [[0, 1], [0.24, 0], [0.5, 0.6], [0.76, 0], [1, 1]]],
+  X: [0.64, [[0, 0], [1, 1]], [[0, 1], [1, 0]]],
+  Y: [0.62, [[0, 1], [0.5, 0.52], [1, 1]], [[0.5, 0.52], [0.5, 0]]],
+  Z: [0.60, [[0, 1], [1, 1], [0, 0], [1, 0]]],
+  0: [0.66, ell(9), [[0.16, 0.22], [0.84, 0.78]]],
+  1: [0.40, [[0.1, 0.78], [0.52, 1], [0.52, 0]], [[0.06, 0], [0.98, 0]]],
+  2: [0.60, [[0, 0.78], [0.28, 1], [0.72, 1], [0.98, 0.76], [0.82, 0.5], [0, 0], [1, 0]]],
+  3: [0.60, [[0, 0.9], [0.34, 1], [0.8, 0.94], [0.95, 0.74], [0.56, 0.55], [0.95, 0.34],
+    [0.8, 0.06], [0.3, 0], [0, 0.12]]],
+  4: [0.62, [[0.74, 0], [0.74, 1], [0, 0.3], [1, 0.3]]],
+  5: [0.60, [[1, 1], [0.12, 1], [0.04, 0.56], [0.5, 0.62], [0.9, 0.48], [0.96, 0.22],
+    [0.6, 0], [0.14, 0.06]]],
+  6: [0.62, [[0.9, 0.9], [0.5, 1], [0.1, 0.72], [0.04, 0.3], [0.34, 0], [0.7, 0],
+    [0.96, 0.24], [0.7, 0.5], [0.26, 0.5], [0.06, 0.34]]],
+  7: [0.56, [[0, 1], [1, 1], [0.34, 0]]],
+  8: [0.64, ell(8, 0.06, 0.52, 0.94, 1), ell(8, 0, 0, 1, 0.54)],
+  9: [0.62, [[0.1, 0.1], [0.5, 0], [0.9, 0.28], [0.96, 0.7], [0.66, 1], [0.3, 1],
+    [0.04, 0.76], [0.3, 0.5], [0.74, 0.5], [0.94, 0.66]]],
+  '&': [0.72, [[1, 0], [0.2, 0.72], [0.2, 0.9], [0.42, 1], [0.62, 0.9], [0.6, 0.72],
+    [0.02, 0.3], [0.06, 0.08], [0.36, 0], [0.7, 0.16], [0.9, 0.44]]],
+  '.': [0.28, [[0.42, 0.05], [0.58, 0.05]]],
+  ',': [0.28, [[0.56, 0.1], [0.36, -0.16]]],
+  "'": [0.22, [[0.5, 1], [0.4, 0.68]]],
+  '-': [0.46, [[0.08, 0.5], [0.92, 0.5]]],
+  '/': [0.48, [[0, 0], [1, 1]]],
+  ':': [0.26, [[0.42, 0.06], [0.58, 0.06]], [[0.42, 0.62], [0.58, 0.62]]],
+  '!': [0.26, [[0.5, 1], [0.5, 0.3]], [[0.42, 0.05], [0.58, 0.05]]],
+  // The interpunct is this city's own separator — GREASE FM 98.3 . ALL NIGHT.
+  '·': [0.36, [[0.4, 0.5], [0.6, 0.5]]],
+  ' ': [0.34],
+};
+
+/** Letter-space, in em. Deliberately loose: a painted sign is not a book. */
+const TRACKING = 0.13;
+/** Line leading, in em, measured baseline to baseline. */
+const LEADING = 1.42;
+
+/** Advance width of one string in em, tracking included, no trailing space. */
+export function textWidth(s) {
+  let w = 0;
+  for (let i = 0; i < s.length; i++) {
+    const g = GLYPHS[s[i]] ?? GLYPHS[' '];
+    w += g[0] + TRACKING;
+  }
+  return Math.max(0.001, w - TRACKING);
+}
+
+/**
+ * One stroke segment as a quad in the XY plane, facing +Z.
+ *
+ * The ends are EXTENDED by the half-weight rather than butted, which squares
+ * off the cap and — the reason it is done this way — closes the notch at every
+ * polyline joint without a round join and its extra triangles. On a 0.17 em
+ * stroke the overshoot is 1.5 % of a cap height and invisible; the notch was
+ * not.
+ */
+function strokeQuad(out, ax, ay, bx, by, h, z) {
+  let dx = bx - ax;
+  let dy = by - ay;
+  const len = Math.hypot(dx, dy);
+  if (len < 1e-6) {
+    dx = 1;
+    dy = 0;
+  } else {
+    dx /= len;
+    dy /= len;
+  }
+  const ex = dx * h;
+  const ey = dy * h;
+  const nx = -dy * h;
+  const ny = dx * h;
+  const base = out.n;
+  out.p.push(
+    ax - ex + nx, ay - ey + ny, z,
+    bx + ex + nx, by + ey + ny, z,
+    bx + ex - nx, by + ey - ny, z,
+    ax - ex - nx, ay - ey - ny, z
+  );
+  for (let i = 0; i < 4; i++) out.nrm.push(0, 0, 1);
+  out.uv.push(0, 1, 1, 1, 1, 0, 0, 0);
+  out.i.push(base, base + 2, base + 1, base, base + 3, base + 2);
+  out.n += 4;
+}
+
+/**
+ * Build one or more lines of type as a single geometry.
+ *
+ * The result is in EM UNITS about its own centre — cap height 1, width
+ * whatever the string needs — and the caller scales it UNIFORMLY to the board
+ * it is painting on. That is the whole reason this returns its metrics: the
+ * fascia board is stretched to its shop's frontage and a word that rode that
+ * stretch would be a 25 cm slab on a wide shop and a smudge on a narrow one,
+ * which is the defect the `fascia_letters` comment already documents. Type
+ * never rides a non-uniform scale.
+ *
+ * `opts.weight` is the stroke half-width in em (default 0.085 → a 0.17 em
+ * stroke, which is a bold grotesque and the weight a painted sign is cut at).
+ * `opts.wear(x, y, line)` returns the mask triple per vertex; that is where
+ * weathering and the eaten-back edges of a ghost sign come from.
+ */
+export function buildTextGeo(lines, opts = {}) {
+  const h = opts.weight ?? 0.085;
+  const z = opts.z ?? 0;
+  const rows = Array.isArray(lines) ? lines : [lines];
+  const lead = opts.leading ?? LEADING;
+  const out = { p: [], nrm: [], uv: [], i: [], n: 0 };
+  let maxW = 0;
+  for (const r of rows) maxW = Math.max(maxW, textWidth(r));
+  // Baselines run DOWN from the top line; the block is then centred on the
+  // full inked height, caps included, so a one-line and a two-line sign hang
+  // from the same anchor.
+  const blockH = (rows.length - 1) * lead + 1;
+  const y0 = blockH / 2 - 1;
+
+  for (let r = 0; r < rows.length; r++) {
+    const s = rows[r];
+    const lineW = textWidth(s);
+    let x = -lineW / 2;
+    const by = y0 - r * lead;
+    for (let i = 0; i < s.length; i++) {
+      const g = GLYPHS[s[i]] ?? GLYPHS[' '];
+      const gw = g[0];
+      for (let k = 1; k < g.length; k++) {
+        const poly = g[k];
+        for (let j = 0; j + 1 < poly.length; j++) {
+          strokeQuad(out,
+            x + poly[j][0] * gw, by + poly[j][1],
+            x + poly[j + 1][0] * gw, by + poly[j + 1][1], h, z);
+        }
       }
+      x += gw + TRACKING;
     }
-    return a.build();
-  }, 'ghost_ink', { castShadow: false, noShadow: true });
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(out.p, 3));
+  geo.setAttribute('normal', new THREE.Float32BufferAttribute(out.nrm, 3));
+  geo.setAttribute('uv', new THREE.Float32BufferAttribute(out.uv, 2));
+  geo.setIndex(out.i);
+  const wear = opts.wear;
+  if (wear) paint(geo, (x, y) => wear(x, y, maxW, blockH));
+  else {
+    // The default ageing of painted lettering: it bleaches from the TOP (that
+    // is where the sun and the rain get at it) and grime collects in the
+    // bottom of every stroke. Both are per-vertex, so one glyph is never the
+    // same as the one beside it.
+    paint(geo, (x, y) => {
+      const n = smoothNoise(x * 4.3 + 17.1, y * 5.7 - 3.3);
+      const up = clamp01((y + blockH / 2) / Math.max(0.6, blockH));
+      return [clamp01(0.35 + 0.5 * up + 0.45 * (n - 0.5)),
+        clamp01(0.4 + 0.45 * (1 - up) + 0.3 * (n - 0.5)), 0.25];
+    });
+  }
+  return { geo, w: maxW, h: blockH };
+}
+
+/** A filesystem-safe, collision-free key for a string. */
+function slug(s) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(36);
+}
+
+/**
+ * Register (once) the prototype for one piece of type, and return its id.
+ *
+ * LAZY ON PURPOSE. `ProtoLibrary.proto` builds eagerly, so registering the
+ * whole vocabulary up front would build several hundred geometries whether the
+ * camera ever stood in front of them or not — and the STREET names are not
+ * even knowable up front, they come out of `world.streetAt`. Registering on
+ * first use means a tile pays for the words it actually says, once, for the
+ * lifetime of the library.
+ *
+ * The metrics ride on the proto record, not in a module-level map, so they die
+ * with `ProtoLibrary.dispose()` instead of outliving it and handing the next
+ * city a width for a geometry that has been freed.
+ */
+export function signTextProto(K, lines, surface, opts = {}) {
+  const rows = Array.isArray(lines) ? lines : [lines];
+  /**
+   * THE ID CARRIES EVERY INPUT THAT CHANGES THE GEOMETRY. `weight`, `leading`
+   * and a caller-supplied `wear` all do; if they are not in the key, the
+   * second caller asking for the same words at a different stroke weight
+   * silently gets the FIRST caller's geometry. That is the classic shared-
+   * cache bug and it stays invisible until a ghost sign comes back crisp.
+   */
+  const id = `sgn_${slug(rows.join('\u001f') + '|' + (opts.key ?? '')
+    + '|' + (opts.weight ?? '') + '|' + (opts.leading ?? '')
+    + '|' + (opts.wear ? 'w' : ''))}_${surface}`;
+  const known = K.get?.(id);
+  if (known) return id;
+  const built = buildTextGeo(rows, opts);
+  P(K, id, () => built.geo, surface, {
+    castShadow: false,
+    noShadow: true,
+    ...(opts.proto ?? {}),
+  });
+  const rec = K.get?.(id);
+  if (rec) rec.owText = { w: built.w, h: built.h, text: rows.join(' ') };
+  return id;
+}
+
+/** Metrics of a registered piece of type: `{ w, h, text }` in em, or null. */
+export function textMeta(K, id) {
+  return K.get?.(id)?.owText ?? null;
+}
+
+/**
+ * The uniform scale that fits a registered word into a `fw` x `fh` field, with
+ * a margin. Returns 0 when the word cannot be made to fit legibly — the caller
+ * then draws NO sign, which is the right answer: an unreadable sign is the
+ * defect, not the absence of one.
+ */
+export function fitScale(K, id, fw, fh, margin = 0.88) {
+  const m = textMeta(K, id);
+  if (!m) return 0;
+  const s = Math.min((fw * margin) / m.w, (fh * margin) / m.h);
+  return s < 0.035 ? 0 : s;
+}
+
+/* ---------------------------------------------------------------------- */
+/* THE VOCABULARY                                                          */
+/* ---------------------------------------------------------------------- */
+
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * EVERY WORD THIS CITY SAYS. STEEL CITY ORIGINALS, NO EXCEPTIONS.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * DESIGN.md is the content bible and it is the source for every authored name
+ * below: the shops and safehouses (DeCarlo Body Shop, Rustbelt Respray, Foundry
+ * Supply, Primo's Sandwich, Incline Diner, Row Hardware), the six radio
+ * stations (GREASE FM, BLACK & GOLD, REDLINE, SLACKWATER, FURNACE 101, INCLINE
+ * AM), the vehicle marques (Peregrine, Ironside, Riverjack, Slagbolt, Millhand,
+ * Foundry Van) and the rivals (Duke Marrow, the Harbormaster, Viper Lane).
+ *
+ * Everything else is an ORIGINAL COINAGE in the same register — rustbelt trade
+ * names built out of the industry's own vocabulary: slag, coke, ladle, tipple,
+ * hearth, bessemer, tap, ingot, wharf. `signprobe.mjs` holds a denylist of real
+ * marks and fails on any of them, and it fails on a NEGATIVE CONTROL too, so
+ * the check is known to be able to fail.
+ *
+ * A NAME THAT SOUNDS REAL IS THE POINT AND IS ALSO THE TRAP. "IRON CITY" is a
+ * real beer; "FURNACE 101" is ours and is in DESIGN.md. When in doubt, coin
+ * from the process rather than from memory.
+ */
+export const SIGN_WORDS = {
+  /** Named businesses, by the district character they belong to. */
+  core: ['MERCANTILE TRUST', 'GOLDEN TRIANGLE LOAN', 'STANWIX OPTICAL', 'THE POINT ARCADE',
+    'ALLEGHENY OUTFITTERS', 'BLACK & GOLD RADIO', 'TRIANGLE HABERDASHER', 'OLIVER & SONS',
+    'CENTRE CAMERA', 'SMITHFIELD SHOES', 'DUQUESNE DRUG CO', 'THE STEEL TOWER GRILL'],
+  market: ['LADLE & SPOON', 'PIG IRON PIZZA', 'STRIP MARKET PRODUCE', 'MON WHARF FISH',
+    'COKE OVEN COFFEE', 'MARROW BROS MEATS', 'TERMINAL WAY GROCER', 'HEARTH BAKERY',
+    'RAILROAD ST SPICE', 'THE TIPPLE TAVERN', 'PENN AVE OLIVES', 'SLAG RING BAKERY'],
+  row: ['BUTLER ST BARBER', 'THE OPEN HEARTH', 'FORTIETH ST LAUNDRY', 'RIVET & RIB',
+    'CHARLOTTE ST BOOKS', 'DOYLE HARDWARE', 'SLACKWATER LOUNGE', 'HOLMES ST DINER',
+    'KEYSTONE SHOE REPAIR', 'BERLIN WAY RECORDS', 'THE LADLE ROOM', 'FISK ST FLORIST'],
+  mill: ['MILL GATE SUPPLY', 'INGOT WELDING', 'STEEL ROW SALVAGE', 'TAPHOLE TOOL',
+    'SLAGMASTER OIL', 'FOUNDRY CANTEEN', 'SCRAP & SPAR', 'HAZELWOOD AXLE',
+    'BLAST LANE MOTORS', 'ORE DOCK DINER'],
+  hill: ['GRANDVIEW GROCER', 'INCLINE HARDWARE', 'BOGGS AVE BAKERY', 'THE OVERLOOK CAFE',
+    'SHILOH ST SHOES', 'MERRIMAC LAUNDRY', 'HILLTOP BARBER'],
+  civic: ['SHORE LOFT REALTY', 'FEDERAL ST DINER', 'NORTH SIDE PRINT', 'STEEL BOWL TICKETS',
+    'ANDERSON ST CAFE', 'RIVERSIDE SPORTING'],
+  park: ['POINT MARINA STORES', 'FOUNTAIN CAFE', 'PORTAGE PATH KIOSK'],
+
+  /** What a projecting blade says: one word, read from a moving car. */
+  blade: ['HOTEL', 'DINER', 'BAR', 'LOANS', 'SHOES', 'BARBER', 'DRUGS', 'PIZZA',
+    'TAVERN', 'BOOKS', 'CAFE', 'GRILL', 'PAWN', 'BAKERY', 'RECORDS', 'TOOLS',
+    'PARTS', 'LAUNDRY', 'BEER'],
+
+  /** Neon: short, because a tube is bent by hand and every letter costs. */
+  neon: ['OPEN', 'BAR', 'COLD BEER', 'DINER', 'EATS', 'HOTEL', 'PIE', 'GRILL',
+    'LOUNGE', 'ALE', 'CHOP SUEY', 'BOWL'],
+
+  /**
+   * ROOFTOP AND ROADSIDE HOARDINGS. Period painted-board advertising for Steel
+   * City products — the radio stations and the marques out of DESIGN.md, plus
+   * the motor oil and coffee a rustbelt city sold itself.
+   */
+  billboard: [
+    ['SLAGMASTER', 'MOTOR OIL'],
+    ['GREASE FM', 'GARAGE ROCK 98.3'],
+    ['FURNACE 101', 'THE MILL NEVER SLEEPS'],
+    ['BLACK & GOLD', 'SOUL ALL NIGHT'],
+    ['REDLINE 104.7', 'DRIVE IT HARDER'],
+    ['SLACKWATER 90.1', 'EASY ON THE RIVER'],
+    ['INCLINE AM', 'OLD COUNTRY 1250'],
+    ['COKE OVEN', 'COFFEE'],
+    ['PEREGRINE GT', 'THE WEDGE'],
+    ['IRONSIDE 440', 'ALL THE TORQUE'],
+    ['SLAGBOLT', 'MOTORCYCLES'],
+    ['MILLHAND SIX', 'TRUCKS THAT WORK'],
+    ['RIVERJACK', 'OUTBOARD BOATS'],
+    ['DECARLO BODY SHOP', 'DENTS OUT BY FRIDAY'],
+    ['THREE RIVERS', 'SAVINGS & LOAN'],
+    ['HEARTH BRAND', 'FLOUR'],
+  ],
+
+  /**
+   * GHOST SIGNS. Half-century-old painted wall adverts — the single most
+   * Pittsburgh texture there is. These are companies that CLOSED: the register
+   * is pre-war wholesale, and the third line is the giveaway ("WHOLESALE ONLY",
+   * a phone exchange, a street number).
+   */
+  ghost: [
+    ['BESSEMER BROS', 'WHOLESALE', 'DRY GOODS'],
+    ['MON VALLEY', 'COAL & COKE'],
+    ['HEARTH BRAND', 'FLOUR', 'BEST BY TEST'],
+    ['RIVERTON', 'MILLING CO'],
+    ['STEEL CITY', 'DRY GOODS'],
+    ['ALLEGHENY', 'ICE & COAL'],
+    ['TAPHOLE', 'FIRE BRICK'],
+    ['DUQUESNE WORKS', 'No 4'],
+    ['SLAG RING', 'FOUNDRY CO'],
+    ['WHARF ST', 'STORAGE', 'BONDED'],
+    ['LADLE & CO', 'IRON MERCHANTS'],
+    ['KEYSTONE', 'AWNING WORKS'],
+  ],
+};
+
+/** Which vocabulary a district's `kind` (see `DISTRICT_STYLE`) draws from. */
+export function shopWords(kind) {
+  return SIGN_WORDS[kind] ?? SIGN_WORDS.row;
+}
+
+/**
+ * LAMP-COLUMN BANNERS, by district id.
+ *
+ * A civic banner exists to name the neighbourhood it hangs in, so this is
+ * keyed by `world.districtAt`'s id rather than by the `kind` the shop names
+ * use — a banner that says THE STRIP on Butler Street is worse than a blank
+ * one. Two lines, and every word is kept short on purpose: the sheet is
+ * 0.44 m wide, and MEASURED through `fitScale`, a nine-letter line comes out
+ * under a 45 mm cap and `_type` refuses to draw it at all.
+ */
+export const BANNER_WORDS = {
+  point: ['THE', 'POINT'],
+  downtown: ['GOLDEN', 'TRIANGLE'],
+  strip: ['THE', 'STRIP'],
+  lawren: ['BUTLER', 'STREET'],
+  northsh: ['NORTH', 'SHORE'],
+  troy: ['TROY', 'HILL'],
+  southside: ['SOUTH', 'SIDE'],
+  mtwash: ['GRAND', 'VIEW'],
+  steelrow: ['STEEL', 'ROW'],
+  westend: ['WEST', 'END'],
+  northside: ['NORTH', 'SIDE'],
+  hazel: ['HAZEL', 'WOOD'],
+};
+
+/**
+ * THE INK A DISTRICT WRITES IN, and it is an ERA rather than a taste.
+ *
+ * `gilt` is gold leaf burnished onto the inside of shop glass — a downtown
+ * trade that survives on the professions and dies out two streets from the
+ * Triangle. `box` is the post-war internally-lit plastic fascia, which is what
+ * the arterials and the market street re-fronted with. `painted` is the sign
+ * writer's board and is what everywhere else still has, because nobody spent
+ * the money.
+ */
+const DISTRICT_INK = {
+  core: ['gilt', 'box', 'gilt', 'painted'],
+  market: ['box', 'painted', 'box', 'painted'],
+  row: ['painted', 'painted', 'box', 'painted'],
+  mill: ['painted', 'painted', 'painted', 'box'],
+  hill: ['painted', 'painted', 'painted', 'gilt'],
+  civic: ['box', 'painted', 'box', 'painted'],
+  park: ['painted', 'gilt'],
+};
+
+/**
+ * Resolve an ink to the surface that carries it, given the board underneath.
+ *
+ * CONTRAST IS THE ONLY RULE. Black type on a navy board is an unreadable sign,
+ * which is a worse defect than no sign — so this reads the panel the layout
+ * already chose and picks the ink that survives against it.
+ */
+export function inkSurface(ink, panelKey) {
+  if (ink === 'gilt') return 'sign_gilt';
+  if (ink === 'box') return 'shop_lit';
+  const dark = panelKey === 'panel_navy' || panelKey === 'panel_maroon'
+    || panelKey === 'panel_forest';
+  return dark ? 'sign_pale' : 'sign_ink';
+}
+
+/** Ink for a district kind, deterministic in the mount's own seed. */
+export function pickInk(kind, u) {
+  const list = DISTRICT_INK[kind] ?? DISTRICT_INK.row;
+  return list[Math.floor(u * list.length) % list.length];
+}
+
+/**
+ * STREET-BLADE ABBREVIATION.
+ *
+ * `world.streetAt` speaks the real vocabulary — "Boulevard of the Allies",
+ * "General Robinson Street" — and a 1.05 m blade at a legible cap height holds
+ * about twelve characters. Cities solved this a century ago by abbreviating
+ * the type and dropping the article, so this does the same rather than
+ * shrinking the type until nobody can read it.
+ */
+const STREET_ABBREV = [
+  [/\bBoulevard\b/g, 'BLVD'], [/\bAvenue\b/g, 'AVE'], [/\bStreet\b/g, 'ST'],
+  [/\bDrive\b/g, 'DR'], [/\bPlace\b/g, 'PL'], [/\bTerrace\b/g, 'TER'],
+  [/\bParkway\b/g, 'PKWY'], [/\bBridge\b/g, 'BR'], [/\bLane\b/g, 'LN'],
+  [/\bRoad\b/g, 'RD'], [/\bCourt\b/g, 'CT'], [/\bSquare\b/g, 'SQ'],
+  [/\bHighway\b/g, 'HWY'], [/\bof the\b/g, ''], [/\bWalk\b/g, 'WALK'],
+];
+
+export function streetPlateText(name) {
+  if (!name) return null;
+  let s = String(name);
+  for (const [re, to] of STREET_ABBREV) s = s.replace(re, to);
+  s = s.toUpperCase().replace(/\s+/g, ' ').trim();
+  // Anything still over the blade's capacity loses its last word rather than
+  // its legibility. "TWENTY-SECOND ST" is a street name; 4 mm type is not.
+  while (textWidth(s) > 9.4 && s.includes(' ')) s = s.slice(0, s.lastIndexOf(' '));
+  return s.length ? s : null;
+}
+
+/* ---------------------------------------------------------------------- */
+/* NEON WORDS — the readable half of the neon family                       */
+/* ---------------------------------------------------------------------- */
+
+/**
+ * A word in bent tube.
+ *
+ * This is the same font, swept as a 22 mm tube instead of stroked as a quad,
+ * because that is physically what the difference between a painted sign and a
+ * neon sign IS — and at four radial segments the round cross-section is what
+ * gives the letter its specular line and its bloom footprint. It is also eight
+ * times the triangles of the painted form, which is why neon words are capped
+ * at ten characters and why `SIGN_WORDS.neon` is a list of short ones.
+ *
+ * DEAD TUBES. A deterministic fraction of the strokes are pulled OUT of the
+ * emissive geometry and returned separately, to be drawn in cold glass. Every
+ * neon street in the world has a letter out; a wall of perfect signs is the
+ * thing that reads as a kit. This is a STATIC failure per word, not an animated
+ * flicker — `props._driveLights` drives intensity per MATERIAL off the sun
+ * altitude and there is one material per colour, so a per-sign animation would
+ * have to live in a subsystem this file does not own.
+ */
+function neonTubeWord(text, seed, opts = {}) {
+  const R = opts.r ?? 0.021;
+  const lit = [];
+  const dead = [];
+  const w = textWidth(text);
+  let x = -w / 2;
+  let k = 0;
+  for (let i = 0; i < text.length; i++) {
+    const g = GLYPHS[text[i]] ?? GLYPHS[' '];
+    const gw = g[0];
+    for (let s = 1; s < g.length; s++) {
+      const poly = g[s].map(([px, py]) => ({ x: x + px * gw, y: py - 0.5, z: 0 }));
+      if (poly.length < 2) continue;
+      const t = tube(poly, R, 4);
+      // ~7% of strokes are out. Keyed on the WORD's seed and the stroke index,
+      // so the same sign is dark in the same place every time it streams in.
+      (hash3i(seed, k, 3) < 0.07 ? dead : lit).push([t, null]);
+      k++;
+    }
+    x += gw + TRACKING;
+  }
+  return {
+    lit: lit.length ? combine(lit, 'neonword') : null,
+    dead: dead.length ? combine(dead, 'neondead') : null,
+    w,
+  };
+}
+
+/**
+ * Register a neon word and return `{ id, dead, halo, w }` — up to three
+ * prototypes, any of which may be null.
+ *
+ * The halo is a single card behind the word, its mask ramped to zero at the
+ * rim so the additive surface has no edge (see `neon_halo_warm` in
+ * `palette.js`). It is a QUARTER the word's own footprint in draw terms
+ * because the whole family shares one surface per temperature.
+ */
+export function neonWordProto(K, text, key, opts = {}) {
+  const seed = (slug(text).charCodeAt(0) * 2654435761) >>> 0;
+  const idBase = `nw_${slug(text)}`;
+  const id = `${idBase}_${key}`;
+  const deadId = `${idBase}_dead`;
+  const warm = key === 'neon_amber' || key === 'neon_red';
+  const haloSurface = warm ? 'neon_halo_warm' : 'neon_halo_cool';
+  const haloId = `${idBase}_halo_${warm ? 'w' : 'c'}`;
+  let w = textMeta(K, id)?.w ?? 0;
+  if (!K.has?.(id)) {
+    const built = neonTubeWord(text, seed, opts);
+    w = built.w;
+    if (built.lit) {
+      if (signOff('neon')) flatten(built.lit);
+      /**
+       * `noPrepass`, and it costs the sign nothing it had.
+       *
+       * A neon word is an UNLIT emitter: it takes no shadow, no AO and no
+       * shading of any kind, and it never moves — the tubes are welded to a
+       * facade. The depth/normal/velocity prepass exists to give moving, shaded
+       * surfaces their motion vectors and their occlusion, and for static
+       * unlit geometry the camera-only velocity TAA falls back to is not an
+       * approximation, it is the same answer. So the prepass was drawing eight
+       * times the triangles of the painted form of the same word for a result
+       * nothing reads. The dead tubes go with them for the same reason and the
+       * additive halo already had the flag (see `batch.js`).
+       */
+      P(K, id, () => built.lit, key,
+        { castShadow: false, noShadow: true, noPrepass: true });
+      const rec = K.get?.(id);
+      if (rec) rec.owText = { w: built.w, h: 1, text };
+    }
+    if (built.dead && !K.has?.(deadId)) {
+      P(K, deadId, () => built.dead, 'glass_prop',
+        { castShadow: false, noShadow: true, noPrepass: true });
+    } else if (built.dead) {
+      built.dead.dispose();
+    }
+  }
+  if (!K.has?.(haloId)) {
+    const g = new THREE.PlaneGeometry(w + 0.5, 1.9, 5, 3);
+    paint(g, (x, y) => {
+      const e = Math.max(Math.abs(x) / ((w + 0.5) / 2), Math.abs(y) / 0.95);
+      const f = clamp01(1 - e);
+      const s = f * f * (3 - 2 * f);
+      return [s, s, s];
+    });
+    if (signOff('halo')) flatten(g);
+    P(K, haloId, () => g, haloSurface,
+      { castShadow: false, noShadow: true, noPrepass: true, renderOrder: 3 });
+  }
+  return { id: K.has?.(id) ? id : null, dead: K.has?.(deadId) ? deadId : null, halo: haloId, w };
+}
+
+/* ---------------------------------------------------------------------- */
+/* THE SIGNS THE TYPE GOES ON                                              */
+/* ---------------------------------------------------------------------- */
+
+export function registerSignText(K) {
+  /**
+   * THE ROOFTOP HOARDING. A billboard on a roof deck is not the roadside one
+   * on two legs: it stands on a raked steel A-frame with its back legs on the
+   * deck behind it, and it is the silhouette that reads from three streets
+   * away, so the frame is authored and only the face is scaled.
+   *
+   * Unit width about the origin, standing UP from y = 0 — matching the
+   * 'billboard' mount kind in `tile.js`'s contract, where `h` is HEADROOM
+   * above the deck rather than a centred half-height.
+   */
+  /**
+   * EVERY MEMBER IS A BOX, INCLUDING THE RAKED STAY. This prototype is the one
+   * in the kit that is scaled to thirteen metres in x and four in y, and a
+   * round section cannot survive that — a 48 mm tube stretched thirteen times
+   * reads as a flat ribbon, which is the trap `fascia_board` documents. The
+   * stay is therefore a rotated box: it distorts into a parallelogram section
+   * under the same scale, which is what a rolled steel angle looks like anyway.
+   */
+  P(K, 'roof_board_frame', () => {
+    const parts = [];
+    const rake = Math.atan2(0.75, 0.66);
+    for (const s of [-1, 1]) {
+      // front post, raked back stay, and the foot each stands on
+      parts.push([box(0.16, 1.0, 0.16), newTrs(s * 0.46, 0.5, 0)]);
+      parts.push([box(0.10, 1.0, 0.10),
+        newTrs(s * 0.46, 0.63, -0.375, 0, 1, 1, 1, rake)]);
+      parts.push([box(0.30, 0.10, 0.30), newTrs(s * 0.46, 0.05, -0.75)]);
+    }
+    parts.push([box(1.04, 0.09, 0.10), newTrs(0, 0.99, 0)]);
+    parts.push([box(1.04, 0.09, 0.10), newTrs(0, 0.36, 0)]);
+    for (let i = 0; i < 4; i++) {
+      parts.push([box(0.07, 0.66, 0.07), newTrs(-0.33 + i * 0.22, 0.67, 0)]);
+    }
+    // the lighting bar over the top
+    parts.push([box(1.06, 0.07, 0.20), newTrs(0, 1.06, 0.13)]);
+    const g = combine(parts, 'roofboard');
+    weather(g, { grimeBase: 0.8, grimeHeight: 4.0, wear: 0.85, seed: 691 });
+    return g;
+  }, 'rust');
+
+  /**
+   * Its board. Unit box, so the layout stretches it to the hoarding.
+   *
+   * TWO THINGS HERE ARE NOT FREE CHOICES.
+   *
+   * z = 0.13 puts the board PROUD of the front posts, whose 0.16 m section
+   * reaches +0.08. The layout scales this prototype in x and y only for
+   * exactly this reason: if the z scale rode the hoarding's height, a 4 m
+   * board would have 0.64 m deep posts and the paper would be buried inside
+   * them.
+   *
+   * `panel_cream` and not `poster_d`, which is what the roadside hoarding
+   * uses. `TileBatch`'s `DETAIL_SURFACES` puts every poster surface under a
+   * `THREE.LOD` that empties at 145 m — right for flyposting at eye level and
+   * exactly wrong here, because a ROOFTOP hoarding is a skyline object and its
+   * whole job is to be read from the far bank. On `poster_d` the frame stayed
+   * and the advert vanished at 145 m, which is a hoarding with no poster on it.
+   */
+  P(K, 'roof_board_face', () => {
+    const g = new THREE.PlaneGeometry(0.98, 0.60, 6, 3);
+    const pos = g.getAttribute('position');
+    for (let i = 0; i < pos.count; i++) {
+      pos.setZ(i, pos.getZ(i) + Math.sin(pos.getX(i) * 14.3) * 0.006);
+    }
+    g.computeVertexNormals();
+    g.translate(0, 0.68, 0.13);
+    paint(g, (x, y) => [0.55 + 0.3 * smoothNoise(x * 6, y * 6), 0.5, 0.15]);
+    return g;
+  }, 'panel_cream', { castShadow: false });
+
+  /**
+   * A FREE-STANDING PLATE ON TWO POSTS — bridge name plaques, the mill gate,
+   * the incline station board. One prototype, three jobs, because they are the
+   * same object in the real city: a painted steel plate bolted to two channel
+   * posts set in concrete.
+   *
+   * Unit WIDTH (x within +/-0.5) and authored height, so the layout scales x to
+   * the words and leaves y alone — the plate is 0.62 m deep whatever it says.
+   */
+  P(K, 'plaque_posts', () => {
+    const parts = [];
+    for (const s of [-1, 1]) {
+      parts.push([box(0.10, 2.05, 0.10), newTrs(s * 0.40, 1.02, 0)]);
+      parts.push([box(0.24, 0.12, 0.24), newTrs(s * 0.40, 0.06, 0)]);
+    }
+    const g = combine(parts, 'plaqueposts');
+    weather(g, { grimeBase: 0.75, grimeHeight: 1.6, wear: 0.7, seed: 693 });
+    return g;
+  }, 'pole_dark');
+
+  P(K, 'plaque_plate', () => {
+    const parts = [];
+    parts.push([chamferBox(1.0, 0.62, 0.05, 0.012), newTrs(0, 1.72, 0.05)]);
+    // a raised bead round the plate: what stops it reading as a flat rectangle
+    parts.push([box(1.02, 0.045, 0.075), newTrs(0, 2.00, 0.055)]);
+    parts.push([box(1.02, 0.045, 0.075), newTrs(0, 1.44, 0.055)]);
+    const g = combine(parts, 'plaqueplate');
+    weather(g, { grimeBase: 0.7, grimeHeight: 2.2, wear: 0.65, seed: 694, up: 0.55 });
+    return g;
+  }, 'sign_green');
+
+  /**
+   * THE MILL GATE HEADER — a riveted arch over the works entrance, which is how
+   * every steel plant in the valley announced itself. Two heavy stanchions and
+   * a bowed top rail; the words go on the rail.
+   */
+  P(K, 'gate_arch', () => {
+    const parts = [];
+    for (const s of [-1, 1]) {
+      parts.push([box(0.34, 5.4, 0.34), newTrs(s * 3.5, 2.7, 0)]);
+      parts.push([box(0.62, 0.22, 0.62), newTrs(s * 3.5, 0.11, 0)]);
+      parts.push([tube([
+        { x: s * 3.5, y: 4.2, z: 0 }, { x: s * 2.6, y: 5.3, z: 0 },
+      ], 0.07, 5), null]);
+    }
+    const rail = [];
+    for (let i = 0; i <= 10; i++) {
+      const t = i / 10;
+      rail.push({ x: -3.5 + t * 7, y: 5.4 + Math.sin(t * Math.PI) * 0.55, z: 0 });
+    }
+    parts.push([tube(rail, 0.10, 5), null]);
+    for (let i = 0; i <= 10; i++) {
+      const t = i / 10;
+      const y = 5.4 + Math.sin(t * Math.PI) * 0.55;
+      parts.push([box(0.09, 0.9, 0.09), newTrs(-3.5 + t * 7, y - 0.5, 0)]);
+    }
+    parts.push([box(7.1, 0.10, 0.14), newTrs(0, 4.92, 0)]);
+    const g = combine(parts, 'gatearch');
+    weather(g, { grimeBase: 0.85, grimeHeight: 6.0, wear: 0.95, seed: 697 });
+    return g;
+  }, 'rust');
 }
 
 export function registerSignKit(K) {
@@ -784,4 +1569,5 @@ export function registerSignKit(K) {
   registerNeon(K);
   registerCommerce(K);
   registerPaint(K);
+  registerSignText(K);
 }

@@ -38,8 +38,21 @@
  *
  * THE CONTROL. `--legacy` re-imports the kit with
  * `location.search = '?owLegacyCanopy=1'`, which restores the card normals
- * (no shell bias), the crown-interior AO on everything, and the old far tier.
+ * (no shell bias), the crown-interior AO on everything, and the old far tier,
+ * AND with `OW_ONE_AUTUMN=1`, which puts the single turning surface back.
  * `--gate` runs both and requires the control to fail.
+ *
+ * THE AUTUMN HALF OF THAT CONTROL HAD TO MOVE, and the reason is worth reading
+ * because it is the general shape of a control going quietly decorative. The
+ * env var used to be set inside `measureAutumn`, which runs AFTER
+ * `registerGreen`. That was correct while `layout.js` registered the extra
+ * turning surfaces — its discovery pass ran later, so the flag was in place in
+ * time. The moment `kit_green.js` took ownership of them (its `LEAF_AUTUMN`),
+ * the flag was being set after the decision it controls: the legacy arm went on
+ * registering all three seasons and "turning leaf surfaces >= 3" PASSED on the
+ * control, i.e. the check stopped proving anything while still printing PASS.
+ * It is now set in `measure()`, before the kit is imported at all. Anything
+ * that gates a REGISTRATION has to be in place before registration runs.
  *
  * ---------------------------------------------------------------------------
  * USAGE
@@ -278,7 +291,10 @@ const TURN_SEASON = 0.55;
 async function measureAutumn(K, legacy) {
   // The control drives the REAL hatch through the real registration path, so
   // what fails below is the shipped behaviour and not a probe-only shortcut.
-  // `oneAutumn()` caches on first call, hence a fresh module per arm.
+  // `measure()` has already set the env var — before `registerGreen`, which is
+  // now the file that registers the turning surfaces; this is the belt on
+  // `layout.js`'s half of it, whose `oneAutumn()` caches on first call and so
+  // needs a fresh module per arm.
   if (legacy) process.env.OW_ONE_AUTUMN = '1';
   else delete process.env.OW_ONE_AUTUMN;
   const { Layout } = await import(`./layout.js?arm=${legacy ? 'legacy' : 'fixed'}`);
@@ -351,6 +367,10 @@ async function measureAutumn(K, legacy) {
 async function measure(legacy) {
   if (legacy) globalThis.location = { search: '?owLegacyCanopy=1' };
   else delete globalThis.location;
+  // BEFORE the import: `registerTrees` reads this hatch to decide how many
+  // turning surfaces to declare. See the note at the top of the file.
+  if (legacy) process.env.OW_ONE_AUTUMN = '1';
+  else delete process.env.OW_ONE_AUTUMN;
   const { registerGreen } = await import(`./kit_green.js?arm=${legacy ? 'legacy' : 'fixed'}`);
   const K = stubLibrary();
   registerGreen(K);
@@ -423,12 +443,38 @@ async function measure(legacy) {
       crownRatio.push((box.x1 - box.x0) / Math.max(1e-6, nbx.x1 - nbx.x0));
     }
   }
+  /**
+   * PER SPECIES, not pooled — and this is the check a NEW species has to clear
+   * on its own.
+   *
+   * `nearFill` below is a mean over the kit, and a mean is exactly what lets a
+   * thin crown ship: a species covering half its silhouette box hides behind
+   * five covering two thirds and the mean barely moves (MEASURED while adding
+   * the oak: five species 0.638, six species 0.621 — the newcomer was at 0.536
+   * and the mean was still comfortably over its 0.55 bar). So the worst species
+   * is reported and gated as well.
+   *
+   * `crownW` is the widest horizontal extent of each species' near crown, taken
+   * off the EMITTED vertices rather than off `SPECIES[].crown`, and it is what
+   * turns "nothing repeats in a line" into a number on the axis a critic reads
+   * first — the silhouette. A kit whose crowns are all one width is a boulevard
+   * of one tree at four seeds however different the leaves are.
+   */
+  const speciesFill = [];
+  const crownW = [];
   for (const [id, p] of K.protos) {
     const m = id.match(/^tree_(\w+?)_0_leaf0$/);
     if (!m) continue;
     const la = attrs(p.geo);
-    nearFill.push(fill(la, bounds(la)));
+    const b = bounds(la);
+    nearFill.push(fill(la, b));
+    speciesFill.push([m[1], +fill(la, b).toFixed(3)]);
+    crownW.push([m[1], +Math.max(b.x1 - b.x0, b.z1 - b.z0).toFixed(2)]);
   }
+  speciesFill.sort((a, b) => a[1] - b[1]);
+  crownW.sort((a, b) => a[1] - b[1]);
+  const widths = crownW.map((c) => c[1]);
+  const wMed = widths.length ? widths[Math.floor(widths.length / 2)] : 1;
 
   return {
     arm: legacy ? 'legacy (control: must fail)' : 'fixed',
@@ -450,6 +496,11 @@ async function measure(legacy) {
     crownRatio: +Math.min(...crownRatio).toFixed(2),
     woodFill: +(woodFill.reduce((s, v) => s + v, 0) / Math.max(1, woodFill.length)).toFixed(3),
     nearFill: +(nearFill.reduce((s, v) => s + v, 0) / Math.max(1, nearFill.length)).toFixed(3),
+    species: speciesFill.length,
+    speciesFill,
+    speciesFillMin: speciesFill.length ? speciesFill[0][1] : 0,
+    crownW,
+    crownSpread: +(widths[widths.length - 1] / Math.max(1e-6, wMed)).toFixed(2),
     autumn: out.autumn,
   };
 }
@@ -484,10 +535,33 @@ async function measure(legacy) {
  *                        tier's pops when it swaps and reads as a lollipop
  *                        whatever its density.
  */
+/**
+ * Two more limits, both about a kit that GROWS.
+ *
+ *   worst species fill >= 0.55   the same bar the mean already carries, applied
+ *                                where it cannot be averaged away. A species
+ *                                below it is a crown you can see through.
+ *   crown spread >= 1.20         RATCHET (hard rule 13). The widest near crown
+ *                                against the MEDIAN one, off emitted bounds. It
+ *                                records where this kit got to — 5.83 m over a
+ *                                4.54 m median, 1.28 — and the bar is set below
+ *                                that, not at it. MEASURED on the build before
+ *                                the oak landed: 4.97 / 4.52 = 1.10, red. The
+ *                                goal is a street with real maturities on it,
+ *                                which is more than one big tree; lower this
+ *                                when the kit earns it, never raise it to make
+ *                                a run go green.
+ */
 function grade(r) {
   return [
     ['near card p95 <= 1.35 m', r.cardP95 <= 1.35, `${r.cardP95}`],
     ['near canopy fill >= 0.55', r.nearFill >= 0.55, `${r.nearFill}`],
+    ['worst species fill >= 0.55', r.speciesFillMin >= 0.55,
+      `${r.speciesFill[0]?.[0] ?? '-'} ${r.speciesFillMin}`],
+    ['crown width spread >= 1.20', r.crownSpread >= 1.20,
+      `${r.crownSpread} (widest ${r.crownW[r.crownW.length - 1]?.[0]} ${r.crownW[r.crownW.length - 1]?.[1]} m)`],
+    ['kit registers its own autumn', r.autumn.protosAdded === 0,
+      `layout added ${r.autumn.protosAdded}`],
     ['shrub shell align >= 0.55', r.shrubAlign >= 0.55, `${r.shrubAlign}`],
     ['shrub AO mask <= 0.55', r.shrubAo <= 0.55, `${r.shrubAo}`],
     ['far canopy fill >= 0.34', r.farFill >= 0.34, `${r.farFill}`],
@@ -507,6 +581,8 @@ function print(r, checks) {
   console.log(`  near cards ${r.cards}: median ${r.cardMed} m, p95 ${r.cardP95} m, max ${r.cardMax} m`);
   console.log(`  far cards ${r.farCards}: median ${r.farCardMed} m`);
   console.log(`  canopy fill  near ${r.nearFill}   far ${r.farFill}   far wood ${r.woodFill}`);
+  console.log(`  ${r.species} species, near fill each: ${r.speciesFill.map(([s, v]) => `${s} ${v}`).join('  ')}`);
+  console.log(`  crown widths: ${r.crownW.map(([s, v]) => `${s} ${v}m`).join('  ')}`);
   console.log(`  far overdraw mean ${r.farOver}, worst species ${r.farOverMin};  far/near crown width ${r.crownRatio}`);
   console.log(`  shrubs: shell align ${r.shrubAlign}   AO mask ${r.shrubAo}`);
   console.log(

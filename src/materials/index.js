@@ -205,10 +205,85 @@ export class MaterialSystem {
     return 'concrete';
   }
 
+  /**
+   * The cache identity of a bake. EVERY field the forge reads has to be in
+   * here: two bakes that hash the same are the SAME texture, so a field left
+   * out is a silent wrong-texture bug rather than a cache miss.
+   *
+   * `relief` and `worldSize` used to be missing. Both are real forge inputs —
+   * `relief` is the peak-to-trough that sets the normal-map slope and
+   * `worldSize` is the metres the tile spans — so a caller asking for a surface
+   * at its library seed with a deeper relief got the FIRST caller's normals,
+   * whichever that was. `src/weapons/mats_improvised.js` overrides `relief` on
+   * fifteen surfaces and only escaped it because it varies `seed` alongside.
+   * MEASURED after adding them to the key: the mill's resident bake count is
+   * unchanged, so nothing in the shipping city was colliding today — this
+   * closes the trap rather than paying off a debt.
+   */
   _bakeKey(name, bake) {
-    return `${name}|${bake.size}|${bake.seed}|${bake.tintA ?? ''}|${bake.tintB ?? ''}|${(
-      bake.param ?? []
-    ).join('_')}`;
+    return (
+      `${name}|${bake.size}|${bake.seed}|${bake.tintA ?? ''}|${bake.tintB ?? ''}|` +
+      `${(bake.param ?? []).join('_')}|${bake.relief ?? ''}|${bake.worldSize ?? ''}`
+    );
+  }
+
+  /**
+   * SEED POOLING — a cap on how many times one surface may be baked purely to
+   * move its noise around.
+   *
+   * `seed` is the only bake input that changes NOTHING about what a surface is:
+   * it offsets the noise field so two walls of the same material do not line
+   * up. That is worth having, and it is worth almost nothing per extra copy,
+   * because the draw-time stack already decorrelates repeats far harder than a
+   * second bake does — `detile` rotates and offsets the lookup per tile,
+   * `macro`/`macroBig` push a metres-scale wash over the top, `detailRot`
+   * turns the micro layer, and the vertex masks differ per mesh regardless.
+   *
+   * MEASURED at the mill before this existed: `rubber` was resident EIGHT
+   * times and `metal_brushed` NINE, all from `src/weapons/mats_improvised.js`
+   * giving each improvised weapon its own seed — 27 MiB of grip rubber and
+   * 27 MiB of brushed steel for objects that are at most two on screen at once
+   * and never adjacent to each other. That is what the soft cap is for.
+   *
+   * So the library may declare `seedPool: n` on a surface: at most n distinct
+   * seeds, chosen deterministically (an integer hash, never `rng`) so the same
+   * caller lands on the same slot every run and captures stay reproducible.
+   * Slot 0 is always the library's own seed, so a surface with `seedPool: 1`
+   * collapses to exactly the texture the library authored.
+   *
+   * It is deliberately NOT applied to `param` or the tints: those change what
+   * the surface IS (a leaf's blade shape, a fabric's dye), and collapsing them
+   * would be a content change wearing a budget change's clothes.
+   *
+   * `relief` IS pooled, and it has to be or the pool does nothing. MEASURED
+   * with seed alone pooled: the mill fell 695 -> 691 MiB, one bake out of the
+   * eighteen the pool was aimed at, because the same callers that vary `seed`
+   * per weapon also vary `relief` per weapon (0.005 / 0.006 / 0.008 …) and
+   * `relief` is part of the bake identity. Like the seed it is a decoration —
+   * the same normal map a shade deeper — so a pooled surface bakes the
+   * library's own relief at up to n noise offsets and nothing else. `size` is
+   * left alone: a caller asking for 256 is asking to spend LESS, and snapping
+   * that up to the library's 512 would make the budget worse.
+   */
+  _poolSeed(def, bake) {
+    const n = def.bake?.seedPool | 0;
+    if (n < 1) return;
+    const base = def.bake.seed ?? 1;
+    const want = bake.seed ?? base;
+    bake.relief = def.bake.relief;
+    if (want === base) return;
+    if (n === 1) {
+      bake.seed = base;
+      return;
+    }
+    // A 32-bit integer mix, so neighbouring caller seeds do not land in the
+    // same slot the way `want % n` would for a caller counting upward.
+    let h = Math.imul(want >>> 0 || 1, 0x9e3779b1) >>> 0;
+    h = (h ^ (h >>> 15)) >>> 0;
+    const slot = h % n;
+    // Slot 0 is the library's own bake; the rest are fixed derivations of it,
+    // so the pool is a property of the SURFACE and not of who asked first.
+    bake.seed = slot === 0 ? base : base + slot * 1013;
   }
 
   /** Build (or fetch) the three packed textures for a surface. */
@@ -219,6 +294,7 @@ export class MaterialSystem {
 
     const bake = { ...def.bake, ...(opts.bake ?? {}) };
     bake.size = this._size(bake.size);
+    this._poolSeed(def, bake);
     const cacheKey = this._bakeKey(key, bake);
     let set = this._sets.get(cacheKey);
     if (set) return set;
@@ -262,8 +338,11 @@ export class MaterialSystem {
      * is visible rather than discovered on a low-end GPU: a level should sit
      * around 30-40 distinct sets.
      */
-    this._bytes +=
+    const setBytes =
       bake.size * bake.size * 4 * (4 / 3) * (1 + (set.orm ? 1 : 0) + (set.normal ? 1 : 0));
+    set.bytes = setBytes;
+    set.bakeKey = cacheKey;
+    this._bytes += setBytes;
     if (this._bytes > this._budget && !this._overBudget) {
       this._overBudget = true;
       console.warn(
@@ -281,6 +360,60 @@ export class MaterialSystem {
   /** Baked texture memory in MiB, and how many distinct sets are resident. */
   get textureMemory() {
     return { mib: +(this._bytes / 1048576).toFixed(1), sets: this._sets.size };
+  }
+
+  /**
+   * THE BAKE LEDGER — per-surface accounting, so "we are over the cap" can be
+   * turned into "these six surfaces are the cap".
+   *
+   * `textureMemory` gives a total, and a total cannot be acted on: it says
+   * nothing about whether the cost is one 1K bake too many or forty variants
+   * that could have shared one. This returns a row per RESIDENT BAKE with the
+   * library key that asked for it, the resolution it was baked at and its byte
+   * cost including mips, plus `shared` — how many distinct library keys resolve
+   * onto that one bake, and `mats` — how many distinct MATERIALS do. `mats` is
+   * the one that reports a family win: `src/buildings/palette.js` gives eleven
+   * masonry surfaces off three brick bakes by varying tint, soot and paint at
+   * draw time, and every one of those lands on the same bake with a different
+   * material, so it shows up as `mats`, not as `shared`.
+   *
+   * The `shared` count is why the ledger lives here and not in a probe: only
+   * the system knows which material keys ended up pointing at which bake, and
+   * that mapping is the whole subject of the texture-budget work.
+   */
+  textureReport() {
+    /** bakeKey -> { library keys, distinct materials } that resolved onto it */
+    const users = new Map();
+    for (const [matKey, mat] of this._materials) {
+      const k = mat.userData?.owBakeKey;
+      if (!k) continue;
+      let u = users.get(k);
+      if (!u) users.set(k, (u = { keys: new Set(), mats: 0 }));
+      u.keys.add(matKey.slice(0, matKey.indexOf('|')));
+      u.mats++;
+    }
+    const rows = [];
+    for (const [k, set] of this._sets) {
+      const px = set.size ?? 0;
+      rows.push({
+        bake: k,
+        key: set.name ?? '?',
+        px,
+        mib: +((set.bytes ?? 0) / 1048576).toFixed(2),
+        maps: 1 + (set.orm ? 1 : 0) + (set.normal ? 1 : 0),
+        shared: users.get(k)?.keys.size ?? 1,
+        mats: users.get(k)?.mats ?? 0,
+      });
+    }
+    rows.sort((a, b) => b.mib - a.mib);
+    return {
+      mib: +(this._bytes / 1048576).toFixed(1),
+      bakes: this._sets.size,
+      materials: this._materials.size,
+      budgetMib: +(this._budget / 1048576).toFixed(0),
+      over: this._bytes > this._budget,
+      rows,
+    };
   }
 
   /**
@@ -404,6 +537,12 @@ export class MaterialSystem {
     } else if (!this._warned) {
       console.warn(`[materials] "${key}" built without textures (no renderer)`);
     }
+
+    // Which bake this material landed on, for the ledger in textureReport().
+    // Recorded here rather than reconstructed later because `opts.bake` can
+    // override the library's, and a reconstruction that gets that wrong reports
+    // sharing that does not exist.
+    if (set?.bakeKey) mat.userData.owBakeKey = set.bakeKey;
 
     if (p.vertexMasks) mat.vertexColors = true;
     applyProps(mat, threeProps);

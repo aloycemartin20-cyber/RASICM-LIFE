@@ -5,6 +5,13 @@
  *   node src/player/preview.mjs --pose=jog --view=hero --out=/tmp/p.png
  *   node src/player/preview.mjs --sheet --out=/tmp/sheet     # every pose
  *   node src/player/preview.mjs --view=grid --out=/tmp/boyz.png
+ *   node src/player/preview.mjs --view=grid --noIdentity --out=/tmp/boyz-control.png
+ *
+ * `--noIdentity` shoots the CONTROL ARM: `build.noIdentity` strips every
+ * per-brother facial and wardrobe choice, so the three brothers become one man
+ * at three sizes. It is what `src/player/character/identityprobe.mjs` requires
+ * of itself before it will believe its own separation numbers, and pairing it
+ * with `--view=grid` is the only way to LOOK at what that probe measures.
  *
  * A development tool only; nothing in the game imports it.
  */
@@ -86,11 +93,13 @@ try {
     const base = OUT.replace(/\.png$/, '');
     for (const [pose, view] of SHEET) {
       const f = `${base}-${pose}-${view}.png`;
-      await shoot(pose, view, f);
+      await shoot(pose, view, f, args.noIdentity ? '&noIdentity=1' : '');
       console.log(f);
     }
   } else {
-    await shoot(args.pose ?? 'idle', args.view ?? 'hero', OUT);
+    // The control is a URL parameter on the page, so it rides through `extra`
+    // and every other argument stays what it was.
+    await shoot(args.pose ?? 'idle', args.view ?? 'hero', OUT, args.noIdentity ? '&noIdentity=1' : '');
     console.log(JSON.stringify({ ok: true, out: OUT }));
   }
 } catch (e) {

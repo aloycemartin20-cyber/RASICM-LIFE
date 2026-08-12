@@ -52,25 +52,208 @@ const JOINERY = (tint, scale = 0.8) =>
     roughness: [0.86, -0.03, 0.3],
   });
 
+/**
+ * ============================ THE BRICK VOCABULARY ==========================
+ *
+ * A Pittsburgh block is not "brick". It is a specific stock, laid in a specific
+ * bond, by a specific decade, with a specific amount of a century of coke smoke
+ * on it — and the differences between those are most of what tells one district
+ * from the next at 60 m. The critics' verdict on the old city was that it had
+ * no material identity, and the reason was mechanical: every masonry key below
+ * used to resolve to the LIBRARY'S GENERIC `brick`, a neutral running-bond map
+ * under a colour multiply. `src/materials/library.js` has had the real thing
+ * all along — `pgh_brick` / `pgh_brick_old` / `brick_buff` off the `PGH_BRICK`
+ * generator, with American common bond and its header course, three fired
+ * stocks, iron spots, spalled faces, eroded-and-repointed joints, efflorescence
+ * and a carbon-film soot model — and `props` was the only subsystem using any
+ * of it. The city walked past its own brick for a whole wave.
+ *
+ * THREE BAKES CARRY ELEVEN SURFACES, and that is the rule this section is
+ * written to. `pgh_brick` (running bond, tight joints, red common) is the newer
+ * stock; `pgh_brick_old` (common bond, eroded joints, header course every
+ * sixth) is the nineteenth-century stock and is ALREADY RESIDENT — `props`
+ * bakes it for the ghost-sign flanks — so every surface below built on it costs
+ * nothing; `brick_buff` is the Kittanning yellow of the North Side, which needs
+ * its own bake because a buff is BRIGHTER than a red in blue and green and a
+ * tint multiply can only ever go down.
+ *
+ * Everything else — soot load, paint, mortar wash, dirt — is a DRAW-TIME
+ * parameter over one of those three:
+ *
+ *   zone[3]   per-building soot. The zone layer (shader.js) draws a warped
+ *             Voronoi of building-sized cells over world XZ and gives each one
+ *             its own soot draw, so the party wall between two rowhouses is a
+ *             hard edge and the mill district is black where the plume settled
+ *             and merely dirty next door. Baked soot cannot do that: it is
+ *             continuous, so it produces sixty metres of identical wallpaper.
+ *   zone[2]   per-building paint chance — a whole elevation painted cream in
+ *             1974 and failing back to the brick, which is what painted brick
+ *             actually looks like.
+ *   grime[]   height-and-cavity dirt, heavier in the valleys.
+ *   tint      the stock's own shade. NEAR-NEUTRAL on purpose: the bake is
+ *             already the right colour, so the strong 0xd9917a-class multiplies
+ *             the generic brick needed would now double the red.
+ */
 export const SURFACES = {
   // ---------------------------------------------------------- masonry ------
-  brick_red: V('brick', { ...M, scale: 1.35, tint: 0xd9917a, weather: [0.36, 0.42, 0.55, 0.42] }),
-  brick_brown: V('brick', { ...M, scale: 1.35, tint: 0xb08570, weather: [0.4, 0.46, 0.6, 0.45] }),
-  brick_buff: V('brick', { ...M, scale: 1.3, tint: 0xe0cba4, weather: [0.34, 0.4, 0.55, 0.4] }),
-  brick_dark: V('brick', { ...M, scale: 1.4, tint: 0x8e6a58, weather: [0.44, 0.52, 0.65, 0.52] }),
-  brick_painted: V('brick', {
+  /**
+   * Lawrenceville and the Strip: hard red Pittsburgh common, running bond,
+   * joints still tight enough to read as courses at 30 m.
+   */
+  brick_red: V('pgh_brick', {
     ...M,
     scale: 1.35,
-    tint: 0xd2d0c6,
+    tint: 0xf4e4de,
+    zone: [1, 13, 0.16, 0.5],
+    weather: [0.36, 0.42, 0.55, 0.42],
+  }),
+  /**
+   * The older stock next door — common bond with its header course, mortar
+   * washed out of the joints, a browner and less even burn.
+   */
+  brick_brown: V('pgh_brick_old', {
+    ...M,
+    scale: 1.35,
+    tint: 0xd8bca8,
+    zone: [1, 12, 0.14, 0.58],
+    weather: [0.4, 0.46, 0.6, 0.45],
+  }),
+  /** North Side buff — Kittanning yellow, the one stock a tint cannot fake. */
+  brick_buff: V('brick_buff', {
+    ...M,
+    scale: 1.3,
+    tint: 0xf6efe2,
+    zone: [1, 12, 0.2, 0.42],
+    weather: [0.34, 0.4, 0.55, 0.4],
+  }),
+  /** South Side: the same red under sixty years of stack fall-out. */
+  brick_dark: V('pgh_brick_old', {
+    ...M,
+    scale: 1.4,
+    tint: 0x9b8479,
+    zone: [1.1, 12, 0.1, 0.85],
+    grime: [0.4, 4.0, 0.95, 0.6],
+    weather: [0.44, 0.52, 0.65, 0.52],
+  }),
+  /**
+   * PAINTED BRICK, done as paint and not as a pale tint.
+   *
+   * A tint multiplies, so "white over red" came out pink over the whole wall
+   * and every wall the same pink. The zone layer paints ONE BUILDING AT A TIME
+   * (paint chance 0.82 here), picks that building's own colour, and sheds it
+   * off the arrises and the wet courses so the brick reads through — which is
+   * what a painted rowhouse in Manchester actually looks like.
+   */
+  brick_painted: V('pgh_brick', {
+    ...M,
+    scale: 1.35,
+    tint: 0xf0ece6,
+    zone: [1, 11, 0.82, 0.3],
     patch: [0.4, 2.4, 0.16, -0.06],
     weather: [0.34, 0.42, 0.52, 0.38],
   }),
+  /**
+   * MILL-DISTRICT BRICK. Steel Row and the works along the Mon: engineering
+   * brick, laid heavy, and black. Soot at 1.0 with the zone amount pushed past
+   * 1 so even the washed elevations take some, plus the deepest grime falloff
+   * in the palette — 9 m, because the valley air put it that high.
+   */
+  brick_soot: V('pgh_brick_old', {
+    ...M,
+    scale: 1.5,
+    tint: 0x7e6f66,
+    zone: [1.35, 18, 0.05, 1.0],
+    grime: [0.5, 9.0, 1.0, 0.65],
+    weather: [0.5, 0.6, 0.8, 0.6],
+    roughness: [1.0, 0.02, 0.4],
+  }),
+  /**
+   * GLAZED BRICK — the storefront course, and the one brick in the city that
+   * is shiny. Half the commercial ground floors on Butler St have a band of
+   * cream or bottle-green glazed brick at eye level, and it is the detail that
+   * says "shop" from across the street because it is the only wet-looking
+   * masonry on the elevation.
+   *
+   * Built on `tile`, not on a brick bake: a glazed brick IS a ceramic tile with
+   * a brick's proportions, its face is smooth (the fired glaze fills the
+   * texture the fired clay had), and `tile` is already resident everywhere.
+   */
+  brick_glazed: V('tile', {
+    ...M,
+    scale: 0.62,
+    tint: 0xdcd6c2,
+    weather: [0.2, 0.3, 0.5, 0.3],
+    roughness: [0.5, -0.06, 0.09],
+    three: { envMapIntensity: 1.15 },
+  }),
+  brick_glazed_green: V('tile', {
+    ...M,
+    scale: 0.62,
+    tint: 0x6f8f78,
+    weather: [0.22, 0.32, 0.5, 0.32],
+    roughness: [0.5, -0.06, 0.09],
+    three: { envMapIntensity: 1.15 },
+  }),
 
-  stone_grey: V('concrete', { ...M, scale: 2.1, tint: 0xc6c1b5 }),
-  stone_warm: V('concrete', { ...M, scale: 2.2, tint: 0xd6c8ab }),
+  /**
+   * STONE — sills, lintels, plinths, cornices and the Golden Triangle's base
+   * course, on the library's `stone_clad` ashlar rather than on concrete.
+   *
+   * This is the other half of the "no material identity" finding and it is the
+   * cheaper half: every punched window in the city already emits a sill and a
+   * lintel (`facade.js` picks `p.sillMat`), every rowhouse already has a
+   * plinth, and all of them were drawing a smooth concrete pour. Ashlar has
+   * coursing joints, a tooled face and a bed that catches a low sun, so the
+   * same geometry now reads as cut stone standing proud of brick.
+   */
+  stone_grey: V('stone_clad', { ...M, scale: 2.1, tint: 0xdcd8cd, weather: [0.32, 0.5, 0.6, 0.45] }),
+  stone_warm: V('stone_clad', { ...M, scale: 2.2, tint: 0xe8d9ba, weather: [0.32, 0.5, 0.6, 0.45] }),
+  /** Downtown and the mill: the same stone with the century on it. */
+  stone_soot: V('stone_clad', {
+    ...M,
+    scale: 2.2,
+    tint: 0x9d9a92,
+    zone: [0.8, 20, 0.02, 0.9],
+    grime: [0.42, 7.0, 1.0, 0.55],
+    weather: [0.42, 0.62, 0.75, 0.6],
+  }),
+  /**
+   * The foundation course. Rock-faced, coarser, and it takes the road splash —
+   * `weather[2]` is the splash height in metres, so 1.1 m of wheel-thrown dirt
+   * up the plinth, which is the band that grounds a building to its pavement.
+   */
+  stone_base: V('stone_clad', {
+    ...M,
+    scale: 2.8,
+    tint: 0xa9a49a,
+    weather: [0.45, 0.55, 1.1, 0.6],
+    grime: [0.45, 2.6, 0.95, 0.5],
+    roughness: [1.0, 0.02, 0.32],
+  }),
+
   concrete_wall: V('concrete', { ...M, scale: 2.5, tint: 0xb8b7b1 }),
   concrete_dark: V('concrete', { ...M, scale: 2.6, tint: 0x8b8a86, weather: [0.4, 0.42, 0.55, 0.45] }),
-  precast: V('concrete', { ...M, scale: 1.7, tint: 0xcbc6bb, patch: [0.2, 1.8, 0.1, -0.05] }),
+  /**
+   * A real precast panel — cast joints, a batch-to-batch pour colour and
+   * exposed aggregate — instead of concrete under a `patch` overlay. Free:
+   * `props` already bakes `precast`, so this is a resident texture the
+   * buildings were declining to use.
+   */
+  precast: V('precast', { ...M, scale: 1.7, tint: 0xdedad0 }),
+  /**
+   * TERRACOTTA — the Golden Triangle's pre-war cladding, and the warm note
+   * that stops downtown being grey-on-grey. Glazed architectural terracotta is
+   * a ceramic, so it shares `tile` with the glazed brick above and costs
+   * nothing.
+   */
+  terracotta: V('tile', {
+    ...M,
+    scale: 1.15,
+    tint: 0xcaa47e,
+    weather: [0.3, 0.45, 0.55, 0.42],
+    roughness: [0.72, -0.03, 0.16],
+    three: { envMapIntensity: 1.0 },
+  }),
 
   render_cream: V('plaster', { ...M, scale: 2.2, tint: 0xe2d7bb }),
   render_grey: V('plaster', { ...M, scale: 2.2, tint: 0xbab9b2 }),
@@ -322,11 +505,21 @@ export const SURFACES = {
     tint: 0x8b8a86,
     weather: [0.1, 0.12, 0.28, 0.18],
   }),
-  sky_brick: V('brick', {
+  /**
+   * The impostor brick now shares the STREAMED city's bake (`pgh_brick`)
+   * instead of the generic one. Same argument the comment above makes about
+   * hue: a block must not change colour when it crosses the LOD boundary, and
+   * with the streamed city moved onto the Pittsburgh stock, an impostor still
+   * on the neutral library brick would do exactly that. Free — the bake is
+   * resident either way — and it deletes a whole surface family from the
+   * far-field budget.
+   */
+  sky_brick: V('pgh_brick', {
     ...M,
     scale: 6.5,
-    tint: 0x8e6a58,
+    tint: 0xb59485,
     weather: [0.12, 0.14, 0.3, 0.2],
+    zone: [0, 13, 0, 0],
   }),
   sky_glass: V('metal_brushed', {
     ...M,
@@ -436,8 +629,14 @@ export const SURFACE_TAG = {
   brick_buff: 'concrete',
   brick_dark: 'concrete',
   brick_painted: 'concrete',
+  brick_soot: 'concrete',
+  brick_glazed: 'concrete',
+  brick_glazed_green: 'concrete',
+  terracotta: 'concrete',
   stone_grey: 'concrete',
   stone_warm: 'concrete',
+  stone_soot: 'concrete',
+  stone_base: 'concrete',
   concrete_wall: 'concrete',
   concrete_dark: 'concrete',
   sky_concrete: 'concrete',
@@ -510,6 +709,21 @@ export const EMISSIVE = new Set(['neon_amber', 'neon_teal', 'neon_red']);
  * roof        flat-roof surfaces in this district
  * age         0 fresh .. 1 derelict; drives grime, boarded windows, wear
  * clutter     0..1 how much roof and facade furniture is placed
+ *
+ * THE LENGTH OF `masonry` IS A DRAW-CALL BUDGET. `facade.js` picks one entry
+ * per BUILDING, `tile.js` merges by surface key, and a tile holds thirty to
+ * sixty buildings — so a list of n keys saturates and costs the tile n merged
+ * meshes whatever the city looks like. This was measured, not assumed: widening
+ * these lists by one or two entries each (the first cut of the brick
+ * vocabulary) took the spawn view from 1495 to 1765 draw calls, `buildings`
+ * from 202 to 301 visible drawables, against a three-run same-tree noise floor
+ * of 1653-1765 / 268-301. Every list below therefore holds EXACTLY as many keys
+ * as it did before that measurement; the district identities changed by
+ * SWAPPING keys, never by adding them, and everything else the vocabulary buys
+ * — soot, paint, mortar age, the stock's own shade — is a draw-time parameter
+ * on a key that was already going to be in the tile. That is the whole reason
+ * the brick family is built out of three bakes and eleven materials rather than
+ * out of eleven surfaces.
  */
 export const DISTRICTS = {
   point: {
@@ -517,7 +731,9 @@ export const DISTRICTS = {
     tall: 0.1,
     tint: [0.3, 0.36, 0.3],
     archetypes: { pavilion: 3, block: 1 },
-    masonry: ['stone_grey', 'concrete_wall'],
+    // Park pavilions in cut stone with a clean base course: the one district
+    // in the city with no soot on it, which is what makes it read as a park.
+    masonry: ['stone_grey', 'stone_warm'],
     accents: ['render_cream', 'trim_white'],
     roof: ['roof_tar'],
     glass: ['glass_plain'],
@@ -529,7 +745,15 @@ export const DISTRICTS = {
     tall: 1.0,
     tint: [0.36, 0.38, 0.44],
     archetypes: { tower: 6, curtain: 5, deco: 3, block: 2 },
-    masonry: ['stone_grey', 'concrete_dark', 'precast', 'stone_warm'],
+    /**
+     * Stone and terracotta under the steel-frame curtain wall — the three eras
+     * the Triangle actually holds, standing next to each other. `stone_soot` is
+     * in the list on purpose: downtown's pre-war stock is the blackest masonry
+     * in the city because it stood downwind of the works for eighty years, and
+     * a Golden Triangle where every base course is clean limestone is a
+     * different city.
+     */
+    masonry: ['stone_grey', 'stone_soot', 'terracotta', 'precast'],
     accents: ['steel_dark', 'alu_dark', 'trim_dark'],
     roof: ['roof_tar', 'roof_gravel'],
     glass: ['glass_sky', 'glass_green', 'glass_bronze'],
@@ -541,7 +765,10 @@ export const DISTRICTS = {
     tall: 0.55,
     tint: [0.42, 0.34, 0.28],
     archetypes: { warehouse: 4, rowhouse: 3, block: 3, market: 2 },
-    masonry: ['brick_red', 'brick_brown', 'brick_painted', 'concrete_wall'],
+    // Produce-terminal red brick, and the district that keeps `brick_painted`
+    // as a key of its own: the Strip's wholesalers painted whole elevations as
+    // signage, so it wants far more painted frontage than a zone chance gives.
+    masonry: ['brick_red', 'brick_brown', 'brick_painted', 'brick_dark'],
     accents: ['render_ochre', 'trim_red', 'steel_green'],
     roof: ['roof_tar', 'roof_gravel'],
     glass: ['glass_plain', 'glass_grimy'],
@@ -553,6 +780,11 @@ export const DISTRICTS = {
     tall: 0.42,
     tint: [0.4, 0.33, 0.3],
     archetypes: { rowhouse: 8, block: 2, warehouse: 1 },
+    // THE reference district for the brick vocabulary: red common and the
+    // older stock alternating down the terrace, with the sooted variant at the
+    // Allegheny end. The painted rowhouses are NOT a fourth key — `brick_red`
+    // carries a 16% per-building paint chance in the zone layer, so they come
+    // out of the same merged mesh as the ones beside them.
     masonry: ['brick_red', 'brick_brown', 'brick_dark'],
     accents: ['render_cream', 'trim_green'],
     roof: ['roof_tar', 'roof_shingle'],
@@ -565,7 +797,7 @@ export const DISTRICTS = {
     tall: 0.5,
     tint: [0.31, 0.36, 0.4],
     archetypes: { block: 4, curtain: 2, warehouse: 2, pavilion: 1 },
-    masonry: ['precast', 'concrete_wall', 'brick_buff'],
+    masonry: ['precast', 'brick_buff', 'stone_grey'],
     accents: ['steel_light', 'alu_bright', 'render_blue'],
     roof: ['roof_tar', 'roof_metal'],
     glass: ['glass_sky', 'glass_plain'],
@@ -589,7 +821,9 @@ export const DISTRICTS = {
     tall: 0.45,
     tint: [0.4, 0.35, 0.3],
     archetypes: { warehouse: 5, rowhouse: 3, mill: 2, block: 1 },
-    masonry: ['brick_dark', 'brick_brown', 'corrugated', 'concrete_wall'],
+    // Soot-dark red, per DESIGN.md: the flats under the works, where the upper
+    // courses went black and nobody ever cleaned them.
+    masonry: ['brick_dark', 'brick_soot', 'brick_brown', 'corrugated'],
     accents: ['rust', 'steel_green', 'brick_painted'],
     roof: ['roof_metal', 'roof_tar'],
     glass: ['glass_grimy', 'glass_plain'],
@@ -613,7 +847,10 @@ export const DISTRICTS = {
     tall: 0.62,
     tint: [0.44, 0.32, 0.26],
     archetypes: { mill: 6, warehouse: 4, block: 1 },
-    masonry: ['corrugated_rust', 'brick_dark', 'rust', 'concrete_dark'],
+    // Industrial brick and corrugated, per the quality pass: `brick_soot` is
+    // the works' own engineering brick, black where the plume settled, and it
+    // is what stops Steel Row being an all-metal district.
+    masonry: ['brick_soot', 'corrugated_rust', 'rust', 'concrete_dark'],
     accents: ['rust_deep', 'steel_dark', 'corrugated'],
     roof: ['roof_metal'],
     glass: ['glass_grimy'],
@@ -637,7 +874,9 @@ export const DISTRICTS = {
     tall: 0.32,
     tint: [0.34, 0.35, 0.38],
     archetypes: { rowhouse: 6, house: 3, block: 1 },
-    masonry: ['brick_red', 'brick_buff', 'brick_painted'],
+    // The buff district. Kittanning yellow is the North Side's signature and it
+    // is the one stock that cannot be reached by tinting a red one.
+    masonry: ['brick_buff', 'brick_red', 'brick_painted'],
     accents: ['render_cream', 'trim_white', 'stone_warm'],
     roof: ['roof_shingle', 'roof_tar'],
     glass: ['glass_plain'],
@@ -649,7 +888,7 @@ export const DISTRICTS = {
     tall: 0.36,
     tint: [0.4, 0.34, 0.28],
     archetypes: { rowhouse: 4, house: 3, warehouse: 3, mill: 1 },
-    masonry: ['brick_brown', 'brick_dark', 'siding_grey', 'corrugated_rust'],
+    masonry: ['brick_brown', 'brick_dark', 'siding_grey', 'brick_soot'],
     accents: ['rust', 'render_grey', 'brick_painted'],
     roof: ['roof_tar', 'roof_shingle'],
     glass: ['glass_grimy', 'glass_plain'],

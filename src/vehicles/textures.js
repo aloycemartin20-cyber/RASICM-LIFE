@@ -14,6 +14,8 @@
  *   plate        a legible number plate
  *   dash         instrument binnacle: two dials, a needle sweep, warning lamps
  *   fabric       seat cloth
+ *   headliner    the roof lining's cloth — the SAME weave lattice, authored in
+ *                linear at a lining's reflectance. See `makeHeadlinerCloth`
  *   reflector    headlight fluting, so the lamp is not a white disc
  *   grille       fine mesh (alpha) behind the grille surround
  *   rust         perforation mask for the beater/damage variant
@@ -1059,6 +1061,106 @@ export function makeFabricNormal(size = 256) {
   }
   heightToNormal(c, h, 1.1);
   return tex(c, { repeat: 5 });
+}
+
+/**
+ * ────────────────────────────────────────────────────────────────────────────
+ * HEADLINER CLOTH — THE SECOND, LIGHTER BAKE. `makeFabric` CANNOT BE LIFTED.
+ * ────────────────────────────────────────────────────────────────────────────
+ * `paint.js`'s `headliner()` ships with NO albedo map, and its own note says
+ * exactly why: "makeFabric peaks at 0.124 linear and a headliner is 0.28-0.36,
+ * which no colour multiplier can reach from there." That is arithmetic, not
+ * taste — `material.color` is a MULTIPLY and multiplies are ≤ 1, so a map whose
+ * brightest texel is 0.124 can only ever make the lining darker. The lining is
+ * therefore a FLAT COLOUR with the seat's normal map on it: relief with no
+ * albedo behind it, i.e. a weave you can only see where a highlight happens to
+ * rake across it. At the one camera that photographs the cabin from the inside
+ * it reads as smooth vinyl.
+ *
+ * THE VALUE IS AUTHORED IN LINEAR AND WRITTEN AS sRGB, which is the whole point
+ * of a second bake rather than a brightened copy. `makeFabric` composes bytes
+ * (`v * 190`) and its linear value is whatever falls out; here the reflectance
+ * is the input — mean `NAP_ALBEDO`, modulated by the weave, converted at the
+ * last step — so the number this returns can be compared against a reflectance
+ * table and against the frame, and `headliner()` can then tint it to whatever
+ * the cabin measures at while keeping the weave's RELATIVE contrast intact (a
+ * multiply preserves ratios exactly, which is why the value belongs in the map
+ * and the tint in the colour — the rule the tyre, the rim and the seat all
+ * follow already).
+ *
+ * THE LATTICE IS THE SEAT'S, DELIBERATELY. Same period-6 twill on both
+ * diagonals as `makeFabric`/`makeFabricNormal`, and the same `repeat: 5`, so
+ * this map REGISTERS with `fabricNormal` texel for texel: the dark threads in
+ * the albedo are the threads the normal map dents. Author a different lattice
+ * here and the two beat against each other into a moiré that reads as noise —
+ * which is worse than the flat colour it replaces. What is different is
+ * everything a lining IS and a seat is not: a third of the seat's weave
+ * contrast (a knit lining is napped, so its threads are softened by fibre
+ * standing up out of the surface), a low-frequency nap cloud, and a fine fibre
+ * grain that survives a couple of mip levels.
+ *
+ * NOT YET WIRED. `src/vehicles/paint.js` owns `headliner()` and its texture
+ * set, and this wave does not own that file — so this adds NO texture memory
+ * today (nothing calls it, nothing bakes it) and the adoption is a followup:
+ * `T.headlinerCloth = makeHeadlinerCloth(Math.round(256 * s))` in `build()`,
+ * then `map: T.headlinerCloth` with `color` retuned so the PRODUCT stays at the
+ * 0.106 linear the cockpit frame was measured at. Gated by
+ * `src/vehicles/paintprobe.mjs`'s CLOTH group, which reads the emitted texels
+ * of both bakes and asserts this one is liftable where `makeFabric` is not.
+ */
+/**
+ * Authored linear reflectance of the lining, before the weave and the nap take
+ * their bite out of it. Both are multiplies under 1, so the EMITTED mean lands
+ * about 8 % below this: MEASURED by `src/vehicles/paintprobe.mjs` on the texels
+ * this returns, 0.325 authored -> mean 0.296, p05 0.266, p95 0.328, max 0.347
+ * linear, which is a pale automotive headliner cloth in the middle of the
+ * 0.28-0.36 band `paint.js` names. `makeFabric`, measured by the same code in
+ * the same run, peaks at 0.116 (mean 0.062) — the whole reason for a second bake.
+ */
+const NAP_ALBEDO = 0.325;
+/**
+ * Peak-to-trough of the weave as a FRACTION of that mean, so the contrast is a
+ * property of the cloth rather than of the level it happens to be tinted to.
+ * `makeFabric`'s twill runs 0.774 to 1.0 on the same lattice — a 26 % swing,
+ * which is a coarse upholstery weave seen from 30 cm. A napped lining seen from
+ * the same distance is about a third of that.
+ */
+const NAP_WEAVE = 0.09;
+
+export function makeHeadlinerCloth(size = 256) {
+  const c = canvas(size);
+  const x = c.getContext('2d');
+  const rand = rngFor(0x4c10a7);
+  // Two octaves: the nap's cloudiness, then the fibre grain on top of it. The
+  // grain is near the texel rate on purpose — it is what stops the lining
+  // flattening to a colour the moment the mip chain averages the weave away.
+  const nap = noiseField(size, size, 12, rand);
+  const fibre = noiseField(size, size, 96, rand);
+  const img = x.createImageData(size, size);
+  // Linear -> sRGB. Written out rather than shared because this file has no
+  // colour-space helper and a wrong one here is a silently mis-valued map.
+  const toSrgb = (v) => (v <= 0.0031308 ? v * 12.92 : 1.055 * Math.pow(v, 1 / 2.4) - 0.055);
+  for (let y = 0; y < size; y++) {
+    for (let i2 = 0; i2 < size; i2++) {
+      const i = y * size + i2;
+      // The seat's twill, softened: same threads, a third of the bite.
+      const twill =
+        ((i2 + y) % 6 < 3 ? 1 : 1 - NAP_WEAVE) *
+        ((i2 - y + size) % 6 < 3 ? 1 : 1 - NAP_WEAVE * 0.7);
+      const v = NAP_ALBEDO * twill * (0.94 + nap[i] * 0.12) * (0.97 + fibre[i] * 0.06);
+      const s = toSrgb(v < 0 ? 0 : v > 1 ? 1 : v);
+      const k = i * 4;
+      // A lining is a warm neutral, not a blue-grey: the b channel is pulled
+      // down a couple of per cent, which is the same direction `makeFabric`
+      // takes (190/182/176) at a fraction of the strength.
+      img.data[k] = Math.round(s * 255);
+      img.data[k + 1] = Math.round(s * 253);
+      img.data[k + 2] = Math.round(s * 248);
+      img.data[k + 3] = 255;
+    }
+  }
+  x.putImageData(img, 0, 0);
+  return tex(c, { repeat: 5, srgb: true });
 }
 
 /** Headlight reflector: concentric fluting plus a projector bowl. */

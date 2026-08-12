@@ -683,8 +683,30 @@ function incline(T, lib, lm, rng, gy, groundAt) {
   /** Track height at along-distance `a`, interpolated between bents. */
   const trackY = trk.trackY;
 
-  // lower station, square to the track
-  box(T, 'brick_dark', x, gy + 5, z, 16, 10, 12, yawUp, [0.4, 0.5, 0.3], _sharedChamfer());
+  /**
+   * IDENTITY PASS — the station is 1877 carpentry, not a shed.
+   *
+   * Both stations were a masonry-or-timber box with a shingle lid and nothing
+   * else, and at 40 m that is what they read as. What makes a funicular station
+   * recognisable is the SECTION at its edges: a stone plinth the hillside is
+   * cut back to, a wainscot band with a moulding on top of it, corner boards
+   * standing proud of the cladding, and an eave fascia deep enough to throw a
+   * shadow line across the whole elevation.
+   *
+   * Every piece below is a box on a surface key the tile is ALREADY drawing
+   * (`tile.js` merges by key, so a station's twelve extra boxes cost zero extra
+   * draw calls — see ARCHITECTURE.md rule 7), and the keys are the palette's,
+   * so the woodwork weathers with the district.
+   */
+  // lower station: stone plinth, sooted brick body, deep eave
+  box(T, 'stone_base', x, gy + 0.9, z, 16.8, 1.8, 12.8, yawUp, [0.5, 0.6, 0.4], _sharedChamfer());
+  box(T, 'brick_dark', x, gy + 5.6, z, 16, 9.4, 12, yawUp, [0.4, 0.5, 0.3], _sharedChamfer());
+  // Bottle-green glazed dado to shoulder height. Every transit building of the
+  // period had one for the same reason the market has one: glaze hoses clean.
+  box(T, 'brick_glazed_green', x, gy + 3.0, z, 16.2, 2.4, 12.2, yawUp, [0.3, 0.5, 0.3], _sharedChamfer());
+  // string course at first-floor level — the horizontal that gives it a storey
+  box(T, 'stone_grey', x, gy + 5.4, z, 16.5, 0.34, 12.5, yawUp, [0.45, 0.55, 0.3], _sharedChamfer());
+  box(T, 'trim_white', x, gy + 10.15, z, 17.2, 0.55, 13.2, yawUp, [0.5, 0.45, 0.25], _sharedChamfer());
   box(T, 'roof_shingle', x, gy + 10.6, z, 18, 1.2, 14, yawUp, [0.4, 0.5, 0.25], _sharedChamfer());
   box(T, 'trim_red', x, gy + 11.6, z, 6, 1.4, 6, yawUp, [0.5, 0.4, 0.2], _sharedChamfer());
   for (const s of [-1, 1]) {
@@ -692,6 +714,11 @@ function incline(T, lib, lm, rng, gy, groundAt) {
     box(T, 'glass_plain', q.x, gy + 5.5, q.z, 4.5, 5, 0.2, yawUp, [0, 0.25, 0]);
     const q2 = at(s * 4, -5.4);
     box(T, 'room_lit_warm', q2.x, gy + 5.5, q2.z, 4.5, 5, 0.2, yawUp, [0, 0.1, 0.4]);
+    // stone jambs down each side of the opening
+    for (const j of [-1, 1]) {
+      const qj = at(s * 4 + j * 2.55, -6.1);
+      box(T, 'stone_grey', qj.x, gy + 5.5, qj.z, 0.5, 5.4, 0.34, yawUp, [0.4, 0.5, 0.3]);
+    }
   }
 
   // upper station, standing on the ground the track actually reaches
@@ -699,7 +726,27 @@ function incline(T, lib, lm, rng, gy, groundAt) {
   const ux = up.x;
   const uz = up.z;
   const uy = gnd[bents];
-  box(T, 'timber_dark', ux, uy + 6, uz, 18, 12, 14, yawUp, [0.5, 0.5, 0.3], _sharedChamfer());
+  box(T, 'stone_base', ux, uy + 0.8, uz, 18.6, 1.6, 14.6, yawUp, [0.5, 0.6, 0.4], _sharedChamfer());
+  box(T, 'timber_dark', ux, uy + 6.4, uz, 18, 11.2, 14, yawUp, [0.5, 0.5, 0.3], _sharedChamfer());
+  // painted wainscot to sill height, with its cap moulding — the one band that
+  // makes board cladding read as carpentry rather than as a dark box
+  box(T, 'timber', ux, uy + 3.0, uz, 18.25, 3.4, 14.25, yawUp, [0.55, 0.6, 0.35], _sharedChamfer());
+  box(T, 'trim_white', ux, uy + 4.78, uz, 18.5, 0.28, 14.5, yawUp, [0.5, 0.45, 0.25], _sharedChamfer());
+  // corner boards, proud of the cladding on all four arrises
+  for (const sx of [-1, 1]) {
+    for (const sz of [-1, 1]) {
+      const c = at(sx * 9.05, RUN + sz * 7.05);
+      box(T, 'trim_white', c.x, uy + 6.4, c.z, 0.5, 11.2, 0.5, yawUp, [0.6, 0.5, 0.3]);
+    }
+  }
+  // lit waiting room behind glass on the valley elevation
+  for (const s of [-1, 1]) {
+    const q = at(s * 4.4, RUN - 7.05);
+    box(T, 'glass_plain', q.x, uy + 7.2, q.z, 5.0, 4.2, 0.2, yawUp, [0, 0.25, 0]);
+    const q2 = at(s * 4.4, RUN - 6.4);
+    box(T, 'room_lit_warm', q2.x, uy + 7.2, q2.z, 5.0, 4.2, 0.2, yawUp, [0, 0.1, 0.4]);
+  }
+  box(T, 'trim_red', ux, uy + 12.15, uz, 19.2, 0.6, 15.2, yawUp, [0.5, 0.45, 0.25], _sharedChamfer());
   box(T, 'roof_shingle', ux, uy + 12.6, uz, 20, 1.4, 16, yawUp, [0.4, 0.5, 0.25], _sharedChamfer());
   box(T, 'trim_white', ux, uy + 13.8, uz, 4.5, 3.2, 4.5, yawUp, [0.5, 0.4, 0.2], _sharedChamfer());
 
@@ -773,6 +820,17 @@ function pointFountain(T, lib, lm, rng, gy) {
   const z = lm.z;
   const R = 30;
 
+  /**
+   * IDENTITY PASS — the basin is granite masonry, and it is WET.
+   *
+   * The apron, the wall and the coping were one smooth concrete family, so the
+   * whole thing read as a poured kerb. Three changes, all material and all
+   * free: the apron becomes laid paving (`precast` carries real cast joints),
+   * the wall becomes warm ashlar, and — the one that actually sells it — a
+   * darkened ring sits at the waterline, because the single most recognisable
+   * thing about any working fountain basin is the tide mark of algae and lime
+   * where the water has stood against the stone for forty years.
+   */
   const apron = new THREE.RingGeometry(R, R + 14, 64, 1);
   apron.rotateX(-Math.PI / 2);
   apron.setAttribute(
@@ -780,12 +838,16 @@ function pointFountain(T, lib, lm, rng, gy) {
     new THREE.Float32BufferAttribute(new Float32Array(apron.getAttribute('position').count * 3).fill(0.25), 3)
   );
   trs(_m, x, gy + 0.06, z, 0, 1, 1, 1);
-  T.addOnce('stone_grey', apron, _m);
+  T.addOnce('precast', apron, _m);
 
   // basin wall
   const wall = cylinderY(R, 1.1, 64, { open: true });
   trs(_m, x, gy + 0.55, z, 0, 1, 1, 1);
   T.addOnce('stone_warm', wall, _m, { masks: [0.55, 0.6, 0.3] });
+  // the waterline stain, 6 cm proud so it catches its own shadow
+  const tide = cylinderY(R + 0.06, 0.34, 64, { open: true });
+  trs(_m, x, gy + 0.74, z, 0, 1, 1, 1);
+  T.addOnce('stone_soot', tide, _m, { masks: [0.7, 0.95, 0.55] });
   const cap = new THREE.TorusGeometry(R, 0.34, 8, 64);
   cap.rotateX(Math.PI / 2);
   cap.setAttribute(
@@ -861,13 +923,25 @@ function stripMarket(T, lib, lm, rng, gy) {
   const W = MKT_W;
   const H = MKT_H;
 
-  // head building
-  box(T, 'brick_red', x, gy + 7, z - L / 2 - 8, W + 6, 14, 16, 0, [0.35, 0.5, 0.3], _sharedChamfer());
+  /**
+   * Head building. IDENTITY PASS — a produce terminal's street elevation is
+   * three materials stacked in the order the trade needed them: a rock-faced
+   * stone base that survives a handcart, a GLAZED BRICK course at eye level
+   * because glaze washes down and the wholesalers had to hose the frontage,
+   * and common red brick above. The glazed band is the detail that says
+   * "market" from the far pavement, and it is the one surface on the elevation
+   * that comes back wet-looking under a low sun.
+   */
+  box(T, 'stone_base', x, gy + 1.1, z - L / 2 - 8, W + 6.4, 2.2, 16.4, 0, [0.5, 0.6, 0.4], _sharedChamfer());
+  box(T, 'brick_glazed', x, gy + 3.5, z - L / 2 - 8, W + 6.2, 2.6, 16.2, 0, [0.3, 0.45, 0.25], _sharedChamfer());
+  box(T, 'brick_red', x, gy + 9.4, z - L / 2 - 8, W + 6, 9.2, 16, 0, [0.35, 0.5, 0.3], _sharedChamfer());
   box(T, 'stone_grey', x, gy + 14.4, z - L / 2 - 8, W + 8, 1.1, 18, 0, [0.5, 0.5, 0.3], _sharedChamfer());
   for (let i = 0; i < 5; i++) {
     const px = x - 12 + i * 6;
     box(T, 'glass_grimy', px, gy + 8.5, z - L / 2 - 0.2, 3.4, 4.2, 0.3, 0, [0, 0.3, 0]);
     box(T, 'room_dark', px, gy + 8.5, z - L / 2 - 0.9, 3.4, 4.2, 0.3, 0, [0, 0.1, 0.5]);
+    // stone head over each opening — the lintel that makes it a punched window
+    box(T, 'stone_grey', px, gy + 10.85, z - L / 2 - 0.15, 4.2, 0.5, 0.42, 0, [0.45, 0.5, 0.3]);
   }
   box(T, 'sign_board', x, gy + 12.4, z - L / 2 - 0.1, 20, 2.4, 0.5, 0, [0.5, 0.5, 0.3], _sharedChamfer());
   T.putS(Kit.signFace(lib, 'neon_amber'), x, gy + 12.4, z - L / 2 + 0.25, 0, 16, 1.4, 1);

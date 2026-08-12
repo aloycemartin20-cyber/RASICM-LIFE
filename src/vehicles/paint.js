@@ -26,6 +26,7 @@ import {
   makeRimMaps, makeBodyAlbedo, makeRoadFilm, makeRustBloom, makeGlassMaps,
   makeTrimMaps,
   makePlate, makeDash, makeDashEmissive, makeFabric, makeFabricNormal,
+  makeHeadlinerCloth,
   makeReflector, makeGrilleMesh, makeRust, makeGlassCracks, makeLivery,
 } from './textures.js';
 
@@ -205,6 +206,15 @@ export class VehicleMaterials {
     T.dashEmissive = makeDashEmissive(Math.round(512 * s));
     T.fabric = makeFabric(Math.round(256 * s));
     T.fabricNormal = makeFabricNormal(Math.round(256 * s));
+    /**
+     * The lining's own albedo. 256 px sRGB + mips is ~0.33 MiB at `high` and
+     * ~0.08 MiB at `low` — MEASURED as +1 on `renderer.info.memory.textures`
+     * and no change at all to `materials.textureReport()`, which counts the
+     * MaterialSystem's bakes and never saw the vehicle set. It registers with
+     * `fabricNormal` texel for texel (same lattice, same `repeat: 5`), which is
+     * the whole reason it is a second bake rather than a tint.
+     */
+    T.headlinerCloth = makeHeadlinerCloth(Math.round(256 * s));
     T.reflector = makeReflector(Math.round(256 * s));
     T.grille = makeGrilleMesh(Math.round(256 * s));
     T.rust = makeRust(Math.round(512 * s));
@@ -753,10 +763,23 @@ export class VehicleMaterials {
    * is a hole. The cockpit capture measured 23/28/33 across its upper third
    * before this existed.
    *
-   * So it takes NO albedo map: `makeFabric` peaks at 0.124 linear and a
-   * headliner is 0.28-0.36, which no colour multiplier can reach from there.
-   * 0x9fa2a6 is 0.34 linear flat, with the fabric NORMAL for weave — the same
-   * slot set `leather()` uses, so the two share a program.
+   * IT TOOK NO ALBEDO MAP, and the reason it could not was a real one:
+   * `makeFabric` peaks at 0.124 linear and a headliner is 0.28-0.36, and
+   * `material.color` is a MULTIPLY, so no tint can climb from a seat cloth to a
+   * lining. `textures.js` answered that with a SECOND bake — `makeHeadlinerCloth`,
+   * whose emitted texels mean 0.296 linear (p05 0.266, p95 0.328, max 0.347),
+   * measured by `paintprobe`'s CLOTH group in the page every run, with
+   * `makeFabric` measured beside it as the control that must fail the same test.
+   *
+   * So the map is bound here and `color` is re-derived to hold the PRODUCT
+   * where the cockpit frame put it. Per channel: 0.3015 / 0.2959 / 0.2820 is
+   * what the bake means in r/g/b linear (its blue is pulled down 2%, because a
+   * lining is a warm neutral), and 0x9da3ad divided into that lands
+   * 0.1016 / 0.1084 / 0.1179 — the same three numbers 0x5a5d61 was, to half a
+   * per cent, i.e. luminance 0.1076 against the 0.106 the frame was set from.
+   * What is new is the weave: the map REGISTERS with `fabricNormal` texel for
+   * texel, so the threads the normal map dents are the threads the albedo
+   * darkens, which is the whole reason the second bake exists.
    */
   headliner() {
     return this._cached('headliner', () =>
@@ -773,8 +796,14 @@ export class VehicleMaterials {
          * dash, darker than the sky through the glass, which is the ordering a
          * real cabin has. The number is set from the frame, not from a
          * reflectance table, because the reflectance table has been wrong twice.
+         *
+         * 0x9da3ad is that same 0.106, re-expressed as a tint ON the cloth
+         * rather than instead of it. `cabin.lined` (roof lum > 52) and
+         * `cabin.notblack` (darkFrac < 0.25) are the two assertions that hold
+         * the product where it was.
          */
-        color: 0x5a5d61,
+        color: 0x9da3ad,
+        map: this._tex.headlinerCloth,
         normalMap: this._tex.fabricNormal,
         normalScale: new THREE.Vector2(0.45, 0.45),
         roughness: 0.95,

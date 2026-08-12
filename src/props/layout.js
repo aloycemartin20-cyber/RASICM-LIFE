@@ -2,6 +2,11 @@ import * as THREE from 'three';
 import { Accum, trs, newTrs, clamp01, lerp, TAU, hash3i, smoothNoise } from './geom.js';
 import { DISTRICT_STYLE, DEFAULT_STYLE, DISTRICT_NEON, SURFACE_TAG } from './palette.js';
 import { polesOnEdge, armHeight, buildSpan, buildDrop, buildGuy, buildTrolley } from './wires.js';
+import {
+  signTextProto, fitScale, shopWords, pickInk, inkSurface,
+  streetPlateText, neonWordProto, SIGN_WORDS, BANNER_WORDS,
+} from './kit_sign.js';
+import { KIT_SPECIES } from './kit_green.js';
 
 /**
  * PROPS — the placement solver.
@@ -36,6 +41,31 @@ const _wv = new THREE.Vector3();
 const KERB_LANE = 0.62;
 
 /**
+ * `?owNoOak=1` (or `OW_NO_OAK=1` headless) plants the four species this file
+ * planted before the oak was adopted, and changes nothing else — same hashes,
+ * same pits, same spacing, because every planting site below indexes
+ * `STREET_SPECIES` by `% STREET_SPECIES.length` rather than by a hardcoded 4.
+ * It is the negative control for the triangle and batch deltas quoted in the
+ * table below, and it is never reachable in play. Same shape as the
+ * `?owNoSigns=1` hatch further down this file.
+ */
+let _noOak = null;
+function noOak() {
+  if (_noOak !== null) return _noOak;
+  _noOak = false;
+  try {
+    if (typeof location !== 'undefined' && new URLSearchParams(location.search).get('owNoOak') === '1') {
+      _noOak = true;
+    }
+  } catch { /* no location */ }
+  try {
+    if (typeof process !== 'undefined' && process?.env?.OW_NO_OAK === '1') _noOak = true;
+  } catch { /* no process */ }
+  if (_noOak) console.warn('[props] LEGACY planting — four street species, no oak');
+  return _noOak;
+}
+
+/**
  * THE STREET SPECIES, IN ONE PLACE.
  *
  * `kit_green.js` registers `tree_<id>_<v>_wood` and `tree_<id>_<v>_leaf<n>`
@@ -55,8 +85,53 @@ const KERB_LANE = 0.62;
  * `young` is not here. It is the replacement sapling every planting scheme has
  * a few of, chosen by its own hash below, not a species anybody plants a street
  * with.
+ *
+ * ───────────────────────────────────────────────────────────────────────────
+ * THE FIFTH SPECIES, AND WHAT IT COST.
+ * ───────────────────────────────────────────────────────────────────────────
+ * `kit_green.js` built the red oak and said so plainly at the bottom of its own
+ * table: "NOT PLANTED YET ... until that list takes `oak` this costs four
+ * canopies and a far tier of build time at boot and ZERO draw calls, because
+ * nothing instances it." It is the widest crown in the kit — 3.0 x 2.35 x 2.9
+ * against a plane's 1.46x smaller volume — and the one that most changes what a
+ * run of street trees does to a skyline, which is what a fifth species is
+ * bought for. Planting it turns that dead build cost into pixels.
+ *
+ * MEASURED ON TREE-DENSE TILES, which is what the kit's note asked whoever
+ * landed this to do, through the `?owNoOak=1` hatch above so that both arms
+ * are the SHIPPED planting code and not two edits of it. Three tiles off the
+ * `street` shot, counted off the emitted meshes — per-instance triangles and
+ * `InstancedMesh` batches, collision proxies excluded:
+ *
+ *   tile        trees   triangles  ->  triangles     batches -> batches
+ *   props_5_-3    140      67 552       69 970  +3.6%     17      19  (+2)
+ *   props_5_-2    136      79 516       81 140  +2.0%     22      24  (+2)
+ *   props_3_-4    132      66 842       68 438  +2.4%     17      19  (+2)
+ *
+ * THE TREE COUNT IS THE SAME ON BOTH SIDES OF EVERY ROW, and that is what
+ * makes it a measurement of the oak rather than of a different planting: no
+ * decision in `_treeRun` reads the species, so the pits, the spacings and the
+ * canopy variants are untouched and the only thing that moved is which crown
+ * stands in each pit. Tiles whose count differed between the two runs — the
+ * far ring, where a tile can be built at LOD1 in one run and LOD0 in the next
+ * — are excluded for that reason rather than averaged in.
+ *
+ * The +2 batches is exactly the price `kit_green.js` predicted and named: one
+ * more wood proto and one more leaf material on any tile that grows an oak.
+ * The 2-4% of triangles is the crown — an oak canopy is 2 240 triangles
+ * against a plane's 1 408 — and it lands only on tiles that already have
+ * trees, which is the right shape for a cost that buys silhouette variety.
+ *
+ * FILTERED AGAINST THE KIT, not asserted equal to it. `young` is in
+ * `KIT_SPECIES` and is deliberately not a street species, so the two lists are
+ * not the same list; what the filter stops is the failure this pair of lists
+ * actually has — naming a species here that `kit_green.js` never registered,
+ * which puts an id into `B.put` that silently resolves to no tree at all.
  */
-export const STREET_SPECIES = ['plane', 'maple', 'locust', 'pear'];
+export const STREET_SPECIES = ['plane', 'maple', 'locust', 'pear', 'oak'].filter(
+  (s) => KIT_SPECIES.includes(s) && !(s === 'oak' && noOak())
+);
+
 
 /**
  * The leaf materials `kit_green.js` registers per species, in its own order:
@@ -71,43 +146,99 @@ export const STREET_SPECIES = ['plane', 'maple', 'locust', 'pear'];
  */
 const LEAF_GREENS = 3;
 /**
- * The autumn surfaces beyond the kit's own single `leaf_autumn` at index 3.
- * See the long note in `palette.js`: they differ by SEASON, not just tint, so
- * a street of turning trees is a planting at three different stages rather
- * than one orange asset instanced.
+ * `leaf_autumn_b` / `leaf_autumn_c` AND THE `?oneautumn=1` HATCH BOTH LIVED
+ * HERE, and both went with the guest pass — see `_registerAutumn`.
  *
- * REGISTERED FROM HERE, WHICH IS NOT WHERE THEY BELONG. The right home is
- * `kit_green.js`'s own `LEAVES`, which is the file that owns the canopy; this
- * builder does not own that file. `ProtoLibrary.proto` takes a prebuilt
- * `opts.geo`, and the kit already shares ONE canopy mesh across all four of its
- * leaf materials, so re-using `leaf0`'s geometry costs no triangles, no bake
- * and no draw call that the fourth variant did not already cost — only the two
- * extra materials and their bakes.
+ * The surfaces are declared by `kit_green.js`, which owns the canopy they are
+ * painted on, and the hatch is read there too. Nothing in this file needs
+ * either name any more: `_registerAutumn` counts what the kit actually built,
+ * so the control arm reaches this file as a smaller count rather than as a
+ * second copy of a query parameter. A duplicated hatch is a hatch that can be
+ * half-off.
  */
-const LEAF_AUTUMN_EXTRA = ['leaf_autumn_b', 'leaf_autumn_c'];
 
 /**
- * A/B hatch for the above, same shape as `kit_green.js`'s `?owLegacyCanopy=1`
- * and `world/roadmesh.js`'s `legacyPave`. `?oneautumn=1`, or `OW_ONE_AUTUMN=1`
- * for the headless harnesses, registers no extra variants — so every turning
- * tree in the city is the one `leaf_autumn` again. It is the negative control
- * for the turning-tree assertions in `src/props/foliageprobe.mjs` and is never
- * reachable in normal play.
+ * WHAT A REGULATORY PLATE SAYS, AND WHERE ON THE POST IT SAYS IT.
+ *
+ * Keyed by the FACE PROTO the kerb walk planted, because the legend and the
+ * plate are one decision: `sign_reg_face2` is a 0.46 x 0.62 plate at y 2.15
+ * with a 0.44 x 0.30 rider under it at y 1.66, so it gets a restriction AND
+ * the hours it applies, and `sign_oneway_face` is a 0.92 x 0.28 blade that can
+ * only ever carry one short line. The fields below are the plate's own
+ * dimensions less a margin, at unit scale; the placement multiplies by its own
+ * `sc`. The numbers come from `kit_street.js`'s `registerSigns` — if a plate is
+ * ever resized, these move with it.
+ *
+ * EVERY LEGEND HERE WAS SIZED BEFORE IT WAS WRITTEN, not after. `signprobe`
+ * requires a 0.055 m cap height on every word in the city and the kerb walk
+ * scales its furniture by 0.88..1.14, so a legend has to clear the floor at
+ * the SMALL end of that range. `fitScale` on these fields, times 0.88:
+ *
+ *   SPEED/LIMIT/25      0.090      MON-FRI            0.062
+ *   NO/PARKING          0.065      7-9 AM / 4-6 PM    0.074
+ *   2 HOUR/PARKING      0.065      2 HOURS            0.061
+ *   LOADING/ZONE        0.065      ONE WAY            0.118
+ *
+ * Four legends that read perfectly well and did not survive it are worth
+ * recording so nobody adds them back: NO/STOPPING 0.057, NO/STANDING 0.056,
+ * TOW AWAY/ZONE 0.050, EXCEPT SUNDAY 0.031. A plate is 46 cm wide; the longer
+ * the phrase, the smaller the type, and an unreadable plate is the defect this
+ * whole method exists to remove rather than a smaller version of the fix.
+ *
+ * The vocabulary lives here rather than in `kit_sign.js`'s `SIGN_WORDS`
+ * because it is paired to that geometry line by line — which plate carries how
+ * many lines in how many centimetres — and a list of shop names is not.
+ * `signprobe.mjs` imports it FROM HERE for its classifier, so there is exactly
+ * one copy of it; moving it into `SIGN_WORDS` is a `kit_sign.js` followup and
+ * would want the field table to travel with it.
  */
-let _oneAutumn = null;
-function oneAutumn() {
-  if (_oneAutumn !== null) return _oneAutumn;
-  _oneAutumn = false;
+export const REG_PLATES = {
+  reg: [{
+    y: 2.15, w: 0.42, h: 0.54,
+    words: [['NO', 'PARKING'], ['SPEED', 'LIMIT', '25'], ['2 HOUR', 'PARKING'],
+      ['LOADING', 'ZONE']],
+  }],
+  reg2: [{
+    y: 2.15, w: 0.42, h: 0.54,
+    words: [['NO', 'PARKING'], ['2 HOUR', 'PARKING'], ['LOADING', 'ZONE']],
+  }, {
+    y: 1.66, w: 0.40, h: 0.25,
+    words: [['MON-FRI'], ['7-9 AM'], ['4-6 PM'], ['2 HOURS']],
+  }],
+  oneway: [{
+    y: 2.35, w: 0.82, h: 0.22,
+    words: [['ONE WAY'], ['DO NOT ENTER'], ['NO TRUCKS'], ['BUS ONLY']],
+  }],
+};
+
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * `?owNoSigns=1` — the signage layer's kill switch, and why it exists.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * It is not a feature flag and nothing in play reaches it. It exists so that
+ * `tools/perfcheck.mjs --ab='.|owNoSigns=1,.'` can measure the cost of the
+ * type layer as ONE BUILD with the change off and on, which is the only honest
+ * A/B on a tree several agents are editing at once: two separate builds
+ * minutes apart are not the same picture and the frame time difference between
+ * them is mostly somebody else's commit.
+ *
+ * It suppresses only the emission of TYPE (`Layout._type` and `_neonWord`).
+ * The boards, blades, hoardings and plaques it goes on stay, so the arms
+ * differ by the letters and nothing else.
+ */
+let _noSigns = null;
+function noSigns() {
+  if (_noSigns !== null) return _noSigns;
+  _noSigns = false;
   try {
-    if (typeof location !== 'undefined' && new URLSearchParams(location.search).get('oneautumn') === '1') {
-      _oneAutumn = true;
-    }
+    if (typeof location !== 'undefined'
+      && new URLSearchParams(location.search).get('owNoSigns') === '1') _noSigns = true;
   } catch { /* no location */ }
   try {
-    if (typeof process !== 'undefined' && process?.env?.OW_ONE_AUTUMN === '1') _oneAutumn = true;
+    if (typeof process !== 'undefined' && process?.env?.OW_NO_SIGNS === '1') _noSigns = true;
   } catch { /* no process */ }
-  if (_oneAutumn) console.warn('[props] LEGACY autumn — one turning-leaf surface for the whole city');
-  return _oneAutumn;
+  if (_noSigns) console.warn('[props] SIGNAGE OFF — no lettering anywhere (A/B control)');
+  return _noSigns;
 }
 
 /**
@@ -210,47 +341,39 @@ export class Layout {
   }
 
   /**
-   * Paint the kit's existing canopy mesh in the extra autumn surfaces.
+   * ───────────────────────────────────────────────────────────────────────
+   * THE GUEST PASS IS GONE. THIS COUNTS; IT NO LONGER REGISTERS.
+   * ───────────────────────────────────────────────────────────────────────
+   * This used to walk the library for every `..._leaf0` the kit had built and
+   * declare two more turning surfaces over each one — a PLACEMENT solver
+   * writing entries into the canopy's own material list, which is a file it
+   * does not own a vertex of. `kit_green.js` took that registration back when
+   * it adopted the leaf table, and said so: "when `layout.js` drops its
+   * discovery pass its copy goes with it." This is that drop.
    *
-   * Discovered off the library rather than enumerated: every `..._leaf0` the
-   * kit registered names a species and a canopy variant that exists, so this
-   * cannot fall out of step with `kit_green.js`'s own `SPECIES` table, and it
-   * registers nothing for a species the kit never built. `protos` is read into
-   * an array before anything is added to it — `proto` writes to the same Map.
+   * What is left is the one thing this file legitimately needs to know:
+   * HOW MANY turning variants exist beyond the kit's own `leaf_autumn`, which
+   * is what `_leafIndex` spans when it picks a canopy. It is still MEASURED
+   * off the library rather than restated as a constant, for the reason the old
+   * note gave and which has not changed — the two files would otherwise both
+   * hold the number and could disagree — and because the measurement is what
+   * makes the `?oneautumn=1` control work through this path for free: in that
+   * arm the kit declares only `leaf3`, the highest index found is
+   * `LEAF_GREENS`, and this correctly returns 0 without knowing the hatch
+   * exists. That is why there is no `oneAutumn()` call left in here.
    *
-   * Returns the number of extra variants registered, and everything downstream
-   * indexes off that return value, so if the kit's proto names ever change
-   * shape this plants ordinary orange trees instead of putting an id into
-   * `B.put` that silently resolves to no tree at all.
+   * Renaming it to something that says "count" is owed and is NOT this wave's
+   * to make: `src/props/foliageprobe.mjs` calls it by this name.
    */
   _registerAutumn() {
-    const lib = this.lib;
-    if (oneAutumn()) return 0;
-    if (!lib?.protos || typeof lib.proto !== 'function') return 0;
-    const bases = [];
-    for (const [id, p] of lib.protos) {
-      const m = /^tree_(.+)_(\d+)_leaf0$/.exec(id);
-      if (m && p.geo) bases.push([m[1], m[2], p]);
+    const protos = this.lib?.protos;
+    if (!protos) return 0;
+    let top = LEAF_GREENS;
+    for (const id of protos.keys()) {
+      const m = /^tree_.+_\d+_leaf(\d+)$/.exec(id);
+      if (m) top = Math.max(top, +m[1]);
     }
-    if (!bases.length) return 0;
-    let added = 0;
-    for (let k = 0; k < LEAF_AUTUMN_EXTRA.length; k++) {
-      // The kit's own `leaf_autumn` sits at LEAF_GREENS; these follow it.
-      const idx = LEAF_GREENS + 1 + k;
-      for (const [sp, v, p] of bases) {
-        lib.proto(`tree_${sp}_${v}_leaf${idx}`, null, LEAF_AUTUMN_EXTRA[k], {
-          geo: p.geo,
-          shared: true,
-          castShadow: p.castShadow,
-          receiveShadow: p.receiveShadow,
-          noShadow: p.noShadow,
-          noPrepass: p.noPrepass,
-          renderOrder: p.renderOrder,
-        });
-      }
-      added++;
-    }
-    return added;
+    return Math.max(0, top - LEAF_GREENS);
   }
 
   /**
@@ -380,6 +503,210 @@ export class Layout {
     }
     for (const lot of lots ?? []) this._lot(B, lot, bx, lod, rng, parked);
     if (lod === 0) this._wasteGround(B, bx, lots, rng);
+    if (lod === 0) this._placeSigns(B, bx);
+  }
+
+  /* ================================================================== */
+  /* NAMED PLACES — bridges, the mill gate, the incline station         */
+  /* ================================================================== */
+
+  /**
+   * A clear spot for a free-standing sign, searched rather than assumed.
+   *
+   * Every one of these signs stands next to something big that `world` and
+   * `buildings` placed — a bridge abutment, a blast furnace, a funicular
+   * trestle — and the sign is the only thing in the frame that will be read
+   * from two metres away, so it cannot be shoved at a nominal offset and
+   * hoped for. This walks a ring of bearings, keeps only the candidates that
+   * are dry, off the carriageway by `clear` and have headroom, and returns the
+   * one CLOSEST TO A ROAD, because a gate nobody drives past is not a gate.
+   *
+   * Returns null when nothing on the ring qualifies, and the caller then draws
+   * no sign at all.
+   */
+  /**
+   * The same search over several rings, nearest first.
+   *
+   * ONE RING IS A COIN TOSS. A landmark's own radius is where its apron ends,
+   * and whether that ring happens to contain a spot that is dry, has 6 m of
+   * lane clearance and 7 m of headroom depends entirely on what `buildings`
+   * put on the site — which is why the first pass at the mill gate placed
+   * nothing at all in `--shot=mill`. Widening the search is the fix; giving up
+   * silently is not, because a landmark with no sign is the finding.
+   */
+  _signSpotRings(cx, cz, radii, clear, headroom) {
+    for (let i = 0; i < radii.length; i++) {
+      const s = this._signSpot(cx, cz, radii[i], clear, headroom);
+      if (s) return s;
+    }
+    return null;
+  }
+
+  _signSpot(cx, cz, r, clear, headroom) {
+    const roads = this.world.roads;
+    const near = roads ? roads.edgesInRect(cx - 90, cz - 90, cx + 90, cz + 90, []) : [];
+    let best = null;
+    let bestD = Infinity;
+    /**
+     * THE ROAD IS A PREFERENCE, NOT A PRECONDITION. Scoring by distance to the
+     * nearest road puts the gate where the traffic is — but a landmark whose
+     * apron has no corridor inside the 180 m query box then scored EVERY
+     * candidate at Infinity and `d >= bestD` rejected all of them, so the
+     * Duquesne Incline came out with no station board at all. Keep the first
+     * qualifying bearing as a fallback so "no road nearby" degrades to "signed
+     * somewhere sensible" rather than to "not signed".
+     */
+    let any = null;
+    for (let i = 0; i < 24; i++) {
+      const a = (i / 24) * TAU;
+      const x = cx + Math.cos(a) * r;
+      const z = cz + Math.sin(a) * r;
+      if (this.world.isWater?.(x, z)) continue;
+      const y = this.world.heightAt(x, z);
+      if (!Number.isFinite(y)) continue;
+      if (!this._clearsLanes(x, y, z, clear)) continue;
+      if (!this._headroom(x, y, z, headroom)) continue;
+      if (!any) any = { x, y, z, a };
+      let d = Infinity;
+      for (let k = 0; k < near.length; k++) {
+        const e = near[k];
+        if (e.rail) continue;
+        const na = roads.nodes[e.a];
+        const nb = roads.nodes[e.b];
+        if (!na || !nb) continue;
+        d = Math.min(d, Math.hypot((na.x + nb.x) / 2 - x, (na.z + nb.z) / 2 - z));
+      }
+      if (d >= bestD) continue;
+      bestD = d;
+      best = { x, y, z, a };
+    }
+    return best ?? any;
+  }
+
+  /**
+   * A named plate on two posts. `lines` sets the plate's WIDTH — a two-word
+   * bridge name gets a wider plate than 'GATE 3', which is what a fabricated
+   * steel sign actually does; the plate is not a fixed rectangle the words are
+   * squeezed into.
+   */
+  _plaque(B, lines, x, y, z, yaw, mask) {
+    const rows = Array.isArray(lines) ? lines : [lines];
+    let w = 0;
+    for (const r of rows) w = Math.max(w, r.length);
+    const pw = Math.min(4.4, Math.max(1.6, w * 0.145 + 0.5));
+    const M = trs(new THREE.Matrix4(), x, y, z, yaw, pw, 1, 1);
+    B.put('plaque_posts', M, mask);
+    B.put('plaque_plate', M, mask);
+    this._type(B, rows, 'sign_pale',
+      x + Math.sin(yaw) * 0.10, y + 1.72, z + Math.cos(yaw) * 0.10, yaw,
+      pw * 0.86, 0.42, mask);
+  }
+
+  /**
+   * ─────────────────────────────────────────────────────────────────────────
+   * THE PLACES THAT HAVE NAMES IN THE PLAN TABLES.
+   * ─────────────────────────────────────────────────────────────────────────
+   * `world.bridges` and `world.landmarks` carry the names — Sixth Street
+   * Bridge, Hot Metal Bridge, the Old Blast Furnace, the Duquesne Incline —
+   * and until this pass none of them appeared anywhere a player could read.
+   * Every sign here is derived from the SHIPPED table (`world.*` at runtime,
+   * never `plan.js`, which is another subsystem's module), so a bridge that
+   * moves takes its plaque with it.
+   *
+   * TILE-INDEPENDENCE. These are world singletons, not edge-derived props, so
+   * the rule at the top of this file applies in its second form: each one is
+   * emitted by exactly the tile whose bounds contain its own anchor, which is
+   * a pure function of the anchor and therefore cannot double up or fall down
+   * a seam.
+   */
+  _placeSigns(B, bx) {
+    const mask = [0.85, 0.8, 0.4];
+
+    // ---- bridge name plaques, at both ends of every crossing -------------
+    for (const b of this.world.bridges ?? []) {
+      if (!b?.name || !b.a || !b.b) continue;
+      const dx = b.b[0] - b.a[0];
+      const dz = b.b[1] - b.a[1];
+      const l = Math.hypot(dx, dz) || 1;
+      for (const end of [0, 1]) {
+        const ax = end === 0 ? b.a[0] : b.b[0];
+        const az = end === 0 ? b.a[1] : b.b[1];
+        if (!this._in(bx, ax, az)) continue;
+        // Perpendicular to the deck, walked outward until it is off the road.
+        const px = -dz / l;
+        const pz = dx / l;
+        let spot = null;
+        for (const s of [1, -1]) {
+          for (let d = 7; d <= 16 && !spot; d += 2.5) {
+            const x = ax + px * s * d;
+            const z = az + pz * s * d;
+            if (this.world.isWater?.(x, z)) continue;
+            const y = this.world.heightAt(x, z);
+            if (!Number.isFinite(y)) continue;
+            if (!this._clearsLanes(x, y, z, 2.6)) continue;
+            spot = { x, y, z };
+          }
+          if (spot) break;
+        }
+        if (!spot) continue;
+        // Facing back along the deck, so it is read on the way onto the bridge.
+        const yaw = Math.atan2(end === 0 ? dx / l : -dx / l, end === 0 ? dz / l : -dz / l);
+        const name = String(b.name).toUpperCase();
+        const cut = name.lastIndexOf(' ');
+        this._plaque(B, cut > 0 ? [name.slice(0, cut), name.slice(cut + 1)] : [name],
+          spot.x, spot.y, spot.z, yaw, mask);
+      }
+    }
+
+    // ---- the landmarks that a working city labels ------------------------
+    for (const lm of this.world.landmarks ?? []) {
+      if (!this._in(bx, lm.x, lm.z)) continue;
+      const r = (lm.site?.r ?? 30) + 6;
+      if (lm.kind === 'mill') {
+        /**
+         * THE WORKS GATE. A riveted arch over the entrance is how every plant
+         * in this valley announced itself, and DESIGN.md's Old Blast Furnace
+         * is the district's whole identity. The arch is 7.1 m across, so the
+         * spot has to clear the carriageway by more than a plaque does.
+         */
+        const spot = this._signSpotRings(lm.x, lm.z, [r, r + 16, r + 32, r - 14], 6.0, 7);
+        if (spot) {
+          const yaw = Math.atan2(Math.cos(spot.a), Math.sin(spot.a));
+          B.put('gate_arch',
+            trs(new THREE.Matrix4(), spot.x, spot.y, spot.z, yaw), [0.9, 0.85, 0.5]);
+          this._type(B, String(lm.name).toUpperCase(), 'sign_pale',
+            spot.x + Math.sin(yaw) * 0.14, spot.y + 5.62, spot.z + Math.cos(yaw) * 0.14,
+            yaw, 6.2, 0.62, [0.9, 0.85, 0.35]);
+          this._type(B, 'STEEL ROW WORKS · GATE 3', 'sign_ink',
+            spot.x + Math.sin(yaw) * 0.14, spot.y + 4.66, spot.z + Math.cos(yaw) * 0.14,
+            yaw, 5.4, 0.30, [0.9, 0.85, 0.35]);
+          B.box('metal', spot.x, spot.y, spot.z, 7.4, 5.4, 0.6, yaw);
+          continue;
+        }
+        // A 7.4 m arch did not fit anywhere on the site. A plate on two posts
+        // needs a third of the clearance and a fifth of the headroom, and the
+        // works being NAMED matters more than the arch that names it.
+        const alt = this._signSpotRings(lm.x, lm.z, [r, r + 16, r + 32, r - 14], 3.0, 4);
+        if (!alt) continue;
+        this._plaque(B, [String(lm.name).toUpperCase(), 'STEEL ROW WORKS'],
+          alt.x, alt.y, alt.z, Math.atan2(Math.cos(alt.a), Math.sin(alt.a)), mask);
+      } else if (lm.kind === 'incline') {
+        // The funicular's lower station board. `uphill.run` is the length of
+        // the track, so the base of it is the landmark itself.
+        const spot = this._signSpotRings(lm.x, lm.z,
+          [Math.max(14, r), Math.max(14, r) + 14, Math.max(14, r) + 28], 3.0, 4);
+        if (!spot) continue;
+        const yaw = Math.atan2(Math.cos(spot.a), Math.sin(spot.a));
+        this._plaque(B, [String(lm.name).toUpperCase(), 'LOWER STATION'],
+          spot.x, spot.y, spot.z, yaw, mask);
+      } else if (lm.kind === 'market' || lm.kind === 'stadium') {
+        const spot = this._signSpotRings(lm.x, lm.z,
+          [Math.max(12, r), Math.max(12, r) + 14, Math.max(12, r) + 28], 3.0, 4);
+        if (!spot) continue;
+        const yaw = Math.atan2(Math.cos(spot.a), Math.sin(spot.a));
+        this._plaque(B, String(lm.name).toUpperCase(), spot.x, spot.y, spot.z, yaw, mask);
+      }
+    }
   }
 
   _in(bx, x, z) {
@@ -498,8 +825,31 @@ export class Layout {
           }
         }
         if (r > 0.80 && style.signage > 0.5) {
+          const byaw = yaw + Math.PI / 2;
           B.put('banner_pair', trs(new THREE.Matrix4(),
-            p.x, p.y + 4.6, p.z, yaw + Math.PI / 2, 1, 1, 1), mask);
+            p.x, p.y + 4.6, p.z, byaw, 1, 1, 1), mask);
+          /**
+           * A CIVIC BANNER WITH NOTHING ON IT IS A GREY SHEET, and two of them
+           * were the largest objects in the foreground of `--shot=hero`. A pole
+           * banner exists to name the district it hangs in, so it says so: the
+           * name comes off `world.districtAt` through `districtIdAt`, which is
+           * the same table `DISTRICT_STYLE` is keyed by, so a banner cannot
+           * name a district it is not in.
+           *
+           * Both banners of the pair, both faces of each — a banner is a
+           * printed sheet, not a decal, and reads from either side of the pole.
+           */
+          const bn = BANNER_WORDS[this.districtIdAt(p.x, p.z)] ?? BANNER_WORDS.lawren;
+          for (const s of [-1, 1]) {
+            for (const f of [-1, 1]) {
+              this._type(B, bn, 'sign_pale',
+                p.x + Math.cos(byaw) * (s * 0.32) + Math.sin(byaw) * (f * 0.03),
+                p.y + 4.6 - 0.72,
+                p.z - Math.sin(byaw) * (s * 0.32) + Math.cos(byaw) * (f * 0.03),
+                byaw + (f < 0 ? Math.PI : 0), 0.42, 1.10, mask,
+                { weight: 0.10, margin: 0.95 });
+            }
+          }
         }
         if (hash3i(seed, i, 19) < 0.30) {
           B.put('sticker_cluster', trs(new THREE.Matrix4(),
@@ -662,8 +1012,38 @@ export class Layout {
         if (lod === 0 && hash3i(nSeed, 13, 1) < 0.3) B.put('sticker_cluster', M, null);
       }
 
-      // Street name blades on one corner of every junction.
-      if (lod === 0 && hash3i(nSeed, 14, 1) < 0.42) {
+      /**
+       * ─────────────────────────────────────────────────────────────────────
+       * ONE POST PER JUNCTION, AND THE NODE — NOT THE EDGE — DECIDES.
+       * ─────────────────────────────────────────────────────────────────────
+       * `_cornerKit` runs once per (edge, side, end), so a three-way node is
+       * visited up to six times and `nSeed` differs on every visit. At p = 0.42
+       * that put two and sometimes three posts on the same corner, a few
+       * centimetres and a few percent of scale apart.
+       *
+       * That was invisible while the blades were BLANK — two coincident green
+       * plates z-fight into one green plate. It stopped being invisible the
+       * moment they carried words: MEASURED in `--shot=street`, the blade at
+       * the Bushnell/Butler corner read as its own name printed twice, offset
+       * by about a tenth of a cap height, which is what a doubled sign looks
+       * like from 40 m and reads as a rendering fault rather than as a sign.
+       *
+       * So the node elects a single owner — its lowest-numbered link, and one
+       * fixed side of it — and the 0.42 roll is taken on the NODE's own seed
+       * so the density is unchanged. Nothing else in the corner kit is
+       * deduplicated this way, deliberately: a junction really does get a stop
+       * sign per approach.
+       */
+      let ownsBlade = false;
+      if (lod === 0) {
+        let lowest = Infinity;
+        for (let li = 0; li < node.links.length; li++) {
+          if (node.links[li] < lowest) lowest = node.links[li];
+        }
+        ownsBlade = edge.id === lowest && side === ((node.id & 1) ? 1 : -1);
+      }
+      const bladeSeed = Math.imul(node.id + 1, 0x9e3779b1) >>> 0;
+      if (ownsBlade && hash3i(bladeSeed, 14, 1) < 0.42) {
         // Was `s0 - 1.6` — 1.6 m further into the junction than the stop sign.
         const p2 = this._clearCorner(edge, end, s0 + 1.6, s1 - 1.6, side, KERB_LANE + 0.5, SIGN_CLEAR);
         if (p2 && this._in(bx, p2.x, p2.z)) {
@@ -672,6 +1052,7 @@ export class Layout {
           const M = trs(new THREE.Matrix4(), p2.x, p2.y, p2.z, yaw, sc, sc, sc, (hash3i(nSeed, 17, 1) - 0.5) * 0.05);
           B.put('sign_street_post', M, mask);
           B.put('sign_street_blades', M, mask);
+          this._streetPlates(B, node, p2, yaw, sc, mask);
         }
       }
 
@@ -750,10 +1131,10 @@ export class Layout {
       { id: ['planter_timber', 'planter_soil', 'shrub_c'], w: 0.3, len: 1.6, tag: 'wood', planter: true },
       { id: ['bike_chained'], w: 0.4, len: 1.3, tag: 'metal', bike: true },
       { id: ['cone'], w: 0.35, len: 0.4, tag: 'plastic', cone: true },
-      { id: ['sign_reg', 'sign_reg_face'], w: 0.4, len: 0.4, tag: 'metal', sign: true },
-      { id: ['sign_reg', 'sign_reg_face2'], w: 0.28, len: 0.4, tag: 'metal', sign: true },
+      { id: ['sign_reg', 'sign_reg_face'], w: 0.4, len: 0.4, tag: 'metal', sign: true, plates: 'reg' },
+      { id: ['sign_reg', 'sign_reg_face2'], w: 0.28, len: 0.4, tag: 'metal', sign: true, plates: 'reg2' },
       { id: ['sign_warn', 'sign_warn_face'], w: 0.22, len: 0.4, tag: 'metal', sign: true },
-      { id: ['sign_reg', 'sign_oneway_face'], w: 0.2, len: 0.4, tag: 'metal', sign: true },
+      { id: ['sign_reg', 'sign_oneway_face'], w: 0.2, len: 0.4, tag: 'metal', sign: true, plates: 'oneway' },
       { id: ['standpipe'], w: 0.12, len: 0.5, tag: 'metal' },
       { id: ['rail_guard'], w: 0.35, len: 2.0, tag: 'metal', rail: true },
     ];
@@ -821,6 +1202,7 @@ export class Layout {
       const M = trs(new THREE.Matrix4(), p.x, p.y, p.z, yaw, sc,
         sc * (0.94 + hash3i(seed, i, 61) * 0.13), sc, tiltA, tiltB);
       for (const id of fam.id) B.put(id, M, mask);
+      if (fam.plates) this._regLegend(B, fam.plates, M, yaw, sc, seed, i);
       if (fam.cone) {
         B.put('cone_band', M, null);
         // cones come in threes
@@ -1291,6 +1673,224 @@ export class Layout {
     return hits >= need;
   }
 
+  /* ================================================================== */
+  /* SIGNAGE — what the city actually SAYS                              */
+  /* ================================================================== */
+
+  /**
+   * ───────────────────────────────────────────────────────────────────────
+   * THE AUTHORED NAMES, AND WHY THEY BEAT THE VOCABULARY.
+   * ───────────────────────────────────────────────────────────────────────
+   * Most shopfronts get a name out of `SIGN_WORDS` chosen by their own mount
+   * seed, and that is fine — they are set dressing. But six of them are not:
+   * DeCarlo Body Shop is a SAFEHOUSE, Rustbelt Respray is the one hard heat
+   * reset in the game, Foundry Supply and Row Hardware sell ammunition,
+   * Primo's Sandwich and the Incline Diner sell health, and every gas station
+   * is a fuel stop. A player told to "get to the respray" and standing in
+   * front of a building signed LADLE & SPOON has been lied to by the art.
+   *
+   * So the frontage pass asks this first, and an authored hit OVERRIDES both
+   * the name and the "does this unit trade at all" roll. The coordinates come
+   * from `world` at runtime (`world.pois`, `world.safehouses`) — never from
+   * `game/data.js`, which is another subsystem's module (rule 2) — and
+   * `world.pois` is the RESOLVED table, i.e. where the forecourt actually
+   * ended up after `resolvePoi` walked it off a river or a carriageway, not
+   * where the plan wished it were.
+   */
+  _namedSites() {
+    if (this._sites) return this._sites;
+    const out = [];
+    const add = (p, r, kind) => {
+      if (!p || !p.name) return;
+      const x = +p.x;
+      const z = +p.z;
+      if (!Number.isFinite(x) || !Number.isFinite(z)) return;
+      out.push({ x, z, r, kind, name: String(p.name).toUpperCase() });
+    };
+    // A shop frontage is signed if the unit's own centre is within `r` of the
+    // POI. 34 m is the forecourt radius (`POI_PAD.r` is 17) plus the depth of
+    // the lot behind it — wide enough that the building fronting the pad is
+    // caught, tight enough that its neighbour across the junction is not.
+    for (const p of this.world.pois ?? []) add(p, 34, p.kind ?? 'service');
+    for (const s of this.world.safehouses ?? []) add(s, 30, 'safehouse');
+    this._sites = out;
+    return out;
+  }
+
+  /** The authored name for a frontage at (x, z), or null. Nearest wins. */
+  _authoredName(x, z) {
+    const sites = this._namedSites();
+    let best = null;
+    let bestD = Infinity;
+    for (let i = 0; i < sites.length; i++) {
+      const s = sites[i];
+      const d = Math.hypot(s.x - x, s.z - z);
+      if (d > s.r || d >= bestD) continue;
+      bestD = d;
+      best = s;
+    }
+    return best;
+  }
+
+  /**
+   * Draw one piece of type, fitted to a field, at UNIFORM scale.
+   *
+   * `fw`/`fh` is the board's usable field in metres and the word is scaled to
+   * fill it — never stretched to it. Returns false when the word would land
+   * under `fitScale`'s legibility floor, and the caller then draws nothing:
+   * the "blank rectangles standing in for signage" finding is a sign that was
+   * drawn too small to read, not a sign that was missing.
+   */
+  _type(B, lines, surface, x, y, z, yaw, fw, fh, mask = null, opts = null) {
+    if (noSigns()) return false;
+    const id = signTextProto(B.lib, lines, surface, opts ?? undefined);
+    const s = fitScale(B.lib, id, fw, fh, opts?.margin ?? 0.86);
+    if (!s) return false;
+    B.put(id, trs(new THREE.Matrix4(), x, y, z, yaw, s, s, s), mask);
+    return true;
+  }
+
+  /**
+   * ───────────────────────────────────────────────────────────────────────
+   * STREET NAME BLADES — the wayfinding layer nobody could read.
+   * ───────────────────────────────────────────────────────────────────────
+   * `sign_street_blades` is two crossed green plates on a cast bracket and it
+   * has been in the city since the street kit landed, blank. The names exist:
+   * `world.streetAt(x, z)` speaks the full Pittsburgh vocabulary — the grid
+   * names out of `plan.DISTRICT_STREETS` and the connectors `netgen` names by
+   * hand — and the minimap has been using them all along.
+   *
+   * WHICH TWO NAMES. A junction node carries its links; sampling `streetAt` at
+   * the MIDPOINT of each linked edge asks the public API what that road is
+   * called rather than reaching into `edge.name` / `corridorStreetName`, which
+   * are `world`'s internals. Two DISTINCT names are then taken in link order,
+   * which is what a corner plate says: the street you are on and the one you
+   * are crossing. A node whose links all resolve to one name (a bend, or a
+   * corridor that continues) gets one plate, not two of the same.
+   *
+   * Both faces of both plates, four instances of type, because a blade with a
+   * name on one side only is a sign that is blank from half the junction.
+   */
+  _streetPlates(B, node, p, yaw, sc, mask) {
+    const g = this.world.roads;
+    if (!g || !this.world.streetAt) return;
+    const names = [];
+    for (let i = 0; i < node.links.length && names.length < 2; i++) {
+      const e = g.edges[node.links[i]];
+      if (!e || e.rail) continue;
+      const na = g.nodes[e.a];
+      const nb = g.nodes[e.b];
+      if (!na || !nb) continue;
+      const t = this.world.streetAt((na.x + nb.x) / 2, (na.z + nb.z) / 2);
+      const plate = streetPlateText(t);
+      if (plate && !names.includes(plate)) names.push(plate);
+    }
+    if (!names.length) return;
+    // The two plates of `sign_street_blades`: 1.05 x 0.20 at y 2.92 facing +Z,
+    // and the same rotated a quarter turn at y 2.68. Both are at unit scale in
+    // the prototype, so everything here rides the placement's own `sc`.
+    const decks = [{ y: 2.92, ry: 0 }, { y: 2.68, ry: Math.PI / 2 }];
+    for (let k = 0; k < names.length && k < 2; k++) {
+      const d = decks[k];
+      for (const s of [-1, 1]) {
+        const a = yaw + d.ry + (s < 0 ? Math.PI : 0);
+        // 18 mm off the plate's own centre plane: the plate is a 12 mm box
+        // bowed 4 mm, so this is ~8 mm of relief — a painted legend, not a
+        // set of letters floating in front of the sign.
+        this._type(B, names[k], 'sign_pale',
+          p.x + Math.sin(a) * 0.018 * sc, p.y + d.y * sc, p.z + Math.cos(a) * 0.018 * sc,
+          a, 0.92 * sc, 0.125 * sc, mask);
+      }
+    }
+  }
+
+  /**
+   * ───────────────────────────────────────────────────────────────────────
+   * THE REGULATORY PLATES, WHICH WERE BLANK.
+   * ───────────────────────────────────────────────────────────────────────
+   * `sign_reg_face`, `sign_reg_face2` and `sign_oneway_face` are white plates
+   * on a 2.6 m post and this file plants a lot of them — they are four of the
+   * twenty-eight families in the kerb walk. Every one of them shipped with
+   * NOTHING ON IT, and a white rectangle on a pole a few metres from the lens
+   * is the single most conspicuous version of the "blank rectangles standing
+   * in for signage" defect there is: FOUND BY MEASUREMENT, not by reading the
+   * kit — a raycast through the `detail` frame at (365, 180) and (365, 290)
+   * lands on `p-2_0:sign_white` / `sign_reg` at 13.0 m, two grey panels
+   * stacked on one post filling 160 px of a 1080p frame with no legend.
+   *
+   * They predate the signage system rather than being excluded from it: the
+   * shopfront fascias, blades, ghost signs, street blades and hoardings were
+   * all typed when `kit_sign.js` landed, and the street kit's own plates —
+   * which are older — were never revisited.
+   *
+   * ONE LEGEND PER PLATE, PICKED BY THE POST'S OWN HASH, so a street does not
+   * repeat and a re-run does not change. Below `fitScale`'s legibility floor
+   * `_type` draws nothing at all and the plate stays blank, which is the right
+   * failure: an unreadable smear of type is worse than a plain plate.
+   */
+  _regLegend(B, kind, M, yaw, sc, seed, i) {
+    const spec = REG_PLATES[kind];
+    if (!spec) return;
+    for (let k = 0; k < spec.length; k++) {
+      const d = spec[k];
+      const list = d.words;
+      const lines = list[Math.floor(hash3i(seed, i, 84 + k) * list.length) % list.length];
+      /**
+       * THE ANCHOR RIDES THE SIGN'S OWN MATRIX, and it has to.
+       *
+       * The obvious version of this — `p.x + Math.sin(yaw) * z`, the way
+       * `_streetPlates` offsets a blade — was written first and MEASURED
+       * WRONG: the legend landed 13 mm INSIDE the plate and rendered nothing
+       * at all, because a post also carries a lean (`tiltA`/`tiltB`) and a
+       * non-uniform height scale, and reconstructing its plane by hand from
+       * the yaw alone drops both. Pushing the same offset out to 0.30 m for a
+       * diagnostic capture put the words 26 cm to the SIDE of the sign, in
+       * mid-air over the building behind it, which is what that error looks
+       * like when it is big enough to see.
+       *
+       * So the plate's own placement matrix transforms the plate's own local
+       * anchor: `(0, y, 0.045)` in the frame `registerSigns` authored the face
+       * in. 45 mm is 11 mm proud of that face — `signFace` is a 12 mm box
+       * bowed 6 mm whose centre sits 22 mm off the post — which is a painted
+       * legend rather than letters floating in front of a sign, and it stays
+       * 11 mm whatever the post's scale and lean happen to be.
+       */
+      _v.set(0, d.y, 0.045).applyMatrix4(M);
+      this._type(B, lines, 'sign_ink', _v.x, _v.y, _v.z,
+        yaw, d.w * sc, d.h * sc, [0.5, 0.55, 0.3]);
+    }
+  }
+
+  /**
+   * A neon word: emissive tube core, dead tubes in cold glass, additive halo.
+   *
+   * The three go on TOGETHER or not at all — a halo with no word in it is a
+   * glowing smear, which is what an early pass at this looked like when the
+   * word failed its own fit test and the halo did not.
+   */
+  _neonWord(B, text, key, x, y, z, yaw, nx, nz, fw, mask = null) {
+    if (noSigns()) return false;
+    const n = neonWordProto(B.lib, text, key);
+    if (!n.id || !n.w) return false;
+    // Tube geometry is authored at cap height 1, so the scale that fits the
+    // field is the field over the word's own em width. Clamped: a two-letter
+    // word on a five-metre fascia is not a 2.5 m tall letter.
+    const s = Math.min(0.42, (fw * 0.8) / n.w);
+    if (s < 0.09) return false;
+    const M = trs(new THREE.Matrix4(), x, y, z, yaw, s, s, s);
+    B.put(n.id, M, mask);
+    if (n.dead) B.put(n.dead, M, [0.8, 0.9, 0.4]);
+    // The halo sits 3 cm BEHIND the tubes, which is where the glass actually
+    // is. Coplanar with them it brightens the core instead of surrounding it,
+    // and coplanar with the WALL it z-fights — the caller has already stood
+    // the word off the brick, so this only has to stay inside that gap.
+    if (n.halo) {
+      B.put(n.halo, trs(new THREE.Matrix4(), x - nx * 0.03, y, z - nz * 0.03,
+        yaw, s * 1.15, s * 1.1, 1), null);
+    }
+    return true;
+  }
+
   _lot(B, lot, bx, lod, rng, parked = null, wallOut = null) {
     const foot = lot.footprint;
     if (!foot || foot.length < 3) return;
@@ -1354,6 +1954,9 @@ export class Layout {
 
     if (lod !== 0) return;
 
+    // ---- the roof: a hoarding on the tall flat-topped lots ---------------
+    this._rooftopBoard(B, lot, seed, style);
+
     // ---- the other walls: ghost signs, ivy, tags, posters, scaffolding ---
     for (let i = 0; i < foot.length; i++) {
       const a = foot[i];
@@ -1404,7 +2007,18 @@ export class Layout {
        * corners have a wall behind them. It also walks DOWN the wall first, so
        * a sign whose top overhangs the roof is lowered rather than dropped.
        */
-      if (!isFront && len > 9 && (lot.height ?? 0) > 9 && hash3i(wSeed, 1, 1) < 0.30
+      /**
+       * A GHOST SIGN IS A DISTRICT'S AGE, NOT ITS SIGNAGE BUDGET. It advertises
+       * a company that closed fifty years ago, so it belongs on the brick of
+       * the mill districts and the rowhouse streets and NOT on a glass tower or
+       * in a park — the flat 0.30 put as many on the Golden Triangle as on
+       * Steel Row. The weights below are the age of the fabric, which is why
+       * they do not come from `style.signage`.
+       */
+      const ghostAge = { mill: 1.5, row: 1.25, market: 1.15, hill: 0.8, civic: 0.6,
+        core: 0.35, park: 0.1 }[style.kind] ?? 1.0;
+      if (!isFront && len > 9 && (lot.height ?? 0) > 9
+          && hash3i(wSeed, 1, 1) < 0.30 * ghostAge
           && this._wallKnown) {
         const gw = Math.min(len - 2.4, 10 + hash3i(wSeed, 2, 1) * 8);
         const gh = Math.min((lot.height ?? 10) - 4.5, 5 + hash3i(wSeed, 3, 1) * 6);
@@ -1418,7 +2032,44 @@ export class Layout {
             yaw, gw, gh, 1);
           if (!this._wallBacked('ghost_field', M, nx, nz, 4)) continue;
           B.put('ghost_field', M, [0.6 + hash3i(wSeed, 5, 1) * 0.6, 0.6, 0.3]);
-          B.put('ghost_letters', M, null);
+          /**
+           * ─────────────────────────────────────────────────────────────────
+           * THE GHOST SIGN — a fifty-year-old painted advert for a company
+           * that closed, and the single most Pittsburgh texture there is.
+           * ─────────────────────────────────────────────────────────────────
+           * `ghost_letters` was a unit-square block of abstract bars stretched
+           * with the field. It goes; the field keeps the non-uniform stretch
+           * (it is a stain, and a stain does not mind) and the WORDS go on
+           * separately at uniform scale out of `SIGN_WORDS.ghost`.
+           *
+           * WHAT MAKES IT A GHOST AND NOT A SIGN is the `wear` callback: the
+           * mask is driven by a two-octave noise field in the sign's own
+           * space, so the paint survives in patches and is scoured to nothing
+           * across the middle of the wall. Vertical banding on top of it is
+           * the mortar courses drinking the lead white out of the paint — the
+           * reason a real ghost sign fades in STRIPES rather than evenly.
+           * The layout does not choose where it fades; the wall does.
+           */
+          const gAds = SIGN_WORDS.ghost;
+          const ad = gAds[Math.floor(hash3i(wSeed, 60, 1) * gAds.length) % gAds.length];
+          const age = 0.45 + hash3i(wSeed, 61, 1) * 0.5;
+          this._type(B, ad, 'ghost_ink',
+            cx + nx * (push + 0.03), gy + gh / 2, cz + nz * (push + 0.03), yaw,
+            gw * 0.82, gh * 0.66,
+            [0.75 + hash3i(wSeed, 62, 1) * 0.25, 0.85, 0.25],
+            {
+              key: `ghost${Math.round(age * 6)}`,
+              weight: 0.105,
+              leading: 1.5,
+              wear: (x, y, w, h) => {
+                const patch = smoothNoise(x * 1.7 + 3.1, y * 1.9 - 5.4);
+                const fine = smoothNoise(x * 6.1 - 1.7, y * 5.3 + 2.2);
+                const course = 0.5 + 0.5 * Math.sin(y * 21.0);
+                const scour = clamp01(0.35 + 0.9 * patch + 0.35 * (fine - 0.5)
+                  - 0.25 * course) * age;
+                return [clamp01(0.35 + scour), clamp01(0.55 + 0.45 * (1 - scour)), 0.15];
+              },
+            });
           break;
         }
       }
@@ -1534,7 +2185,52 @@ export class Layout {
       if (push === null) continue;
       const cx = pcx + nx * (0.10 + push);
       const cz = pcz + nz * (0.10 + push);
-      const trades = shopish && hash3i(uSeed, 2, 2) < 0.62 + style.signage * 0.25;
+      /**
+       * WHAT THIS SHOP IS CALLED, decided once for the unit so the fascia, the
+       * blade and the window all agree. An authored site wins outright and
+       * also forces the unit to trade — see `_namedSites`.
+       */
+      const site = this._authoredName(pcx, pcz);
+      /**
+       * HOW MANY UNITS ON THIS FRONTAGE ACTUALLY TRADE — and this coefficient
+       * is the one that decides whether twelve districts read as twelve
+       * places. It was `0.62 + signage * 0.25`, which maps `style.signage`'s
+       * full 0.15 to 1.30 range onto 0.66 to 0.95: the market street and the
+       * clifftop terrace differed by three shops in ten and the city read as
+       * one commercial strip laid down everywhere.
+       *
+       * MEASURED with `signprobe.mjs`, identical lots in every district: the
+       * old curve put the Strip + Lawrenceville at 1.34x Mt Washington + Troy
+       * Hill. The rubric asks for the Strip and Butler Street DENSE and the
+       * residential hills SPARSE, so the slope is now the dominant term.
+       */
+      const trades = !!site || (shopish && hash3i(uSeed, 2, 2) < 0.40 + style.signage * 0.46);
+      const words = shopWords(style.kind);
+      const name = site
+        ? site.name
+        : words[Math.floor(hash3i(uSeed, 44, 2) * words.length) % words.length];
+      /**
+       * Two lines once the name is longer than the board is wide. `fitScale`
+       * would otherwise honour the request and shrink 'FORTIETH ST LAUNDRY' to
+       * 55 mm caps on a 4 m fascia, which is a sign nobody can read — and an
+       * illegible sign is the finding, not a missing one. The split is at the
+       * space nearest the middle, which is where a sign writer puts it.
+       */
+      const nameLines = (() => {
+        if (name.length <= 13 || !name.includes(' ')) return [name];
+        let cut = -1;
+        let bestD = Infinity;
+        for (let k = 0; k < name.length; k++) {
+          if (name[k] !== ' ') continue;
+          const d = Math.abs(k - name.length / 2);
+          if (d < bestD) {
+            bestD = d;
+            cut = k;
+          }
+        }
+        return cut > 0 ? [name.slice(0, cut), name.slice(cut + 1)] : [name];
+      })();
+      const ink = pickInk(style.kind, hash3i(uSeed, 45, 2));
 
       // --- the fascia board ---------------------------------------------
       if (trades) {
@@ -1543,8 +2239,9 @@ export class Layout {
         const M = trs(new THREE.Matrix4(), cx, fy, cz, yaw + (hash3i(uSeed, 5, 2) - 0.5) * 0.02,
           fw, 0.85 + hash3i(uSeed, 6, 2) * 0.35, 1);
         const fmask = [0.6 + hash3i(uSeed, 7, 2) * 0.7, 0.6 + hash3i(uSeed, 8, 2) * 0.6, 0.5];
+        const panel = PANELS[(u + pOff) % PANELS.length];
         B.put('fascia_board', M, fmask);
-        B.put(`fascia_face_${PANELS[(u + pOff) % PANELS.length]}`, M,
+        B.put(`fascia_face_${panel}`, M,
           [0.5 + hash3i(uSeed, 40, 2) * 0.8, 0.5 + hash3i(uSeed, 41, 2) * 0.8, 0.4]);
         // The gooseneck lamps go on at UNIFORM scale, at the board's own ends.
         for (const sgn of [-1, 1]) {
@@ -1553,21 +2250,38 @@ export class Layout {
           B.put('fascia_lamp', trs(new THREE.Matrix4(), lx, fy, lz, yaw), fmask);
         }
         /**
-         * The word goes on at UNIFORM scale. Riding the board's x-stretch turned
-         * 4 cm strokes into 25 cm slabs and the sign read as a row of lit panels
-         * rather than as lettering.
+         * ───────────────────────────────────────────────────────────────────
+         * THE SHOP'S NAME, IN WORDS. This is the finding the wave is answering:
+         * "a signless, empty world — no billboards, storefronts, shop names".
+         * ───────────────────────────────────────────────────────────────────
+         * What was here was a row of abstract neon glyphs in the district's
+         * colour: correct as a light source, and completely mute. It is now
+         * real type, at UNIFORM scale (see `_type`), in one of three inks
+         * chosen by district era and for contrast against the panel the board
+         * was just painted (`inkSurface`).
          *
-         * It also goes on ALMOST ALWAYS, and it is sized to the board. The
-         * prototype word is ~1.45 m across, so the scale that fills 60% of a
-         * frontage is fw*0.6/1.45 — under the old cap of 1.35 a five-metre
-         * fascia carried a 0.9 m smudge in the middle of a blank cream panel,
-         * which is the "blank rectangles standing in for signage" finding.
+         * The board field is the face's own reveal, not the board's outline:
+         * `fascia_face_*` runs 0.94 wide by 0.48 tall about a centre 0.07 up,
+         * and the type has to stay inside the two reveal rails or it reads as
+         * lettering that has slipped off its sign.
          */
-        if (hash3i(uSeed, 9, 2) < 0.88) {
-          const ls = Math.min(2.3, Math.max(0.72, (fw * 0.62) / 1.45));
-          B.put(`fascia_letters_${neon[u % neon.length]}`,
-            trs(new THREE.Matrix4(), cx, fy, cz, yaw, ls, ls, 1), null);
-        }
+        const bandY = fy + (0.85 + hash3i(uSeed, 6, 2) * 0.35) * 0.07;
+        const bandH = (0.85 + hash3i(uSeed, 6, 2) * 0.35) * 0.40;
+        /**
+         * `shop_lit` IS THE BACKLIT BOX, and it needs no case behind it. An
+         * `EMISSIVE` entry resolves to `color 0x0a0a0a + emissive`, so by day
+         * these letters are near-black plastic pans and after dark
+         * `props._driveLights` runs them up — which is exactly the life of an
+         * internally-lit fascia and is most of what separates the three eras
+         * at night. An early pass put a `neon_backer` behind them; the board
+         * is 0.14 m deep and the backer landed INSIDE it.
+         */
+        const inkKey = inkSurface(ink, panel);
+        this._type(B, nameLines, inkKey,
+          cx + nx * 0.17, bandY, cz + nz * 0.17, yaw, fw * 0.94, bandH,
+          inkKey === 'shop_lit' ? null
+            : [0.55 + hash3i(uSeed, 46, 2) * 0.7, 0.5 + hash3i(uSeed, 47, 2) * 0.7, 0.3],
+          { margin: 0.94 });
       }
 
       // --- a projecting blade sign --------------------------------------
@@ -1580,6 +2294,31 @@ export class Layout {
         B.put('blade_bracket', M, [0.7, 0.8, 0.5]);
         B.put('blade_panel', M, [0.7, 0.8, 0.5]);
         B.put(`blade_face_${neon[(u + 1) % neon.length]}`, M, null);
+        /**
+         * ONE WORD, ON BOTH FACES, READING THE RIGHT WAY ROUND FROM EACH SIDE.
+         *
+         * A blade projects at right angles to the wall, so its faces are the
+         * two sides of the panel and their normals are the wall's TANGENT, not
+         * its normal. `trs` only gives yaw, and yaw +/- PI/2 is exactly the pair
+         * that puts +Z' on each face — and, checked rather than assumed, each
+         * one's +X' then runs left-to-right for the viewer standing on THAT
+         * side. Draw one instance per face and neither is mirrored.
+         *
+         * The panel is 0.86 deep and 0.78 tall at unit scale, centred 0.42 out
+         * and 0.12 down; the neon border eats 0.36 of it, so the word gets what
+         * is left inside.
+         */
+        const bw = SIGN_WORDS.blade;
+        const word = bw[Math.floor(hash3i(uSeed, 48, 2) * bw.length) % bw.length];
+        const bcx = px + nx * (0.42 * sc);
+        const bcz = pz + nz * (0.42 * sc);
+        const bcy = py - 0.12 * sc;
+        const bmask = [0.7 + hash3i(uSeed, 49, 2) * 0.5, 0.7, 0.35];
+        for (const s of [-1, 1]) {
+          this._type(B, word, 'sign_pale',
+            bcx + ux * (s * 0.034 * sc), bcy, bcz + uz * (s * 0.034 * sc),
+            yaw + s * Math.PI / 2, 0.62 * sc, 0.52 * sc, bmask);
+        }
       }
 
       // --- a big neon on the wall ---------------------------------------
@@ -1588,7 +2327,24 @@ export class Layout {
         const sc = 0.8 + hash3i(uSeed, 15, 2) * 0.7;
         const M = trs(new THREE.Matrix4(), cx, py, cz, yaw, sc, sc, sc);
         B.put('neon_backer', M, [0.7, 0.85, 0.5]);
-        B.put(`neon_${Math.floor(hash3i(uSeed, 16, 2) * 6)}_${neon[(u + 2) % neon.length]}`, M, null);
+        /**
+         * HALF THE WALL NEONS NOW SAY SOMETHING. The abstract family — the
+         * squiggle, the ring, the martini glass, the OPEN box — is the right
+         * answer for a bar's window and the WRONG one for the whole city: a
+         * street of six shapes and no words is the "signless world" finding
+         * with the lights on. So a coin decides between the shape kit and a
+         * readable tube word out of `SIGN_WORDS.neon`, and the word carries a
+         * halo and its own dead tubes (see `_neonWord`).
+         */
+        const key = neon[(u + 2) % neon.length];
+        const nw = SIGN_WORDS.neon;
+        if (hash3i(uSeed, 50, 2) < 0.55
+          && this._neonWord(B, nw[Math.floor(hash3i(uSeed, 51, 2) * nw.length) % nw.length],
+            key, cx + nx * 0.10, py - 0.46 * sc, cz + nz * 0.10, yaw, nx, nz, 1.35 * sc, null)) {
+          // the word took the backer's field; nothing else goes on it
+        } else {
+          B.put(`neon_${Math.floor(hash3i(uSeed, 16, 2) * 6)}_${key}`, M, null);
+        }
       }
 
       /**
@@ -1607,9 +2363,33 @@ export class Layout {
         B.put('blade_tall_frame', M, [0.8, 0.9, 0.5]);
         // the frame is a ladder 0.95 m deep, hung off the wall: the sign sits on
         // its centre plane, facing along the street rather than out of the wall.
-        B.put(`neon_vert_${neon[u % neon.length]}`,
-          trs(new THREE.Matrix4(), cx + nx * 0.575, py - 1.80, cz + nz * 0.575,
-            yaw + Math.PI / 2), null);
+        const vkey = neon[u % neon.length];
+        /**
+         * THE THEATRE BUG NOW SPELLS SOMETHING. A vertical sign is one letter
+         * per line, which is what `buildTextGeo`'s multi-line layout already
+         * is — so H O T E L is a five-row block with a one-glyph row, no new
+         * machinery. It goes on BOTH faces at yaw +/- PI/2, for the same reason
+         * the blade word does: this sign faces along the street, not out of the
+         * wall, and each side needs its own instance to read the right way.
+         *
+         * `neon_vert_*` stays as the fallback for the words the frame cannot
+         * hold at a legible cap height — it is abstract, but a 4 cm letter is
+         * worse than an abstract one.
+         */
+        const vw = ['HOTEL', 'DINER', 'ROOMS', 'LOANS', 'CAFE', 'GRAND', 'PALACE'];
+        const vword = vw[Math.floor(hash3i(uSeed, 52, 2) * vw.length) % vw.length];
+        let drewVert = false;
+        for (const s of [-1, 1]) {
+          drewVert = this._type(B, vword.split(''), vkey,
+            cx + nx * 0.575 + ux * (s * 0.06), py - 1.80, cz + nz * 0.575 + uz * (s * 0.06),
+            yaw + s * Math.PI / 2, 0.80, 3.10, null, { weight: 0.10, leading: 1.30 })
+            || drewVert;
+        }
+        if (!drewVert) {
+          B.put(`neon_vert_${vkey}`,
+            trs(new THREE.Matrix4(), cx + nx * 0.575, py - 1.80, cz + nz * 0.575,
+              yaw + Math.PI / 2), null);
+        }
       }
 
       if (lod !== 0) continue;
@@ -1829,7 +2609,145 @@ export class Layout {
       B.put('billboard_face', M, [0.8, 0.8, 0.3]);
       B.put('billboard_art', M, [0.75, 0.85, 0.3]);
       B.put('billboard_lit', M, null);
+      /**
+       * THE COPY. `billboard_art` is the image block and the strapline RULES —
+       * grey bars standing in for type, which read as an unfinished poster in
+       * every capture. The words go on top of them out of `SIGN_WORDS.billboard`:
+       * a headline and a strapline, both original Steel City products (the
+       * radio stations and the marques from DESIGN.md, the motor oil, the
+       * coffee). The art block occupies the left third of the panel, so the
+       * type is set in the right two thirds and centred there.
+       */
+      const ads = SIGN_WORDS.billboard;
+      const ad = ads[Math.floor(hash3i(seed, 32, 1) * ads.length) % ads.length];
+      const yawB = yaw + (hash3i(seed, 31, 1) - 0.5) * 0.2;
+      const bnx = Math.sin(yawB);
+      const bnz = Math.cos(yawB);
+      const bux = Math.cos(yawB);
+      const buz = -Math.sin(yawB);
+      const gy = this.world.heightAt(px, pz);
+      this._type(B, [ad[0]], 'sign_ink',
+        px + bux * 0.95 + bnx * 0.13, gy + 5.17, pz + buz * 0.95 + bnz * 0.13,
+        yawB, 2.8, 0.38, [0.85, 0.7, 0.2]);
+      this._type(B, [ad[1]], 'sign_ink',
+        px + bux * 1.30 + bnx * 0.13, gy + 3.99, pz + buz * 1.30 + bnz * 0.13,
+        yawB, 2.0, 0.20, [0.9, 0.75, 0.2]);
     }
+  }
+
+  /**
+   * ─────────────────────────────────────────────────────────────────────────
+   * ROOFTOP HOARDINGS — the skyline's half of the signage layer.
+   * ─────────────────────────────────────────────────────────────────────────
+   * `tile.js`'s mount contract publishes a 'billboard' anchor on the roof deck
+   * of tall flat-roofed archetypes, and that is the right shape for this. It is
+   * NOT what this reads, and the reason is worth stating rather than hiding: a
+   * mount array lives on the near BUILDING tile's group, `props` builds its own
+   * tiles from `world.lotsInTile` and holds no reference to the buildings
+   * subsystem, and reaching for one would be exactly the cross-subsystem import
+   * rule 2 forbids.
+   *
+   * So this derives the anchor from the same inputs the mount does — the lot
+   * polygon, its height, the street it faces — and then VERIFIES it against
+   * the built world with a downward ray, which the mount pass cannot do because
+   * it runs before its own colliders exist. A hoarding is only drawn where
+   * physics agrees there is a deck under all four feet at roughly the height
+   * the lot record claims. That is a stronger guarantee than the contract
+   * offers, and it is what stops the "two floating illegible billboards in
+   * mid-air" defect coming back at roof height.
+   */
+  _rooftopBoard(B, lot, seed, style) {
+    const foot = lot.footprint;
+    const h = lot.height ?? 0;
+    if (!foot || foot.length < 3 || h < 16) return;
+    if (hash3i(seed, 70, 1) > 0.16 + style.signage * 0.14) return;
+    const phys = this._phys();
+    if (!phys?.raycast) return;
+    const baseY = this._lotGround(lot);
+
+    // The street-facing edge: the longest one whose outward normal points away
+    // from the lot centroid and which is long enough to carry the board.
+    let best = null;
+    for (let i = 0; i < foot.length; i++) {
+      const a = foot[i];
+      const b = foot[(i + 1) % foot.length];
+      const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      if (len < 9) continue;
+      if (!best || len > best.len) {
+        const ux = (b[0] - a[0]) / len;
+        const uz = (b[1] - a[1]) / len;
+        let nx = uz;
+        let nz = -ux;
+        const mx = (a[0] + b[0]) / 2;
+        const mz = (a[1] + b[1]) / 2;
+        if (nx * (mx - lot.cx) + nz * (mz - lot.cz) < 0) {
+          nx = -nx;
+          nz = -nz;
+        }
+        best = { len, ux, uz, nx, nz, mx, mz };
+      }
+    }
+    if (!best) return;
+
+    /**
+     * IS THERE A ROOF THERE? Four rays down the board's own footprint from
+     * well above it. `lot.height` is what `world` ASKED for; `buildings` sets
+     * back, steps and pitches its massing, so on a stepped tower the deck at
+     * the parapet line is metres below the lot record and on a pitched roof
+     * there is no deck at all. Requiring all four feet inside 1.6 m of each
+     * other rejects both without this file knowing anything about archetypes.
+     */
+    const bw = Math.min(best.len - 3.0, 13);
+    const inset = 2.2;
+    const ox = best.mx - best.nx * inset;
+    const oz = best.mz - best.nz * inset;
+    let deck = 0;
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (let k = 0; k < 4; k++) {
+      const t = (k - 1.5) / 1.5;
+      const sx = ox + best.ux * (t * bw * 0.5) - best.nx * (k & 1 ? 0.8 : 0);
+      const sz = oz + best.uz * (t * bw * 0.5) - best.nz * (k & 1 ? 0.8 : 0);
+      const hit = phys.raycast(sx, baseY + h + 14, sz, 0, -1, 0, h + 22, phys.MASK?.WORLD);
+      if (!hit?.hit) return;
+      const y = hit.point.y;
+      if (y < baseY + 10) return; // that is the ground, not a roof
+      lo = Math.min(lo, y);
+      hi = Math.max(hi, y);
+      deck += y;
+    }
+    if (hi - lo > 1.6) return; // stepped or pitched: no deck to stand on
+    deck /= 4;
+
+    const bh = Math.min(5.6, Math.max(3.2, h * 0.20));
+    const yaw = Math.atan2(best.nx, best.nz);
+    const mask = [0.75 + hash3i(seed, 71, 1) * 0.5, 0.85, 0.4];
+    /**
+     * NON-UNIFORM SCALE IS SAFE HERE ONLY BECAUSE THE FRAME IS ALL BOXES. See
+     * `roof_board_frame` — the raked back stay is a rotated box and not a
+     * tube, for exactly this reason: a 48 mm round section stretched thirteen
+     * times in x is a ribbon, which is the trap `fascia_board` documents.
+     *
+     * Z IS NEVER SCALED. The section of a post and the depth of the back stay
+     * are properties of the steel, not of how tall the hoarding is; scaling z
+     * with the height gave a 4 m board 0.64 m deep legs and swallowed its own
+     * poster, which sits at z = 0.13.
+     */
+    B.put('roof_board_frame',
+      trs(new THREE.Matrix4(), ox, deck, oz, yaw, bw, bh, 1), mask);
+    B.put('roof_board_face',
+      trs(new THREE.Matrix4(), ox, deck, oz, yaw, bw, bh, 1), [0.8, 0.8, 0.3]);
+
+    const ads = SIGN_WORDS.billboard;
+    const ad = ads[Math.floor(hash3i(seed, 72, 1) * ads.length) % ads.length];
+    // The face runs 0.98 x 0.60 about (0, 0.68) at unit scale: headline in the
+    // top two thirds, strapline under it, both inside the paper.
+    this._type(B, [ad[0]], 'sign_ink',
+      ox + best.nx * 0.17, deck + bh * 0.80, oz + best.nz * 0.17, yaw,
+      bw * 0.86, bh * 0.26, [0.9, 0.7, 0.25]);
+    this._type(B, [ad[1]], 'sign_ink',
+      ox + best.nx * 0.17, deck + bh * 0.55, oz + best.nz * 0.17, yaw,
+      bw * 0.72, bh * 0.15, [0.9, 0.75, 0.25]);
   }
 
   /* -------------------------------------------- verges and waste ground -- */

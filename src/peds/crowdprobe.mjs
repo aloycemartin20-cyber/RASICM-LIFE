@@ -45,6 +45,37 @@
  * spawn in front of that camera at that hour. This walks every archetype and
  * every silhouette the wardrobe can produce.
  *
+ * ---------------------------------------------------------------------------
+ * 7 GROUND — the one thing here that is not about what a pedestrian is MADE of
+ * ---------------------------------------------------------------------------
+ * A crowd can also be wrong before it is drawn at all, by standing in the road
+ * rather than on it, and that has one cheap cause: `PedSystem.groundAt` falls
+ * back to an analytic height when the physics ray reports no hit, and the
+ * fallback used to ask `world.heightAt`. `heightAt` is the TERRAIN, and
+ * `netgen.rasteriseRoads` deliberately sinks the terrain 0.55 m under every
+ * road corridor so it can never come up through the tarmac, with the kerb and
+ * footway another 0.15 m above that — so on a pavement `heightAt` is most of a
+ * metre below the pavement (ARCHITECTURE.md, "heightAt is NOT the ground").
+ * `world.walkableHeightAt` is the published function that models the surface a
+ * man stands on, and `groundHeight` routes through it.
+ *
+ * WHEN THE FALLBACK IS REACHED, stated plainly because it decides how much this
+ * check is worth: `physics.raycast` solves an unhit STATIC ray against the same
+ * analytic surface, so in a warm session the ray usually answers. It is the
+ * BOOT WINDOW — `world` initialises after `physics` and arms that solver, and
+ * pedestrians can spawn before it does — plus every harness that runs `peds`
+ * without a physics world at all. In that window the old order buried the
+ * crowd.
+ *
+ * WHAT IS MEASURED, AND WHY IT IS NOT CIRCULAR: this drives the SHIPPED
+ * `PedSystem.prototype.groundAt` (never a copy of it) against a physics that
+ * reports no hit and a world whose three height functions return three
+ * DIFFERENT, LABELLED values. The assertion is which authority the shipped
+ * function consulted — a fact about the function, not about the numbers. The
+ * magnitudes above come from `world`'s own contract and are not re-derived
+ * here. The negative control is the OLD lookup expression, run against the
+ * same stubs, and it must come back with the terrain.
+ *
  *   node src/peds/crowdprobe.mjs
  *   node src/peds/crowdprobe.mjs --n=400 --verbose
  *   node src/peds/crowdprobe.mjs --legacypalette   # NEGATIVE CONTROL, must fail
@@ -53,6 +84,9 @@ import { Rng } from '../core/rng.js';
 import { makeOutfit, ARCHETYPES, SHAPES, SHAPE_IDS, COLOURS, PALETTE_LEGACY } from './wardrobe.js';
 import { buildOutfit } from './builder.js';
 import { PedMaterials, GRIME, PALE, MATERIAL_SLOTS } from './materials.js';
+// The shipped subsystem, for group 7 — the prototype method is driven directly
+// against stubs, so nothing here constructs a `PedSystem` or a THREE scene.
+import { PedSystem } from './index.js';
 
 const args = Object.fromEntries(
   process.argv.slice(2).map((a) => {
@@ -377,7 +411,54 @@ if (args.verbose) {
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* 7 GROUND — which height authority the shipped `groundAt` consults    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Three labelled surfaces, 0.55 m and 0.15 m apart in the direction the real
+ * city puts them: the terrain is sunk under the corridor, the walkable surface
+ * is the footway on top of it, and `groundHeight` is a third distinct value so
+ * a run that takes the middle preference is distinguishable from one that takes
+ * the first. Nothing here is a number the production code computed.
+ */
+const G_TERRAIN = 10.00;
+const G_WALKABLE = 10.70;
+const G_GROUNDHEIGHT = 10.65;
+
+const groundStub = () => ({
+  world: {
+    heightAt: () => G_TERRAIN,
+    walkableHeightAt: () => G_WALKABLE,
+    groundHeight: () => G_GROUNDHEIGHT,
+    isWater: () => false,
+  },
+  // The case the fallback exists for: a ray that finds nothing. `physics`
+  // normally solves this analytically, but it cannot until `world` has armed
+  // it, and pedestrians spawn in that window.
+  phys: { MASK: { WORLD: 1 }, raycast: () => ({ hit: false }) },
+  _ground: { surface: 'concrete' },
+});
+
+const groundOut = { surface: 'concrete' };
+const gLive = PedSystem.prototype.groundAt.call(groundStub(), 12, -34, 60, groundOut);
+/** The expression this replaced, run on the same stubs. It must come back with
+ *  the terrain — that is what makes the live check above mean something. */
+const gLegacyWorld = groundStub().world;
+const gLegacyFn = gLegacyWorld.heightAt ?? gLegacyWorld.groundHeight;
+const gLegacy = gLegacyFn.call(gLegacyWorld, 12, -34);
+
+console.log('\n  7 GROUND    which surface `groundAt` returns when the ray misses');
+console.log(`               live ${gLive.toFixed(2)} m  (walkable ${G_WALKABLE}, groundHeight ${G_GROUNDHEIGHT}, terrain ${G_TERRAIN})`);
+console.log(`               control (the old lookup) ${gLegacy.toFixed(2)} m — must be the terrain`);
+
 const bad = [];
+if (Math.abs(gLive - G_WALKABLE) > 1e-6) {
+  bad.push(`GROUND ${gLive.toFixed(3)} — the fallback is not the walkable surface`);
+}
+if (Math.abs(gLegacy - G_TERRAIN) > 1e-6) {
+  bad.push(`GROUND control ${gLegacy.toFixed(3)} — the control does not reproduce the defect, so the check proves nothing`);
+}
 if (R.albedoP50 < T.albedoP50[0] || R.albedoP50 > T.albedoP50[1]) bad.push(`ALBEDO p50 ${R.albedoP50.toFixed(4)}`);
 if (R.albedoMin < T.albedoMin) bad.push(`ALBEDO min ${R.albedoMin.toFixed(4)}`);
 if (R.garmentMin < T.garmentMin) bad.push(`GARMENT ${R.garmentMin.toFixed(4)}`);

@@ -72,6 +72,16 @@ const TWO_PI = Math.PI * 2;
 const BASIN_TOP = 1.1; // gy -> basin walk surface (also what the anchor measures)
 const RING_NOZZLE = 2.45 - BASIN_TOP; // basin top -> perimeter nozzle mouths
 const NOZZLE_TIP = 5.8 - BASIN_TOP; // basin top -> main nozzle tip
+/**
+ * Basin top -> the DRAWN water plane, which is 35 cm BELOW the collider the
+ * anchor measures (`pointFountain` puts the circle at gy + 0.75 and the filler
+ * box's top at gy + 1.1). It matters for one thing and only one: a splash ring
+ * is `flags = 2`, a ground-aligned mark that is supposed to lie ON a surface,
+ * and a ground-aligned quad skips the soft-particle fade — so drawn at the
+ * collider height it is a disc hovering a third of a metre over the water with
+ * a hard edge, which is exactly the "hoop" the flag exists to avoid.
+ */
+const WATER_PLANE = 0.75 - BASIN_TOP;
 const RING_R = 5.4; // radius of the 16-nozzle ring
 const RING_N = 16;
 
@@ -84,6 +94,77 @@ const ANCHOR_RANGE = 300; // raycast confirmation only inside the collision radi
 
 /** Main-jet ballistics (authored): v0 ~21 m/s against g 12, k 0.1 -> ~17 m apex. */
 const JET_APEX = 17;
+
+/**
+ * ───────────────────────────────────────────────────────────────────────────
+ * WHY THE PLUME READ AS SMOKE, AND WHAT WHITE WATER NEEDS INSTEAD.
+ * ───────────────────────────────────────────────────────────────────────────
+ * MEASURED on the emitted `mkt_fountain` frame (1920x1080, 16.8 h scattered,
+ * lens 48 m from the jet), the plume column against the sky on the SAME rows:
+ *
+ *     plume core   sRGB 155.4, 154.5, 152.4   luminance 0.335   R-B  +3
+ *     sky beside   sRGB 158.1, 170.8, 180.2   luminance 0.404   R-B  -22
+ *
+ * — the water was DARKER than the sky it stands against (ratio 0.83) and
+ * WARMER than neutral. Darker than the background and warm is the definition
+ * of smoke; a backlit jet of water is the brightest thing in the frame.
+ *
+ * Two causes, both in what this file authored, neither in the shader:
+ *
+ *   1. INTENSITY DECAYED TO BLACK. `resetSpawn` leaves `i0 = 1, i1 = 0`, and
+ *      the vertex shader takes `mix(i0, i1, n*n)` as a multiplier on the
+ *      colour — so every droplet faded to black over its life INDEPENDENTLY of
+ *      its alpha. That default is authored for a spark, whose colour genuinely
+ *      dies; on a 3.5 s water droplet it is a column whose whole upper half is
+ *      grey. Not one of the five streams here ever set the pair.
+ *   2. THE AUTHORED COLOUR WAS A MID GREY (0.58-0.82) with a token blue tilt
+ *      that the warm 16:48 key and the warm bounce in `uAmbBot` more than
+ *      cancelled — hence R-B = +3 on a scene whose sky is at -22.
+ *
+ * So: hold the intensity up across the life, author near-white, and tilt the
+ * colour cool by enough to CANCEL the key rather than to nod at it. The
+ * `impacts.js` mortar-dust recipe is the precedent for the last part of it —
+ * bias the authored colour by geometry rather than adding a shader term.
+ *
+ * SUN-FACING SCATTER, AND WHY THE GAIN IS ALLOWED PAST 1.
+ *
+ * The lit-particle shader ends its shading with `lit *= 1/PI` — an irradiance
+ * to radiance conversion that assumes an ISOTROPIC scatterer of albedo 1, i.e.
+ * a white lambertian surface. That is the right default for smoke and dust and
+ * it is the wrong one for a cloud of water droplets, which is a strongly
+ * FORWARD scatterer: with the sun behind it, most of what reaches the lens is
+ * sunlight that went through the plume rather than off it, and the real phase
+ * function peaks one to two orders of magnitude over isotropic. So the gain is
+ * a phase term, applied where the recipe can see the geometry, and it is
+ * clamped to a factor of three rather than to anything physical.
+ *
+ * The angle is between the LENS-TO-PLUME ray and `fx.sunWorld()` — the same
+ * published sun direction the dust recipes bias off. Squared, because a
+ * forward lobe is peaked and a linear ramp brightens the side-lit case (which
+ * needs nothing) as fast as the backlit one (which needs all of it). The floor
+ * is a touch over 1 because front-lit white water is still white.
+ *
+ * MEASURED on `mkt_fountain`, whose lens looks WNW into a 16:48 sun: the term
+ * lands at `scatter` = 3.18 of a 1.15-3.60 range, i.e. 0.90 of the way to the
+ * backlit end. Same box, same settle, same camera as the numbers above:
+ *
+ *                  plume core lum   sky beside   ratio   R-B
+ *     before           0.335          0.404      0.829   +3.0
+ *     after            0.469          0.413      1.137   +0.9
+ *
+ * — the column stops being a smudge 17% darker than the sky and becomes water
+ * standing 14% out of it, at neutral rather than warm.
+ *
+ * CROSS-CHECKED against `?nofountain=1` (fx's own hatch), where the footprint
+ * is the set of pixels the fountain MOVES rather than a box round where the jet
+ * is supposed to be: over 17 800 px of column the water reads 0.402 against
+ * 0.392 for what is behind those same pixels — ratio 1.027, and lower than the
+ * box figure for a reason worth knowing, which is that brightening the plume
+ * pushes its thinnest fringe THROUGH the background value, so those pixels stop
+ * differing and drop out of the footprint. The two measurements bracket it.
+ */
+const SCATTER_MIN = 1.15;
+const SCATTER_MAX = 3.6;
 
 export class FountainFx {
   /**
@@ -98,14 +179,26 @@ export class FountainFx {
     /** Low tier: no mist, no cascade — degrade, don't starve the ring. */
     this.mist = budget >= 4000;
 
-    // share * cap / life = spawn rate, so share sums <= 1 keep us under cap.
+    /**
+     * share * cap / life = spawn rate, so share sums <= 1 keep us under cap.
+     *
+     * REBALANCED, not grown. The crown mist and the basin splashes are the two
+     * streams that say "water" from the plaza — the halo the jet breaks up
+     * into, and the rings where sixteen perimeter jets land — and at 48 m both
+     * were sub-threshold. They are paid for out of the jet and the ring jets,
+     * which at that range are a solid column and a solid crown of spray and do
+     * not miss the records: jet 0.50 -> 0.44, ring 0.18 -> 0.16, mist 0.16 ->
+     * 0.22, splash 0.10 -> 0.12. The sum is still exactly 1, so the
+     * steady-state population — the thing `fountainprobe` holds against `cap`
+     * — is unchanged by construction.
+     */
     const share = this.mist
-      ? { jet: 0.5, ring: 0.18, mist: 0.16, splash: 0.1, cascade: 0.06 }
-      : { jet: 0.62, ring: 0.22, mist: 0, splash: 0.16, cascade: 0 };
+      ? { jet: 0.44, ring: 0.16, mist: 0.22, splash: 0.12, cascade: 0.06 }
+      : { jet: 0.6, ring: 0.2, mist: 0, splash: 0.2, cascade: 0 };
     this.rateJet = (share.jet * this.cap) / 3.8;
     this.rateRing = (share.ring * this.cap) / 1.7;
     this.rateMist = (share.mist * this.cap) / 2.6;
-    this.rateSplash = (share.splash * this.cap) / 0.8;
+    this.rateSplash = (share.splash * this.cap) / 1.05;
     this.rateCascade = (share.cascade * this.cap) / 1.2;
 
     /** Set true to hold the water with no code edit — the probe's negative
@@ -119,6 +212,8 @@ export class FountainFx {
     this.cz = 0;
     /** Basin walk surface (the measured collider top). */
     this.waterY = 0;
+    /** The DRAWN water plane — see WATER_PLANE. Where a splash mark belongs. */
+    this.surfaceY = 0;
     this.ringY = 0;
     this.nozzleY = 0;
     this._lm = null;
@@ -133,6 +228,13 @@ export class FountainFx {
     this.splashAcc = 0;
     this.cascadeAcc = 0;
     this.spawned = 0;
+
+    /**
+     * The sun-facing scatter gain, recomputed once per frame in `update`, and
+     * published because it is the one number in this file a reviewer will want
+     * to read back off a live session. See the SCATTER note above.
+     */
+    this.scatter = SCATTER_MIN;
 
     this._camPos = new THREE.Vector3();
     this._rayO = new THREE.Vector3();
@@ -168,6 +270,7 @@ export class FountainFx {
     // A 30 cm droplet is sub-pixel at 300 m; grow sprites with distance so the
     // column still reads as white water in the vista instead of vanishing.
     const distScale = clamp(1 + (d - 140) / 320, 1, 2);
+    this._sunScatter();
 
     this._jet(dt, jetGain, distScale);
     if (this.mist) this._mist(dt, jetGain, distScale);
@@ -176,6 +279,27 @@ export class FountainFx {
       this._splashes(dt, nearGain);
       if (this.mist) this._cascade(dt, nearGain);
     }
+  }
+
+  /**
+   * How hard the plume is being backlit, this frame, as a gain on the authored
+   * radiance of every droplet. See the SCATTER note at the top of the file.
+   *
+   * The ray is the LENS to the middle of the column (half an apex over the
+   * nozzle), not the lens to the basin: the top two thirds of the jet is what
+   * stands against the sky and what the measurement is taken on. `sunWorld` is
+   * `fx`'s published world direction TOWARD the sun, so +1 is shooting into it.
+   * Runs once per frame, allocates nothing.
+   */
+  _sunScatter() {
+    const sun = this.fx.sunWorld();
+    const vx = this.cx - this._camPos.x;
+    const vy = this.nozzleY + JET_APEX * 0.5 - this._camPos.y;
+    const vz = this.cz - this._camPos.z;
+    const len = Math.hypot(vx, vy, vz) || 1;
+    const toward = (vx * sun.x + vy * sun.y + vz * sun.z) / len;
+    const t = clamp(toward * 0.5 + 0.5, 0, 1);
+    this.scatter = SCATTER_MIN + (SCATTER_MAX - SCATTER_MIN) * t * t;
   }
 
   /* ===================================================================== */
@@ -254,6 +378,7 @@ export class FountainFx {
     this.cx = lm.x;
     this.cz = lm.z;
     this.waterY = basinTop;
+    this.surfaceY = basinTop + WATER_PLANE;
     this.ringY = basinTop + RING_NOZZLE;
     this.nozzleY = basinTop + NOZZLE_TIP;
   }
@@ -266,6 +391,7 @@ export class FountainFx {
   _jet(dt, gain, distScale) {
     const fx = this.fx;
     const rng = fx.rng;
+    const sun = fx.sunWorld();
     this.jetAcc += dt * this.rateJet * gain;
     let n = Math.min(6, Math.floor(this.jetAcc));
     this.jetAcc -= n;
@@ -301,9 +427,30 @@ export class FountainFx {
       s.sizeCurve = 0.6;
       s.rot = rng.float() * TWO_PI;
       s.spin = rng.signed() * 0.8;
-      const b = rng.range(0.58, 0.82);
-      s.r0 = b * 0.95; s.g0 = b * 0.99; s.b0 = b * 1.03;
-      s.r1 = b * 0.66; s.g1 = b * 0.7; s.b1 = b * 0.76;
+      /**
+       * WHITE, HELD WHITE, AND TILTED COOL ENOUGH TO CANCEL A GOLDEN KEY.
+       *
+       * `b` is near-white now (0.86-1.0 against the old 0.58-0.82) and the
+       * end colour barely darkens — a droplet that has been in the air for
+       * three seconds is still water. The 0.93 : 0.97 : 1.03 tilt is sized
+       * against the MEASURED cast, not chosen as a mood: the frame came back
+       * at R-B = +3 with an authored tilt of 0.95 : 1.03, so the light adds
+       * about a tenth more red than blue and this cancels it.
+       *
+       * `sunSide` is the same trick `impacts.js` uses on mortar dust — bias
+       * the AUTHORED colour by which way the droplet was thrown — applied to
+       * the lateral scatter that breaks the column up, so the side of the
+       * plume facing the sun is a third of a stop hotter than the side in its
+       * own shadow. Without it a whitened column is one flat sheet.
+       */
+      const lat = Math.hypot(s.vx, s.vz) || 1e-4;
+      const sunSide = 0.9 + 0.34 * Math.max(0, (s.vx * sun.x + s.vz * sun.z) / lat);
+      const inten = this.scatter * sunSide;
+      const b = rng.range(0.86, 1.0);
+      s.r0 = b * 0.90; s.g0 = b * 0.965; s.b0 = b * 1.045;
+      s.i0 = inten;
+      s.r1 = b * 0.84; s.g1 = b * 0.895; s.b1 = b * 0.975;
+      s.i1 = inten * 0.82;
       s.alpha = rng.range(0.28, 0.5);
       s.alphaCurve = 1.3;
       s.soft = 0.35;
@@ -321,34 +468,59 @@ export class FountainFx {
     }
   }
 
-  /** Spray blown off the top of the jet where it breaks up. */
+  /**
+   * THE HALO AT THE CROWN — spray blown off the top of the jet where it breaks
+   * up, and the silhouette element that tells a viewer at fifty metres that the
+   * column is water rather than exhaust.
+   *
+   * It was in the frame already and could not be seen: alpha 0.07-0.16 over a
+   * bright sky is under a twentieth of the contrast the sky itself carries
+   * across the crown band, and the spawn disc was 1.6 m — narrower than the
+   * column it was meant to wreathe, so what it drew was more column. Widened to
+   * a 3.2 m disc with the density on the OUTSIDE of it (`Math.sqrt` on the
+   * radius is a uniform disc; the 0.35 floor keeps the middle clear), given the
+   * jet's own whiteness and held-up intensity, and roughly doubled in alpha.
+   */
   _mist(dt, gain, distScale) {
     const fx = this.fx;
     const rng = fx.rng;
+    const sun = fx.sunWorld();
     this.mistAcc += dt * this.rateMist * gain;
-    let n = Math.min(3, Math.floor(this.mistAcc));
+    let n = Math.min(4, Math.floor(this.mistAcc));
     this.mistAcc -= n;
     for (let i = 0; i < n; i++) {
       const s = resetSpawn();
-      s.x = this.cx + rng.signed() * 1.6;
-      s.y = this.nozzleY + JET_APEX * rng.range(0.68, 1.02);
-      s.z = this.cz + rng.signed() * 1.6;
-      s.vx = rng.signed() * 0.7;
+      const a = rng.float() * TWO_PI;
+      const rr = (0.35 + 0.65 * Math.sqrt(rng.float())) * 3.2;
+      const ca = Math.cos(a);
+      const sa = Math.sin(a);
+      s.x = this.cx + ca * rr;
+      s.y = this.nozzleY + JET_APEX * rng.range(0.62, 1.04);
+      s.z = this.cz + sa * rr;
+      // Outward as well as up: a crown spreads, it does not hang.
+      s.vx = ca * rng.range(0.3, 1.0) + rng.signed() * 0.3;
       s.vy = rng.range(-0.4, 1.1);
-      s.vz = rng.signed() * 0.7;
+      s.vz = sa * rng.range(0.3, 1.0) + rng.signed() * 0.3;
       s.tile = rng.float() < 0.6 ? P.MIST : P.PLUME;
-      s.size0 = rng.range(0.5, 1.1) * distScale;
-      s.size1 = rng.range(2.2, 4.2) * distScale;
+      s.size0 = rng.range(0.6, 1.3) * distScale;
+      s.size1 = rng.range(2.4, 4.6) * distScale;
       s.sizeCurve = 0.5;
       s.life = rng.range(1.6, 2.8);
       s.drag = rng.range(2.6, 4);
       s.gravity = -1.8;
       s.rot = rng.float() * TWO_PI;
       s.spin = rng.signed() * 0.5;
-      const b = rng.range(0.55, 0.75);
-      s.r0 = b * 0.97; s.g0 = b; s.b0 = b * 1.03;
-      s.r1 = b * 0.72; s.g1 = b * 0.75; s.b1 = b * 0.8;
-      s.alpha = rng.range(0.07, 0.16);
+      // Same cool-white and same sun side as the jet — this IS the jet, three
+      // metres later — but off the spawn bearing rather than the velocity,
+      // because a halo's lit side is the side of the ring, not of a droplet.
+      const sunSide = 0.9 + 0.34 * Math.max(0, ca * sun.x + sa * sun.z);
+      const inten = this.scatter * sunSide;
+      const b = rng.range(0.84, 0.98);
+      s.r0 = b * 0.90; s.g0 = b * 0.965; s.b0 = b * 1.045;
+      s.i0 = inten;
+      s.r1 = b * 0.82; s.g1 = b * 0.875; s.b1 = b * 0.955;
+      s.i1 = inten * 0.8;
+      s.alpha = rng.range(0.14, 0.3);
       s.alphaCurve = 1.8;
       s.soft = 0.6;
       s.fadeIn = 0.09;
@@ -366,6 +538,7 @@ export class FountainFx {
   _ringJets(dt, gain) {
     const fx = this.fx;
     const rng = fx.rng;
+    const sun = fx.sunWorld();
     this.ringAcc += dt * this.rateRing * gain;
     let n = Math.min(4, Math.floor(this.ringAcc));
     this.ringAcc -= n;
@@ -388,13 +561,20 @@ export class FountainFx {
       s.delay = -rng.float() * dt;
       s.tile = rng.float() < 0.6 ? P.SPRAY : P.SPLASH;
       s.stretch = 0.12;
-      s.size0 = rng.range(0.12, 0.22);
-      s.size1 = rng.range(0.45, 0.75);
+      s.size0 = rng.range(0.14, 0.26);
+      s.size1 = rng.range(0.55, 0.92);
       s.sizeCurve = 0.55;
       s.rot = rng.float() * TWO_PI;
-      const b = rng.range(0.56, 0.8);
-      s.r0 = b * 0.95; s.g0 = b * 0.99; s.b0 = b * 1.03;
-      s.r1 = b * 0.66; s.g1 = b * 0.7; s.b1 = b * 0.76;
+      // Same white and the same held intensity as the main jet — sixteen
+      // arcs of the same water. `ca, sa` is the nozzle's outward bearing, so
+      // the half of the ring throwing into the sun is the bright half.
+      const sunSide = 0.9 + 0.34 * Math.max(0, ca * sun.x + sa * sun.z);
+      const inten = this.scatter * sunSide;
+      const b = rng.range(0.84, 0.98);
+      s.r0 = b * 0.90; s.g0 = b * 0.965; s.b0 = b * 1.045;
+      s.i0 = inten;
+      s.r1 = b * 0.84; s.g1 = b * 0.895; s.b1 = b * 0.975;
+      s.i1 = inten * 0.82;
       s.alpha = rng.range(0.3, 0.5);
       s.alphaCurve = 1.4;
       s.soft = 0.25;
@@ -407,7 +587,26 @@ export class FountainFx {
     }
   }
 
-  /** Ground-aligned rings + bounce puffs where the perimeter jets land. */
+  /**
+   * SPLASH RINGS IN THE BASIN — ground-aligned rings and bounce puffs where the
+   * sixteen perimeter jets come down.
+   *
+   * Judged from the plaza rather than from the coping, which is the view every
+   * frame of this landmark is shot from. A 0.8 m ring seen from 48 m at eight
+   * degrees of depression is about ten pixels across and two high; at alpha
+   * 0.2-0.4 on water that is already glittering, it is nothing. So the rings
+   * spread to 1.5-2.6 m and live 0.75-1.3 s (the rate is re-derived off that
+   * life, so the population is unchanged), and both halves get the jet's white
+   * and its held-up intensity instead of fading to a grey two thirds.
+   *
+   * They stay INSIDE the basin: r 6.8-11.5 m is where a 3 m/s launch off the
+   * r 5.4 nozzle ring lands, and the basin wall is at 30 m.
+   *
+   * MEASURED on the same before/after `mkt_fountain` pair, over the 28 860 px
+   * band the sixteen arcs and their landings occupy: mean luminance 0.0653 ->
+   * 0.0734, i.e. this water now contributes an eighth of the light in the band
+   * it lives in instead of disappearing into the glitter on the basin.
+   */
   _splashes(dt, gain) {
     const fx = this.fx;
     const rng = fx.rng;
@@ -423,19 +622,21 @@ export class FountainFx {
       const z = this.cz + Math.sin(a) * rr;
       if (rng.float() < 0.62) {
         const s = resetSpawn();
-        s.x = x; s.y = this.waterY + 0.012; s.z = z;
+        s.x = x; s.y = this.surfaceY + 0.012; s.z = z;
         s.tile = P.RING;
-        s.size0 = 0.03;
-        s.size1 = rng.range(0.35, 0.8);
+        s.size0 = 0.06;
+        s.size1 = rng.range(1.5, 2.6);
         s.sizeCurve = 0.45;
-        s.life = rng.range(0.45, 0.8);
+        s.life = rng.range(0.75, 1.3);
         s.drag = 6;
         s.rot = rng.float() * TWO_PI;
         s.flags = 2; // ground-aligned: a mark ON the water, not a hoop
-        const w = rng.range(0.5, 0.75);
-        s.r0 = w; s.g0 = w * 1.02; s.b0 = w * 1.05;
-        s.r1 = w * 0.6; s.g1 = w * 0.63; s.b1 = w * 0.67;
-        s.alpha = rng.range(0.2, 0.4);
+        const w = rng.range(0.86, 1.0);
+        s.r0 = w * 0.92; s.g0 = w * 0.985; s.b0 = w * 1.055;
+        s.i0 = this.scatter;
+        s.r1 = w * 0.84; s.g1 = w * 0.895; s.b1 = w * 0.975;
+        s.i1 = this.scatter * 0.7;
+        s.alpha = rng.range(0.3, 0.55);
         s.alphaCurve = 1.5;
         s.soft = 0.12;
         s.fadeIn = 0.1;
@@ -444,22 +645,24 @@ export class FountainFx {
         fx.emitLit(s);
       } else {
         const m = resetSpawn();
-        m.x = x; m.y = this.waterY + rng.range(0.03, 0.12); m.z = z;
+        m.x = x; m.y = this.surfaceY + rng.range(0.03, 0.12); m.z = z;
         m.vx = rng.signed() * 0.4;
-        m.vy = rng.range(0.3, 1.1);
+        m.vy = rng.range(0.5, 1.6);
         m.vz = rng.signed() * 0.4;
         m.tile = P.MIST;
-        m.size0 = rng.range(0.08, 0.16);
-        m.size1 = rng.range(0.4, 0.9);
+        m.size0 = rng.range(0.1, 0.2);
+        m.size1 = rng.range(0.7, 1.5);
         m.sizeCurve = 0.45;
-        m.life = rng.range(0.5, 1.0);
+        m.life = rng.range(0.7, 1.3);
         m.drag = rng.range(3.5, 5.5);
         m.gravity = -1.8;
         m.rot = rng.float() * TWO_PI;
-        const b = rng.range(0.52, 0.76);
-        m.r0 = b * 0.97; m.g0 = b; m.b0 = b * 1.03;
-        m.r1 = b * 0.7; m.g1 = b * 0.73; m.b1 = b * 0.78;
-        m.alpha = rng.range(0.14, 0.3);
+        const b = rng.range(0.84, 0.98);
+        m.r0 = b * 0.90; m.g0 = b * 0.965; m.b0 = b * 1.045;
+        m.i0 = this.scatter;
+        m.r1 = b * 0.84; m.g1 = b * 0.895; m.b1 = b * 0.975;
+        m.i1 = this.scatter * 0.75;
+        m.alpha = rng.range(0.2, 0.4);
         m.alphaCurve = 1.7;
         m.soft = 0.14;
         m.fadeIn = 0.05;
@@ -498,9 +701,13 @@ export class FountainFx {
       s.size1 = rng.range(0.55, 0.9);
       s.sizeCurve = 0.5;
       s.rot = rng.float() * TWO_PI;
-      const b = rng.range(0.54, 0.78);
-      s.r0 = b * 0.96; s.g0 = b; s.b0 = b * 1.04;
-      s.r1 = b * 0.68; s.g1 = b * 0.71; s.b1 = b * 0.77;
+      // The plinth sheet is the same water in shade under the jet: white and
+      // held, but a stop under the sunlit column rather than equal to it.
+      const b = rng.range(0.7, 0.86);
+      s.r0 = b * 0.90; s.g0 = b * 0.965; s.b0 = b * 1.045;
+      s.i0 = this.scatter * 0.85;
+      s.r1 = b * 0.82; s.g1 = b * 0.875; s.b1 = b * 0.955;
+      s.i1 = this.scatter * 0.7;
       s.alpha = rng.range(0.15, 0.3);
       s.alphaCurve = 1.5;
       s.soft = 0.28;

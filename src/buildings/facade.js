@@ -27,6 +27,50 @@ import { surfaceTagOf } from './palette.js';
  * Everything here writes into a TileBuilder. Nothing touches the scene.
  */
 
+/**
+ * THE NEGATIVE-CONTROL SWITCHES, and the only thing that reads them is a probe.
+ *
+ * Same shape and same reasoning as `collisionOpts` in `archetypes.js`: a gate
+ * that only ever runs one arm is measuring the harness, not the change. Each
+ * flag turns exactly one of this wave's additions off and nothing else, so
+ * `src/buildings/kitprobe.mjs` can show its assertions going red when the
+ * feature is absent — which is the only evidence that they were testing the
+ * feature and not the weather.
+ *
+ *   crown    the cornice profile family and its dentil/modillion course
+ *   terrace  the stepped foundation apron below the plinth
+ *   mounts   publishing sign mount points at all
+ *   roof     the rooftop additions: chimney stacks, hatches, the water-tower
+ *            rate. `false` restores the rates the wave inherited.
+ *
+ * `?owNoFacadeKit=1` turns all four off in a LIVE build, which is what makes
+ * the frame-cost claim measurable: `perfcheck --ab='.|owNoFacadeKit=1,.'` runs
+ * both arms out of one build in one minute on one machine, and a delta measured
+ * that way is a property of the code rather than of whatever else the machine
+ * was doing. Same convention as `?owNoTileAo=1` and `?owNoKerbGuard=1`.
+ */
+const NO_KIT = (() => {
+  if (typeof location === 'undefined') return '';
+  const m = /[?&]owNoFacadeKit=([^&]*)/.exec(location.search);
+  return m ? decodeURIComponent(m[1]) : '';
+})();
+/**
+ * `owNoFacadeKit=1` turns the lot off; a comma list turns off exactly the named
+ * parts (`owNoFacadeKit=terrace`, `owNoFacadeKit=crown,roof`). The granularity
+ * is not decoration: when `solidprobe`'s ghost count moved with this wave, the
+ * only way to say WHICH addition moved it was to build the city with one of
+ * them missing and nothing else changed — including the RNG stream, which a
+ * revert would have shifted and which decides where every building in Steel
+ * City stands.
+ */
+const kitOff = (part) => NO_KIT === '1' || NO_KIT.split(',').includes(part);
+export const facadeOpts = {
+  crown: !kitOff('crown'),
+  terrace: !kitOff('terrace'),
+  mounts: !kitOff('mounts'),
+  roof: !kitOff('roof'),
+};
+
 const _m = new THREE.Matrix4();
 const _m2 = new THREE.Matrix4();
 const _x = new THREE.Vector3();
@@ -86,6 +130,41 @@ export function wallBasis(out, ax, az, bx, bz, nx, nz, y0, t) {
   return len;
 }
 
+/**
+ * Publish one sign mount, given a point in the elevation's own frame.
+ *
+ * THE CONTRACT IS DOCUMENTED IN `tile.js` — read that comment, not this one.
+ * This is only the transform: the caller works in panel space (x along the
+ * wall, y up from the wall base, z out of the outer face, which is exactly
+ * where it already placed the fascia or the parapet) and gets a world-space
+ * record with the yaw a consumer needs to face a board at the street.
+ *
+ * `ry = atan2(nx, nz)` is the inverse of `wallBasis`: that function builds
+ * +Z = (ox, oz), and a rotation of `a` about +Y sends +Z to (sin a, 0, cos a),
+ * so `a` is the yaw whose +Z is this elevation's outward normal and whose +X
+ * runs along the wall. A consumer calling `trs(m, x, y, z, ry, w, h, 1)` lands
+ * on the mount face, right way up, facing out — with no knowledge of this file.
+ */
+function mountAt(T, basis, w, kind, lx, ly, lz, mw, mh) {
+  if (!facadeOpts.mounts) return;
+  _p.set(lx, ly, lz).applyMatrix4(basis);
+  const nl = Math.hypot(w.nx, w.nz) || 1;
+  T.mount({
+    kind,
+    x: _p.x,
+    y: _p.y,
+    z: _p.z,
+    ry: Math.atan2(w.nx / nl, w.nz / nl),
+    nx: w.nx / nl,
+    nz: w.nz / nl,
+    w: mw,
+    h: mh,
+    arch: w.prog.arch,
+    era: w.prog.era ?? 'plain',
+    front: !!w.front,
+  });
+}
+
 /** Outward normal of edge a->b for a polygon whose interior contains `c`. */
 export function outwardNormal(ax, az, bx, bz, cx, cz, out = [0, 0]) {
   const dx = bx - ax;
@@ -106,14 +185,58 @@ export function outwardNormal(ax, az, bx, bz, cx, cz, out = [0, 0]) {
 
 // ------------------------------------------------------------ programmes --
 /**
+ * Which `DISTRICTS[*].accents` keys are PAINT ON JOINERY rather than a wall
+ * material. Everything not in here is a render, a siding, a steel, a rust or a
+ * brick — a surface you clad an elevation in — and becomes an accent BAND
+ * instead of a window frame. See the accent block in `makeProgramme`.
+ *
+ * Enumerated rather than pattern-matched on the `trim_` prefix: `alu_bright`
+ * and `alu_dark` are joinery too (a shop's aluminium shopfront section), and
+ * `brick_painted` starts with neither prefix and is emphatically not one.
+ */
+const ACCENT_JOINERY = new Set([
+  'trim_white', 'trim_dark', 'trim_green', 'trim_red',
+  'timber_dark', 'alu_dark', 'alu_bright',
+]);
+
+/**
  * The facade programme: every decision that must stay consistent from the
  * pavement to the parapet, decided once per building so a single elevation
  * cannot contradict its neighbour.
  */
 export function makeProgramme(rng, style, arch, opts = {}) {
+  /**
+   * ─────────────────────────────────────────────────────────────────────────
+   * STREAM PARITY, and why a content wave has to care about it.
+   * ─────────────────────────────────────────────────────────────────────────
+   * Every decision below draws from ONE per-lot stream, and the draws after
+   * this function — `floors`, `height`, `era`, `shapePlan`, the setback
+   * fractions — draw from the same one. So a new decision taken from `rng`
+   * does not just add a feature: it SHIFTS EVERY LATER DRAW, and the city
+   * comes back with different buildings, of different heights, on different
+   * hills. That is not a cosmetic difference. MEASURED on this wave's first
+   * cut, with `solidprobe`: the worst archetype's sealed fraction moved from
+   * green to 94.9% against a 95% ratchet, IN BOTH ARMS of the wave's own
+   * negative control — i.e. the regression was the re-rolled city, not the new
+   * geometry, and no switch could tell them apart because the switch cannot
+   * un-draw a number.
+   *
+   * So new decisions draw from `aux`, a side stream seeded from the lot, and
+   * anywhere a draw was REPLACED by a constant the draw is still taken and
+   * discarded. The rule for anyone adding to this file: if your change alters
+   * how many times `rng` is called, you have changed the whole city.
+   */
+  const aux = opts.aux ?? rng;
   const age = Math.min(1, Math.max(0, style.age + rng.range(-0.22, 0.22)));
   const masonry = rng.pick(style.masonry);
-  const accent = rng.pick(style.accents);
+  /**
+   * The lot's own accent draw. It is KEPT — see the stream-parity note above:
+   * deleting it re-rolls every later draw and comes back with a different city
+   * — but the block's accent wins where there is one, so a tile pays one extra
+   * merged surface for the district accent instead of three. It is the
+   * fallback for the callers that have no block (`preview.js`, `kitprobe`).
+   */
+  const lotAccent = rng.pick(style.accents);
   /**
    * `block` is the dressing palette shared by every building on this block —
    * joinery, stone, signage, awning canvas, roof covering. Two reasons, and
@@ -153,7 +276,7 @@ export function makeProgramme(rng, style, arch, opts = {}) {
     arch,
     age,
     masonry,
-    accent,
+    accent: b.accent ?? lotAccent,
     glass,
     trim,
     room: rng.float() < 0.5 ? 'room_dark' : 'room_mid',
@@ -235,7 +358,7 @@ export function makeProgramme(rng, style, arch, opts = {}) {
       p.wallT = 0.46;
       p.lintel = true;
       p.stringCourse = true;
-      p.cornice = 'stone';
+      p.cornice = 'stepped';
       p.parapet = 1.5;
       p.quoins = true;
       p.ground = 'lobby';
@@ -251,11 +374,11 @@ export function makeProgramme(rng, style, arch, opts = {}) {
       p.groundH = rng.range(3.9, 4.6);
       p.lintel = rng.float() < 0.5;
       p.stringCourse = rng.float() < 0.55;
-      p.cornice = rng.float() < 0.5 ? 'brick' : 'stone';
+      p.cornice = rng.pick(['brick', 'stone', 'dentil', 'dentil', 'stepped']);
       p.ground = b.commercial === false && rng.float() < 0.5 ? 'stoop' : 'shop';
       p.acRate = 0.22 * age;
       p.balcony = rng.float() < 0.25 ? 0.35 : 0;
-      p.fireEscape = rng.float() < 0.4 ? 1 : 0;
+      p.fireEscape = rng.float() < 0.7 ? 1 : 0;
       break;
     case 'rowhouse':
       p.winStyle = 'sash';
@@ -266,12 +389,14 @@ export function makeProgramme(rng, style, arch, opts = {}) {
       p.groundH = rng.range(3.4, 3.9);
       p.wallT = 0.36;
       p.lintel = rng.float() < 0.65;
-      p.cornice = 'brick';
+      p.cornice = aux.float() < 0.45 ? 'dentil' : 'brick';
       p.parapet = rng.float() < 0.5 ? 0.75 : 0.25;
       p.ground = (b.commercial ?? rng.float() < 0.45) ? 'shop' : 'stoop';
       p.acRate = 0.3 * age;
       p.boarded = age > 0.6 ? 0.14 : 0.03;
-      p.fireEscape = rng.float() < 0.25 ? 1 : 0;
+      // Lawrenceville and the Strip: the escape is on the flank, and it is on
+      // most of the terrace rather than a quarter of it.
+      p.fireEscape = rng.float() < 0.6 ? 1 : 0;
       p.blinds = 0.6;
       p.litRate = 0.3;
       break;
@@ -301,13 +426,24 @@ export function makeProgramme(rng, style, arch, opts = {}) {
       p.sillH = 1.25;
       p.wallT = 0.42;
       p.lintel = true;
-      p.cornice = 'brick';
+      p.cornice = aux.float() < 0.4 ? 'stepped' : 'brick';
       p.parapet = 1.05;
       p.ground = 'dock';
       p.boarded = 0.16 * age;
       p.room = 'room_dark';
       p.litRate = 0.12;
-      p.fireEscape = rng.float() < 0.45 ? 1 : 0;
+      /**
+       * A LOFT ALWAYS HAS ONE. The Strip's warehouses and Lawrenceville's mill
+       * lofts are the buildings a Pittsburgh fire escape actually hangs off,
+       * and they now carry one on their flank whatever the roll said — the old
+       * 45% coin flip meant most of the district had none.
+       *
+       * The roll is still TAKEN and thrown away. See the stream-parity note at
+       * the top of this function: deleting a draw re-rolls every building in
+       * the city, which is a much larger change than the one intended here.
+       */
+      rng.float();
+      p.fireEscape = 1;
       break;
     case 'mill':
       p.winStyle = 'grid';
@@ -318,12 +454,13 @@ export function makeProgramme(rng, style, arch, opts = {}) {
       p.groundH = rng.range(6.0, 8.5);
       p.sillH = 1.8;
       p.wallT = 0.5;
-      p.cornice = 'flat';
+      p.cornice = aux.float() < 0.45 ? 'stepped' : 'flat';
       p.parapet = 0.7;
       p.ground = 'dock';
       p.boarded = 0.3 * age;
       p.room = 'room_dark';
       p.litRate = 0.08;
+      p.fireEscape = 1;
       break;
     case 'market':
       p.winStyle = 'shop';
@@ -351,7 +488,65 @@ export function makeProgramme(rng, style, arch, opts = {}) {
   // whole building — mixing them is what makes a facade look assembled from a
   // parts bin rather than built.
   p.sillMat = b.sillMat ?? rng.pick(['stone_grey', 'stone_warm', 'precast', 'concrete_wall']);
-  p.baseMat = rng.float() < 0.6 ? p.sillMat : 'concrete_dark';
+  /**
+   * THE FOUNDATION COURSE, on the surface that was authored for it.
+   *
+   * `palette.js` shipped `stone_base` — rock-faced, coarser, with 1.1 m of
+   * wheel-thrown road splash up it, "the band that grounds a building to its
+   * pavement" — and nothing in this file ever named it, so every plinth in the
+   * city drew the same ashlar as the sills three storeys up or a smooth
+   * concrete pour. The draw is unchanged (see the stream-parity note): the
+   * same coin flip, a different pair of faces on it.
+   *
+   * `stone_base` is one more merged surface in a tile, which is a real cost
+   * and is why the OTHER face of the flip stays `concrete_dark` — a key the
+   * tile was already paying for — rather than becoming a second new stone.
+   */
+  p.baseMat = rng.float() < 0.6 ? 'stone_base' : 'concrete_dark';
+  /**
+   * The glazed-brick dado under a shopfront, and the terracotta dressing on a
+   * pre-war downtown elevation. Both are block-scoped (see `blockPalette`) so
+   * a tile pays at most one extra batch for the first and none at all for the
+   * second; both are null on a block that has no business with them.
+   */
+  p.dado = b.dado ?? null;
+  p.dressMat = b.dress ?? null;
+  /**
+   * ─────────────────────────────────────────────────────────────────────────
+   * THE DISTRICT ACCENT, WHICH TWELVE AUTHORED LISTS HAD NOWHERE TO LAND.
+   * ─────────────────────────────────────────────────────────────────────────
+   * `DISTRICTS[*].accents` is documented in `palette.js` as "paint/render used
+   * for a minority of buildings and for TRIM", and it is three hand-chosen
+   * keys per district: `render_ochre`/`trim_red`/`steel_green` in the Strip,
+   * `rust_deep`/`steel_dark`/`corrugated` in Steel Row, `render_cream`/
+   * `trim_green` in Lawrenceville. Until now the pick was assigned to
+   * `p.accent` and read by nothing — twelve district identities that cost a
+   * draw and produced no pixels. `p.accentIsTrim`, which `buildElevation` has
+   * always branched on to decide whether a SILL follows the joinery instead of
+   * the stone, was dead for the same reason: nothing ever set it.
+   *
+   * The lists hold two classes of key and they land in two different places,
+   * because a window frame painted `corrugated` is not a district identity, it
+   * is a bug:
+   *
+   *   JOINERY class   `trim_*`, `timber_*`, `alu_*` — this is paint on wood or
+   *                   on aluminium, so it becomes the building's own joinery,
+   *                   and the sills follow it through `p.accentIsTrim`.
+   *   BAND class      renders, sidings, steels, rusts, bricks — a wall
+   *                   material, so it becomes the horizontal ACCENT BAND: the
+   *                   string course where the archetype has one, and the base
+   *                   moulding where it does not, which is the only band a
+   *                   two-storey rowhouse carries.
+   *
+   * A MINORITY, per the authored intent, and drawn from `aux` — the side
+   * stream — so wiring twelve dead lists in does not re-roll the city. The
+   * accent is block-scoped, so "a third of a block" is what this reads as on
+   * the street: two or three painted houses in a terrace, not a chequerboard.
+   */
+  const wearsAccent = aux.float() < 0.34 && p.arch !== 'curtain' && p.arch !== 'tower';
+  p.accentIsTrim = wearsAccent && ACCENT_JOINERY.has(p.accent);
+  if (p.accentIsTrim) p.trim = p.accent;
+  p.accentBand = wearsAccent && !p.accentIsTrim ? p.accent : null;
   p.paints = b.paints ?? ['paint_red', 'paint_green', 'paint_cream'];
   p.awning = b.awning ?? rng.pick(['awning_canvas', 'awning_green', 'awning_navy']);
   p.signMat = b.signMat ?? rng.pick(['sign_board', 'trim_dark', 'trim_red', 'trim_green']);
@@ -400,6 +595,20 @@ export function buildElevation(T, lib, w) {
     T.addOnce(w.blankSurface ?? p.masonry, g, basis);
     if (w.collide !== false) T.slabBox(surfaceTagOf(p.masonry), basis, 0, total / 2, len, total, t);
     if (len > 7 && total > 6 && rng.float() < 0.42) ghostSign(T, basis, len, total, t, p, rng);
+    /**
+     * GHOST-SIGN TERRITORY. A blank flank is the only surface in this city with
+     * room for a painted wall sign, so it is published as one — inset a metre
+     * from each arris and stopped below the cornice, because a hand-painted
+     * sign that runs off the corner of the building reads as a decal.
+     * `ghostSign` above may already have put the FADED one there; a mount is an
+     * offer of the space, not a claim on it, and the two are allowed to coexist
+     * the way a repainted flank does.
+     */
+    if (len > 8 && total > 7) {
+      const fw = Math.min(len - 2.0, 16);
+      const fh = Math.min(total - 2.4, 9);
+      mountAt(T, basis, w, 'wall', 0, total * 0.55, t + 0.03, fw, fh);
+    }
     return;
   }
 
@@ -538,7 +747,10 @@ export function buildElevation(T, lib, w) {
       ]);
       trs(_m2, 0, y - 0.09, t, 0);
       _m2.premultiply(basis);
-      T.addOnce(p.sillMat ?? 'stone_grey', band, _m2);
+      // The band a district accent lands on when it is a wall material, and
+      // the terracotta dressing where a downtown block carries one. Neither is
+      // a new batch in the tile it appears in — see `blockPalette`.
+      T.addOnce(p.accentBand ?? p.dressMat ?? p.sillMat ?? 'stone_grey', band, _m2);
     }
   }
 
@@ -580,9 +792,19 @@ export function buildElevation(T, lib, w) {
   }
 
   // --- fire escape -------------------------------------------------------
-  // Centred on a window bay (it has to be reachable from inside) and scaled so
-  // its flight spans exactly one storey.
-  if (p.fireEscape && w.front && len > 6 && w.floors.length > 1) {
+  /**
+   * Centred on a window bay (it has to be reachable from inside) and scaled so
+   * its flight spans exactly one storey.
+   *
+   * WHICH ELEVATION. `w.escape` — decided by the caller, which is the only
+   * place that can see all four elevations at once and therefore the only
+   * place that can put ONE escape on the building instead of one per wall.
+   * It used to key off `w.front`, which is wrong twice over: a fire escape
+   * hangs off the flank or the rear yard of a Lawrenceville rowhouse and a
+   * Strip loft, not across its shopfront, and keying off `front` meant a
+   * corner building grew two of them at right angles to each other.
+   */
+  if (p.fireEscape && w.escape && len > 6 && w.floors.length > 1) {
     const feId = Kit.fireEscape(lib, rng.float() < 0.5 ? 'steel_dark' : 'rust');
     const bi = Math.max(0, Math.min(nBays - 1, Math.floor(nBays / 2) + rng.int(-1, 1)));
     const fx = cx[bi];
@@ -603,7 +825,10 @@ export function buildElevation(T, lib, w) {
       for (const s of [-1, 1]) {
         trs(_m2, fx + s * 1.0, by - 0.4, t + 0.35, 0, 0.07, 0.07, 0.7, 0, s * 0.6);
         _m2.premultiply(basis);
-        T.add('steel_dark', brk, _m2, { masks: [0.8, 0.6, 0.3] });
+        // 7 cm angle. It goes where the landings it carries go — see the note
+        // on `Kit.fireEscape`; a bracket that cast while the escape did not
+        // would be a floating shadow with no stair in it.
+        T.add('steel_dark', brk, _m2, { masks: [0.8, 0.6, 0.3], noShadow: true });
       }
       by += w.floors[fi].h;
     }
@@ -671,7 +896,17 @@ function buildBase(T, lib, basis, len, t, p, rng, w) {
   ]);
   trs(_m2, 0, 0, t, 0);
   _m2.premultiply(basis);
-  T.addOnce(p.baseMat ?? 'stone_grey', g, _m2, { masks: [0.5, 0.75, 0.35] });
+  /**
+   * A rowhouse and a house have no string course, so the base moulding is the
+   * only horizontal band they carry and it is where their district accent has
+   * to land — otherwise `render_cream` in Lawrenceville and `siding_grey` on
+   * Troy Hill would be authored, drawn from, and still invisible. Where the
+   * elevation DOES have a string course the accent went there and the plinth
+   * keeps the foundation stone, which is the right way round: you do not paint
+   * the course that takes the road splash.
+   */
+  const baseMat = p.stringCourse ? (p.baseMat ?? 'stone_grey') : (p.accentBand ?? p.baseMat ?? 'stone_grey');
+  T.addOnce(baseMat, g, _m2, { masks: [0.5, 0.75, 0.35] });
 
   // air bricks / cellar lights along the plinth
   if (!w.front || len < 4) return;
@@ -683,14 +918,15 @@ function buildBase(T, lib, basis, len, t, p, rng, w) {
     trs(_m2, x, h * 0.55, t - 0.07, 0, 0.62, 0.34, 0.16);
     _m2.premultiply(basis);
     T.add('room_dark', box, _m2, { masks: [0, 0.4, 0.8] });
-    // the grille over it
+    // The grille over it: 3 cm bars, RECESSED 5 cm into the plinth. Nothing it
+    // could cast onto is outside its own reveal.
     for (let b = 0; b < 4; b++) {
       trs(_m2, x, h * 0.55, t - 0.02, 0, 0.62, 0.03, 0.05);
       _m2.premultiply(basis);
-      T.add('steel_dark', box, _m2, { masks: [0.7, 0.6, 0.4] });
+      T.add('steel_dark', box, _m2, { masks: [0.7, 0.6, 0.4], noShadow: true });
       trs(_m2, x - 0.22 + b * 0.15, h * 0.55, t - 0.02, 0, 0.035, 0.34, 0.05);
       _m2.premultiply(basis);
-      T.add('steel_dark', box, _m2, { masks: [0.7, 0.6, 0.4] });
+      T.add('steel_dark', box, _m2, { masks: [0.7, 0.6, 0.4], noShadow: true });
     }
   }
   box.dispose();
@@ -1070,6 +1306,8 @@ function buildShopfront(T, lib, w, basis, len, y, h, nBays, bay, cx) {
   const glassId = Kit.glass(lib, p.age > 0.6 ? 'glass_grimy' : glazing);
   const roomId = Kit.room(lib, 'room_mid', 'deep');
   const litRoomId = Kit.room(lib, 'room_lit_warm', 'deep');
+  /** What is behind a transom light: the top of the shop, and it is dark. */
+  const transomRoomId = Kit.room(lib, 'room_dark', 'shallow');
   
   
   const signId = Kit.signBoard(lib, p.signMat);
@@ -1078,7 +1316,18 @@ function buildShopfront(T, lib, w, basis, len, y, h, nBays, bay, cx) {
   const awnId = Kit.awning(lib, p.awning);
   const awnFrameId = Kit.awningFrame(lib, 'steel_dark');
   const shutterIds = [0, 1, 2].map((s) => Kit.shutter(lib, 'shutter', s));
-  const stallId = Kit.sill(lib, 'stone_grey', 'deep');
+  /**
+   * THE STALL RISER IS THE DADO. `palette.js` shipped `brick_glazed` and
+   * `brick_glazed_green` with the note that half the commercial ground floors
+   * on Butler St carry a band of cream or bottle-green glazed brick at eye
+   * level, and that "it is the detail that says shop from across the street
+   * because it is the only wet-looking masonry on the elevation" — and then
+   * every stall riser in the city drew flat `stone_grey`. This is the course
+   * that band goes on: the panel under the shop glass, at eye level, facing
+   * the pavement. Block-scoped, so a tile pays one extra batch for it and a
+   * whole parade is glazed by the same builder, which is what a parade is.
+   */
+  const stallId = Kit.sill(lib, p.dado ?? 'stone_grey', 'deep');
 
   for (let u = 0; u < nUnits; u++) {
     const ux = -len / 2 + (u + 0.5) * unit;
@@ -1118,6 +1367,28 @@ function buildShopfront(T, lib, w, basis, len, y, h, nBays, bay, cx) {
       const gx = ux - side * (doorW / 2 + 0.07);
 
       T.putM(Kit.door(lib, paint, 'glazed'), basis, dx, y + 0.32 + (openH - 0.35) / 2, zf, 0, doorW, openH - 0.35, 1);
+      /**
+       * THE TRANSOM over the entrance. The strip of glass above a shop door,
+       * with its own bar under it, and the single cheapest way to stop a
+       * recessed entrance reading as a rectangular hole: the bar is a hard
+       * horizontal at head height, lit from a different angle than the glass
+       * above and below it, so the opening acquires a top before the eye gets
+       * to the fascia. Every pre-war Pittsburgh storefront has one.
+       */
+      {
+        const th = 0.34;
+        const ty = y + 0.32 + openH - th / 2 - 0.06;
+        T.putM(transomRoomId, basis, dx, ty, zf - 0.04, 0, doorW * 0.96, th, 1);
+        T.putM(glassId, basis, dx, ty, zf + 0.01, 0, doorW * 0.96, th, 1, [0, p.age * 0.4, 0]);
+        const bar = plainBox();
+        trs(_m2, dx, ty - th / 2 - 0.04, zf + 0.04, 0, doorW + 0.1, 0.09, 0.1);
+        _m2.premultiply(basis);
+        // 9 cm deep, standing inside a recessed entrance that is already in
+        // shadow. It is a shading line, never a cascade's business — see
+        // `TileBuilder.add`'s `noShadow`.
+        T.add(paint, bar, _m2, { masks: [0.5, 0.5, 0.3], noShadow: true });
+        bar.dispose();
+      }
       T.putM(Kit.frame(lib, paint, 'shop', 'lg'), basis, gx, y + stall + (openH - stall) / 2 + 0.16, zf, 0, glassW, openH - stall - 0.1, 1);
       T.putM(glassId, basis, gx, y + stall + (openH - stall) / 2 + 0.16, zf - 0.02, 0, glassW * 0.98, (openH - stall - 0.1) * 0.98, 1);
       const lit = rng.float() < 0.75;
@@ -1167,6 +1438,31 @@ function buildShopfront(T, lib, w, basis, len, y, h, nBays, bay, cx) {
     _m2.premultiply(basis);
     T.add(p.sillMat ?? 'stone_grey', fascia, _m2, { masks: [0.55, 0.5, 0.3] });
     fascia.dispose();
+    /**
+     * THE MOUNTS. Published from the SAME numbers that just built the fascia,
+     * which is the only reason they can be trusted: a mount derived from the
+     * programme rather than from the placement would drift the moment a unit
+     * was narrowed, recessed or dropped, and the signage layer has no way to
+     * see that it had.
+     *
+     * The fascia field is the board itself, less a 20 cm margin so a name is
+     * never jammed against the pilaster beside it. The blade anchor hangs off
+     * the top corner of the unit furthest from the party wall.
+     */
+    mountAt(
+      T,
+      basis,
+      w,
+      'fascia',
+      ux,
+      y + h - fasciaH / 2 - 0.06,
+      t + 0.16,
+      Math.max(0.8, unit - 0.4),
+      fasciaH * 0.82
+    );
+    if (unit > 4.2) {
+      mountAt(T, basis, w, 'blade', ux + unit * 0.34, y + h - 0.45, t + 0.05, 1.15, 0.95);
+    }
     T.putM(
       faceId,
       basis,
@@ -1451,6 +1747,11 @@ function buildLobby(T, lib, w, basis, len, y, h, nBays, bay, cx) {
   trs(_m2, 0, y + h - 0.42, t + 0.09, 0, len, 0.84, 0.2);
   _m2.premultiply(basis);
   T.add(p.sillMat ?? 'stone_grey', mull, _m2, { masks: [0.4, 0.45, 0.25] });
+  // The head beam IS the building's name band — every office tower in the
+  // Triangle carries its tenant across it in cut letters.
+  if (w.front && len > 8) {
+    mountAt(T, basis, w, 'fascia', 0, y + h - 0.42, t + 0.2, Math.min(len - 2.4, 14), 0.62);
+  }
   trs(_m2, 0, y + h - 0.86, t + 0.11, 0, len, 0.06, 0.24);
   _m2.premultiply(basis);
   T.add('steel_dark', mull, _m2, { masks: [0.5, 0.6, 0.5] });
@@ -1562,55 +1863,186 @@ function buildDock(T, lib, w, basis, len, y, h, nBays, bay, cx) {
 
 // ------------------------------------------------------------------ crown --
 /**
+ * THE CORNICE PROFILE FAMILY.
+ *
+ * Each entry is a `moulding` section in the wall's own frame: [z, y] pairs,
+ * z out of the wall face, y up from the profile's base. The family exists
+ * because the critics measured "no cornices anywhere" TWICE, and because one
+ * profile on every building is the same finding in a different costume — an
+ * elevation is dated by its crown before anything else on it, and a city with
+ * one crown is a city with one date.
+ *
+ * The numbers are projections, and projection is the entire point: a cornice
+ * that stands 6 cm off the wall throws a 6 cm shadow, which at street distance
+ * under Pittsburgh's overcast is nothing at all. Every profile here reaches at
+ * least 24 cm and the heavy ones 40, because the SHADOW is the cornice — the
+ * moulding is just what casts it.
+ *
+ *   plain     a squared-off capping band. Post-war, and the mill's own.
+ *   stone     the 1900s commercial moulding: cyma, corona, heavy corona drip.
+ *   stepped   deco/industrial: three hard rectangular steps, no curves. This
+ *             is the Golden Triangle's 1920s-30s vocabulary.
+ *   dentil    stone's section carried on a course of instanced dentil blocks
+ *             (see `denticulate`), which is the classical commercial block.
+ *   eave      a house's projecting timber eave, carried on modillions.
+ *   brick     NOT in this table: corbelled brick is courses of brick, not a
+ *             cut section, so it is three boxes in the building's own masonry.
+ */
+const CORNICE_PROFILE = {
+  plain: [
+    [-0.02, 0],
+    [0.24, 0.05],
+    [0.24, 0.3],
+    [0.14, 0.38],
+    [-0.02, 0.38],
+  ],
+  stone: [
+    [-0.02, 0],
+    [0.16, 0.14],
+    [0.34, 0.24],
+    [0.34, 0.44],
+    [0.22, 0.58],
+    [-0.02, 0.58],
+  ],
+  stepped: [
+    [-0.02, 0],
+    [0.16, 0],
+    [0.16, 0.16],
+    [0.3, 0.16],
+    [0.3, 0.34],
+    [0.44, 0.34],
+    [0.44, 0.54],
+    [0.22, 0.62],
+    [-0.02, 0.62],
+  ],
+  dentil: [
+    [-0.02, 0],
+    [0.2, 0.02],
+    [0.38, 0.12],
+    [0.38, 0.34],
+    [0.24, 0.46],
+    [-0.02, 0.46],
+  ],
+  /**
+   * The eave keeps the 42 cm it always had rather than the 52 this wave first
+   * gave it — but no less, and that was MEASURED rather than guessed. When
+   * `solidprobe`'s ghost tier moved with this wave, the obvious suspect was
+   * cornice projection on the smallest archetype in the city, so all three of
+   * these profiles were trimmed to their pre-wave depths (eave 0.42 -> 0.30,
+   * stone 0.34 -> 0.30, stepped 0.44 -> 0.38) and the gate was re-run: FOUR
+   * ghosts before the trim and FOUR after. Depth is not the lever there —
+   * removing the cornice entirely is, and every one of these archetypes had a
+   * cornice before this wave existed. So the depths stay where the shadow
+   * wants them.
+   */
+  eave: [
+    [-0.02, 0],
+    [0.42, 0.0],
+    [0.42, 0.16],
+    [0.1, 0.32],
+    [-0.02, 0.32],
+  ],
+};
+
+/**
+ * The tooth course under a dentil or eave cornice.
+ *
+ * Instanced, not merged, and authored at REAL SIZE — a dentil is 13 cm on a
+ * rowhouse and 13 cm on a 20-storey block, and the run is what changes, not
+ * the tooth. One prototype serves the whole city, so a street of these is one
+ * draw call however many teeth are in it.
+ *
+ * Two guards, both about cost rather than looks, and both MEASURED: at a pitch
+ * of 0.31 with a cap of 96 the course was most of this wave's triangle budget
+ * (`kitprobe` put the whole kit at +15.5%, over its own limit). The pitch is
+ * now the widest a tooth course still reads at, and the cap is the point past
+ * which a cornice is a straight line at any distance you can see all of it
+ * from. The caller adds the third guard — front elevations and long flanks
+ * only; nobody stands in the light well.
+ */
+function denticulate(T, lib, basis, len, y, t, mat, kind, rng) {
+  if (len < 2.2) return 0;
+  const pitch = kind === 'modillion' ? 1.15 : 0.37;
+  const cap = kind === 'modillion' ? 22 : 54;
+  const n = Math.min(cap, Math.floor((len - 0.4) / pitch));
+  if (n < 3) return 0;
+  const id = kind === 'modillion' ? Kit.modillion(lib, mat) : Kit.dentil(lib, mat);
+  const span = n * pitch;
+  for (let i = 0; i < n; i++) {
+    const x = -span / 2 + (i + 0.5) * pitch;
+    // A course of identical blocks in identical dirt is a comb, not a cornice.
+    T.putM(id, basis, x, y, t, 0, 1, 1, 1, [
+      rng.range(0.3, 0.9),
+      rng.range(0.35, 1),
+      rng.range(0.2, 0.5),
+    ]);
+  }
+  return n;
+}
+
+/**
  * Where a building meets the sky. A flat top on a box is the fastest way to
  * make a city look like a bar chart, so every elevation gets a cornice with a
  * real projection and a parapet with a coping, and the projection throws a
  * shadow onto the top two metres of the wall.
+ *
+ * All of this is SILHOUETTE and goes in the static bucket: the cornice must
+ * survive to the mid LOD (`buildLotLod` draws its own band at LOD_RELIEF+0.14
+ * for the same reason). Only the dentil/modillion COURSE is allowed to be a
+ * near-field luxury, and it is instanced rather than merged so that dropping
+ * it is a matter of distance culling one InstancedMesh.
  */
 function buildCrown(T, lib, basis, len, total, t, p, rng, w) {
-  const capMat = p.sillMat ?? 'stone_grey';
-  if (p.cornice === 'brick') {
-    // corbelled brick: three courses, each stepping out
-    const b = plainBox();
-    for (let i = 0; i < 3; i++) {
-      trs(_m2, 0, total - 0.62 + i * 0.16, t + 0.03 + i * 0.045, 0, len, 0.15, 0.1 + i * 0.09);
-      _m2.premultiply(basis);
-      T.add(p.masonry, b, _m2, { masks: [0.45, 0.55, 0.35] });
-    }
-    b.dispose();
-  } else if (p.cornice === 'stone') {
-    const c = moulding(len, [
-      [-0.02, 0],
-      [0.16, 0.14],
-      [0.3, 0.24],
-      [0.3, 0.42],
-      [0.2, 0.56],
-      [-0.02, 0.56],
-    ]);
-    trs(_m2, 0, total - 0.72, t, 0);
-    _m2.premultiply(basis);
-    T.addOnce(capMat, c, _m2);
-  } else if (p.cornice === 'eave') {
-    const c = moulding(len + 0.7, [
-      [-0.02, 0],
-      [0.42, 0.0],
-      [0.42, 0.16],
-      [0.1, 0.3],
-      [-0.02, 0.3],
-    ]);
-    trs(_m2, 0, total - 0.32, t, 0);
-    _m2.premultiply(basis);
-    T.addOnce('trim_white', c, _m2);
-  } else {
+  // The cornice is the other half of a terracotta dressing: a Golden Triangle
+  // elevation is stone or brick with a glazed terracotta cap and string
+  // course, and doing only the course leaves the top of the building in the
+  // wrong material. `dressMat` is null everywhere terracotta is not already a
+  // masonry key in the district, so this costs those tiles no batch.
+  const capMat = p.dressMat ?? p.sillMat ?? 'stone_grey';
+  const kind = facadeOpts.crown ? (p.cornice ?? 'plain') : 'none';
+  if (kind === 'none') {
+    /**
+     * The control arm: the flat capping band this wave replaced. Not "nothing"
+     * — a probe that compares a cornice against an unbuilt roofline is
+     * measuring whether a roof exists, which is not the question.
+     */
     const b = plainBox();
     trs(_m2, 0, total - 0.28, t + 0.06, 0, len, 0.3, 0.16);
     _m2.premultiply(basis);
     T.add(capMat, b, _m2, { masks: [0.5, 0.5, 0.3] });
     b.dispose();
+  } else if (kind === 'brick') {
+    // corbelled brick: three courses, each stepping out
+    const b = plainBox();
+    for (let i = 0; i < 3; i++) {
+      trs(_m2, 0, total - 0.62 + i * 0.16, t + 0.03 + i * 0.055, 0, len, 0.15, 0.12 + i * 0.11);
+      _m2.premultiply(basis);
+      T.add(p.masonry, b, _m2, { masks: [0.45, 0.55, 0.35] });
+    }
+    b.dispose();
+  } else {
+    const prof = CORNICE_PROFILE[kind] ?? CORNICE_PROFILE.plain;
+    const over = kind === 'eave' ? 0.7 : 0;
+    const drop = kind === 'eave' ? 0.32 : prof[prof.length - 1][1] + 0.16;
+    const c = moulding(len + over, prof);
+    trs(_m2, 0, total - drop, t, 0);
+    _m2.premultiply(basis);
+    T.addOnce(kind === 'eave' ? 'trim_white' : capMat, c, _m2, {
+      masks: [0.35, p.age * 0.5, 0.2],
+    });
+    // Under the corona, never inside it: the tooth course projects 21 cm and
+    // the section it hangs off reaches 38, so the overhang shades the teeth.
+    // Street elevations and long flanks only — see `denticulate`.
+    const cut = w.front || len > 13;
+    if (kind === 'dentil' && cut) {
+      denticulate(T, lib, basis, len, total - drop - 0.11, t + 0.02, capMat, 'dentil', rng);
+    } else if (kind === 'eave' && cut) {
+      denticulate(T, lib, basis, len, total - drop - 0.12, t + 0.02, 'trim_white', 'modillion', rng);
+    }
   }
 
   // the dark band the cornice casts, painted straight into the wall's masks
-  if (p.cornice !== 'eave') {
+  if (kind !== 'eave') {
     const shade = quad(len, 1.6);
     fillMasks(shade, 0, 0.55, 0.55);
     trs(_m2, 0, total - 1.5, t + 0.008, 0);
@@ -1623,6 +2055,17 @@ function buildCrown(T, lib, basis, len, total, t, p, rng, w) {
     trs(_m2, 0, total + p.parapet / 2, t - 0.08, 0, len, p.parapet, 0.24);
     _m2.premultiply(basis);
     T.add(p.masonry, b, _m2, { masks: [0.35, 0.4, 0.2] });
+    /**
+     * A stepped parapet CAP on the profiles that ask for one. A flat coping
+     * run reads as a lid; a deco or industrial parapet is capped by a course
+     * that oversails it on both sides, and the shadow under the oversail is
+     * what keeps the top edge of the building from dissolving into the sky.
+     */
+    if (kind === 'stepped' || kind === 'dentil') {
+      trs(_m2, 0, total + p.parapet + 0.06, t - 0.02, 0, len, 0.12, 0.4);
+      _m2.premultiply(basis);
+      T.add(capMat, b, _m2, { masks: [0.5, 0.5, 0.3] });
+    }
     b.dispose();
     T.putM(Kit.coping(lib, capMat), basis, 0, total + p.parapet, t - 0.08, 0, len, 1, 1);
   }

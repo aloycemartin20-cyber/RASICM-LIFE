@@ -428,8 +428,8 @@ export function buildCarBody(spec, lod = 0) {
 
   const out = {
     paint: [], trim: [], chrome: [], cavity: [], glass: [], lamps: {},
-    plate: [], livery: [], grilleMesh: [], disc: [], liner: [], surface, perSeg,
-    anchors: {}, doors: [],
+    plate: [], livery: [], grilleMesh: [], disc: [], liner: [], leather: [],
+    surface, perSeg, anchors: {}, doors: [],
   };
   const lamp = (k, g) => (out.lamps[k] = out.lamps[k] ?? []).push(g);
 
@@ -543,6 +543,35 @@ export function buildCarBody(spec, lod = 0) {
      * is on the far side, and a dark reveal is what stops that reading as a
      * grey wall behind the windows. Same geometry, same vertex count, split at
      * `CP.ROOF_EDGE` — the column where the roof stops and the glass begins.
+     *
+     * ────────────────────────────────────────────────────────────────────────
+     * AND THE FLANK HALF WAS STILL `cavity`, WHICH IS THE SAME DEFECT AGAIN
+     * ────────────────────────────────────────────────────────────────────────
+     * The note above fixed the ROOF and left the flank on 0x050607 — the hole
+     * material — reasoning that a dark reveal is what you want behind glass.
+     * That reasoning holds for a reveal and fails for a WALL, and which of the
+     * two this patch is depends entirely on how tall the class's greenhouse is.
+     *
+     * MEASURED on `mkt_boyzcars`, false-colouring the cabin groups in the live
+     * frame: on Carson's Overlook the flank patch is 0.85 m tall over a 3.02 m
+     * cabin, and the FAR side's copy of it fills essentially the whole
+     * near-side window aperture — the greenhouse region metered mean 44.7,
+     * median 12, with 57.7% of its pixels under 24/255. The pickup, whose cab
+     * is 0.95 m long, shows the HEADLINER through its screen instead and meters
+     * median 49 with 38.2% dark. Same code, same materials; the SUV simply has
+     * the biggest windows in the fleet, so it is the class that shows what is
+     * behind them. That is the "greenhouse reads as open black holes" finding,
+     * and it is not a glazing defect at all: hiding every glass mesh in the
+     * frame moves the same region by a mean of 12 code values, i.e. the pane is
+     * there and doing its job.
+     *
+     * So the flank lining goes into `leather` — the soft dark trim the dash
+     * roll, the console and the door cards are already drawn in. It is still
+     * the darkest thing you can see through a window, which is what the note
+     * above is protecting; it is just made of trim (0x1b1d21, 0.0116 linear)
+     * instead of made of nothing (0.0015). NO new group, NO new material and NO
+     * new draw call: `leather` is materialised at LOD0 and folded into the
+     * single dark group at LOD1 exactly as `cavity` was.
      */
     if (lod < 2) {
       const zL0 = Math.min(sideZ0, zBack) - 0.05;
@@ -553,7 +582,7 @@ export function buildCarBody(spec, lod = 0) {
           inset: 0.052, zSamples: 10, flip: true,
         })
       );
-      out.cavity.push(
+      out.leather.push(
         loftPatch(surface, {
           c0: C(CP.ROOF_EDGE), c1: C(CP.BELT), z0: zL0, z1: zL1,
           inset: 0.055, zSamples: 10, flip: true,

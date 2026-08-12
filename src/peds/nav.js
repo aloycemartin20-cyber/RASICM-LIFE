@@ -315,12 +315,28 @@ export class SidewalkNet {
  * another. The pause distribution is what stops a wander reading as a random
  * walk.
  */
+
+/** Resamples allowed inside one `Wander.pick` before the last one is kept. */
+const WANDER_TRIES = 6;
+
 export class Wander {
   constructor() {
     this.target = new THREE.Vector3();
     this.anchor = new THREE.Vector3();
     this.radius = 26;
     this.pause = 0;
+    /**
+     * Optional `(x, z) => boolean` KEEP-OUT, installed by whoever reset this
+     * wander. `pick` resamples while it answers true.
+     *
+     * It is a callback rather than a rule in here because a wander has no idea
+     * what ground it is over — the disqualifying fact (today: a flooded
+     * fountain basin) needs a resolved height, and `PedSystem` is the only
+     * object that can get one. Null by default, so a wander with no owner
+     * opinion — the ped preview harness, a `Wander` built inside `ped.js`
+     * before a system has touched it — behaves exactly as before.
+     */
+    this.avoid = null;
   }
 
   reset(rng, anchor, radius = 26) {
@@ -330,10 +346,22 @@ export class Wander {
     this.pause = rng.range(0, 2);
   }
 
+  /**
+   * A destination inside the disc, resampled up to `WANDER_TRIES` times while
+   * `avoid` rejects it.
+   *
+   * The LAST sample is kept rather than the walker being frozen: a wanderer
+   * whose whole disc is disqualified (standing in the middle of the thing being
+   * excluded) still has to have somewhere to go, and the alternative — no
+   * target — reads as a crowd of statues. He walks out on the next pick.
+   */
   pick(rng) {
-    const a = rng.float() * Math.PI * 2;
-    const r = Math.sqrt(rng.float()) * this.radius;
-    this.target.set(this.anchor.x + Math.cos(a) * r, this.anchor.y, this.anchor.z + Math.sin(a) * r);
+    for (let i = 0; i < WANDER_TRIES; i++) {
+      const a = rng.float() * Math.PI * 2;
+      const r = Math.sqrt(rng.float()) * this.radius;
+      this.target.set(this.anchor.x + Math.cos(a) * r, this.anchor.y, this.anchor.z + Math.sin(a) * r);
+      if (!this.avoid || !this.avoid(this.target.x, this.target.z)) return;
+    }
   }
 
   /** @returns true when the walker should keep moving toward `target`. */
@@ -431,6 +459,22 @@ export { INSET as SIDEWALK_INSET };
  * this stays in lock-step with `world`'s field geometry for free and touches
  * nothing `peds` does not own.
  *
+ * RIDGELINE'S FENCED PERIMETER IS THE SAME REGION AS `airbaseAt`, and that is
+ * worth stating because the other published test — `world.airbase.
+ * insidePerimeter(x, z)`, the encounter agent's — reads like a second, larger
+ * one. It is not: both are `inRect(FIELD_STRIP) || inRect(FIELD_APRON)` over
+ * the L-shape `FENCE_POLY` walks. SWEPT on the live build, a 25 m lattice of
+ * 5 329 points over a 1 800 m box centred on the base: 458 inside, and the two
+ * predicates DISAGREED on none of them. So consulting `airbaseAt` here already
+ * excludes the whole fenced base, and adding `insidePerimeter` alongside it
+ * would be a second name for one fact (rule 12) that could only ever drift.
+ * MEASURED with the crowd streaming for 600 frames from two Ridgeline cameras
+ * (`mkt_afb`'s flightline composition and a lens on the tank apron, ambient
+ * target 36 and 17): ZERO ambient pedestrians inside the perimeter on either,
+ * the nearest at 118 m from the base centre. What DOES still reach a
+ * flightline is a staged tableau — see `PedSystem.debugStage`, which had no
+ * keep-out at all and now runs this same test.
+ *
  *   - inside a field  -> reject the spawn outright (open ground, no crowd);
  *   - on the perimeter (a field edge within `AF_PERIMETER` of the point, i.e.
  *     on the ring road round the fence) -> keep only `AF_PERIMETER_KEEP` of
@@ -478,4 +522,85 @@ export function airfieldSpawnBlocked(world, x, z, rng) {
     }
   }
   return false;
+}
+
+/* ---------------------------------------------------------- fountain --- */
+
+/**
+ * THE POINT FOUNTAIN'S BASIN IS NOT A PLAZA, AND NOTHING ABOUT ITS SURFACE
+ * SAYS SO.
+ *
+ * `mkt_fountain` photographed four pedestrians strolling across the middle of
+ * the flooded basin. Every check `_spawnNear` already had passed them: the
+ * ground is not `water` (the basin's collider is tagged `concrete`), it is not
+ * `asphalt`, `isOpen` is true because no building stands there, and no field
+ * predicate covers a landmark. `world.isWater` answers for the three rivers,
+ * not for 2 800 m^2 of standing water inside a granite wall.
+ *
+ * So the disqualifying fact is measured rather than named. `landmarks.js`
+ * builds the basin as one collision box `T.box('concrete', x, gy + 0.55, z,
+ * R*2, 1.1, R*2)` — a SHELF whose top is a single world height, laid over
+ * terrain that is anything but flat here. MEASURED on the emitted frame, the
+ * twenty-eight ambient pedestrians within 50 m of `lm_point`:
+ *
+ *     on the shelf (y = 3.80 exactly)   13   ground stands  +0.74 .. +4.84 m
+ *                                             over the terrain beneath them
+ *     off the shelf                     15   ground stands  -0.15 .. +0.22 m
+ *
+ * — two populations with half a metre of clear air between them and no
+ * overlap, so "the resolved ground stands more than `BASIN_LIP` above the
+ * terrain, inside the landmark's own published site" separates them exactly
+ * and has margin on both sides. It also catches the
+ * corners of that square shelf, which reach 42 m out over a granite apron
+ * drawn a metre BELOW them, and it costs one distance test everywhere else in
+ * the city.
+ *
+ * Both facts come from their owners: the centre and the site radius are
+ * `world.landmarks` (the city's single source of truth for where a landmark
+ * is), and the height is `world.heightAt`. This file adopts no basin
+ * dimension of its own, so a reshaped fountain needs no edit here.
+ *
+ * `peds` applies it at the two places it PLACES a pedestrian (`_spawnNear`,
+ * `debugStage`) and through `Wander.avoid` for the one who walks in — every
+ * pedestrian measured in the basin was in `wander` mode, which is what the
+ * Point's roadless plaza leaves them in.
+ */
+export const BASIN_LIP = 0.6;
+
+/** Cache keyed on the published array's identity — see `fountainSite`. */
+let _lmFor = null;
+let _lmPoint = null;
+
+/**
+ * The Point fountain's published site — `{ x, z, r, r2 }` — or null. Cached
+ * because this is on the spawn path and a `find` over the landmark table per
+ * call is a scan (rule 5); keyed on the ARRAY, so a rebuilt world replaces it
+ * rather than going stale. The REUSED record must not be mutated by a caller.
+ */
+export function fountainSite(world) {
+  const list = world?.landmarks;
+  if (!Array.isArray(list)) return null;
+  if (list !== _lmFor) {
+    _lmFor = list;
+    const lm = list.find((l) => l.id === 'lm_point') ?? null;
+    const r = lm?.site?.r ?? 46;
+    _lmPoint = lm ? { x: lm.x, z: lm.z, r, r2: r * r } : null;
+  }
+  return _lmPoint;
+}
+
+/**
+ * True when a pedestrian standing at (x, z) on ground `groundY` would be in the
+ * fountain basin. `groundY` is what the CALLER resolved (a physics raycast, not
+ * a guess) — the whole test is that number against the terrain. See above.
+ */
+export function fountainBasinBlocked(world, x, z, groundY) {
+  if (!world || !Number.isFinite(groundY)) return false;
+  const lm = fountainSite(world);
+  if (!lm) return false;
+  const dx = x - lm.x;
+  const dz = z - lm.z;
+  if (dx * dx + dz * dz > lm.r2) return false;
+  const t = world.heightAt?.(x, z);
+  return Number.isFinite(t) && groundY - t > BASIN_LIP;
 }

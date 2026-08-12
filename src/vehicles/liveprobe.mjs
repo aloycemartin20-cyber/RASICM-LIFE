@@ -256,6 +256,93 @@ try {
     `head ${seat.headAboveBelt} m over the belt line, crown ${seat.crownUnderRoof} m under the roof`);
 
   /* ------------------------------------------------------------------ */
+  /* SPOOL — a staged aircraft's rotors turn, and the DRAWN pivot moves.  */
+  /* ------------------------------------------------------------------ */
+  /**
+   * `vehicles.debugSpool(v, rpm01)` is the published hook that lets a
+   * kinematically staged aircraft turn its disc: `stepHeli`/`stepPlane` only
+   * run inside `fixedStep`, which a posed subject never reaches, so before this
+   * a helicopter framed for a marketing shot sat with its blades stopped.
+   *
+   * This is a LIVE assertion for the same reason the rest of the file is one:
+   * the question is not "did a number change", it is "did the number reach the
+   * SCENE GRAPH". So it spawns a helicopter with no driver (nothing to run the
+   * flight model even if the clock did), calls the hook once per frame for a
+   * second, and reads the rotor pivot's own `rotation` off the object three
+   * will submit — the same value `syncTransforms` writes and the same one the
+   * camera sees.
+   *
+   * The negative control is taken in the same run and is what makes it mean
+   * anything: an identical vehicle, identically staged, NOT spooled. Its pivot
+   * must not move. If it did, something else is already turning the rotor and
+   * this hook is decorative.
+   */
+  const spool = await page.evaluate(async () => {
+    const e = window.__ENGINE__;
+    const veh = e.ctx.peek('vehicles');
+    if (typeof veh?.debugSpool !== 'function') return { error: 'vehicles.debugSpool is not published' };
+    const pl = e.ctx.peek('player');
+    const p = pl.position ?? pl.root?.position ?? { x: 0, y: 40, z: 0 };
+    // CLOSE, and that is not cosmetic: the rotor pivots are built by
+    // `buildBodyLod`, so they do not exist until `_selectLod` has materialised
+    // a level — and it picks the level off the CAMERA distance. Staged 40 m out
+    // the first cut of this read `model.rotors` as empty and reported a working
+    // hook as broken.
+    const mk = (dx) => veh.spawn('heli', new (Object.getPrototypeOf(p).constructor)(p.x + dx, p.y + 7, p.z + 9), 0);
+    const a = mk(-7);
+    const b = mk(7);
+    if (!a || !b) return { error: 'could not spawn a helicopter' };
+    a._staged = b._staged = true;
+    const pivotOf = (v) => v.model?.rotors?.find((r) => r.axis !== 'x')?.pivot ?? null;
+    const tailOf = (v) => v.model?.rotors?.find((r) => r.axis === 'x')?.pivot ?? null;
+    const pump = (n) => new Promise((d) => { let i = 0; const t = () => (++i >= n ? d() : requestAnimationFrame(t)); requestAnimationFrame(t); });
+    await pump(30);
+    if (!pivotOf(a)) return { error: 'no rotor pivot was materialised — LOD0 never selected' };
+    const before = { spooled: pivotOf(a)?.rotation.y ?? null, control: pivotOf(b)?.rotation.y ?? null };
+    let frames = 0;
+    await new Promise((done) => {
+      const tick = () => {
+        veh.debugSpool(a, 1);            // the hook, once per frame
+        // b is deliberately left alone: the control.
+        if (++frames >= 60) return done();
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    });
+    const out = {
+      frames,
+      spin: a.rotorSpin,
+      lever: a.throttleLever,
+      phase: a.rotorPhase,
+      tailPhase: a.tailPhase,
+      pivotSpooled: pivotOf(a)?.rotation.y ?? null,
+      pivotControl: pivotOf(b)?.rotation.y ?? null,
+      tailSpooled: tailOf(a)?.rotation.x ?? null,
+      controlSpin: b.rotorSpin,
+      before,
+      nominal: a.spec?.rotor?.nominal ?? null,
+    };
+    veh.despawn(a);
+    veh.despawn(b);
+    return out;
+  });
+  if (spool.error) {
+    check('vehicles.debugSpool exists and spins a staged rotor', false, spool.error);
+  } else {
+    check('debugSpool drives the governor state a staged aircraft cannot reach',
+      spool.spin === 1 && spool.lever === 1,
+      `rotorSpin ${spool.spin}, throttleLever ${spool.lever} after ${spool.frames} calls`);
+    check('...and the DRAWN rotor pivot turns with it',
+      spool.pivotSpooled !== null && Math.abs(spool.pivotSpooled - (spool.before.spooled ?? 0)) > 0.2,
+      `main pivot rotation.y ${spool.before.spooled} -> ${spool.pivotSpooled}, ` +
+      `tail ${spool.tailSpooled} (rotor.nominal ${spool.nominal} rad/s)`);
+    check('CONTROL: an identically staged aircraft that is NOT spooled stays still',
+      spool.controlSpin === 0 &&
+      (spool.pivotControl === null || Math.abs(spool.pivotControl - (spool.before.control ?? 0)) < 1e-6),
+      `unspooled rotorSpin ${spool.controlSpin}, pivot ${spool.before.control} -> ${spool.pivotControl}`);
+  }
+
+  /* ------------------------------------------------------------------ */
   /* SPEED — flat out on a real street.                                  */
   /* ------------------------------------------------------------------ */
   const speed = await page.evaluate(async (secs) => {

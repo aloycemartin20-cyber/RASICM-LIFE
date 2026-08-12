@@ -2416,6 +2416,67 @@ export class VehicleSystem {
    * `veh` may be 'lineup', 'row', 'damage', 'none', or a class id, optionally
    * with a paint: 'sports:0xff2200'.
    */
+  /**
+   * ────────────────────────────────────────────────────────────────────────
+   * SPIN A STAGED AIRCRAFT'S ROTORS WITHOUT FLYING IT.
+   * ────────────────────────────────────────────────────────────────────────
+   * `rotorSpin`, `rotorPhase`, `tailPhase` and `throttleLever` are written by
+   * `stepHeli`/`stepPlane`, and those run from `fixedStep` — which a
+   * KINEMATICALLY STAGED aircraft never reaches. `syncTransforms` runs every
+   * frame regardless (it is what draws the pose), and it reads `rotorPhase`
+   * straight onto the rotor pivots, so a helicopter posed for a marketing frame
+   * sat with its disc dead still and its blades legible one by one. That is the
+   * single most obvious "this is a model, not an aircraft" tell there is.
+   *
+   * This is the missing half: the SPOOL STATE, published, with no integrator
+   * behind it. It does not accumulate a flight model, does not touch forces and
+   * does not care whether the vehicle is on the ground — it sets the governor
+   * state to `rpm01` and advances the blade phase by one frame's worth at the
+   * head speed that state implies, using the class's OWN `rotor.nominal` /
+   * `rotor.tailRatio` (helicopter) or the same `24 + 90 * lever` law
+   * `plane.js` uses, so the disc turns at the rate it would if it were flying.
+   *
+   * Called once per frame by whoever is staging the shot — `src/dev/shots.js`
+   * wires it; this file only has to publish it. `dt` is a parameter rather than
+   * a constant so a capture harness stepping at its own cadence still gets a
+   * phase that advances at the right RATE.
+   *
+   *   vehicles.debugSpool(v, 1)        full governor, one 60 Hz frame of phase
+   *   vehicles.debugSpool(v, 0.6, dt)  part-spooled, caller's own step
+   *
+   * @param {object} v      a vehicle of kind 'heli', 'plane' or 'jet'
+   * @param {number} rpm01  governor state, 0..1
+   * @param {number} dt     seconds of blade phase to advance
+   * @returns {{rotorSpin, rotorPhase, tailPhase, throttleLever}|null}
+   */
+  debugSpool(v, rpm01 = 1, dt = 1 / 60) {
+    if (!v || !v.spec) return null;
+    const kind = v.spec.kind;
+    if (kind !== 'heli' && kind !== 'plane') return null;
+    const s = rpm01 > 1 ? 1 : rpm01 < 0 ? 0 : rpm01 || 0;
+    const TAU = Math.PI * 2;
+    v.rotorSpin = s;
+    v.throttleLever = s;
+    if (kind === 'heli') {
+      // `heli.js`: headW = rotor.nominal * rotorSpin, tail geared off the same
+      // shaft. Reading the spec rather than a constant is what keeps the Skylift
+      // and the newsroom bird turning at their own different speeds.
+      const R = v.spec.rotor ?? {};
+      const headW = (R.nominal ?? 41.9) * s;
+      v.rotorPhase = (v.rotorPhase + headW * dt) % TAU;
+      v.tailPhase = (v.tailPhase + headW * (R.tailRatio ?? 5.2) * dt) % TAU;
+    } else {
+      // `plane.js`: the propeller's rate is throttle-dependent, not governed.
+      v.rotorPhase = (v.rotorPhase + (24 + 90 * s) * s * dt) % TAU;
+    }
+    return {
+      rotorSpin: v.rotorSpin,
+      rotorPhase: v.rotorPhase,
+      tailPhase: v.tailPhase,
+      throttleLever: v.throttleLever,
+    };
+  }
+
   debugStage(kind, shot = {}) {
     for (const v of this._debugSpawned) this.despawn(v);
     this._debugSpawned.length = 0;

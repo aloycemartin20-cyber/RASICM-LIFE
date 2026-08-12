@@ -1505,7 +1505,75 @@ export class BuildingSystem {
             '  float owC = 1.0 - smoothstep( 0.20, 0.32, owN );',
             '  owK *= mix( 1.0, 0.42, owC );',
             '  vec3 owTint = mix( vec3( 1.0 ), vec3( 1.14, 0.94, 0.72 ), owC );',
-            '  totalEmissiveRadiance *= owK * owTint;',
+            '  vec3 owE = totalEmissiveRadiance * owK * owTint;',
+            /*
+             * ────────────────────────────────────────────────────────────────
+             * THE ROOM'S OWN AO, APPLIED TO WHAT IT EMITS AND NOT ONLY TO WHAT
+             * IT REFLECTS — which is where the "flat white slab" really lives.
+             * ────────────────────────────────────────────────────────────────
+             * `palette.js` says of the room box: "a real room has a lit ceiling
+             * plane, a floor a stop darker and a back wall darker still, and the
+             * eye reads those three values as depth even at 40 m", and
+             * `kit.js`'s `roomGeo` bakes exactly that into the AO mask — ceiling
+             * 0.12, back wall 0.45, floor and reveals 0.50. All of it was being
+             * spent on the DIFFUSE term, which after dark is a rounding error
+             * next to the emission, so the five faces of the box emitted one
+             * identical value and the depth the kit had already authored never
+             * reached the frame. That is why lowering the level alone did not
+             * help: MEASURED on `mkt_chase`, the knee below took the shopfront
+             * from p50 231 / p95 234 to p50 215 / p95 218 — still a three-code
+             * plateau, because a dimmer flat slab is still flat.
+             *
+             * An emitting surface that is occluded from the rest of the room
+             * also receives less of the room's own bounce, so this is the same
+             * physics the AO mask was baked for, applied to the term that
+             * actually carries the night frame. Windows whose geometry has no AO
+             * authored (`vColor.b` 0) are untouched, which is every flat glazing
+             * band in the city.
+             */
+            '#ifdef USE_COLOR',
+            '  owE *= 1.0 - 0.85 * clamp( vColor.b, 0.0, 1.0 );',
+            '#endif',
+            /*
+             * ────────────────────────────────────────────────────────────────
+             * THE SOFT KNEE — why the brightest windows had no shape in them.
+             * ────────────────────────────────────────────────────────────────
+             * Everything above sets a LEVEL and nothing bounds it. At full
+             * night `room_lit_cool` runs 0.3 * (0.22 + 2.4) = 0.786, the
+             * variance multiplies the top of the range by another 1.28, and the
+             * emissive has no map — so a lit room is one flat radiance with
+             * nothing in it but its own colour. That is fine at 40 m and it is
+             * not fine on a ground-floor shopfront eight metres from the lens:
+             * MEASURED on `mkt_chase`, the shopfront filling the left edge came
+             * back p50 231, p95 234 over a 300 x 250 px region — a plateau four
+             * code values wide, i.e. the tone curve's shoulder, with the whole
+             * interior collapsed onto one value.
+             *
+             * A ceiling is the wrong shape for this: a hard clamp puts EVERY
+             * bright window on the identical number and keeps the plateau, just
+             * lower. What the frame needs is the opposite — the dim end left
+             * alone and the top end COMPRESSED, so two windows that both used to
+             * clip end up a stop apart. So: linear to `KNEE`, then a hyperbolic
+             * roll-off asymptotic to `KNEE + RANGE`.
+             *
+             *   0.20 -> 0.20   the curtained band, untouched
+             *   0.50 -> 0.42
+             *   1.01 -> 0.52   the brightest cool room, was clipping
+             *   1.17 -> 0.55   the brightest warm room
+             *
+             * Applied on the CHANNEL MAXIMUM and scaled back onto the colour, so
+             * a warm room desaturating into white as it brightens — which is
+             * what a per-channel curve does — cannot happen. Sodium stays
+             * sodium.
+             */
+            '  float owPk = max( owE.r, max( owE.g, owE.b ) );',
+            '  const float OW_KNEE = 0.30;',
+            '  const float OW_RANGE = 0.32;',
+            '  if ( owPk > OW_KNEE ) {',
+            '    float owOver = owPk - OW_KNEE;',
+            '    owE *= ( OW_KNEE + owOver / ( 1.0 + owOver / OW_RANGE ) ) / owPk;',
+            '  }',
+            '  totalEmissiveRadiance = owE;',
             '}',
           ].join('\n')
         );

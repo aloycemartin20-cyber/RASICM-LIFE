@@ -129,7 +129,9 @@ import { RIG } from './rig.js';
 import { PedMaterials, MATERIAL_SLOTS } from './materials.js';
 import { buildOutfit } from './builder.js';
 import { SHAPE_IDS, SHAPES, makeOutfit, densityAt, archetypeAt } from './wardrobe.js';
-import { SidewalkNet, Wander, CrowdGrid, airfieldSpawnBlocked } from './nav.js';
+import {
+  SidewalkNet, Wander, CrowdGrid, airfieldSpawnBlocked, fountainBasinBlocked, fountainSite,
+} from './nav.js';
 import { Ped, STATE } from './ped.js';
 import { GroundShadows, FarCrowd, PropPool } from './crowdfx.js';
 import { Crew, CREW_MAX } from './crew.js';
@@ -235,6 +237,25 @@ export class PedSystem {
      * it to prove its sidewalk fraction is measuring the fix and not the shot.
      */
     this.debugNoRejoin = false;
+
+    /**
+     * Live negative-control hatch for the fountain-basin keep-out, same pattern
+     * and same rule: never set in play. When true, `_spawnNear`, `debugStage`
+     * and `_avoidBasin` all stop excluding the Point's flooded basin and the
+     * crowd walks on the water again — which is what `mkt_fountain`
+     * photographed. MEASURED on that shot: 13 of the 28 pedestrians within 50 m
+     * of `lm_point` stood on the basin shelf before this wave, 0 of 18 with the
+     * keep-out live, and 6 of 25 again with this flipped mid-session. See
+     * `fountainBasinBlocked` in `nav.js`.
+     */
+    this.debugIgnoreBasin = false;
+
+    /**
+     * The `Wander.avoid` keep-out installed on every ambient walker this system
+     * places. Bound ONCE (rule 5): `pick` calls it up to six times per
+     * destination, and a fresh closure per spawn is an allocation per spawn.
+     */
+    this._avoidBasin = (x, z) => this._inFountainBasin(x, z);
 
     /* ---- the crew: two brothers, their own pool, never streamed ---- */
     this.crew = new Crew(this);
@@ -429,9 +450,27 @@ export class PedSystem {
     return true;
   }
 
+  /**
+   * Return a body to the free pool.
+   *
+   * THE POOL'S INVARIANT IS ASSERTED HERE BECAUSE THIS FUNCTION OWNS THE POOL.
+   * `Ped.detachBody` already hides the group, and `_makeBody` builds it hidden,
+   * so this line has never yet had anything to do — MEASURED at the `mkt_tanks`
+   * shutter after `debugStage('none')`: six `ped_body` groups in the live
+   * `peds` node, the four with no owner all `visible: false`. It is one compare
+   * on a path that runs when a pedestrian leaves body range, and it means the
+   * "nothing in `_free` is drawn" rule is enforced by the file that maintains
+   * `_free` rather than inferred from a sibling.
+   *
+   * IT IS NOT WHAT PUT A BODY IN THAT FRAME. The two visible ones were 5.19 m
+   * and 5.32 m from the lens and they belonged to THE CREW, whose pool
+   * `debugStage` never touched — see the note there.
+   */
   _releaseBody(ped) {
     const body = ped.detachBody();
-    if (body) this._free.push(body);
+    if (!body) return;
+    body.group.visible = false;
+    this._free.push(body);
   }
 
   /* ================================================================== */
@@ -475,6 +514,37 @@ export class PedSystem {
    * name so callers can refuse to stand on the river — three rivers are a third
    * of this map and a crowd walking on the Monongahela is the single most
    * obvious way this system can embarrass itself.
+   *
+   * ──────────────────────────────────────────────────────────────────────────
+   * THE FALLBACK IS `walkableHeightAt`, NOT `heightAt`. THE TWO ARE 0.55 m APART
+   * ON EVERY ROAD IN THE CITY.
+   * ──────────────────────────────────────────────────────────────────────────
+   * The ray is still the first authority and still wins where it hits. What
+   * changed is what happens when it MISSES — outside the streamed triangle
+   * radius, before a sector's collision has arrived, or on the first frames of
+   * a session. This used to read `w.heightAt ?? w.groundHeight`, which means it
+   * always took `heightAt`, and `heightAt` IS THE TERRAIN:
+   * `netgen.rasteriseRoads` deliberately sinks the terrain 0.55 m under every
+   * road corridor so it can never come up through the tarmac, and the kerb and
+   * footway stand another 0.15 m above that. So a pedestrian placed off this
+   * path stood up to 0.70 m UNDER the pavement he was meant to be on — buried
+   * to the waist, with his contact shadow, his footstep FX and his capsule
+   * following him down. It is the same defect ARCHITECTURE.md records the
+   * player spawn falling into (0.86 m under the footway), from the same cause.
+   *
+   * `walkableHeightAt` is the published function that reproduces the profile
+   * `roadmesh` actually builds — cambered carriageway, kerb, footway — and it
+   * is analytic and city-wide, so it answers before the collision has streamed.
+   * `groundHeight` routes through it; `heightAt` is kept last only so a harness
+   * whose stub world publishes nothing else still gets a number.
+   *
+   * NO `y` HINT IS PASSED, deliberately. `fromY` is where the RAY STARTS —
+   * 30-80 m overhead — and `walkableHeightAt` forwards its `y` to
+   * `roads.nearestEdge`, which scores an edge by how close its deck is to that
+   * height. Handing it the ray origin would let a flyover 30 m up outbid the
+   * street underneath. With no hint, the function's own rule applies instead:
+   * a deck more than 2.5 m off the terrain is overhead and is not the floor,
+   * which is what a pedestrian wants.
    */
   groundAt(x, z, fromY = 60, out = this._ground) {
     if (out) out.surface = 'concrete';
@@ -487,7 +557,7 @@ export class PedSystem {
       }
     }
     const w = this.world;
-    const f = w?.heightAt ?? w?.groundHeight;
+    const f = w?.walkableHeightAt ?? w?.groundHeight ?? w?.heightAt;
     if (f) {
       const y = f.call(w, x, z);
       if (Number.isFinite(y)) {
@@ -496,6 +566,64 @@ export class PedSystem {
       }
     }
     return 0;
+  }
+
+  /**
+   * True where a pedestrian must not be: standing in the Point fountain.
+   *
+   * `y` is the ground the caller already resolved, where it has one — the two
+   * placement sites do, and passing it keeps this free for them. The
+   * `Wander.avoid` path has only a candidate (x, z), so it pays a raycast — but
+   * the published-site reject in front of it means it pays that ONLY for a
+   * walker whose disc actually overlaps the landmark, which is a handful of
+   * people at one place on the map and nobody at all anywhere else.
+   */
+  _inFountainBasin(x, z, y) {
+    if (this.debugIgnoreBasin) return false;
+    const w = this.world;
+    if (!w) return false;
+    if (!Number.isFinite(y)) {
+      const lm = fountainSite(w);
+      if (!lm) return false;
+      const dx = x - lm.x;
+      const dz = z - lm.z;
+      if (dx * dx + dz * dz > lm.r2) return false;
+      y = this.groundAt(x, z, this.playerPos.y + 40, this._ground);
+    }
+    return fountainBasinBlocked(w, x, z, y);
+  }
+
+  /**
+   * A wanderer who is ALREADY standing in the basin, walked back out.
+   *
+   * `Wander.avoid` disqualifies a destination, not a route, so a walker whose
+   * disc straddles the fountain crosses it on the way to a legal target on the
+   * far side — MEASURED: with the placement keep-outs alone, 1 of the 17
+   * pedestrians within 50 m of `lm_point` was still on the shelf at the shutter
+   * (down from 13 of 28). With this, 0 of 18. Re-anchoring his disc OUTSIDE the landmark and re-picking
+   * from there turns him round; he walks off the water in the time the shot's
+   * own settle takes, and nothing pops. This is deliberately not a despawn
+   * (what `_stream` does to a man in the river) — the basin is 60 m across and
+   * the whole plaza is in frame, so a person deleting himself would be the more
+   * visible defect. `pause` is cleared, or `reset`'s own 0-2 s would leave him
+   * standing in the water for the length of it.
+   */
+  _evictBasin(ped) {
+    const lm = fountainSite(this.world);
+    const wan = ped.wander;
+    if (!lm || !wan) return;
+    const dx = ped.position.x - lm.x;
+    const dz = ped.position.z - lm.z;
+    const d = Math.hypot(dx, dz) || 1;
+    // Radially out past the site — the granite apron and the bollard ring, the
+    // ground a crowd round a fountain is meant to be standing on.
+    const out = lm.r + 6;
+    wan.anchor.set(lm.x + (dx / d) * out, ped.position.y, lm.z + (dz / d) * out);
+    wan.radius = 18;
+    wan.avoid = this._avoidBasin;
+    wan.pick(ped.rng);
+    wan.pause = 0;
+    ped.wanderTarget = wan.target;
   }
 
   /** True where a pedestrian must not be: open water. */
@@ -554,13 +682,19 @@ export class PedSystem {
     if (this._streamTimer > 0) return;
     this._streamTimer = 0.28;
 
-    // despawn anything that has walked out of the world we care about
+    // despawn anything that has walked out of the world we care about, and turn
+    // anyone who has walked INTO the fountain back towards the apron
     for (let i = 0; i < this.peds.length; i++) {
       const p = this.peds[i];
       if (!p.active) continue;
       const d = Math.hypot(p.position.x - anchor.x, p.position.z - anchor.z);
       if (d > DESPAWN || (!p.alive && p._deadTime > 26) || p._waterTime > 3) {
         this._despawn(p);
+        continue;
+      }
+      if (p.alive && p.navMode === 'wander' &&
+          this._inFountainBasin(p.position.x, p.position.z, p.position.y)) {
+        this._evictBasin(p);
       }
     }
 
@@ -618,6 +752,9 @@ export class PedSystem {
     const y = this.groundAt(pos.x, pos.z, anchor.y + 30, this._ground);
     if (!Number.isFinite(y) || y < -400) return null;
     if (this._ground.surface === 'water') return null;
+    // The Point's basin is standing water on a `concrete` collider, so the
+    // surface test above cannot see it. `nav.js` measures it instead.
+    if (this._inFountainBasin(pos.x, pos.z, y)) return null;
     pos.y = y;
     /**
      * THE HOLE ROUND THE PLAYER.
@@ -662,6 +799,15 @@ export class PedSystem {
 
     ped.spawn(outfit, pos, yaw, rng.fork());
     ped.wander = ped.wander ?? new Wander();
+    /**
+     * Installed on the WANDER rather than on the ped, and installed here rather
+     * than at every `reset` site, because the wander outlives every one of
+     * them: `ped.js` builds its own on a calm-down and on a failed pavement
+     * rejoin, but it reuses `this.wander` when there is one, and this pool
+     * hands the same `Ped` object out again and again. So one write per spawn
+     * covers the walker for his whole life, whoever resets him next.
+     */
+    ped.wander.avoid = this._avoidBasin;
     ped.lateral = rng.range(-0.55, 0.55);
     if (link) {
       ped.setLink(link);
@@ -1618,11 +1764,43 @@ export class PedSystem {
    * `debugStage(name)` composes a crowd in front of whatever camera the shot
    * API has just set, so a capture does not depend on the player happening to
    * be standing somewhere busy.
+   *
+   * ────────────────────────────────────────────────────────────────────────
+   * 'none' MEANS NOBODY, AND THAT INCLUDES THE BROTHERS.
+   * ────────────────────────────────────────────────────────────────────────
+   * `src/dev/shots.js` hides the whole `peds` node on the Ridgeline frames
+   * (`noCrowd`) because clearing the crowd here was not enough, and records the
+   * cause as a pooled body nothing hides. MEASURED at the `mkt_tanks` shutter
+   * on this build, every `ped_body` group in the live node with its owner:
+   *
+   *     4 groups   no owner (pooled)   visible FALSE   1565-1622 m away
+   *     2 groups   crew                visible TRUE    5.19 m and 5.32 m
+   *
+   * — the pool is clean (see `_releaseBody`); what stood ten metres in front of
+   * a Bulwark's main gun was the two brothers. They are the one population this
+   * function never touched: `this.peds` is the ambient pool, and the crew lives
+   * in `crew.pool` precisely so the streamer can never reach it.
+   *
+   * `crewAuto` is RESTORED rather than left off, which is the difference
+   * between clearing a frame and changing the game. `despawnCrew()` turns the
+   * switch off permanently — right for a solo chapter, wrong here, because
+   * this is also the hook `core/prewarm.js` uses to put its transient staging
+   * back. In play the brothers are re-spawned by `_crewStream` within a second;
+   * in a capture the sim is frozen two calls later (see `shotChrome`), so
+   * nothing can repopulate before the shutter.
+   *
+   * MISSION HOSTILES are deliberately left alone. A goon is placed by a caller
+   * that asked for him (`spawnHostile`), not streamed, so removing him here
+   * would delete a shot's own subject; `coverprobe` clears its own with
+   * `clearHostiles()` before staging, which is the right owner for that call.
    */
   debugStage(name) {
     if (name === 'none' || name === 'clean') {
       this._staged = false;
       for (const p of this.peds) if (p.active) this._despawn(p);
+      const auto = this.crewAuto;
+      this.despawnCrew();
+      this.crewAuto = auto;
       return this.stats;
     }
     // 'far' is a dev stage: the same crowd with every skinned body withheld, so
@@ -1686,6 +1864,18 @@ export class PedSystem {
       if (!Number.isFinite(y) || y < -400) continue;
       if (Math.abs(y - cam.position.y) > 14) continue;
       if (this._ground.surface === 'water' || this.isWaterAt(x, z)) continue;
+      /**
+       * THE STAGED TABLEAU OBEYS THE SAME KEEP-OUTS THE STREAMER DOES.
+       *
+       * This loop had none, which made `debugStage` the one path left in this
+       * system that can stand a civilian on a restricted flightline or in the
+       * Point's basin — and it is the path every dev and marketing frame goes
+       * through, i.e. exactly the frames that get looked at. The streamer's
+       * negative-control hatches govern both, so a probe that ablates one
+       * ablates it here too.
+       */
+      if (!this.debugIgnoreAirfields && airfieldSpawnBlocked(this.world, x, z, rng)) continue;
+      if (this._inFountainBasin(x, z, y)) continue;
 
       const ped = this._freePed();
       if (!ped) break;
@@ -1698,6 +1888,7 @@ export class PedSystem {
       const yaw = staged ? this.net.headingOf(staged) : rng.range(-Math.PI, Math.PI);
       ped.spawn(outfit, this._v3.set(x, y, z), yaw, rng.fork());
       ped.wander = ped.wander ?? new Wander();
+      ped.wander.avoid = this._avoidBasin;
       if (staged) {
         ped.setLink({ edge: staged.edge, side: staged.side, dir: staged.dir, t: staged.t });
       } else {

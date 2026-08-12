@@ -238,7 +238,10 @@ export const LIBRARY = {
   metal_rust: {
     glsl: METAL_RUST,
     surface: 'metal',
-    bake: { size: 1024, worldSize: 1.2, relief: 0.035, seed: 37 },
+    // seedPool 1: this is a 16 MiB bake, and `src/weapons/mats_improvised.js`
+    // asked for a second copy of it for one pipe. Rust already varies at draw
+    // through macro, macroBig and the per-mesh wear masks.
+    bake: { size: 1024, worldSize: 1.2, relief: 0.035, seed: 37, seedPool: 1 },
     mat: {
       detailSet: 2,
       detailRot: 0.109,
@@ -303,7 +306,10 @@ export const LIBRARY = {
   metal_brushed: {
     glsl: METAL_BRUSHED,
     surface: 'metal',
-    bake: { size: 512, worldSize: 0.8, relief: 0.004, seed: 83 },
+    // seedPool 2: nine resident copies at the mill, all improvised weapons.
+    // Two keeps a machined part from matching the one next to it in a rack;
+    // the other seven bought nothing at 4 MiB each.
+    bake: { size: 512, worldSize: 0.8, relief: 0.004, seed: 83, seedPool: 2 },
     mat: {
       detailSet: 2,
       detailRot: 0.903,
@@ -398,7 +404,7 @@ export const LIBRARY = {
     glsl: BURLAP,
     surface: 'fabric',
     // hessian is coarse: a fat, visible thread bump
-    bake: { size: 512, worldSize: 0.5, relief: 0.018, seed: 67 },
+    bake: { size: 512, worldSize: 0.5, relief: 0.018, seed: 67, seedPool: 1 },
     mat: {
       detailSet: 1,
       detailRot: 0.641,
@@ -450,7 +456,8 @@ export const LIBRARY = {
   rubber: {
     glsl: RUBBER,
     surface: 'rubber',
-    bake: { size: 512, worldSize: 0.5, relief: 0.013, seed: 97 },
+    // seedPool 2: eight resident copies at the mill, one per weapon grip.
+    bake: { size: 512, worldSize: 0.5, relief: 0.013, seed: 97, seedPool: 2 },
     mat: {
       scale: 0.45,
       detail: [7, 0.62, 0.42, 13],
@@ -1256,7 +1263,15 @@ Object.assign(LIBRARY, {
   tyre: {
     glsl: TYRE,
     surface: 'rubber',
-    bake: { size: 1024, worldSize: 0.55, relief: 0.012, seed: 97, param: [0, 0.45, 0.45, 0] },
+    /**
+     * 512, not 1024. At worldSize 0.55 a 1K bake is 1862 texels per metre —
+     * four and a half times the 410 t/m the city's walls run at (`concrete` is
+     * 1024 over 2.5 m) — for a sidewall the camera is never closer to than a
+     * kerb height. 512 still leaves 931 t/m, more than twice the wall, and it
+     * hands 12 MiB back to the level budget. `tyre_tread`, which is the one a
+     * vehicle beauty shot gets close to, keeps its 1K.
+     */
+    bake: { size: 512, worldSize: 0.55, relief: 0.012, seed: 97, param: [0, 0.45, 0.45, 0] },
     mat: {
       meso: [0.055, 0, 0, 0],
       uvMode: 'mesh',
@@ -1754,13 +1769,20 @@ Object.assign(LIBRARY, {
   grass_dry: {
     glsl: GRASS,
     surface: 'grass',
-    bake: { size: 1024, worldSize: 1.6, relief: 0.070, seed: 15, param: [0.22, 0.45, 0.25, 0.45] },
+    /**
+     * A SECONDARY of the grass family, so 512. `grass` keeps the 1K and carries
+     * every close-up; these two exist to stop a park and the verge beside it
+     * being the same field, and decorrelation does not need the primary's
+     * texel density. 512 over 1.6 m is 320 t/m — still above the 256 t/m of
+     * `road_asphalt`, which is the surface a verge is always seen against.
+     */
+    bake: { size: 512, worldSize: 1.6, relief: 0.070, seed: 15, param: [0.22, 0.45, 0.25, 0.45] },
     mat: { $ref: 'grass' },
   },
   grass_verge: {
     glsl: GRASS,
     surface: 'grass',
-    bake: { size: 1024, worldSize: 1.6, relief: 0.090, seed: 25, param: [0.65, 0.15, 0.95, 0.55] },
+    bake: { size: 512, worldSize: 1.6, relief: 0.090, seed: 25, param: [0.65, 0.15, 0.95, 0.55] },
     mat: { $ref: 'grass' },
   },
   grass_worn: {
@@ -1837,13 +1859,19 @@ Object.assign(LIBRARY, {
   bark_plane: {
     glsl: BARK,
     surface: 'wood',
-    bake: { size: 1024, worldSize: 1.2, relief: 0.055, seed: 95, param: [0.5, 0.35, 0.50, 0] },
+    /**
+     * A SECONDARY of the bark family, so 512 (427 t/m, exactly the city wall
+     * norm). `bark` keeps the 1K for the trunk the player walks past; these two
+     * are here so a street of trees is not one tree, and three 1K bakes of bark
+     * was 48 MiB for a surface that is a 40 cm cylinder.
+     */
+    bake: { size: 512, worldSize: 1.2, relief: 0.055, seed: 95, param: [0.5, 0.35, 0.50, 0] },
     mat: { $ref: 'bark' },
   },
   bark_smooth: {
     glsl: BARK,
     surface: 'wood',
-    bake: { size: 1024, worldSize: 1.2, relief: 0.030, seed: 105, param: [1.0, 0.25, 0.35, 0] },
+    bake: { size: 512, worldSize: 1.2, relief: 0.030, seed: 105, param: [1.0, 0.25, 0.35, 0] },
     mat: { $ref: 'bark' },
   },
   /**

@@ -124,10 +124,31 @@ buildLandmark(T, null, lm, new Rng(lm.seed), groundAt(lm.x, lm.z), groundAt);
 
 /* ----------------------------------------- measure the emitted rail lines --- */
 
+/**
+ * Every emitted vertex for `key`, from EVERY merged bucket a `TileBuilder`
+ * keeps — not just `_static`.
+ *
+ * `_noCast` is the one this used to miss. A tile splits a surface into a
+ * casting and a non-casting accumulator when it carries enough geometry that
+ * keeping it out of the shadow cascades pays for the extra batch (see
+ * `TileBuilder.add`'s `noShadow`), and `_detail` has always been a second home
+ * for the same key. A probe that reads one of the three is asserting on a
+ * fraction of the emitted geometry and calling it the whole, which is a claim
+ * about the probe's bookkeeping rather than about the model.
+ *
+ * The incline landmark happens to put nothing in either today. That is exactly
+ * why it is worth reading them: the day it does, this file should measure it
+ * rather than report a station that moved.
+ */
 function emittedVerts(key) {
-  const acc = T._static.get(key);
-  if (!acc || acc.empty) return null;
-  return acc.pos;
+  let out = null;
+  for (const bucket of [T._static, T._noCast, T._detail]) {
+    const acc = bucket?.get(key);
+    if (!acc || acc.empty) continue;
+    if (!out) out = [];
+    for (let i = 0; i < acc.pos.length; i++) out.push(acc.pos[i]);
+  }
+  return out;
 }
 
 const railPos = emittedVerts('steel_light');
@@ -261,24 +282,64 @@ function railAt(line, a) {
 const spanLo = Math.min(leftLine[0].a, rightLine[0].a);
 const spanHi = Math.max(leftLine[leftLine.length - 1].a, rightLine[rightLine.length - 1].a);
 
-// Emitted station masses. Within this landmark build, 'brick_dark' is only
-// the lower headhouse and 'trim_white' only the upper station cupola.
-function centroidOf(key) {
-  const pos = emittedVerts(key);
-  if (!pos) return null;
-  let cx = 0;
-  let cy = 0;
-  let cz = 0;
-  const c = pos.length / 3;
-  for (let i = 0; i < c; i++) {
-    cx += pos[i * 3];
-    cy += pos[i * 3 + 1];
-    cz += pos[i * 3 + 2];
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * STATION MASS, FOUND BY WHERE IT STANDS — NOT BY WHICH PAINT IT WEARS
+ * ─────────────────────────────────────────────────────────────────────────────
+ * This used to take the CENTROID OF A SURFACE KEY and call it a station, on the
+ * stated assumption that "'brick_dark' is only the lower headhouse and
+ * 'trim_white' only the upper station cupola". The second half of that is not
+ * true and, reading `landmarks.js`, never was: the lower headhouse is authored
+ * with a deep white eave (`box(T, 'trim_white', x, gy + 10.15, ...)`) and the
+ * upper station with a white parapet, colonnade and cupola. One key, both ends.
+ *
+ * A centroid cannot represent two clusters. MEASURED here: 132 `trim_white`
+ * vertices at along -90 and 360 at along +90, whose mean is
+ * (132·-90 + 360·90) / 492 = +41.7 — which is the number this tier reported as
+ * "the upper station has moved". Nothing had moved. The probe was averaging the
+ * two stations together and comparing the midpoint to one end.
+ *
+ * So the question is asked the way the tier's own description asks it —
+ * "emitted station masses stand at BOTH measured rail ends" — as a test for
+ * MASS PRESENT AT AN END, over every shell surface the two headhouses are built
+ * from, binned by position along the measured rail axis. A key that appears at
+ * both ends now contributes to both, which is what a white eave on two
+ * buildings should do.
+ */
+const STATION_KEYS = [
+  'brick_dark', 'trim_white', 'stone_base', 'stone_grey',
+  'brick_glazed_green', 'roof_shingle', 'trim_red',
+];
+/** Vertices of the station shells, with their position along the rail axis. */
+function stationCloud() {
+  const pts = [];
+  for (const key of STATION_KEYS) {
+    const pos = emittedVerts(key);
+    if (!pos) continue;
+    for (let i = 0; i < pos.length / 3; i++) {
+      pts.push({ a: along(pos[i * 3], pos[i * 3 + 2]), y: pos[i * 3 + 1] });
+    }
   }
-  return { x: cx / c, y: cy / c, z: cz / c };
+  return pts;
 }
-const lowerStation = centroidOf('brick_dark');
-const upperStation = centroidOf('trim_white');
+/**
+ * How much shell mass stands within `MAX_STATION_GAP` of a given rail end, and
+ * where its own centre is. A count rather than a fraction: what makes a station
+ * a station is that there is a building there, and the failure this guards
+ * against is one end having none.
+ */
+function massAt(endA, pts) {
+  let n = 0;
+  let sum = 0;
+  for (const p of pts) {
+    if (Math.abs(p.a - endA) > MAX_STATION_GAP) continue;
+    n++;
+    sum += p.a;
+  }
+  return { n, a: n ? sum / n : NaN };
+}
+/** A headhouse is a few hundred vertices; well clear of a stray trestle brace. */
+const MIN_STATION_VERTS = 40;
 
 /* ------------------------------------------------------ run the live cars --- */
 
@@ -415,15 +476,18 @@ const check = (name, ok, msg) => {
 
 // stations
 {
-  const loA = lowerStation ? along(lowerStation.x, lowerStation.z) : NaN;
-  const upA = upperStation ? along(upperStation.x, upperStation.z) : NaN;
-  const ok =
-    Number.isFinite(loA) && Number.isFinite(upA) && Math.abs(loA - spanLo) < 25 && Math.abs(upA - spanHi) < 25;
+  const pts = stationCloud();
+  const lo = massAt(spanLo, pts);
+  const up = massAt(spanHi, pts);
+  const ok = lo.n >= MIN_STATION_VERTS && up.n >= MIN_STATION_VERTS;
   check(
     'stations',
     ok,
-    `lower mass at along ${Number.isFinite(loA) ? loA.toFixed(1) : 'none'} (rail end ${spanLo.toFixed(1)}), ` +
-      `upper at ${Number.isFinite(upA) ? upA.toFixed(1) : 'none'} (end ${spanHi.toFixed(1)})`
+    `lower ${lo.n} shell verts within ${MAX_STATION_GAP} m of rail end ${spanLo.toFixed(1)} ` +
+      `(centred ${Number.isFinite(lo.a) ? lo.a.toFixed(1) : 'n/a'}), ` +
+      `upper ${up.n} at end ${spanHi.toFixed(1)} ` +
+      `(centred ${Number.isFinite(up.a) ? up.a.toFixed(1) : 'n/a'}); ` +
+      `floor ${MIN_STATION_VERTS} verts each`
   );
 }
 

@@ -218,6 +218,56 @@ export const SURFACES = {
   },
 
   /**
+   * ────────────────────────────────────────────────────────────────────────
+   * LETTERING. The three inks the sign painter of this city owns.
+   * ────────────────────────────────────────────────────────────────────────
+   *
+   * These carry the WORDS — see the STEEL CITY TYPE section of `kit_sign.js`.
+   * A shop name is stroke geometry, not a texture, so the whole signage layer
+   * costs nothing in the texture budget: `materials._bakeKey` is
+   * `name|size|seed|tintA|tintB|param|relief|worldSize` and `tint` is NOT in
+   * it, so every entry below resolves onto the SAME `metal_painted` bake that
+   * `pole_dark`, `sign_white` and the tags already made resident. MEASURED as
+   * the reason this design was chosen over a canvas atlas: one 1024 RGBA atlas
+   * with mips is 5.3 MiB and the city is already 47 MiB over its soft cap.
+   *
+   * Three and only three, because each one that a tile touches is a draw call
+   * (`TileBatch.build` merges per surface key). Ink, pale and gilt is the whole
+   * palette of shopfront lettering between 1910 and 1975, and the layout picks
+   * between them for CONTRAST against the board it is painting on rather than
+   * for variety.
+   */
+  /** Sign-writer's black — the default, on cream, white and gilt-edged boards. */
+  sign_ink: {
+    name: 'metal_painted', opts: {
+      scale: 0.55, tint: 0x14171b, vertexMasks: true, ...wear(0.95, 0.85, 0.35),
+      roughness: [0.95, 0.04, 0.36], grime: [0.55, 3.0, 0.8, 0.6],
+      wearMaterial: [0.55, 0, 0, 0.45], ...PAINTED,
+    },
+  },
+  /** Bone white / cream, for lettering on a dark board or a green blade. */
+  sign_pale: {
+    name: 'metal_painted', opts: {
+      scale: 0.55, tint: 0xece3cd, vertexMasks: true, ...wear(0.95, 0.85, 0.35),
+      roughness: [0.92, 0.05, 0.36], grime: [0.6, 3.0, 0.85, 0.6],
+      wearMaterial: [0.55, 0, 0, 0.45], ...PAINTED,
+    },
+  },
+  /**
+   * GOLD LEAF ON GLASS — downtown, and the one place `PAINTED` does not apply.
+   * Leaf IS metal: it is beaten gold burnished onto a size, so it keeps a
+   * conductor's specular and goes almost black in shadow, which is exactly what
+   * separates a jeweller's door from a painted board two streets away.
+   */
+  sign_gilt: {
+    name: 'metal_painted', opts: {
+      scale: 0.5, tint: 0xc79a2e, vertexMasks: true, ...wear(0.8, 0.7, 0.35),
+      roughness: [0.42, 0.06, 0.16], three: { metalness: 0.82 },
+      grime: [0.5, 3.0, 0.7, 0.5],
+    },
+  },
+
+  /**
    * SIGNBOARD FACES. Painted sheet, not a light. The first pass made the whole
    * fascia an emissive panel and by daylight every shopfront was a flat cream
    * rectangle with no texture in it — a direct hit on the "no flat/untextured
@@ -679,6 +729,29 @@ export const EMISSIVE = {
    * it would be a flat pale rectangle sitting inside the glass.
    */
   window_glow: { color: 0xffd6a4, base: 0, night: 0.95, nightOnly: true },
+  /**
+   * ────────────────────────────────────────────────────────────────────────
+   * THE NEON HALO — the only additive surface in the signage layer.
+   * ────────────────────────────────────────────────────────────────────────
+   *
+   * A neon tube in air is not just a bright line: the discharge lights the
+   * dust and the glazing around it, and at 22 mm the tube itself is far too
+   * small an area for bloom to build that out of. So the word carries a card
+   * BEHIND it whose vertex mask ramps to zero at the rim — the same trick
+   * `sodium_glow` uses on the road, and for the same reason: an additive
+   * surface multiplied to black contributes nothing, so the disc has no edge.
+   *
+   * TWO ENTRIES, NOT FIVE. Halo colour has to follow the tube — an amber halo
+   * behind a teal word is a filter, which is the exact defect `sodium_glow`'s
+   * comment documents from the other side — but every entry here is a draw
+   * call on any tile that touches it, so the five tube colours collapse onto
+   * the warm/cool pair they actually divide into.
+   *
+   * `peak` is a quarter of `sodium_glow`'s. A halo is a metre across against a
+   * lamp pool's eight, and additive brightness is area times opacity.
+   */
+  neon_halo_warm: { color: 0xff9a4e, additive: true, peak: 0.012 },
+  neon_halo_cool: { color: 0x7fe4e8, additive: true, peak: 0.011 },
 };
 
 /** Neon colour rotation per district — this is how a district reads at night. */
@@ -728,6 +801,7 @@ export const SURFACE_TAG = {
   rust: 'metal', steel: 'metal', corrugated: 'metal', concrete_prop: 'concrete',
   kerbstone: 'concrete', wood_prop: 'wood', wood_grey: 'wood', brickface: 'concrete',
   plastic: 'plastic', bag: 'fabric', tyre: 'rubber', glass_prop: 'glass',
+  sign_ink: 'metal', sign_pale: 'metal', sign_gilt: 'metal',
   bark_street: 'wood', bark_plane: 'wood', bark_smooth: 'wood',
   leaf_a: 'foliage', leaf_b: 'foliage', leaf_autumn: 'foliage',
   leaf_autumn_b: 'foliage', leaf_autumn_c: 'foliage',

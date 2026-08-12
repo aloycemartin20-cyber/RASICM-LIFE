@@ -362,6 +362,17 @@ const SURFACE_LIFT_CAP = 0.10;
  */
 const SURFACE_EPS = 0.030;
 
+/**
+ * How many actors from OUTSIDE this pool's owner may be waiting in the queue.
+ *
+ * The queue is drained and emptied by `end()`, and `end()` is called once a
+ * frame by `peds.lateUpdate`, so in a running game it never holds more than the
+ * submitters (one: the player). The cap is the safety on the other case — a
+ * harness that submits with no `peds` frame behind it would otherwise grow an
+ * array forever.
+ */
+const EXTERNAL_MAX = 8;
+
 export class GroundShadows {
   constructor(parent, capacity = 48) {
     this.capacity = Math.max(4, capacity);
@@ -421,6 +432,32 @@ export class GroundShadows {
      * and the drawn surface are the same thing.
      */
     this._world = null;
+    /**
+     * ──────────────────────────────────────────────────────────────────────
+     * THE EXTERNAL SUBMISSION QUEUE — how an actor outside `peds` gets a mark.
+     * ──────────────────────────────────────────────────────────────────────
+     * The player needs the crowd's contact mark and cannot write into this pool
+     * the obvious way, because of the FRAME ORDER rather than the API:
+     * `peds.lateUpdate` is `begin()` · one `addPed` per pedestrian · `end()`,
+     * and `player` runs in the `update` phase, i.e. entirely before `begin()`
+     * resets the write cursor. Anything he put in a quad slot is erased
+     * microseconds later. So `src/player/index.js` ran a SECOND INSTANCE of
+     * this class over its own three quads — two extra instanced draws and two
+     * more 64x64 occlusion textures (32 KiB) to hang one blob.
+     *
+     * `submit` is the same feature at no cost. It appends to a queue that
+     * `begin()` deliberately does NOT touch, and `end()` drains through
+     * `addPed` before it finalises the meshes — so a write that arrives BEFORE
+     * `begin()` is the one case that works, which is precisely the case the
+     * caller has. One pool, one bake, one blend switch, one lift cap and one
+     * surface resolve for everybody in the frame.
+     *
+     * A submitted actor is DUCK-TYPED exactly like a `Ped` — `addPed` reads
+     * `position`, `scale`, `yaw`, `body`, `lod`, `animator.footContact` and
+     * `sys` — and it is drained in the frame it was submitted, so the caller
+     * may (and does) hand over one reused record and mutate it in place.
+     */
+    this._queue = [];
   }
 
   /**
@@ -453,6 +490,19 @@ export class GroundShadows {
   begin() {
     this.body.begin();
     this.feet.begin();
+  }
+
+  /**
+   * Queue one actor from outside this pool's owner for the NEXT `end()`.
+   *
+   * Call it once per frame per actor, whenever that actor should wear a mark;
+   * skip the call to suppress it. Returns false only when the queue is full.
+   * See the note on `_queue`.
+   */
+  submit(actor) {
+    if (!actor || this._queue.length >= EXTERNAL_MAX) return false;
+    this._queue.push(actor);
+    return true;
   }
 
   /**
@@ -530,12 +580,23 @@ export class GroundShadows {
     }
   }
 
+  /**
+   * Drain the external queue, then finalise both meshes.
+   *
+   * The queue is emptied whether or not the pool had room for its quads, so a
+   * submitter that stops being called cannot leave a stale mark behind — an
+   * actor is in this frame or he is not.
+   */
   end() {
+    const q = this._queue;
+    for (let i = 0; i < q.length; i++) this.addPed(q[i]);
+    q.length = 0;
     this.body.end();
     this.feet.end();
   }
 
   dispose() {
+    this._queue.length = 0;
     this.body.dispose();
     this.feet.dispose();
   }

@@ -17,7 +17,7 @@ import {
   fbm3,
 } from './geom.js';
 import { Kit } from './kit.js';
-import { buildElevation, makeProgramme, outwardNormal, wallBasis } from './facade.js';
+import { buildElevation, facadeOpts, makeProgramme, outwardNormal, wallBasis } from './facade.js';
 import { archetypeFor, districtStyle, surfaceTagOf } from './palette.js';
 
 /**
@@ -80,6 +80,53 @@ export function blockPalette(RngCtor, seed, style) {
     door: r.pick(['door_wood', 'door_paint']),
     roof: r.pick(style.roof),
     glass: r.pick(style.glass),
+
+    /**
+     * ─────────────────────────────────────────────────────────────────────
+     * THE THREE BLOCK-SCOPED KEYS BELOW ARE APPENDED, AND THAT IS LOAD-BEARING.
+     * ─────────────────────────────────────────────────────────────────────
+     * `r` is this block's own stream and every draw above already decided a
+     * surface somebody is looking at, so a draw inserted ANYWHERE but the end
+     * re-rolls the roofs, the glass and the shopfront paint of every block in
+     * the city. Same rule as the stream-parity note in `facade.js`, one scope
+     * down. Add here, at the bottom, or not at all.
+     *
+     * They are block-scoped rather than per-building for the reason the
+     * `masonry` note in `palette.js` gives in draw calls: `tile.js` merges by
+     * surface key over thirty to sixty buildings, so a per-building pick out
+     * of a three-entry list costs a tile three extra merged meshes and a
+     * block-scoped one costs it one.
+     */
+
+    /**
+     * THE DISTRICT ACCENT — twelve authored lists that nothing read.
+     *
+     * `DISTRICTS[*].accents` has carried three keys per district since the
+     * district table was written ("paint/render used for a minority of
+     * buildings and for trim"), `makeProgramme` drew one per lot, and the
+     * result was assigned to `p.accent` and then never looked at by any
+     * emitter. Twelve authored district identities, dead. See the accent
+     * block in `facade.js` for which half of a facade each class lands on.
+     */
+    accent: r.pick(style.accents),
+    /**
+     * THE SHOPFRONT DADO. Half the pre-war commercial ground floors in this
+     * city want a band of glazed brick at eye level — see the `brick_glazed`
+     * note in `palette.js`, which shipped the surfaces and had no caller. Only
+     * a commercial block gets one; a residential terrace has no stall riser to
+     * put it on.
+     */
+    dado: r.float() < 0.55 ? r.pick(['brick_glazed', 'brick_glazed_green']) : null,
+    /**
+     * TERRACOTTA, WHERE IT IS ALREADY IN THE TILE. Architectural terracotta is
+     * the Golden Triangle's pre-war dressing, and `palette.js` shipped the
+     * surface with no caller. Gated on the district's own masonry vocabulary,
+     * so it only appears where `terracotta` is already a masonry key and the
+     * tile therefore already merges that surface — the dressing costs the
+     * downtown tiles NO extra batch, and it cannot leak into a rowhouse
+     * street where it would be wrong twice over.
+     */
+    dress: style.masonry.includes('terracotta') && r.float() < 0.5 ? 'terracotta' : null,
   };
 }
 
@@ -123,7 +170,14 @@ export function planBuilding(lot, style, rng, block = null) {
   const fl = Math.hypot(fx, fz) || 1;
   const toStreet = [fx / fl, fz / fl];
 
-  const prog = makeProgramme(rng, style, arch, { block });
+  /**
+   * The side stream for decisions this wave ADDED. See the stream-parity note
+   * over `makeProgramme`: taking them from `rng` would shift every later draw
+   * and re-roll the whole city. Seeded from the lot, so it is as deterministic
+   * as the main stream and independent of how many times either is called.
+   */
+  const aux = new rng.constructor((((lot.seed ?? 1) >>> 0) ^ 0x5c07de) >>> 0);
+  const prog = makeProgramme(rng, style, arch, { block, aux });
   prog.style = style;
 
   // Floors. `world` is authoritative when it says how tall the lot is.
@@ -166,6 +220,31 @@ export function planBuilding(lot, style, rng, block = null) {
   if (tall) prog.era = era;
 
   /**
+   * THE CROWN FOLLOWS THE ERA. A tower's cornice is the one detail that dates
+   * it from the far side of the river, so it is decided from `era` and not from
+   * the archetype's default — which is why this is here, three lines after the
+   * era is chosen, rather than in `makeProgramme` which runs before it.
+   *
+   *   deco        stepped: hard rectangular setback courses, 1920s-30s.
+   *   midcentury  plain: a squared capping band, and nothing else.
+   *   modern      flat, i.e. the parapet IS the crown; the read is the plant.
+   *   postmodern  a heavy stone moulding put back on, self-consciously.
+   *   (prewar masonry towers keep the dentil course they were born with)
+   */
+  if (tall) {
+    prog.cornice =
+      era === 'deco'
+        ? 'stepped'
+        : era === 'midcentury'
+          ? 'plain'
+          : era === 'postmodern'
+            ? 'stone'
+            : arch === 'tower'
+              ? aux.pick(['dentil', 'stone', 'stepped'])
+              : 'flat';
+  }
+
+  /**
    * The plan itself. A chamfered or shaved plan costs nothing at runtime and is
    * the difference between a skyline and a bar chart, because it changes the
    * SILHOUETTE — the one property that survives every LOD, every distance and
@@ -179,9 +258,22 @@ export function planBuilding(lot, style, rng, block = null) {
   let y = 0;
   let remaining = floors;
   const nVol = setbacks + 1;
+  /**
+   * WHERE A 1920s TOWER STEPS BACK is not a random fraction — it is the zoning
+   * envelope. New York's 1916 ordinance and the setback codes Pittsburgh copied
+   * from it put the first step at a fixed multiple of the street width, so a
+   * deco tower's shoulders land at consistent HEIGHTS up and down a block and
+   * that consistency is most of what makes a 1920s downtown read as one. The
+   * modern stock keeps its free-hand fractions: a 1970s slab really does step
+   * wherever the floor plate wanted to.
+   */
+  const DECO_SHARE = [0.58, 0.66, 0.72];
   for (let v = 0; v < nVol; v++) {
-    const share =
-      v === nVol - 1 ? remaining : Math.max(2, Math.round(remaining * rng.range(0.42, 0.68)));
+    // The free-hand draw is taken either way — stream parity, see the note over
+    // `makeProgramme`. A deco tower ignores the number; it does not skip it.
+    const free = rng.range(0.42, 0.68);
+    const frac = era === 'deco' ? (DECO_SHARE[v] ?? 0.7) : free;
+    const share = v === nVol - 1 ? remaining : Math.max(2, Math.round(remaining * frac));
     const n = Math.min(remaining, share);
     const fl2 = [];
     for (let i = 0; i < n; i++) {
@@ -510,14 +602,63 @@ export function buildLot(T, lib, plan, rng, groundY = 0) {
      * removal once, rather than leaving an invisible slab across the road.
      */
     if (collisionOpts.volumeShell) volumeShell(T, plan, vol, groundY);
+
+    /**
+     * CLASSIFY EVERY ELEVATION BEFORE BUILDING ANY OF THEM.
+     *
+     * The loop used to decide `front`, `side` and `blank` inline and build
+     * immediately, which means no elevation could ever know what the others
+     * were — and a fire escape is a decision about the BUILDING, not about a
+     * wall. Keying it off `front` (what it did) put one on the shopfront of
+     * every corner block, and two at right angles on a chamfered plan.
+     *
+     * So: one pass to work out what each face is, then one choice, then build.
+     * The rng draw order for `blank` is unchanged, so the party walls of Steel
+     * City are exactly where they were.
+     */
+    const faces = [];
     for (let i = 0; i < poly.length; i++) {
       const a = poly[i];
       const b = poly[(i + 1) % poly.length];
       outwardNormal(a[0], a[1], b[0], b[1], c[0], c[1], _n);
       const dotStreet = _n[0] * plan.toStreet[0] + _n[1] * plan.toStreet[1];
-      const front = dotStreet > 0.45;
       const side = Math.abs(dotStreet) < 0.55;
-      const blank = partyWalls && side && vol.level === 0 && rng.float() < 0.8;
+      faces.push({
+        a,
+        b,
+        nx: _n[0],
+        nz: _n[1],
+        len: Math.hypot(b[0] - a[0], b[1] - a[1]),
+        front: dotStreet > 0.45,
+        rear: dotStreet < -0.45,
+        side,
+        blank: partyWalls && side && vol.level === 0 && rng.float() < 0.8,
+      });
+    }
+
+    /**
+     * ONE escape per volume, on the rear if there is one, else a flank, and
+     * only ever on the street front if the building has no other face long
+     * enough — which on the Strip's corner lofts is the honest answer anyway.
+     * A blank party wall is excluded: it is shared with next door, and a stair
+     * bolted to it would hang over a building that is already there.
+     */
+    let escapeIdx = -1;
+    let escapeRank = -1;
+    for (let i = 0; i < faces.length; i++) {
+      const f = faces[i];
+      if (f.blank || f.len < 6) continue;
+      const rank = f.rear ? 3 : f.side ? 2 : 1;
+      if (rank > escapeRank) {
+        escapeRank = rank;
+        escapeIdx = i;
+      }
+    }
+
+    for (let i = 0; i < faces.length; i++) {
+      const { a, b, front, blank } = faces[i];
+      _n[0] = faces[i].nx;
+      _n[1] = faces[i].nz;
 
       buildElevation(T, lib, {
         ax: a[0],
@@ -533,6 +674,8 @@ export function buildLot(T, lib, plan, rng, groundY = 0) {
         style: plan.style,
         front,
         blank,
+        /** Exactly one elevation per volume carries the zig-zag. */
+        escape: i === escapeIdx,
         blankSurface: prog.masonry,
         /**
          * The facade kit no longer authors collision: `volumeShell` above owns
@@ -1099,10 +1242,145 @@ function dressRoof(T, lib, plan, rng, groundY) {
       if (p) T.put(Kit.antenna(lib, 'steel_dark'), p[0], y, p[1], rng.range(0, 6.28), rng.range(0.7, 1.4));
     }
 
-    // the water tower — one per few blocks, and worth every triangle
-    if (isTop && area > 200 && b.w > 12 && b.d > 12 && rng.float() < 0.3 * clutter) {
+    /**
+     * THE WOODEN WATER TOWER — and it is now a property of the ERA rather than
+     * of a coin flip.
+     *
+     * A riveted timber tank on a steel trestle is a PRE-WAR roof: it is there
+     * because the building predates municipal pressure at the eighth floor, so
+     * it belongs on the rowhouse terraces, the Strip lofts, the mill offices
+     * and the masonry commercial blocks — and NOT on a 1970s curtain-wall slab,
+     * which has pumps in the basement and a plant room on the roof. The old
+     * gate was `area > 200 && 12 m square && 30% of clutter` on any archetype,
+     * which put them on glass towers and nowhere near a terrace.
+     */
+    const prewar =
+      plan.arch === 'rowhouse' ||
+      plan.arch === 'block' ||
+      plan.arch === 'warehouse' ||
+      plan.arch === 'mill' ||
+      plan.era === 'deco';
+    /**
+     * MEASURED TWICE, from the `lawrenRoof` frame both times, because the gate
+     * has two terms and only one of them is the probability.
+     *
+     *   0.55 chance, area > 110, 8 m square  →  a tank on nearly every roof.
+     *                                           That reads as a texture.
+     *   0.26 chance, area > 130, 9 m square  →  NONE IN THE FRAME. The cut that
+     *                                           did it was the SIZE gate, not
+     *                                           the chance: a Lawrenceville
+     *                                           rowhouse plot is about 8 m
+     *                                           wide, so `b.w > 9` excluded the
+     *                                           entire district at a stroke.
+     *
+     * So the size gate goes back to what a terrace actually measures and the
+     * probability alone does the thinning. ~1 roof in 4, which is a tank in
+     * every wide shot and a tank on nobody's neighbour.
+     */
+    const tankChance = !facadeOpts.roof
+      ? 0.3 * clutter // the rate this wave inherited; see facade.js
+      : prewar
+        ? 0.21
+        : plan.arch === 'curtain'
+          ? 0
+          : 0.06;
+    const tankArea = facadeOpts.roof ? 105 : 200;
+    const tankSide = facadeOpts.roof ? 8 : 12;
+    /**
+     * The gate the DRAWS are taken under is the union of both arms' thresholds
+     * — the loosest of the two — so the stream advances identically whichever
+     * arm is running, and only the arm's own gate decides whether a tank is
+     * actually placed. See the stream-parity note below the condensers: the
+     * arms of a negative control have to build the same city.
+     */
+    const tankRolled =
+      isTop && area > Math.min(tankArea, 105) && b.w > Math.min(tankSide, 8) && b.d > Math.min(tankSide, 8);
+    if (tankRolled) {
+      const roll = rng.float();
       const p = at();
-      if (p) T.put(Kit.waterTower(lib, 'timber'), p[0], y, p[1], rng.range(0, 6.28), rng.range(0.85, 1.15));
+      const rot = rng.range(0, 6.28);
+      const scale = rng.range(0.85, 1.15);
+      if (
+        area > tankArea &&
+        b.w > tankSide &&
+        b.d > tankSide &&
+        roll < tankChance * (facadeOpts.roof ? 0.6 + clutter : 1) &&
+        p
+      ) {
+        T.put(Kit.waterTower(lib, 'timber'), p[0], y, p[1], rot, scale);
+      }
+    }
+
+    /**
+     * CHIMNEY POTS. A Pittsburgh rowhouse has a flue stack on the party line
+     * whether or not it has a pitched roof, and a flat-roofed terrace without
+     * them is a row of empty trays. `buildPitchedRoof` already puts one on the
+     * gabled stock; this is the other 85% of the residential city.
+     *
+     * Placed at the EDGE of the roof, not in the middle of it: a chimney serves
+     * a flue in a party wall, and a stack standing in the centre of a roof deck
+     * is the tell that it was scattered rather than built.
+     */
+    /**
+     * ─────────────────────────────────────────────────────────────────────────
+     * THE HATCH TAKES ITS DRAWS WHETHER OR NOT IT BUILDS ANYTHING.
+     * ─────────────────────────────────────────────────────────────────────────
+     * `facadeOpts.roof` used to short-circuit the `&&` chains below, so the
+     * `rng.float()` calls inside them were never made in the control arm — and
+     * a skipped draw shifts every later draw on the stream, which is exactly
+     * the failure `makeProgramme`'s stream-parity note is written about. The
+     * two arms of `?owNoFacadeKit=1` were therefore building DIFFERENT CITIES:
+     * different roof furniture, different lit rates, different everything
+     * downstream of here on the same tile.
+     *
+     * MEASURED before this fix, on the settled night frame with the two arms
+     * one page load apart: the near tiles came back with different lot
+     * contents, different merged-batch counts and a triangle count that moved
+     * by 600 000 in the direction that made the kit look expensive. That delta
+     * was the re-rolled city, and it is what convicted this kit of a frame cost
+     * it does not have. A negative control that cannot un-draw a number is not
+     * a control.
+     *
+     * So the rolls are taken FIRST, unconditionally, and the flag only decides
+     * whether the result is used. Same discipline as the discarded
+     * `rng.float()` in `makeProgramme`'s `warehouse` case.
+     */
+    const chimneyOk =
+      isTop && (plan.arch === 'rowhouse' || plan.arch === 'block') && b.w > 3.5 && b.d > 3.5;
+    const nCh = rng.float() < 0.55 ? 2 : 1;
+    for (let i = 0; i < nCh; i++) {
+      // Walk out from the roof centre to a plan edge and stop just inside it.
+      const th = rng.range(0, TAU);
+      const jitter = rng.range(-0.2, 0.2);
+      const scale = rng.range(0.85, 1.25);
+      if (!facadeOpts.roof || !chimneyOk) continue;
+      // The building's OWN masonry, not a chimney palette: a flue stack is
+      // built out of the same brick as the wall it rises out of, and picking
+      // an independent brick would add a merged batch to the tile for two
+      // boxes on a roof.
+      const cid = Kit.chimney(lib, prog.masonry);
+      let px = b.cx;
+      let pz = b.cz;
+      for (let s = 0; s < 24; s++) {
+        const nx2 = b.cx + Math.cos(th) * (s * 0.45);
+        const nz2 = b.cz + Math.sin(th) * (s * 0.45);
+        if (!pointInPoly(poly, nx2, nz2)) break;
+        px = nx2;
+        pz = nz2;
+      }
+      T.put(cid, px, y, pz, th + jitter, scale);
+    }
+
+    // The way onto the roof. Every flat roof in a city has one and they are
+    // never closed. Rolls first, flag second — see the note above.
+    {
+      const roll = rng.float();
+      if (isTop && area > 60 && roll < 0.45 * clutter + 0.2) {
+        const p = at();
+        const rot = rng.range(0, TAU);
+        const scale = rng.range(0.9, 1.15);
+        if (facadeOpts.roof && p) T.put(Kit.roofHatch(lib, 'steel_dark'), p[0], y, p[1], rot, scale);
+      }
     }
 
     // roof access ladder up the parapet
@@ -1110,7 +1388,66 @@ function dressRoof(T, lib, plan, rng, groundY) {
       const p = at();
       if (p) T.putS(Kit.ladder(lib, 'steel_dark'), p[0], y, p[1], rng.range(0, 6.28), 1, 2.2, 1);
     }
+
+    if (isTop) publishBillboard(T, plan, poly, b, y, groundY);
   }
+}
+
+/**
+ * THE ROOFTOP HOARDING ANCHOR — a mount point, not a sign.
+ *
+ * See THE SIGN MOUNT CONTRACT in `tile.js`. This publishes one 'billboard'
+ * record per qualifying roof and builds nothing: what the hoarding SAYS is the
+ * signage layer's business, and a facade kit that painted GREASE FM on a roof
+ * itself would be two subsystems deciding one thing.
+ *
+ * WHO QUALIFIES. A flat roof, high enough off the street that a board on it
+ * clears the buildings in front (the whole point of a rooftop hoarding), and
+ * deep enough in plan to stand the back legs on. A pitched roof never gets one.
+ *
+ * WHERE. On the STREET-FACING edge, one metre inside the parapet, facing the
+ * way the building faces. Derived from the roof polygon rather than from the
+ * bounding box, because Steel City's twelve district grids run at twelve
+ * different angles and a box-aligned anchor on a rotated lot is off the roof.
+ */
+function publishBillboard(T, plan, poly, b, y, groundY) {
+  if (!facadeOpts.mounts) return; // negative control; see facade.js
+  if (plan.pitched) return;
+  if (y - groundY < 11) return;
+  if (Math.min(b.w, b.d) < 9) return;
+  const c = polyCentroid(poly);
+  let best = null;
+  let bestDot = 0.35;
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i];
+    const bb = poly[(i + 1) % poly.length];
+    const len = Math.hypot(bb[0] - a[0], bb[1] - a[1]);
+    if (len < 7) continue;
+    outwardNormal(a[0], a[1], bb[0], bb[1], c[0], c[1], _n);
+    const dot = _n[0] * plan.toStreet[0] + _n[1] * plan.toStreet[1];
+    if (dot <= bestDot) continue;
+    bestDot = dot;
+    best = { mx: (a[0] + bb[0]) / 2, mz: (a[1] + bb[1]) / 2, nx: _n[0], nz: _n[1], len };
+  }
+  if (!best) return;
+  const inset = 1.1;
+  T.mount({
+    kind: 'billboard',
+    x: best.mx - best.nx * inset,
+    y: y + plan.prog.parapet,
+    z: best.mz - best.nz * inset,
+    ry: Math.atan2(best.nx, best.nz),
+    nx: best.nx,
+    nz: best.nz,
+    // `h` is HEADROOM above the deck for this kind, not a half-height: a board
+    // stands up from the anchor. Capped so a hoarding never out-tops its own
+    // building by more than a storey.
+    w: Math.min(best.len - 2.0, 14),
+    h: Math.min(6.5, Math.max(3.0, (y - groundY) * 0.22)),
+    arch: plan.arch,
+    era: plan.era ?? 'plain',
+    front: true,
+  });
 }
 
 // --------------------------------------------------------------- far LOD --
@@ -1377,8 +1714,104 @@ export function buildLotLod(T, lib, plan, rng, groundY = 0) {
       }
     }
   }
+  lodHoarding(T, plan, rng, groundY, box);
   band.dispose();
   box.dispose();
+}
+
+/**
+ * ────────────────────────────────────────────────────────────────────────────
+ * THE ROOFTOP HOARDING, AT THE DISTANCE THE ROOFTOP HOARDING IS FOR.
+ * ────────────────────────────────────────────────────────────────────────────
+ * `props/layout.js` stands a hoarding on the deck of every tall flat-roofed
+ * lot it likes the look of, and it says so itself: "ROOFTOP HOARDINGS — the
+ * skyline's half of the signage layer". It then places them on LOD0 TILES ONLY
+ * (`layout.js` returns before `_rooftopBoard` when `lod !== 0`, and `tile.js`
+ * documents the same rule) — so at the Mt Washington vantage, which is 500 m
+ * out and is the one frame those boards were authored for, there is not a
+ * single one of them in the picture. The skyline's half of the signage layer
+ * is absent from the skyline.
+ *
+ * This is the SILHOUETTE half of that board, carried by the massing build so
+ * the far city keeps the ragged roofline a hoarding gives it. Three boxes: the
+ * board, and two legs under it.
+ *
+ * IT IS NOT THE SAME BOARD, and pretending otherwise would be worse than
+ * saying so. `props` derives its anchor from `world.lotsInTile` and a physics
+ * raycast, off its own `hash3i` stream, and rule 2 forbids this file reaching
+ * for either; the two therefore agree on the RULE — tall, flat-topped, longest
+ * street-facing edge, inset 2.2 m, `min(len - 3, 13)` wide and
+ * `min(5.6, max(3.2, h/5))` tall, which are `_rooftopBoard`'s own numbers —
+ * and not on which individual roofs get one. The near tile already gains and
+ * loses the ENTIRE props signage layer at the LOD0 boundary, so a hoarding
+ * that differs across it changes the size of a discontinuity that exists
+ * either way; a downtown with no boards on it at 500 m is a missing feature.
+ *
+ * No copy. A 13 m board at 500 m is 14 px wide in a 1080p 50-degree frame,
+ * which is under `fitScale`'s legibility floor by an order of magnitude, and
+ * an illegible painted word at that range is the "floating illegible
+ * billboard" defect rather than a fix for it.
+ */
+function lodHoarding(T, plan, rng, groundY, box) {
+  if (plan.pitched) return;
+  const vol = plan.volumes[plan.volumes.length - 1];
+  if (!vol) return;
+  const top = vol.y0 + vol.h;
+  if (top < 16) return;
+  /**
+   * The rate is `props`' own base chance with the district signage term it
+   * cannot see dropped — `_rooftopBoard` takes `0.16 + style.signage * 0.14`,
+   * i.e. 0.16 to 0.37 across the twelve districts, and 0.22 sits inside that
+   * band. Drawn LAST in this build, after every other `rng` consumer above, so
+   * adding it re-rolls no window, no pier and no roof plant.
+   */
+  if (rng.float() > 0.22) return;
+
+  // The longest edge of the top volume that faces the street; longest overall
+  // if none of them does. Same choice `_rooftopBoard` makes on the lot polygon.
+  const poly = vol.poly;
+  const c = polyCentroid(poly);
+  let best = null;
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i];
+    const b = poly[(i + 1) % poly.length];
+    const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    if (len < 9) continue;
+    outwardNormal(a[0], a[1], b[0], b[1], c[0], c[1], _n);
+    const street = _n[0] * plan.toStreet[0] + _n[1] * plan.toStreet[1];
+    const score = len + (street > 0.2 ? 1000 : 0);
+    if (!best || score > best.score) {
+      best = {
+        score, len,
+        ux: (b[0] - a[0]) / len, uz: (b[1] - a[1]) / len,
+        nx: _n[0], nz: _n[1],
+        mx: (a[0] + b[0]) / 2, mz: (a[1] + b[1]) / 2,
+      };
+    }
+  }
+  if (!best) return;
+
+  const bw = Math.min(best.len - 3.0, 13);
+  const bh = Math.min(5.6, Math.max(3.2, top * 0.20));
+  const ox = best.mx - best.nx * 2.2;
+  const oz = best.mz - best.nz * 2.2;
+  const deck = groundY + top;
+  const yaw = Math.atan2(best.nx, best.nz);
+
+  // The board. 0.22 m thick, so it is a hoarding seen edge-on from the side
+  // rather than a card that vanishes when the camera crosses its plane.
+  trs(_m, ox, deck + bh * 0.62, oz, yaw, bw, bh, 0.22);
+  T.add('sign_board', box, _m, { masks: [0.55, 0.6, 0.3] });
+  // Two legs and a raked stay, all boxes — a hoarding standing on nothing is
+  // the same floating-board defect one storey up.
+  for (const s of [-1, 1]) {
+    trs(_m, ox + best.ux * s * bw * 0.34, deck + bh * 0.31, oz + best.uz * s * bw * 0.34,
+      yaw, 0.24, bh * 0.62, 0.24);
+    T.add('steel_dark', box, _m, { masks: [0.7, 0.6, 0.35] });
+  }
+  trs(_m, ox - best.nx * bh * 0.24, deck + bh * 0.34, oz - best.nz * bh * 0.24,
+    yaw, bw * 0.8, 0.16, bh * 0.55, -0.62, 0);
+  T.add('steel_dark', box, _m, { masks: [0.75, 0.6, 0.35] });
 }
 
 /**
@@ -1412,9 +1845,95 @@ function buildPlinth(T, plan, groundY, stone) {
   // so it reads as the pavement stepping up to the threshold rather than as a
   // second wall. Deliberately a DIFFERENT surface from the plinth: the tonal
   // break is what makes the join legible in a wide shot.
+  const sub = plan.prog.age > 0.55 ? 'concrete_wall' : 'precast';
   const p2 = polyPrism(polyInset(poly, -0.34), 0.86);
   trs(_m, 0, groundY - 0.7, 0, 0);
-  T.addOnce(plan.prog.age > 0.55 ? 'concrete_wall' : 'precast', p2, _m, grubby);
+  T.addOnce(sub, p2, _m, grubby);
+
+  buildTerrace(T, plan, groundY, poly, b, sub);
+}
+
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * THE TERRACED FOUNDATION, and why it is authored blind.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * The critics photographed it: "a tower spears a hillside with no foundation or
+ * terrain blend". They were looking at a real defect with a specific cause.
+ * `index.js` seats each plan on the LOWEST corner of its footprint, which is
+ * right — a centroid pad floats a whole storey clear of the pavement on the
+ * downhill side of a Pittsburgh lot — but it only guarantees the ground INSIDE
+ * the footprint. Ten metres downhill of a lot cut into the side of Mt.
+ * Washington the terrain is metres lower still, and the plinth reaches 0.9 m.
+ * Between the two there is a wall with nothing under it.
+ *
+ * WHY IT DOES NOT ASK THE TERRAIN. It cannot: `buildLot` is handed one scalar
+ * `groundY` and no sampler, and going to get one would mean `buildings`
+ * re-deriving a fact `world` owns at every lot in the city (rule 12's spatial
+ * form, and the same argument `tile.js` makes about the ground AO bake). It
+ * does not need to. A retaining terrace that is CORRECT WHEN IT IS BURIED
+ * needs no query at all: each course steps out and down from the one above, so
+ * on flat ground the whole apron is under the pavement and invisible, and on a
+ * fall it is revealed exactly as far as the ground has fallen. The hill decides
+ * how much of it you see. That is what a real cut-and-fill foundation IS.
+ *
+ * WHY THE COURSES ARE MARKED `buried` — see the long note on `TileBuilder.add`.
+ * They are metres below grade on purpose, so they may not vote on where the
+ * ground is (the AO junction bake would follow them down and every wall in the
+ * tile would lose its darkening), and the kerb guard may not delete them (they
+ * are wider in plan than the building, so a deletion would orphan it).
+ *
+ * COST. Four prisms of an 8-vertex plan, ~90 triangles, and — this is the part
+ * that had to be MEASURED rather than assumed — ZERO draw calls, because every
+ * course is drawn in the kerb course's own surface. The first cut gave the
+ * apron its own `concrete_dark` key and `kitprobe` reported +115 batches over
+ * 116 single-lot tiles: one new merged batch per building, for geometry that is
+ * under the pavement. A foundation is the same concrete as the kerb it holds
+ * up, so this costs nothing and is also what a foundation is.
+ */
+function buildTerrace(T, plan, groundY, poly, b, key) {
+  if (!facadeOpts.terrace) return; // negative control; see facade.js
+  if (b.w < 3 || b.d < 3) return;
+  const tall = plan.arch === 'tower' || plan.arch === 'curtain' || plan.arch === 'deco';
+  /**
+   * A tower reaches further because a tower is what gets cut into a hillside,
+   * and because it is the one building whose missing foundation is visible from
+   * across the river. Four courses at 2.3 m is 9.2 m of fall covered; the
+   * two-storey stock gets three at 1.5 m, which covers the 4.5 m drop a
+   * Lawrenceville side street actually manages between one lot and the next.
+   */
+  /**
+   * THE BATTER IS STEEP, and the number is a collision property before it is an
+   * aesthetic one. Every centimetre the apron steps OUT is drawn mass that will
+   * stand above the pavement somewhere on a hillside, with no collider on it —
+   * `solidprobe` rasterises the picture and measures exactly that. A real
+   * retaining wall batters about one in six; at one in ten this apron covers a
+   * 6.6 m fall (12 m under a tower) while never reaching a metre past the kerb
+   * course, which keeps it inside the margin that gate already allows for
+   * eaves, copings and porch decks.
+   */
+  const n = tall ? 4 : 3;
+  const step = tall ? 3.0 : 2.2;
+  const out = tall ? 0.3 : 0.22;
+  for (let i = 0; i < n; i++) {
+    // Each course starts at the top of the one above so the stack is solid —
+    // a gap between terraces is a slot you can see the sky through from below.
+    const y0 = groundY - 0.55 - (i + 1) * step;
+    /**
+     * THE TOP COURSE IS EXACTLY THE KERB COURSE'S WIDTH, and only the ones
+     * below it step out. MEASURED with `solidprobe --url=owNoFacadeKit=terrace`:
+     * with the apron widening from the very first course it added 2 ghosts to
+     * that gate, because on a lot whose pavement falls away the first course's
+     * top surface lands inside the band the probe rasterises as a man-height
+     * obstruction — a 44 cm ring of drawn mass, at grade, with no collider on
+     * it. Starting flush with the kerb means the apron adds NOTHING in plan
+     * until it is well under the pavement, which is where a foundation belongs.
+     */
+    const p = polyInset(poly, -(0.34 + i * out));
+    if (p.length < 3) break;
+    const g = polyPrism(p, step + 0.35);
+    trs(_m, 0, y0, 0, 0);
+    T.addOnce(key, g, _m, { masks: [0.6, 0.8, 0.5], buried: true });
+  }
 }
 
 /** Even-odd point-in-polygon for [x,z] pairs. */

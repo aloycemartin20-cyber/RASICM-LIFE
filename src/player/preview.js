@@ -17,6 +17,18 @@
  * field — that is the only way to see foot planting on a slope without the
  * whole engine.
  *
+ * `?noIdentity=1` IS A NEGATIVE CONTROL, AND IT IS THE ONE WAY TO LOOK AT IT.
+ * `build.noIdentity` collapses every brother onto the shared base face and the
+ * shared wardrobe — `mesh.js`'s IDENTITY table AND `brothers.js`'s own
+ * jaw/brow/nose scalars — leaving three bodies that differ only in SIZE. It is
+ * what `src/player/character/identityprobe.mjs` requires of itself before it
+ * will believe its own numbers (every face pair must fall to 0.00 mm of
+ * separation with it on), and until now it existed only inside that probe: the
+ * control was measurable in node and impossible to LOOK at. It is most useful
+ * with `view=grid`, which lines the three brothers up side by side — the arm
+ * where they stop being tellable apart is the arm that proves the identity work
+ * is doing something. Never a play path; this page is not in the build.
+ *
  * Dev tool. Nothing in the game imports it.
  */
 import * as THREE from 'three';
@@ -30,6 +42,24 @@ const POSE = params.get('pose') ?? 'idle';
 const VIEW = params.get('view') ?? 'hero';
 const PHASE = Number(params.get('phase') ?? 0.18); // seconds of animation to run
 const GRID = params.get('view') === 'grid';
+const NO_IDENTITY = params.get('noIdentity') === '1';
+
+/**
+ * The brother spec this page builds from, with the control folded in.
+ *
+ * `CharacterRig.setBrother` stamps `spec.id` onto a COPY of `spec.build` and
+ * hands that to `buildCharacter`, and `identityOf(build)` /
+ * `buildBody(build)` are the two readers of `noIdentity` — so putting the flag
+ * on the build here reaches the face table, the wardrobe cut and brothers.js's
+ * own scalars by exactly the path `identityprobe` drives them by. Nothing is
+ * copied when the control is off, so the default page builds the shipped spec
+ * object itself.
+ */
+function specFor(id) {
+  const spec = BROTHERS[id] ?? BROTHERS.carson;
+  if (!NO_IDENTITY) return spec;
+  return { ...spec, build: { ...spec.build, noIdentity: true } };
+}
 
 const canvas = document.getElementById('c');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
@@ -183,11 +213,11 @@ const ctx = {
 
 /* ------------------------------------------------------------- character -- */
 const rig = new CharacterRig(ctx);
-rig.setBrother(BROTHERS[BOY] ?? BROTHERS.carson, scene);
+rig.setBrother(specFor(BOY), scene);
 const animator = new Animator(ctx, rig);
 
 function makeCharacter(id) {
-  rig.setBrother(BROTHERS[id] ?? BROTHERS.carson, scene);
+  rig.setBrother(specFor(id), scene);
   animator.rig = rig;
   animator._cacheRest();
   animator.reset();
@@ -249,7 +279,7 @@ function stepSim(dt) {
 }
 
 /* ----------------------------------------------------------------- views -- */
-const scale = (BROTHERS[BOY] ?? BROTHERS.carson).build.scale;
+const scale = specFor(BOY).build.scale;
 function frameCamera() {
   const cx = req.x, cz = req.z, cy = req.y;
   const at = new THREE.Vector3(cx, cy + 0.95 * scale, cz);
@@ -318,7 +348,7 @@ if (GRID) {
   const ids = Object.keys(BROTHERS);
   for (let i = 0; i < ids.length; i++) {
     const r = new CharacterRig(ctx);
-    r.setBrother(BROTHERS[ids[i]], scene);
+    r.setBrother(specFor(ids[i]), scene);
     const a = new Animator(ctx, r);
     r.root.position.x = (i - 1) * 1.15;
     clones.push({ rig: r, anim: a, x: (i - 1) * 1.15 });
@@ -349,7 +379,9 @@ function render() {
   renderer.render(scene, camera);
   warmed++;
   hud.textContent =
-    `${BOY} · ${POSE} · ${VIEW}\n` +
+    // The control is stamped on the frame: an A/B whose two images are not
+    // labelled is an A/B somebody will eventually pair up the wrong way.
+    `${BOY} · ${POSE} · ${VIEW}${NO_IDENTITY ? ' · noIdentity (CONTROL)' : ''}\n` +
     `t ${simT.toFixed(2)}s  phase ${(animator.phase / (Math.PI * 2)).toFixed(3)}\n` +
     `pelvisDrop ${animator.pelvisDrop.toFixed(3)}  landDip ${animator.landDip.toFixed(3)}\n` +
     `tris ${renderer.info.render.triangles}  calls ${renderer.info.render.calls}`;
@@ -364,4 +396,6 @@ addEventListener('resize', () => {
   camera.updateProjectionMatrix();
 });
 
-window.__PREVIEW__ = { rig, animator, scene, camera, renderer, makeCharacter, req };
+// `noIdentity` is published so a harness can assert which ARM it photographed
+// rather than trusting the URL it thinks it navigated to.
+window.__PREVIEW__ = { rig, animator, scene, camera, renderer, makeCharacter, req, noIdentity: NO_IDENTITY };

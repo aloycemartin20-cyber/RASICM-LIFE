@@ -522,7 +522,20 @@ export const Kit = {
       p.dispose();
       const g = a.build();
       return weather(g, { wear: 0.95, grime: 0.7, down: 0.9 });
-    }, matKey);
+    /**
+     * THE LANDINGS DO NOT CAST, and this is the single largest shadow saving in
+     * the kit rather than a detail.
+     *
+     * An escape is ~1200 triangles of 22 mm balusters, 45 mm treads and 85 mm
+     * grating slats, and a loft district puts six landings on most buildings —
+     * MEASURED at ~150 placements and 180 000 triangles on one downtown tile,
+     * submitted to every cascade. What comes back for that is not a stair
+     * shadow: every member of it is under the nearest cascade's own PCF disc,
+     * so the grating resolves as a smear and the balusters as acne. The escape
+     * still reads, from the thing that always read it — its silhouette against
+     * the wall, and the wall's own shadow behind it.
+     */
+    }, matKey, { castShadow: false });
   },
 
   // ------------------------------------------------------------- ground ----
@@ -752,6 +765,94 @@ export const Kit = {
       const g = a.build();
       return weather(g, { wear: 0.9, grime: 0.6, down: 0.85 });
     }, matKey);
+  },
+
+  // ----------------------------------------------------------- cornices ----
+  /**
+   * ONE DENTIL. The little tooth-block that marches along the underside of a
+   * classical cornice, and the reason a 1900s commercial block reads as a
+   * 1900s commercial block from the far pavement rather than as a brick box
+   * with a lid on it.
+   *
+   * Authored at REAL SIZE, not at unit size, and placed unscaled: a dentil is
+   * ~13 cm wide whatever the building is, and a run scaled to the elevation is
+   * the single loudest "this is a texture" tell a cornice can have. The caller
+   * spaces them; see `denticulate` in facade.js.
+   *
+   * z = 0 is the wall face, so the block projects OUT. It is short in Y and
+   * deep in Z on purpose — the shadow it casts on the frieze behind it is the
+   * whole read, and a dentil that does not project further than it is tall
+   * casts nothing at a raking sun angle.
+   */
+  dentil(lib, matKey) {
+    const k = id('dt', matKey);
+    return lib.proto(k, () => {
+      // `plainBox`, not `chamferBox`: this is the most-repeated piece in the
+      // kit and an 8 mm arris on a 13 cm block is invisible at any distance a
+      // dentil course is legible from, while the chamfer doubles its triangles.
+      const g = plainBox(0.13, 0.17, 0.19);
+      g.translate(0, 0, 0.095);
+      return weather(g, { wear: 0.6, grime: 0.7, down: 0.9 });
+    /**
+     * IT DOES NOT CAST INTO A CASCADE, and that is not a contradiction of the
+     * paragraph above. The shadow a dentil throws on the frieze behind it is
+     * 13 cm across; the nearest cascade's texel is ~100 mm and the far one's is
+     * 514 mm, so past the first metre of the first cascade the tooth lands
+     * inside its own depth bias and returns a stipple instead of a shadow —
+     * the same failure `emit`'s DETAIL bucket documents for a 2 cm spandrel.
+     * What actually draws the tooth course is its own shading and the vertex AO
+     * under the corona that overhangs it, both of which are resolution
+     * independent and neither of which is the shadow map.
+     */
+    }, matKey, { castShadow: false });
+  },
+
+  /**
+   * A modillion — the scrolled bracket under a projecting eave or a heavy
+   * stone cornice. Same argument as the dentil, one size up: authored at real
+   * size, placed unscaled, three stepped blocks standing in for the scroll
+   * because at the distance a bracket is ever resolved the STEP is what reads
+   * and the volute is not.
+   */
+  modillion(lib, matKey) {
+    const k = id('mo', matKey);
+    return lib.proto(k, () => {
+      const a = new Accum('modillion');
+      const b = plainBox();
+      // Kept INSIDE the 42 cm eave it hangs under, for the reason written over
+      // the `eave` profile in facade.js: on the smallest archetype in the city
+      // every centimetre of overhang past the wall costs somewhere else.
+      a.add(b, trs(_m, 0, 0.0, 0.15, 0, 0.11, 0.34, 0.3));
+      a.add(b, trs(_m, 0, 0.19, 0.18, 0, 0.2, 0.08, 0.36));
+      b.dispose();
+      return weather(a.build(), { wear: 0.6, grime: 0.7, down: 0.95 });
+      // 11 cm wide, and it hangs UNDER a 42 cm eave that already shades it. See
+      // the note on `dentil`: at any cascade texel this city has, the bracket's
+      // own cast shadow is noise inside the eave's.
+    }, matKey, { castShadow: false });
+  },
+
+  /**
+   * Roof hatch: the raised kerb and the lid that is always propped open on a
+   * flat roof somebody actually uses. Real size, unscaled, ~90 cm square.
+   */
+  roofHatch(lib, matKey) {
+    const k = id('rh', matKey);
+    return lib.proto(k, () => {
+      const a = new Accum('hatch');
+      const b = chamferBox(1, 1, 1, 0.012);
+      a.add(b, trs(_m, 0, 0.16, 0, 0, 0.95, 0.32, 0.95));
+      // the lid, hinged along one edge and standing part-open
+      a.add(b, trs(_m, 0, 0.46, -0.34, 0, 1.02, 0.06, 1.0, 0, 0));
+      b.dispose();
+      const p = plainBox();
+      a.add(p, trs(_m, 0, 0.62, 0.44, 0, 0.05, 0.36, 0.05));
+      p.dispose();
+      return weather(a.build(), { wear: 0.85, grime: 0.7, down: 0.9 });
+      // A 90 cm kerb with a lid on it, lying flat on a roof deck nobody sees
+      // from the street. It is skyline dressing, not a silhouette, and its
+      // shadow falls on the deck it is standing on.
+    }, matKey, { castShadow: false });
   },
 
   /** Parapet coping run, 1 m, scaled along X. */

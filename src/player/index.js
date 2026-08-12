@@ -34,6 +34,10 @@
  *   p.pitch           camera pitch
  *   p.character       the physics CharacterController (read-only)
  *   p.hitbox          physics collider on LAYER.PLAYER
+ *   p.groundShadow    the brother's SUBMISSION SWITCH into the crowd's contact
+ *                     pool — `{ on, mode, submitted, pool, setMode('off'|'on') }`.
+ *                     `setMode('off')` is the A/B for his mark alone; the BLEND
+ *                     belongs to `peds.ground`. See `_submitGroundShadow`
  *
  * STATE
  *   p.state    'idle'|'walk'|'jog'|'sprint'|'stop'|'turn'|'crouch'|'jump'|
@@ -109,6 +113,14 @@ const FALLBACK_SWING = { wind: 0.12, strike: 0.14, recover: 0.2, contact: 0.5 };
  * full. See `_onExplosion`.
  */
 const BLAST_PLAYER_SHARE = 0.55;
+
+/**
+ * How far above the actor's own ground a foot's contact mark may be drawn,
+ * metres. See `_footContact` — it is the ceiling that stops a swinging foot
+ * carrying its mark into the air, and it is 0.06 because that clears camber,
+ * a slope and the IK's own settle without reaching a kerb's 0.15 m.
+ */
+const FOOT_MARK_LIFT = 0.06;
 
 export class PlayerSystem {
   static id = 'player';
@@ -264,6 +276,52 @@ export class PlayerSystem {
       guard: 0,
       /** This brother's top speed, so the animator can normalise per brother. */
       topSpeed: MOVE.sprintSpeed, sprinting: false,
+    };
+
+    /* ---- ground contact ------------------------------------------------
+     * The switch and the ped-shaped actor record submitted to the crowd's pool,
+     * both preallocated (hard rule 5 — `_submitGroundShadow` runs every frame).
+     * See the long note on `_submitGroundShadow`.
+     */
+    this._shadowPool = null;
+    /**
+     * PUBLISHED as `player.groundShadow`. Not a pool: a switch and a window.
+     *
+     *   on         false suppresses this actor's submission and NOTHING else
+     *   mode       'off' while suppressed, otherwise the pool's own blend
+     *   submitted  did he actually go into the pool on the last frame — the
+     *              difference between "his mark is off" and "he is driving"
+     *   pool       the `GroundShadows` he writes into, null before `peds` boots
+     *
+     * `setMode` takes 'off' or anything else. The BLEND is deliberately not
+     * settable here: there is now one pool and one material for every person in
+     * the frame, so `peds.ground.setMode('lerp')` is the one switch that can
+     * change it, and a second name for it here could only ever disagree.
+     */
+    this.groundShadow = {
+      on: true,
+      mode: 'multiply',
+      submitted: false,
+      pool: null,
+      setMode: (m) => {
+        this.groundShadow.on = m !== 'off';
+        this.groundShadow.mode = this.groundShadow.on
+          ? (this._shadowPool?.mode ?? 'multiply') : 'off';
+        return this.groundShadow.mode;
+      },
+    };
+    this._shadowSys = { world: null };
+    /** Set once per frame by `_submitGroundShadow`, read by `_footContact`. */
+    this._shadowFoot = { hit: false };
+    this._shadowActor = {
+      position: new THREE.Vector3(),
+      scale: 1,
+      yaw: 0,
+      /** `GroundShadows.addPed` takes the foot path when `body && lod <= 1`. */
+      body: true,
+      lod: 0,
+      animator: { footContact: (k, out) => this._footContact(k, out) },
+      sys: this._shadowSys,
     };
 
     this._tmp = new THREE.Vector3();
@@ -543,6 +601,10 @@ export class PlayerSystem {
     this.vehicles.applySeatAttitude(this.character?.root ?? null);
     this._drainFootstep();
     this._updateVisibility(dt);
+    // After the animator and after `_updateVisibility`: the mark is placed off
+    // the foot IK's final targets and is suppressed for a body that is not in
+    // the picture. See the note on the method.
+    this._submitGroundShadow();
 
     this.lowHealthPass?.sync(this.health);
     this._syncHitbox();
@@ -842,6 +904,181 @@ export class PlayerSystem {
     const target = clamp01((d - C.fadeEnd) / (C.fadeStart - C.fadeEnd));
     this._fade = approach(this._fade ?? 1, target, 0.05, dt);
     this.character.setOpacity(this._fade);
+  }
+
+  /* ==================================================================== */
+  /* ground contact                                                       */
+  /* ==================================================================== */
+
+  /**
+   * ──────────────────────────────────────────────────────────────────────────
+   * THE PLAYER GETS THE CROWD'S CONTACT MARK — FROM HIS OWN INSTANCE OF IT.
+   * ──────────────────────────────────────────────────────────────────────────
+   * `src/peds/crowdfx.js` has had a `GroundShadows` pool under every body and
+   * every foot since early on, and `src/vehicles/groundshadow.js` has the
+   * equivalent under every car. The brother had NEITHER, and he is the most
+   * photographed actor in the game: every `character`, `street` and `crowd`
+   * frame this project has shot has a man standing on a pavement with a
+   * pedestrian three metres behind him wearing a contact mark he does not have.
+   * The cascade cannot cover it — at 4096 px over a 30 m cascade one texel is
+   * 7 mm and the depth bias that stops a skinned mesh self-shadowing eats
+   * exactly that — and `render/contact.js` is quality-gated off at `low`, which
+   * is the whole reason the geometric pool exists for everyone else.
+   *
+   * HE USED TO RUN A SECOND INSTANCE OF THE POOL, AND HE NO LONGER HAS TO.
+   *
+   * Writing into `peds.ground` fails the obvious way because of the FRAME ORDER
+   * rather than the API. `peds` fills its pool inside its OWN `lateUpdate` —
+   * `ground.begin()`, one `addPed` per live pedestrian, `ground.end()` — and
+   * `begin()` resets the write cursor to zero. MEASURED on this build,
+   * `registry.with('lateUpdate')` in topo order:
+   *
+   *     sky · physics · world · traffic · peds · weapons · fx · ui · hud
+   *
+   * `player` is not in that list, and were it added it would sort at position
+   * three (its deps are physics/world/render and `main.js` adds it before
+   * `peds`), i.e. BEFORE `peds`. So every quad this subsystem could write was
+   * erased microseconds later. The answer was a whole second pool over three
+   * quads: two instanced draws and two 64x64 occlusion textures (32 KiB) of
+   * duplicate bake, plus a second blend switch, a second lift cap and a second
+   * copy of every fix made to the first.
+   *
+   * `GroundShadows.submit` is the same feature without any of that. It appends
+   * to a queue `begin()` deliberately does not clear and `end()` drains through
+   * `addPed`, so a write that lands BEFORE `begin()` — which is the only kind
+   * this subsystem can make — is exactly the case that works. What is submitted
+   * is a duck-typed actor record, reused and filled in place, never a Ped.
+   *
+   * WHAT SURVIVES UNCHANGED. Every suppression state below (seated, swimming,
+   * hidden for a shot, aboard an aircraft, more than 3 m over the ground) is
+   * the same test it was; not calling `submit` is how a suppressed frame is
+   * expressed now, and the queue is emptied by `end()` whether or not it was
+   * fed, so a suppressed brother cannot leave a stale mark behind. And THE
+   * SURFACE RESOLVE IS STILL THE CROWD'S — `GroundShadows._contactY` lifts the
+   * mark onto `world.walkableHeightAt` rather than onto the collider the actor
+   * stands on, because `roadmesh` collides on an 11 m cross section and DRAWS a
+   * 2.7 m one with camber and ruts, so the drawn road stands a median 34 mm
+   * above the collider and a mark placed at the actor's own feet depth-tests
+   * out. It is now the crowd's copy of that rule rather than a second one.
+   */
+  _submitGroundShadow() {
+    const g = this._shadowPool ?? this._findGroundShadow();
+    this.groundShadow.submitted = false;
+    if (!g) return;
+    const m = this.movement;
+    const vh = this.vehicles;
+    const draw =
+      m && this.groundShadow.on &&
+      // A seated body is inside a car that is casting its own shadow, and its
+      // root is the seat — the same case `peds` skips for its drivers.
+      !m.driving && !vh?.seated &&
+      // On water there is no ground to mark, and the swim pose has no stance.
+      !m.swimming &&
+      // A body deliberately absent from the picture leaves no shadow: a mark
+      // with no caster is the defect, not the fix.
+      !this._shotHide && !this._inAircraft();
+    if (draw) {
+      const a = this._shadowActor;
+      const p = m.renderPosition;
+      // The ground UNDER him, never his own y. `GroundShadows` reads
+      // `position.y` as the surface the actor stands on (a `Ped` pins it
+      // there); airborne, the player's y is the jump apex and an unadjusted
+      // blob would ride up with him.
+      const gd = m.grounded ? 0 : (m.character?.groundDistance ?? Infinity);
+      // Past this there is nothing to mark: a rooftop gap, a bridge, the river.
+      // 3 m is well beyond where `addPed`'s own height fade has taken the blob
+      // to zero (0.12 m + 0.55 m), so the cutoff can never pop a visible mark.
+      if (Number.isFinite(gd) && gd < 3) {
+        a.position.set(p.x, p.y - gd, p.z);
+        a.scale = m.bodyScale ?? 1;
+        a.yaw = m.faceYaw;
+        /**
+         * THE FEET REPORT EVEN WHEN HE IS IN THE AIR, and that is not a
+         * detail: `GroundShadows.addPed` derives the BODY blob's strength from
+         * the minimum daylight the two feet report, and a foot that answers
+         * `hit: false` is skipped — leaving `minAbove` at 0, i.e. "both soles
+         * are on the deck". Report nothing while airborne and a jumping
+         * brother keeps a full-strength blob pinned to the ground under him,
+         * which is the same class of bug as the blob riding up with him.
+         * `_footContact` measures the daylight against the resolved ground
+         * below, so the fade is continuous through a jump and a fall.
+         */
+        this._shadowFoot.hit = !this.health?.dead;
+        if (this._shadowSys.world === null) this._shadowSys.world = this.ctx.peek('world') ?? null;
+        this.groundShadow.submitted = g.submit(a);
+      }
+    }
+  }
+
+  /**
+   * The crowd's contact record for one of the player's feet: `k` 0 right,
+   * 1 left, matching `Animator.foot` and `PedAnimator.footContact`.
+   *
+   * `foot[k].target` is the ANKLE the leg IK solved to, and the animator's own
+   * footfall event already publishes the ground as `target.y - soleY` — so this
+   * is the same quantity the footstep FX are placed at, not a second opinion
+   * about where the foot is.
+   *
+   * TWO CORRECTIONS THE PED PATH DOES NOT NEED, both because the quantity here
+   * is an IK TARGET and the crowd's is a traced ground.
+   *
+   * `y` is CLAMPED to the actor's own ground. `PedAnimator.footContact` returns
+   * the ground under the foot whether the foot is up or down; this animator's
+   * `foot[k].target` is where the ankle was solved TO, and for a swinging foot
+   * that is `max(swing height, ground)` — so an unclamped mark climbs with the
+   * foot instead of staying on the pavement and fading, which is exactly the
+   * "small hard dot hanging under a foot that is 20 cm in the air" the crowd's
+   * spread-as-it-fades curve exists to avoid. `FOOT_MARK_LIFT` of slack keeps a
+   * planted foot on a cambered or sloping surface at its own sole rather than
+   * dragging it to the capsule floor; it is well under a kerb's 0.15 m, so a
+   * foot genuinely up on a kerb is still the case `lock` covers.
+   *
+   * `above` is daylight under the sole measured against that same ground, so it
+   * is continuous through a jump — the body blob's fade reads it.
+   */
+  _footContact(k, out) {
+    const an = this.animator;
+    const f = an?.foot?.[k];
+    out.hit = !!f && this._shadowFoot.hit;
+    if (!f) return out;
+    const gy = this._shadowActor.position.y;
+    const sole = f.target.y - (an.soleY ?? 0);
+    out.x = f.target.x;
+    out.z = f.target.z;
+    out.y = Math.min(sole, gy + FOOT_MARK_LIFT);
+    out.above = Math.max(0, sole - gy);
+    out.planted = f.planted === true;
+    // The stance lock is the second opinion the height cannot give: a planted
+    // foot is bearing weight by definition, whatever the daylight says.
+    out.lock = f.planted ? 1 : 0;
+    return out;
+  }
+
+  /**
+   * Find the crowd's pool, the first frame `peds` has one.
+   *
+   * Lazy because the registry inits `player` BEFORE `peds` (see the note on
+   * `_submitGroundShadow`), so there is nothing to read in `init()`. The retry
+   * costs one `peek` on a Map per frame and nothing else; a harness with no
+   * `peds` at all — `preview.js`, the character studio — simply never finds a
+   * pool and the brother wears no mark, which is right, because those stand him
+   * on a flat plate where the collider and the drawn surface are the same
+   * thing.
+   *
+   * NO QUERY-STRING READ HERE ANY MORE, and that is a simplification rather
+   * than a loss: `?owNoPedShadow=1` and `?owPedShadowLerp=1` set the blend on
+   * the one pool everyone is now in, so the brother inherits both — which is
+   * what `src/render/aoprobe.mjs` group 2 and `src/peds/shadowprobe.mjs`'s flag
+   * check were asking for. His own switch (`groundShadow.setMode('off')`) gates
+   * only his submission, which is what the probe's player arm needs.
+   */
+  _findGroundShadow() {
+    const pool = this.ctx?.peek('peds')?.ground;
+    if (!pool || typeof pool.submit !== 'function') return null;
+    this._shadowPool = pool;
+    this.groundShadow.pool = pool;
+    this.groundShadow.mode = this.groundShadow.on ? (pool.mode ?? 'multiply') : 'off';
+    return pool;
   }
 
   /**
@@ -1649,6 +1886,11 @@ export class PlayerSystem {
     this._unregisterPass?.();
     this.lowHealthPass?.dispose();
     this.lowHealthPass = null;
+    // Nothing to dispose: the contact pool belongs to `peds` and this
+    // subsystem only ever submitted an actor record into it. Dropping the
+    // reference is the whole of hard rule 6's obligation here.
+    this._shadowPool = null;
+    this.groundShadow.pool = null;
     this.character?.dispose();
     this.movement?.dispose();
     // The rig subscribes to `camera:shake` and `vehicle:collision` itself.

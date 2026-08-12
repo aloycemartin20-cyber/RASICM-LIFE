@@ -313,6 +313,7 @@ process.on('uncaughtException', (e) => {
 
 const results = {};
 let materials = null;
+let cloth = null;
 
 try {
   await page.goto(`http://127.0.0.1:${PORT}/?capture=1&shot=car`, {
@@ -519,6 +520,68 @@ try {
     out.headliners = liner;
     return out;
   });
+
+  /**
+   * ────────────────────────────────────────────────────────────────────────
+   * CABIN CLOTH — MEASURED ON THE TEXELS THE BAKE EMITS, IN THE PAGE.
+   * ────────────────────────────────────────────────────────────────────────
+   * `headliner()` ships with NO albedo map and its own note says why: "makeFabric
+   * peaks at 0.124 linear and a headliner is 0.28-0.36, which no colour
+   * multiplier can reach from there." `material.color` is a MULTIPLY and
+   * multiplies are ≤ 1, so that is a hard ceiling and not an opinion — which
+   * makes it a measurable property of the emitted texels rather than of
+   * anybody's intent.
+   *
+   * So this bakes BOTH cloths through the real module and reads their pixels
+   * back. It is done in the page because the bakes are Canvas2D and there is no
+   * canvas in node (and no new dependency is allowed to give it one, hard rule
+   * 3); the module is the shipping one, served by the same vite this probe
+   * already runs, so nothing here is a re-implementation of what it measures.
+   *
+   * THE NEGATIVE CONTROL IS BUILT IN AND IS TAKEN EVERY RUN: the identical
+   * measurement on `makeFabric`, which must FAIL the liftability test the new
+   * bake passes. If both passed, this would be measuring nothing — a seat cloth
+   * that can be a headliner means the second bake never needed to exist.
+   *
+   * Linear, because reflectance is linear and an sRGB mean of a multiply is not
+   * proportional to anything.
+   */
+  cloth = await page.evaluate(async () => {
+    const mod = await import('/src/vehicles/textures.js');
+    const s2l = (c) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
+    const read = (tex) => {
+      const img = tex.image;
+      const g = img.getContext('2d');
+      const d = g.getImageData(0, 0, img.width, img.height).data;
+      const lums = [];
+      let sum = 0;
+      for (let i = 0; i < d.length; i += 4) {
+        const L = 0.2126 * s2l(d[i] / 255) + 0.7152 * s2l(d[i + 1] / 255) + 0.0722 * s2l(d[i + 2] / 255);
+        lums.push(L);
+        sum += L;
+      }
+      lums.sort((a, b) => a - b);
+      const p = (q) => lums[Math.min(lums.length - 1, Math.floor(lums.length * q))];
+      const mean = sum / lums.length;
+      tex.dispose?.();
+      return {
+        n: lums.length,
+        mean: +mean.toFixed(4),
+        p05: +p(0.05).toFixed(4),
+        p95: +p(0.95).toFixed(4),
+        max: +lums[lums.length - 1].toFixed(4),
+        // The weave, as a fraction of the cloth's own level: a modulation, not
+        // a level, so it survives whatever `color` the material tints it with.
+        weave: +((p(0.95) - p(0.05)) / Math.max(1e-6, mean)).toFixed(4),
+      };
+    };
+    return {
+      seat: read(mod.makeFabric(256)),
+      headliner: typeof mod.makeHeadlinerCloth === 'function'
+        ? read(mod.makeHeadlinerCloth(256))
+        : null,
+    };
+  });
 } finally {
   await browser.close();
   if (server) server.kill();
@@ -710,11 +773,39 @@ check('cockpit.driverside', eyeSide === CABIN_CLASSES.length,
   '...and on the driver\'s side of it, not on the centreline',
   `${eyeSide}/${CABIN_CLASSES.length} on the car's left`);
 
+/* ---- cabin cloth --------------------------------------------------- */
+/**
+ * THE HEADLINER BAND IS 0.28-0.36 LINEAR and it is not this file's opinion:
+ * it is the reflectance `paint.js` names for a lining, and the reason it gives
+ * for the lining having no albedo map at all. The bar here is therefore
+ * "somewhere in this map is a texel a lining could be made of" — `max >= 0.28`,
+ * with the mean held inside the band so the lift is the CLOTH's value and not
+ * one bright fleck.
+ *
+ * The seat bake is measured with the same code every run and must fail that
+ * same test. It is the control, and it is also the reason the second bake
+ * exists.
+ */
+const CH = cloth?.headliner ?? null;
+const CS = cloth?.seat ?? null;
+check('cloth.liftable', !!CH && CH.max >= 0.28,
+  'the headliner bake reaches a lining\'s reflectance (max >= 0.28 linear)',
+  CH ? `max ${CH.max}, mean ${CH.mean}, p05 ${CH.p05}, p95 ${CH.p95}` : 'makeHeadlinerCloth missing');
+check('cloth.band', !!CH && CH.mean >= 0.26 && CH.mean <= 0.36,
+  '...as its MEAN, not as one bright texel — 0.26..0.36 linear',
+  CH ? `mean ${CH.mean}` : 'n/a');
+check('cloth.weave', !!CH && CH.weave >= 0.05,
+  '...and it carries a visible weave: p95-p05 over the mean',
+  CH ? `${CH.weave} (seat cloth ${CS?.weave ?? '?'})` : 'n/a');
+check('cloth.control', !!CS && CS.max < 0.28,
+  'CONTROL: the SEAT bake cannot be lifted to a lining, which is why there are two',
+  CS ? `makeFabric max ${CS.max} linear, mean ${CS.mean}` : 'n/a');
+
 /* ------------------------------------------------------------------ */
 
 const pass = checks.filter((c) => c.ok).length;
 if (VERBOSE || CONTROL) {
-  console.log(JSON.stringify({ control: CONTROL, results, materials }, null, 2));
+  console.log(JSON.stringify({ control: CONTROL, results, materials, cloth }, null, 2));
 }
 for (const c of checks) {
   console.log(`  ${c.ok ? ' ok ' : 'FAIL'}  ${c.label}\n          ${c.detail}`);

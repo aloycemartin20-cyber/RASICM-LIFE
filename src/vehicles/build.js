@@ -125,7 +125,10 @@ function geometryFor(spec, lod) {
     plate: mergeAll(body.plate ?? []),
     disc: mergeAll(body.disc ?? []),
     seat: mergeAll(interior.seat ?? []),
-    leather: mergeAll(interior.leather ?? []),
+    // `body.leather` is the greenhouse's FLANK lining — the trim you see
+    // through the far-side windows. See the note in `body.js` for why it is
+    // trim and not `cavity`; it lands here so it costs no extra draw call.
+    leather: mergeAll([...(body.leather ?? []), ...(interior.leather ?? [])]),
     dash: mergeAll(interior.dash ?? []),
     /**
      * THE HEADLINER IS ITS OWN GROUP AND IT COSTS ONE DRAW CALL AT LOD0.

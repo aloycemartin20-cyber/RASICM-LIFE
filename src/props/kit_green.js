@@ -575,15 +575,21 @@ function trunkAndBranches(h, r0, seed, opts = {}) {
 /* ================================================================= trees == */
 
 /**
- * Five street species, four crown variants each. Pittsburgh street planting is
- * London plane, red maple, honey locust and callery pear over and over, with a
- * young replacement in every fourth pit; the hills and the riverbank get the
- * scrub form and the conifer.
+ * Six street species, four crown variants each. Pittsburgh street planting is
+ * London plane, red maple, honey locust, callery pear and — on the older
+ * avenues and every park edge in the city — northern red oak, with a young
+ * replacement in every fourth pit; the hills and the riverbank get the scrub
+ * form and the conifer.
  *
  * `pitch` is the blade size in metres and it is the species' strongest single
  * identity cue after the silhouette: a plane leaf really is three times a honey
  * locust leaflet, and getting that ratio right is most of what makes two trees
  * on the same street read as two species rather than two random seeds.
+ *
+ * THE SEED IS THE FIRST CHARACTER OF THE ID (`sp.id.charCodeAt(0)`), so two
+ * species whose names start with the same letter get the same canopy scatter —
+ * `plane` and `pear` already do. `oak` is 'o' and collides with nothing here;
+ * anything added later must check.
  */
 const SPECIES = [
   {
@@ -606,6 +612,81 @@ const SPECIES = [
     n: 150, size: 0.94, pitch: 0.105, branches: 6, reach: 0.95, rise: 2.3,
     twigs: 11, lobes: 4, flat: 1, lift: 0.50,
   },
+  /**
+   * NORTHERN RED OAK — the BIG one, and the one this kit did not have.
+   *
+   * Every other species here is a modern street tree, chosen by a city for
+   * fitting between a kerb and a wire, and the whole set lands in one size
+   * class. MEASURED off the emitted crowns (`tree_X_0_leaf0` bounds, variant 0),
+   * widest horizontal extent and height:
+   *
+   *     pear    2.95 x 3.66 m   w/h 0.81    a column
+   *     young   1.82 x 1.69     1.08        a replacement sapling
+   *     maple   4.52 x 3.49     1.30
+   *     plane   4.97 x 3.69     1.35
+   *     oak     5.83 x 4.00     1.46        <- this
+   *     locust  4.56 x 2.53     1.80        wide, but a thin open parasol
+   *
+   * So the honest claim is NOT "the only crown wider than it is tall" — plane,
+   * maple and locust all are. It is that four of the five sit inside 4.5-5.0 m
+   * of width and the fifth is a sapling, and a boulevard of them reads as one
+   * shape at four sizes. The oak is 17 % wider than anything else in the kit,
+   * carries that width on a DOME rather than locust's parasol (0.58 canopy fill
+   * over 5.8 m against locust's 0.63 over 4.6 — comparable density over a third
+   * more silhouette, where locust gets its width by being thin), and hangs it
+   * low on the stoutest bole here. That is a second size class, which is what
+   * "nothing repeats in a line" wants on the axis a critic reads first.
+   *
+   * The numbers that carry it, and none of them is decoration:
+   *   crown 3.0 x 2.35 x 2.9   the largest crown volume in the kit, 1.46x plane
+   *   rise 1.1 / reach 2.4     limbs that spread instead of climbing — the
+   *                            lowest rise and the longest reach here
+   *   lift 0.50                the crown centre sits lowest on the bole, so the
+   *                            mass starts where a plane's is still trunk
+   *   r 0.26                   the stoutest trunk, 52 cm at the base
+   *   pitch 0.135              a red oak leaf between a maple's and a plane's
+   *   n 280 / size 1.10        MEASURED, not chosen — see the sweep below
+   *
+   * THE CARD COUNT AND THE CARD SIZE WERE SWEPT AGAINST
+   * `src/props/foliageprobe.mjs`, because the biggest crown in the kit is the
+   * one that can most easily be a haze with sticks through it, and the one that
+   * can most easily push its cards past the size where a spray stops reading as
+   * leaves. Both numbers came out of the emitted geometry — the oak's OWN near
+   * canopy fill, and the whole kit's pooled card p95:
+   *
+   *   n     size    oak near fill   pooled card p95
+   *   250   1.26        0.561            1.36  FAILS the 1.35 ceiling
+   *   250   1.10        0.561            1.32
+   *   280   1.10        0.580            1.32   <- shipped
+   *   310   1.10        0.589            1.32   +2 400 tris for +0.009
+   *   340   1.10        0.602            1.32   diminishing, and it is fill rate
+   *
+   * Two things that sweep settles. `size` is NOT the card size — `canopy` caps
+   * every card at `CARD_MAX` (1.12 m) in metres, so all a bigger `size` buys on
+   * a crown this large is MORE cards pinned at that ceiling, which is exactly
+   * what the p95 gate exists to catch: at 1.26 the oak alone moved the whole
+   * kit's pooled p95 from 1.31 to 1.36 without making a single card wider than
+   * the plane's already are. And fill has to be bought with COUNT: 280 against
+   * the plane's 176 is 1.59x the cards for 1.46x the crown volume, which is the
+   * same leaf density rather than a bigger tree drawn thinner. The remaining
+   * gap to the rest of the kit (0.580 against 0.605-0.659) is the price of the
+   * extra silhouette and is gated per species, not hidden in the mean.
+   *
+   * NOT PLANTED YET, and that is a boundary rather than an oversight: WHICH
+   * species go in a tree pit is `layout.js`'s `STREET_SPECIES`, which this wave
+   * does not own. Until that list takes `oak` this costs four canopies and a
+   * far tier of build time at boot and zero draw calls, because nothing
+   * instances it. `KIT_SPECIES` below is exported so the adoption is one line
+   * that cannot fall out of step with this table. Note for whoever lands it:
+   * a fifth street species means a tile that plants oaks draws one more
+   * InstancedMesh per leaf material it uses, and an oak tree is 2 240 canopy
+   * triangles against a plane's 1 408 — measure the tree-dense tiles.
+   */
+  {
+    id: 'oak', h: 6.2, r: 0.26, bark: 'bark_street', crown: [3.0, 2.35, 2.9],
+    n: 280, size: 1.10, pitch: 0.135, branches: 5, reach: 2.4, rise: 1.1,
+    twigs: 12, lobes: 6, lift: 0.50,
+  },
   {
     id: 'young', h: 3.6, r: 0.080, bark: 'bark_street', crown: [1.05, 1.0, 1.0],
     n: 58, size: 0.72, pitch: 0.095, branches: 4, reach: 0.75, rise: 0.95,
@@ -613,9 +694,87 @@ const SPECIES = [
   },
 ];
 
-const LEAVES = ['leaf_a', 'leaf_b', 'leaf_c', 'leaf_autumn'];
+/**
+ * The species ids this kit registers, in table order, for the one builder that
+ * has to decide what to plant. `layout.js` keeps its own `STREET_SPECIES` —
+ * which species belong on a STREET is a planting decision and not this file's —
+ * but it can no longer name a species the kit never built, or miss one it did.
+ */
+export const KIT_SPECIES = SPECIES.map((s) => s.id);
+
+/**
+ * ────────────────────────────────────────────────────────────────────────────
+ * THE LEAF TABLE, AND THE TWO TURNING VARIANTS THAT USED TO BE REGISTERED FROM
+ * `layout.js`.
+ * ────────────────────────────────────────────────────────────────────────────
+ * Order is load-bearing: GREENS FIRST, then the turning surfaces in season
+ * order. `layout.js` picks a leaf by INDEX (`_leafIndex` splits the table at
+ * `LEAF_GREENS`), so inserting anything in the middle of this array plants
+ * October canopies in July rather than crashing.
+ *
+ * `leaf_autumn_b` and `leaf_autumn_c` were registered from `layout.js`, which
+ * discovered every `..._leaf0` in the library and painted its geometry in the
+ * two extra surfaces. That worked — `ProtoLibrary.proto` takes a prebuilt
+ * `opts.geo` and the four leaf protos already share ONE canopy mesh, so the
+ * extra variants cost no triangles and no bake — but it left the canopy's own
+ * material list split across two files, one of which is a placement builder
+ * that does not own a single vertex of it. `layout.js`'s own note asked for
+ * this move by name. The surfaces themselves live in `palette.js` and are
+ * unchanged, so this adds NO texture memory: the same three autumn bakes the
+ * city already had, declared by the file that owns the crown.
+ *
+ * `layout.js` still runs its discovery pass. `proto()` is idempotent — it
+ * returns early on an id it already has — so the pass now finds all six in
+ * place and re-registers nothing, and its `_autumnExtra` count (2) is still the
+ * number of turning variants beyond `leaf_autumn`, which is what `_leafIndex`
+ * needs. Deleting that pass is a `props`-owned followup, not a requirement.
+ */
+const LEAF_GREENS = ['leaf_a', 'leaf_b', 'leaf_c'];
+/**
+ * Autumn is three surfaces, not one: they differ by the SEASON handed to the
+ * bake — 0.76 / 0.93 / 1.00, i.e. how many of the leaves on a card have turned
+ * and how far — so a street of turning trees is a planting at three stages
+ * rather than one orange asset instanced. The long argument is in `palette.js`.
+ */
+const LEAF_AUTUMN = ['leaf_autumn', 'leaf_autumn_b', 'leaf_autumn_c'];
+
+/**
+ * `?oneautumn=1` (or `OW_ONE_AUTUMN=1` for the headless harnesses) registers
+ * ONE turning surface for the whole city again — the state before the extra
+ * variants existed. It is the negative control for the turning-tree assertions
+ * in `src/props/foliageprobe.mjs` and is never reachable in play.
+ *
+ * Read here as well as in `layout.js` because the registration moved here and a
+ * control that only reaches half of a feature proves half of it. The two agree
+ * by construction — same query key, same env var, same default — and when
+ * `layout.js` drops its discovery pass its copy goes with it.
+ */
+function oneAutumn() {
+  let on = false;
+  try {
+    if (typeof location !== 'undefined' && new URLSearchParams(location.search).get('oneautumn') === '1') on = true;
+  } catch { /* no location */ }
+  try {
+    if (typeof process !== 'undefined' && process?.env?.OW_ONE_AUTUMN === '1') on = true;
+  } catch { /* no process */ }
+  return on;
+}
+
+/**
+ * The far tier registers only the leading four, which is what it has always
+ * had. `layout.js` pins the far crown to leaf index 0 (`lod !== 0 ? 0 : ...`)
+ * because a season that resolves to twenty pixels is not worth a second
+ * material, so the turning variants would be four protos per species that
+ * nothing can ever ask for.
+ */
+const FAR_LEAVES = 4;
 
 export function registerTrees(K) {
+  // Resolved once per registration rather than at module scope: the probes
+  // re-import this module per arm and flip the hatch between them.
+  const LEAVES = oneAutumn()
+    ? [...LEAF_GREENS, LEAF_AUTUMN[0]]
+    : [...LEAF_GREENS, ...LEAF_AUTUMN];
   for (const sp of SPECIES) {
     for (let v = 0; v < 4; v++) {
       const seed = (sp.id.charCodeAt(0) * 131 + v * 977) | 0;
@@ -632,14 +791,18 @@ export function registerTrees(K) {
       }), sp.bark);
 
       /**
-       * ONE CANOPY GEOMETRY, FOUR MATERIALS.
+       * ONE CANOPY GEOMETRY, SIX MATERIALS.
        *
        * This used to build a separate 1 500-triangle canopy for every leaf
        * variant, so the kit carried sixty-four crowns to show sixteen. The
-       * geometry does not care which green it is painted, so the four leaf
-       * protos share one mesh and the saving buys the card count and the twig
+       * geometry does not care which green it is painted, so every leaf proto
+       * shares one mesh and the saving buys the card count and the twig
        * armature that make the crown read at all. `ProtoLibrary.dispose`
        * de-duplicates, so a shared geometry is freed exactly once.
+       *
+       * It is also why the two extra autumn surfaces are free to declare here:
+       * they are two more materials over the SAME crown, which is what made
+       * `layout.js` able to bolt them on from outside in the first place.
        */
       const geo = canopy(sp.n, crx, cry, crz, seed, {
         size: sp.size, lift: th * sp.lift, inner: 0.52,
@@ -718,7 +881,7 @@ export function registerTrees(K) {
         cardN: 6, cap: sp.crown[0] * 1.5,
         lobesAt: fplan.prim.map((b) => b.tip),
       });
-    for (let li = 0; li < LEAVES.length; li++) {
+    for (let li = 0; li < Math.min(FAR_LEAVES, LEAVES.length); li++) {
       K.proto(`tree_${sp.id}_far_leaf${li}`, null, LEAVES[li], { geo: fgeo, shared: true });
     }
   }

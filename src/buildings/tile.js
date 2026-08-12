@@ -13,11 +13,90 @@ import { SURFACES, TRANSPARENT, surfaceTagOf } from './palette.js';
  *   proto(id, geo, key, opts)     declare a globally shared instance prototype
  *   put(id, x,y,z, ry, s, masks)  add one instance of it to this tile
  *   box(surface, ...)             an axis-aligned collision proxy
+ *   mount(rec)                    publish a sign mount point (contract below)
  *
  * Collision is authored separately from the visual mesh: proxies are boxes
  * generated from the same numbers that built the geometry, so a doorway is a
  * real hole in the hull and the BVH stays in the thousands of triangles instead
  * of chewing through every window chamfer.
+ */
+
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * THE SIGN MOUNT CONTRACT — this comment IS the contract.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * A sign is not facade geometry and it is not authored here. What the facade
+ * kit owes the signage layer is the one thing only the facade knows: WHERE a
+ * sign can legally go and how big it may be. So every built facade publishes
+ * its mount points, and `src/props/kit_sign.js` (which runs after this) reads
+ * them and decides what the sign SAYS.
+ *
+ * WHERE THEY LIVE. `TileBuilder.build()` writes the array onto the returned
+ * group:
+ *
+ *     rec.group.userData.owSignMounts   // Array<Mount>, possibly empty
+ *
+ * `rec` here is what `build()` returns (`{ group, handles, ... }`), and the
+ * group is the node the buildings system parents under the tile. A consumer
+ * that does not know which node it has can `traverse` and take every
+ * `userData.owSignMounts` it finds; the array is plain data, owns nothing, and
+ * is dropped with the tile.
+ *
+ * WHICH TILES CARRY THEM. **LOD0 (near) tiles only.** `buildLotLod` is the
+ * massing mesh — it has no shopfront, no fascia and no party wall to hang a
+ * sign on, so it publishes nothing and a far tile's array is empty. A consumer
+ * must therefore key its signs off the NEAR tile's lifetime and drop them when
+ * the near mesh is released (`releaseTile`), exactly as the near mesh itself is.
+ *
+ * THE RECORD. Every field is world space, metres, and already has the kerb
+ * guard applied — a mount standing in a live carriageway is never published.
+ *
+ *   {
+ *     kind : 'fascia' | 'blade' | 'billboard' | 'wall'
+ *     x,y,z: the CENTRE of the mount face, on the face itself. A sign is drawn
+ *            in front of it, i.e. displaced along +n by its own thickness.
+ *     ry   : yaw, radians. `trs(m, x, y, z, ry, w, h, 1)` (see geom.js) builds
+ *            a basis whose +X runs along the mount's width, +Y is up and +Z is
+ *            the outward normal — the same convention `wallBasis` publishes, so
+ *            a sign placed with it faces the street without further thought.
+ *     nx,nz: the same outward normal as a unit vector, for consumers that would
+ *            rather do their own trigonometry. ny is always 0: every mount face
+ *            in this city is vertical.
+ *     w,h  : the USABLE field, metres. A sign wider or taller than this overlaps
+ *            a window, a pier or the next business, so it is the consumer's
+ *            budget, not a suggestion.
+ *     arch : the archetype that published it ('rowhouse', 'mill', 'tower', ...)
+ *     era  : the massing era for tall buildings ('deco' | 'midcentury' |
+ *            'modern' | 'postmodern'), else 'plain'.
+ *     front: true if this elevation faces the street.
+ *     seed : a stable 32-bit integer derived from the mount's own position, so
+ *            a consumer can pick its content deterministically without carrying
+ *            an RNG stream across a subsystem boundary (rule 4).
+ *   }
+ *
+ * THE FOUR KINDS, and what each is FOR:
+ *
+ *   'fascia'    the signboard band over one shopfront unit. `w` is the unit's
+ *               frontage between its pilasters, `h` the band depth. This is the
+ *               named-business mount: DeCarlo Body Shop, Rustbelt Respray.
+ *   'blade'     a projecting sign at right angles to the street, anchored at
+ *               the fascia's top corner. `w` is the maximum PROJECTION off the
+ *               wall and `h` the maximum drop. The sign's own plane is
+ *               perpendicular to `n` — this normal is the wall's, not the
+ *               board's, because what the mount pins is the bracket.
+ *   'billboard' a rooftop hoarding anchor on a tall flat-roofed archetype.
+ *               x,y,z sit on the roof deck at the parapet line; a board stands
+ *               UP from there, so `h` is headroom above the deck, not a centred
+ *               half-height. Only published where the deck is deep enough to
+ *               carry the back legs.
+ *   'wall'      a blank-flank field: ghost-sign territory. Published only on
+ *               windowless party walls, inset from the arrises, so a painted
+ *               sign never runs off the corner of the building.
+ *
+ * WHAT IS NOT PROMISED. Mounts are not deduplicated against each other across
+ * buildings, they are not sorted, and two mounts on the same elevation may
+ * overlap in Y if a blade and a fascia share a corner — that pair is meant to
+ * be resolved by whoever draws them. Nothing here reserves the space.
  */
 
 const UNIT_BOX = new THREE.BoxGeometry(1, 1, 1);
@@ -26,6 +105,12 @@ const UNIT_BOX = new THREE.BoxGeometry(1, 1, 1);
  * instead of becoming their own InstancedMesh. See build().
  */
 const MERGE_BELOW = 48;
+/**
+ * Triangles a tile's NON-CASTING half of a surface must reach before it is
+ * worth emitting as its own batch instead of being folded back in and left to
+ * cast. See the fold in `build()`.
+ */
+const NOCAST_MIN_TRIS = 3000;
 /**
  * Ground-junction AO bake. See `TileBuilder._bakeGroundAo`.
  *
@@ -49,8 +134,59 @@ const AO_UPFACE_CUT = 0.8;
  * object (a bin, a bollard, a hydrant) can take without going flat.
  */
 const AO_INSTANCE_SCALE = 0.55;
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * SURFACES THAT ARE NEVER SHADOW CASTERS, whatever they are merged with.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Every one of these is an INTERIOR seen through glazing — the cardboard room
+ * behind a window (`Kit.room`), the floor plate behind a curtain wall, the dark
+ * box behind a transom, the lit deck of a setback. Not one of them is ever
+ * outside the building's own hull, so the shadow it casts is cast onto the
+ * inside of a wall that is already fully occluded by the wall itself.
+ *
+ * IT IS A CORRECTNESS FIX BEFORE IT IS A SAVING, and the defect it closes is
+ * in `build()` below. `Kit.room`, `Kit.blind`, `Kit.shopFit` and `Kit.signFace`
+ * are all declared `castShadow: false` at the prototype, and that flag was
+ * honoured only while the piece stayed an `InstancedMesh`. Below `MERGE_BELOW`
+ * instances the group is folded into the tile's static batch — which is most
+ * groups on most tiles — and the fold read `p.key` and `p.geo` and nothing
+ * else, so the flag was dropped on the floor and the room boxes started casting
+ * again. MEASURED on the settled night frame: 43 `room_lit_warm` batches, all
+ * 43 submitted to every cascade.
+ *
+ * Named surfaces rather than a per-piece flag because a whole KEY costs nothing
+ * to exclude: the batch already exists, it is simply not a caster, so this is
+ * the only shadow saving in the file that does not buy itself a second draw
+ * call. See `_noCast` for the pieces that do need one.
+ */
+const NEVER_CASTS = new Set([
+  'room_dark', 'room_mid', 'room_lit_warm', 'room_lit_cool',
+  /**
+   * The OPAQUE glazing keys, which are a window plane and never a silhouette.
+   * Checked at every site that emits them before they went in here:
+   *
+   *   `bandFloor`          set back `min(0.26, t*0.62)` behind piers and
+   *                        spandrels that reach the full outer face. The piers
+   *                        cast the reveal shadow; the pane behind them cannot
+   *                        cast anything they have not already cast.
+   *   `buildLotLod`        2 cm proud of the massing face, and it only ever
+   *                        draws past 130 m. That file's own comment is the
+   *                        argument: "the cascades cannot resolve 19 cm at
+   *                        400 m" — so 2 cm resolves as acne, not as a window.
+   *   deco crown band      `polyInset(poly, 0.22)`, i.e. recessed into the
+   *                        crown it is cut out of.
+   *   far-LOD roof plant   a box on a penthouse roof past the near ring,
+   *                        borrowing this key for batch economy.
+   *
+   * MEASURED on the settled night frame before this: 34 batches and 88 000
+   * triangles, submitted to every cascade, for a shadow that another surface
+   * was already casting in every one of those four cases.
+   */
+  'glass_solid', 'glass_solid_warm',
+]);
 const _m = new THREE.Matrix4();
 const _v = new THREE.Vector3();
+const _box = new THREE.Box3();
 const INVISIBLE = new THREE.MeshBasicMaterial({ visible: false });
 
 /**
@@ -135,15 +271,51 @@ export class TileBuilder {
   static noGroundAo =
     typeof location !== 'undefined' && /[?&]owNoTileAo=1/.test(location.search);
 
+  /**
+   * `?owKitCasters=1` — the NEGATIVE CONTROL for the shadow-caster routing:
+   * every merged batch casts again, exactly as it did before `NEVER_CASTS` and
+   * `_noCast` existed, and the authored `castShadow: false` on a folded
+   * prototype is dropped again. Nothing else changes — same geometry, same
+   * batches, same RNG — so `perfcheck --ab='.|owKitCasters=1,.'` measures the
+   * routing and not the machine. Same convention as `?owNoTileAo=1`.
+   */
+  static keepKitCasters =
+    typeof location !== 'undefined' && /[?&]owKitCasters=1/.test(location.search);
+
+  /**
+   * Instance groups smaller than this are merged into the tile's static batch
+   * instead of becoming their own `InstancedMesh`. A STATIC rather than the
+   * module constant it was, for one reason: `kitprobe`'s streamed-tile tier
+   * needs to run its own arm with merging off, and a threshold a probe cannot
+   * reach is an invariant with no negative control. See `MERGE_BELOW`.
+   */
+  static mergeBelow = MERGE_BELOW;
+
   constructor(lib, name = 'tile') {
     this.lib = lib;
     this.name = name;
     this._static = new Map(); // surface key -> Accum
     this._detail = new Map(); // surface key -> Accum, hosted under a THREE.LOD
+    this._noCast = new Map(); // surface key -> Accum, emitted with castShadow off
     this._inst = new Map(); // proto id -> { m: Matrix4[], c: masks[] }
     this._collide = new Map(); // surface tag -> Accum
     this.lights = [];
-    this.stats = { tris: 0, instTris: 0, instances: 0, draws: 0, keptOut: 0, groundAo: 0 };
+    /** Published sign mount points. See THE SIGN MOUNT CONTRACT at the top. */
+    this.mounts = [];
+    /**
+     * Vertex ranges that are NOT ground reference. See `_bakeGroundAo`.
+     * Map<Accum, number[]> of [v0, v1) pairs; null until something asks.
+     */
+    this._noRef = null;
+    this.stats = {
+      tris: 0,
+      instTris: 0,
+      instances: 0,
+      draws: 0,
+      keptOut: 0,
+      groundAo: 0,
+      mounts: 0,
+    };
     /** See `setKeepOut` and `BuildingSystem._keepOutFor`. */
     this._keepOut = null;
   }
@@ -238,13 +410,87 @@ export class TileBuilder {
    * sill courses. The silhouette must never go in here: the far level being
    * empty means "this disappears", and a silhouette that changes shape at a
    * distance threshold is worse than no LOD at all.
+   *
+   * `opts.buried === true` declares geometry that is authored BELOW GRADE on
+   * purpose — today that is exactly one thing, the terraced foundation apron in
+   * `archetypes.js`. It has two consequences and they are both correctness, not
+   * economy:
+   *
+   *  1. IT IS NOT GROUND REFERENCE. The AO junction bake reads the minimum
+   *     emitted vertex Y per cell to find the ground (`_bakeGroundAo`). An
+   *     apron reaching nine metres down a hillside would become that minimum,
+   *     and every wall in the cell would lose its junction darkening. Buried
+   *     geometry still RECEIVES the term; it is only refused a vote on where
+   *     the ground is.
+   *  2. THE KERB GUARD DOES NOT APPLY. A foundation course carries no
+   *     collision and is under the road surface, so it cannot obstruct a
+   *     carriageway — but it is WIDER in plan than the building standing on it,
+   *     so letting the guard delete one would file its footprint in `_gone`
+   *     and orphan the entire building above it. That is not a hypothetical:
+   *     `buildLotLod` lays the foundation before the crown.
+   *
+   * `opts.noShadow === true` declares geometry whose CAST shadow is not worth a
+   * cascade — a dentil tooth, a modillion, a transom bar, an escape landing.
+   * It is routed into a parallel accumulator for the same surface, emitted with
+   * `castShadow = false`, and that is not free: a key that carries both kinds
+   * costs one extra merged batch on the tiles that carry both. Use it only
+   * where the piece cannot resolve in the shadow map at ANY cascade — the same
+   * argument the DETAIL bucket's `noShadow` already makes, and the same
+   * measurement behind it (a 13 cm block against a 0.1-0.5 m cascade texel
+   * lands inside its own depth bias and self-shadows in a stipple). A silhouette
+   * never goes in here; a parapet coping is silhouette and a dentil is not.
    */
   add(key, geo, matrix = null, opts = null) {
-    if (this._keepOut && this._drop(geo, matrix)) return this;
-    const bucket = opts?.detail === true ? this._detail : this._static;
+    const buried = opts?.buried === true;
+    if (this._keepOut && !buried && this._drop(geo, matrix)) return this;
+    const bucket =
+      opts?.detail === true
+        ? this._detail
+        : opts?.noShadow === true && !TileBuilder.keepKitCasters
+          ? this._noCast
+          : this._static;
     let a = bucket.get(key);
     if (!a) bucket.set(key, (a = new Accum(`${this.name}:${key}`)));
+    const v0 = buried ? a.verts : -1;
     a.add(geo, matrix, opts);
+    if (v0 >= 0 && a.verts > v0) {
+      const m = (this._noRef ??= new Map());
+      let r = m.get(a);
+      if (!r) m.set(a, (r = []));
+      r.push(v0, a.verts);
+    }
+    return this;
+  }
+
+  /**
+   * Publish one sign mount point. THE SIGN MOUNT CONTRACT is documented at the
+   * top of this file and that comment is normative; this is the plumbing.
+   *
+   * The kerb guard applies, for the same reason it applies to geometry: a shop
+   * fascia on a wall the guard has just deleted is a sign hanging over a live
+   * carriageway with no building behind it. `_keepOut` is measured against a
+   * box the size of the mount's own field rather than a point, so a mount whose
+   * CENTRE clears the kerb but whose board would not is refused too.
+   */
+  mount(rec) {
+    if (!rec) return this;
+    if (this._keepOut) {
+      const rx = Math.max(0.5, (rec.w ?? 1) * 0.5);
+      const ry = Math.max(0.5, (rec.h ?? 1) * 0.5);
+      _box.min.set(rec.x - rx, rec.y - ry, rec.z - rx);
+      _box.max.set(rec.x + rx, rec.y + ry, rec.z + rx);
+      if (this._keepOut(_box, null, null)) return this;
+    }
+    // A stable per-mount stream seed. Position only: the same wall rebuilt by
+    // the same tile gets the same signs back, and no RNG crosses the boundary.
+    const h =
+      (Math.imul(Math.round(rec.x * 16) | 0, 0x27d4eb2d) ^
+        Math.imul(Math.round(rec.y * 16) | 0, 0x165667b1) ^
+        Math.imul(Math.round(rec.z * 16) | 0, 0x9e3779b1)) >>>
+      0;
+    rec.seed = h;
+    rec.ny = 0;
+    this.mounts.push(rec);
     return this;
   }
 
@@ -363,6 +609,10 @@ export class TileBuilder {
     const buckets = [];
     for (const a of this._static.values()) if (!a.empty) buckets.push(a);
     for (const a of this._detail.values()) if (!a.empty) buckets.push(a);
+    // Not casting a shadow has nothing to do with receiving one: a dentil
+    // course still sits in the ground-junction bake's world like anything else,
+    // and skipping it here would also cost it its vote on where the ground is.
+    for (const a of this._noCast.values()) if (!a.empty) buckets.push(a);
     if (buckets.length === 0 && this._inst.size === 0) return;
 
     let x0 = Infinity;
@@ -393,9 +643,24 @@ export class TileBuilder {
       return k * nx + i;
     };
 
+    /**
+     * `buried: true` geometry is skipped HERE and only here — it may not lower
+     * the ground, but it is still weathered by it. Built as a byte mask
+     * per accumulator rather than tested against the range list per vertex: a
+     * dense tile has a hundred thousand vertices and a hundred ranges, and the
+     * product of those two numbers is not a per-vertex test anyone should pay.
+     */
+    const noRef = this._noRef;
     for (const a of buckets) {
       const p = a.pos;
-      for (let i = 0; i < p.length; i += 3) {
+      let mask = null;
+      const ranges = noRef?.get(a);
+      if (ranges) {
+        mask = new Uint8Array(a.verts);
+        for (let r = 0; r < ranges.length; r += 2) mask.fill(1, ranges[r], ranges[r + 1]);
+      }
+      for (let i = 0, v = 0; i < p.length; i += 3, v++) {
+        if (mask && mask[v]) continue;
         const c = cellOf(p[i], p[i + 2]);
         if (p[i + 1] < raw[c]) raw[c] = p[i + 1];
       }
@@ -523,7 +788,7 @@ export class TileBuilder {
       for (const [key, acc] of this._detail) {
         const cur = this._static.get(key);
         if (!cur) this._static.set(key, acc);
-        else mergeAccum(cur, acc);
+        else mergeAccum(cur, acc, this._noRef);
       }
       this._detail.clear();
     }
@@ -538,9 +803,20 @@ export class TileBuilder {
      */
     for (const [, e] of this._inst) {
       const p = this.lib.protos.get(e.id);
-      if (!p || e.m.length === 0 || e.m.length >= MERGE_BELOW) continue;
+      if (!p || e.m.length === 0 || e.m.length >= TileBuilder.mergeBelow) continue;
+      /**
+       * THE FOLD CARRIES THE PROTOTYPE'S SHADOW FLAG. It used to read `p.key`
+       * and `p.geo` and nothing else, so `castShadow: false` — authored on
+       * every room box, blind, shopfit and sign face in the kit — survived only
+       * on the groups big enough to stay instanced. Below the threshold the
+       * piece silently became a caster again, which is both a cost and a wrong
+       * picture. See `NEVER_CASTS`.
+       */
+      const noShadow = p.castShadow === false || p.noShadow === true;
       for (let i = 0; i < e.m.length; i++) {
-        this.add(p.key, p.geo, e.m[i], e.c[i] ? { masks: e.c[i] } : null);
+        const o = e.c[i] ? { masks: e.c[i] } : {};
+        if (noShadow) o.noShadow = true;
+        this.add(p.key, p.geo, e.m[i], o);
       }
       e.m.length = 0;
     }
@@ -571,9 +847,10 @@ export class TileBuilder {
         const geo = acc.build();
         const mesh = new THREE.Mesh(geo, this.lib.mat(key));
         mesh.name = `b_${key}`;
-        mesh.castShadow = !TRANSPARENT.has(key) && !noShadow;
+        const dark = noShadow || (NEVER_CASTS.has(key) && !TileBuilder.keepKitCasters);
+        mesh.castShadow = !TRANSPARENT.has(key) && !dark;
         mesh.receiveShadow = true;
-        if (noShadow) mesh.userData.owNoShadow = true;
+        if (dark) mesh.userData.owNoShadow = true;
         mesh.matrixAutoUpdate = false;
         mesh.userData.surface = surfaceTagOf(key);
         mesh.userData.collision = false;
@@ -593,25 +870,77 @@ export class TileBuilder {
         this.stats.draws++;
       }
     };
+    /**
+     * A SECOND BATCH HAS TO BUY ITSELF.
+     *
+     * Splitting a surface into a casting and a non-casting half is not free:
+     * the extra `Mesh` is submitted in the main pass, again in the depth
+     * prepass, and it is one more object for the culler on every frame — call
+     * it five extra submissions — against the triangles it keeps out of the
+     * three cascades that would otherwise have drawn it. So the split only
+     * happens where there is enough geometry to pay for it. A tile's whole
+     * dentil course is 126 teeth at 12 triangles, which is not; a tile's fire
+     * escapes are 180 000 triangles of slat grating, which very much is.
+     *
+     * Under the threshold the non-casting accumulator is folded straight back
+     * into the casting one (`mergeAccum`, which carries the buried-geometry
+     * ground-reference ranges with it) and those pieces go on casting — which
+     * is the right answer, because at that size their contribution to a cascade
+     * is a rounding error either way.
+     */
+    for (const [key, acc] of this._noCast) {
+      if (acc.empty || acc.tris >= NOCAST_MIN_TRIS) continue;
+      const cur = this._static.get(key);
+      /**
+       * A key with NOTHING casting on it is not a split at all — the batch has
+       * to exist either way, so keeping it out of the cascades is free and the
+       * threshold above must not apply to it. That is the whole of a sign face
+       * (`neon_*`), a window blind, a shopfit: surfaces the kit only ever emits
+       * as things that must not cast. Folding those back would have handed the
+       * cascades a batch for two triangles of lit signboard.
+       */
+      if (!cur) continue;
+      mergeAccum(cur, acc, this._noRef);
+      this._noCast.delete(key);
+    }
     emit(this._static, group);
     emit(this._detail, detailHost, true);
+    // Hosted on the GROUP, not on the detail LOD: these pieces are still drawn
+    // at every range, they simply are not submitted to a cascade.
+    emit(this._noCast, group, true);
 
     for (const [id, e] of this._inst) {
       const p = this.lib.protos.get(id);
       if (!p || e.m.length === 0) continue;
       const im = new THREE.InstancedMesh(p.geo, this.lib.mat(p.key), e.m.length);
       im.name = `bi_${id}`;
-      im.castShadow = p.castShadow && !p.noShadow;
+      /**
+       * `castShadow` IS NOT THE SWITCH, and writing it here was doing nothing.
+       *
+       * ARCHITECTURE.md: "`owNoShadow` is the ONLY shadow-caster switch" — the
+       * cascades build their caster list from `isMesh && !userData.owNoShadow`
+       * and never read `object.castShadow` (`src/render/index.js`, the culler's
+       * `casts` term). So `p.castShadow === false`, which the kit sets on every
+       * room box, blind, shopfit and sign face, has been suppressing nothing at
+       * all: those pieces were submitted to every cascade, instanced or folded.
+       * The flag is still written because it is the three-native spelling and a
+       * probe may read it, but the line below it is what the renderer obeys.
+       */
+      const dark =
+        !TileBuilder.keepKitCasters &&
+        (p.castShadow === false || p.noShadow === true || NEVER_CASTS.has(p.key));
+      im.castShadow = !dark;
       im.receiveShadow = p.receiveShadow;
       im.matrixAutoUpdate = false;
       im.userData.surface = surfaceTagOf(p.key);
       im.userData.collision = false;
       im.userData.owStatic = true;
       if (p.noPrepass) im.userData.owNoPrepass = true;
-      if (p.noShadow) {
-        im.userData.owNoShadow = true;
-        im.renderOrder = 2;
-      }
+      if (dark) im.userData.owNoShadow = true;
+      // Sorted last because it is TRANSPARENT, which is a different question
+      // from whether it casts — see the two independent classifications in the
+      // render culler.
+      if (p.noShadow) im.renderOrder = 2;
       let needColor = false;
       for (let i = 0; i < e.c.length; i++) if (e.c[i]) needColor = true;
       if (needColor) {
@@ -657,11 +986,18 @@ export class TileBuilder {
       }
     }
 
+    // The sign mount contract: published on the group, not returned separately,
+    // so a consumer that only ever sees the scene graph can still find them.
+    group.userData.owSignMounts = this.mounts;
+    this.stats.mounts = this.mounts.length;
+
     group.updateMatrix();
     this._static.clear();
     this._detail.clear();
+    this._noCast.clear();
     this._inst.clear();
     this._collide.clear();
+    this._noRef = null;
 
     // A world-space sphere for the hierarchical cull. Derived from the geometry
     // that was actually emitted, so a tile carrying a 60 m tower is not culled
@@ -675,9 +1011,23 @@ export class TileBuilder {
   }
 }
 
-/** Append one Accum onto another (used when a detail bucket has no LOD host). */
-function mergeAccum(dst, src) {
+/**
+ * Append one Accum onto another (used when a detail bucket has no LOD host).
+ *
+ * `noRef` is the ground-reference exclusion map; the source's ranges have to
+ * move with its vertices or a foundation course would silently become ground
+ * reference again on any tile built without an LOD host — which is every tile
+ * a probe or the pre-warm builds.
+ */
+function mergeAccum(dst, src, noRef = null) {
   const base = dst.verts;
+  const sr = noRef?.get(src);
+  if (sr) {
+    let dr = noRef.get(dst);
+    if (!dr) noRef.set(dst, (dr = []));
+    for (let i = 0; i < sr.length; i += 2) dr.push(base + sr[i], base + sr[i + 1]);
+    noRef.delete(src);
+  }
   for (let i = 0; i < src.pos.length; i++) dst.pos.push(src.pos[i]);
   for (let i = 0; i < src.nrm.length; i++) dst.nrm.push(src.nrm[i]);
   for (let i = 0; i < src.uv.length; i++) dst.uv.push(src.uv[i]);
@@ -694,6 +1044,8 @@ export function releaseTile(rec, physics) {
   for (const m of rec.colMeshes ?? []) m.geometry?.dispose();
   const g = rec.group;
   if (g) {
+    // Sign mounts die with the tile that published them; see the contract note.
+    if (g.userData) g.userData.owSignMounts = null;
     g.traverse((o) => {
       if (o.isInstancedMesh) {
         o.dispose?.();

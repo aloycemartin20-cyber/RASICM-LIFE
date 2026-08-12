@@ -120,7 +120,23 @@ function shotChrome(engine, shot) {
   // different shot is applied — see `releaseStagedDrivers`. This runs on both
   // apply paths and at the shutter, so it cannot be missed the way
   // `clearTraffic` once was.
-  if (shot !== SHOTS.pursuit) releaseStagedDrivers(engine);
+  if (shot !== SHOTS.pursuit && !shot.pursuitShot) releaseStagedDrivers(engine);
+  /**
+   * Everything the marketing set STAGES BY HAND goes back the moment a shot
+   * that does not own it is applied — the aircraft parked in mid-air, the
+   * brothers' cars stood on the body-shop forecourt, and the airbase's own
+   * assault switch. Same contract and the same reason as
+   * `releaseStagedDrivers` directly above: shots run back to back in one
+   * browser session (`tools/shotset.mjs`, a review sweep), and the twin left
+   * hanging over the Monongahela at 234 m would be photographed by every later
+   * shot whose lens happens to point at the confluence.
+   *
+   * Both are keyed off flags the SHOT declares rather than off shot identity,
+   * because there are now several shots on each side of the question.
+   */
+  if (!shot.stagesKinematic) releaseStagedKinematic(engine);
+  if (!shot.stagesCars) releaseStagedCars(engine);
+  if (!shot.airbase) airbaseInert(engine, false);
   engine.ctx.peek('ui')?.hideZoneToast?.();
   for (const n of document.querySelectorAll('.ow-zone, [class*="zone"]')) {
     n.style.display = 'none';
@@ -146,6 +162,23 @@ function shotChrome(engine, shot) {
    */
   const tp = engine.scene.getObjectByName('weapons-thirdperson');
   if (tp) tp.visible = !(engine.ctx.peek('player')?._shotHide);
+
+  /**
+   * `noCrowd` — NOBODY WANDERS ONTO A RESTRICTED FLIGHTLINE.
+   *
+   * `peds` streams an ambient crowd around the player and every shot teleports
+   * the player to its camera, so both Ridgeline frames drew a civilian in a
+   * purple overcoat standing on the apron. Despawning them (the shot's
+   * `shutter` hook) is the honest half of the fix and is NOT sufficient:
+   * MEASURED at the shutter with zero active peds, two `ped_body` skinned
+   * meshes were still parented into the live `peds` group 4.8 m from the lens.
+   * `_despawn` -> `_releaseBody` -> `detachBody` returns the body to a free
+   * pool and nothing hides it, so a body outlives its ped until something
+   * happens to reuse it. Flagged; hidden here so a marketing frame is not
+   * judged on it. Restored for every shot that does not ask for it.
+   */
+  const crowd = engine.scene.getObjectByName('peds');
+  if (crowd) crowd.visible = shot.noCrowd !== true;
 
   // `hud: false` — marketing frames only. A screenshot in a README is a
   // photograph of a world, not of an interface. Review shots keep the HUD,
@@ -189,6 +222,23 @@ function shotChrome(engine, shot) {
    */
   if (shot.hudFrame) {
     try { shot.hudFrame(engine); } catch { /* a shot must never take the boot down */ }
+  }
+
+  /**
+   * `shutter` — THE LAST WRITE BEFORE THE PHOTOGRAPH, for anything else.
+   *
+   * `hudFrame` is the same idea for a HUD readout and `clearTraffic` for cars;
+   * this is the general form, and it exists because the airbase frames need
+   * it. `peds` streams an ambient crowd around the player continuously, and
+   * every shot teleports the player to its camera — so the first draft of
+   * `mkt_tanks` photographed a woman in a purple overcoat standing on the
+   * apron of a military airbase, ten metres in front of a Bulwark's main gun.
+   * Clearing at APPLY time cannot fix that: the shot then settles for ~1300
+   * frames and the crowd streams straight back in. Cleared here, the sim is
+   * frozen two calls later and nothing can repopulate before the shutter.
+   */
+  if (shot.shutter) {
+    try { shot.shutter(engine); } catch { /* a shot must never take the boot down */ }
   }
 }
 
@@ -524,8 +574,18 @@ function releaseStagedDrivers(e) {
  * which `police._spawnAt` does not set. It would delete the entire tableau —
  * five frozen cars — between the last pumped frame and the photograph.
  */
-function framePursuit(e, { dist = 8.0, side = 3.2, eye = 1.7, aimAhead = 17, aimY = 3.4, markAlong = 1.0, markSide = 5.8 } = {}) {
-  const shot = SHOTS.pursuit;
+/*
+ * `shot` IS A PARAMETER, not `SHOTS.pursuit` read from inside.
+ *
+ * Two shots stage this tableau now — the review `pursuit` and the marketing
+ * `mkt_chase` — and the helper writes the brother's resolved mark back onto
+ * the shot it is composing (`shot.player.at`). Reading one shot by name from
+ * inside would have `mkt_chase` filling in `pursuit`'s mark and then
+ * photographing nobody, which is the same class of mistake as the absolute
+ * coordinates this file has now made five times: the helper must be told what
+ * it is framing.
+ */
+function framePursuit(e, { dist = 8.0, side = 3.2, eye = 1.7, aimAhead = 17, aimY = 3.4, markAlong = 1.0, markSide = 5.8 } = {}, shot = SHOTS.pursuit) {
   // A mark resolved from a PREVIOUS apply must never be photographed: shots run
   // back to back in one session and the staging can legitimately fail here.
   if (shot?.player) shot.player.at = null;
@@ -1084,6 +1144,569 @@ const STEEL_CITY_SHOTS = {
 // poses) are dropped; the names the tooling enumerates come from __SHOTS__ so
 // nothing downstream needs to change.
 for (const k of ['interior', 'weapon', 'ads', 'muzzle', 'impacts']) delete SHOTS[k];
+
+/* =======================================================================
+ * STAGING FOR THE SECOND MARKETING WAVE — aircraft, armour and the cars.
+ * =======================================================================
+ *
+ * The first marketing set photographed places. This one has to photograph the
+ * VERBS — fly, fight, chase, drive — and three of them have no staging API at
+ * all, because nothing in the game ever needed to hold a machine still:
+ *
+ *   an aircraft IN FLIGHT   `vehicles.debugPose` stages on the ground off the
+ *                           camera's forward ray, and a plane simply spawned
+ *                           at altitude is a plane that falls. A shot settles
+ *                           for roughly 1300 frames — twenty seconds of sim —
+ *                           which is long enough for a Skylark dropped at
+ *                           190 m to reach the river and burn. (Same failure
+ *                           the `chase` pose had: 21 m/s of unpinned car drove
+ *                           420 m and left `driving.png` with NO CAR IN IT.)
+ *   the AIRBASE             its own encounter arms the moment anything crosses
+ *                           the wire, and every shot teleports the player to
+ *                           its camera. A flightline still would photograph a
+ *                           klaxon, three waves of guards and its own subject
+ *                           being shelled — `game/airbase.js` publishes the
+ *                           inert state for exactly this, as `?noassault=1`.
+ *   THREE hero cars         `debugPose` stages one subject; `debugStage('row')`
+ *                           stages several but rays for the ground from
+ *                           `shot.pos[1] + 14`, which is under the terrain at
+ *                           the body shop (deck 24.2 m, a `ground: true` shot's
+ *                           authored y is single digits).
+ *
+ * So three small stagers here, all built out of PUBLISHED doors
+ * (`vehicles.spawn` / `despawn`, `specOf`, `world.heightAt`, the assault's own
+ * negative-control flag), all releasing what they took the moment another shot
+ * is applied (see `shotChrome`), and all composing the camera FROM the staged
+ * subject rather than from authored coordinates — the rule the rest of this
+ * file learned the expensive way.
+ */
+
+/** Scratch for the stagers. Shots run at apply/shutter, never per frame, but
+ *  allocating a Euler per aircraft is still pointless. */
+const _euler = new THREE.Euler();
+const _vec = new THREE.Vector3();
+
+/**
+ * PARK A MACHINE WHERE THE SHOT WANTS IT, and have it still be there at the
+ * shutter — an aircraft in the sky, a hull on the river.
+ *
+ * `v.kinematic` is the one honest way to do this. `VehicleSystem.fixedUpdate`
+ * skips `fixedStep` entirely for a kinematic body (that is how the trolley
+ * rides its rails without being handed to the tyre model and gravity), so the
+ * pose set here is the pose photographed 1300 frames later — no pin to fight
+ * the integrator, no drift to measure, and `syncTransforms` still draws it and
+ * still turns its rotors from `rotorPhase`.
+ *
+ * What it costs: `stepPlane`/`stepHeli` never run, so the governor never spools
+ * and the exhaust flame — which `plane.js` lights from the SPOOLED throttle
+ * inside the flight step — stays dark. The blades are posed by hand below as the
+ * floor, and a shot that wants a TURNING disc asks `vehicles.debugSpool` for one
+ * every frame — see `spoolStaged` and `tickStagedSpool`. A cruising aircraft has
+ * no visible plume anyway; a lit afterburner would be worth a followup, not a
+ * fake.
+ *
+ * `despawn` refuses a kinematic vehicle unless the call is `hard` (the trolley
+ * must survive every cull), so `releaseStagedKinematic` says so explicitly.
+ */
+function stageKinematic(e, { type = 'plane', at, yaw = 0, pitch = 0, roll = 0, phase = 0.9 }) {
+  const veh = e.ctx.peek('vehicles');
+  // Null until a shot ASKS to spool this machine: `false` has to mean "asked and
+  // `vehicles.debugSpool` was not there", not "never asked", or the capture log
+  // reports a missing rotor on the boat.
+  e.__shotSpool = null;
+  if (!veh?.spawn || !at) return null;
+  releaseStagedKinematic(e);
+  const v = veh.spawn(type, _vec.set(at[0], at[1], at[2]), yaw, { plate: 'DCB AIR' });
+  if (!v) return null;
+  // Not a wreck waiting to happen: nothing in the street may write this off,
+  // and nothing may integrate it.
+  v._staged = true;
+  v.kinematic = true;
+  v.quaternion.setFromEuler(_euler.set(pitch, yaw, roll, 'YXZ'));
+  v.prevQuaternion.copy(v.quaternion);
+  v.prevPosition.copy(v.position);
+  v.velocity.set(0, 0, 0);
+  v.angularVelocity.set(0, 0, 0);
+  v.engineOn = true;
+  // The blades: `syncTransforms` reads these two directly, so an aircraft that
+  // is never stepped still has a disc at a believable angle rather than one
+  // frozen at zero with a blade down the fuselage centreline.
+  v.rotorSpin = 1;
+  v.rotorPhase = phase;
+  v.tailPhase = phase * 2.4;
+  v.syncTransforms(1, 0);
+  (e.__shotKinematic ??= []).push(v);
+  return v;
+}
+
+/**
+ * SPIN THE DISC ON A MACHINE THAT IS NEVER STEPPED.
+ *
+ * `stageKinematic` documents the hole this fills: a kinematic body skips
+ * `fixedStep`, so `stepHeli` / `stepPlane` never run, the governor never spools,
+ * and the aircraft in a marketing frame is a machine with its engine off. The
+ * blades are hand-posed there (`rotorSpin = 1`, a phase off zero) which at least
+ * stops a blade lying down the fuselage centreline, but it is a POSE: the disc
+ * stands still, every blade is legible one at a time, and `vehicles` calls that
+ * "the single most obvious 'this is a model, not an aircraft' tell there is".
+ *
+ * `vehicles.debugSpool(v, rpm01, dt)` is that subsystem's own published door for
+ * it and it is theirs to own — the shot asks, it does not reach in. Its contract
+ * says it is CALLED ONCE PER FRAME by whoever is staging the shot, which is why
+ * `tickStagedSpool` below exists: one call at apply time would set a governor
+ * state and one frame of phase, and the 1300 frames of settle that follow would
+ * photograph it standing still again.
+ *
+ * STILL OPTIONAL, deliberately. It landed mid-wave; a capture on a tree without
+ * it must degrade to the hand-set pose rather than fail, so every call is
+ * guarded and the outcome is published on the engine — `null` never asked,
+ * `false` asked and skipped, `true` ran — for `tools/screenshots.mjs` to report.
+ * `spool_control` (scratch) stubs the method in and out to prove those three
+ * states are distinguishable.
+ */
+function spoolStaged(e, v) {
+  const veh = e.ctx.peek('vehicles');
+  e.__shotSpool = false;
+  if (!v || typeof veh?.debugSpool !== 'function') return false;
+  try {
+    veh.debugSpool(v, 1);
+  } catch {
+    return false;
+  }
+  e.__shotSpool = true;
+  // The pose the shutter photographs is the one `syncTransforms` last wrote, so
+  // publish this one onto the drawn nodes now rather than waiting a frame. Same
+  // rule as `holdCamera` and the re-pinned sky clock: the last write before the
+  // photograph is the one that counts.
+  try { v.syncTransforms(1, 0); } catch { /* a shot must never take the boot down */ }
+  return true;
+}
+
+/**
+ * One frame's worth of rotor, for everything this file has staged in the air.
+ *
+ * Hung off the capture step wrapper (see `installShotApi`) rather than off an
+ * engine event, because there is no per-frame hook to subscribe to and because
+ * CAPTURE is exactly the case that needs it: the shot's own apply runs once,
+ * ~1300 frames before the shutter. `dt` is the capture clock's fixed 1/60 and
+ * not `time.dt`, on purpose — the shutter freezes the sim with `time.scale = 0`
+ * and then converges TAA over a fixed 32 frames, and a disc that stops dead for
+ * those frames resolves as a sharp cross. Turning through them is what puts a
+ * BLURRED disc in the photograph, which is what a rotor looks like.
+ *
+ * Costs nothing when nothing is staged, and `debugSpool` returns null for the
+ * kinds that have no rotor (the staged Riverjack), so the boat shot pays one
+ * property read.
+ */
+function tickStagedSpool(engine) {
+  const list = engine.__shotKinematic;
+  if (!list?.length) return;
+  const veh = engine.ctx.peek('vehicles');
+  if (typeof veh?.debugSpool !== 'function') return;
+  for (let i = 0; i < list.length; i++) {
+    try { veh.debugSpool(list[i], 1, 1 / 60); } catch { /* never take the capture down */ }
+  }
+}
+
+function releaseStagedKinematic(e) {
+  const list = e.__shotKinematic;
+  if (!list?.length) return;
+  e.__shotKinematic = null;
+  const veh = e.ctx.peek('vehicles');
+  for (const v of list) {
+    try { veh?.despawn?.(v, { hard: true }); } catch { /* a shot must never take the boot down */ }
+  }
+}
+
+/**
+ * Frame a staged aircraft FROM the aircraft — a chase rig, not a drone.
+ *
+ * `dist` back along its flattened nose, `side` off its right wing, `up` above
+ * it; the aim runs `aimAhead` further down the same line and `aimY` below it,
+ * which is what tips the horizon down far enough to put the city and its
+ * bridges UNDER the aeroplane instead of behind it.
+ *
+ * The nose is flattened to the ground plane on purpose: a banked aircraft's
+ * own right vector rolls the LENS with it, and a marketing frame wants the
+ * bank in the subject and the horizon level. (`player/camera.js`'s flight
+ * chase makes the same choice for the same reason.)
+ */
+function frameAircraft(e, v, { dist = 30, up = 6, side = 9, aimAhead = 26, aimY = -8 } = {}) {
+  if (!v?.position) return;
+  const cam = e.ctx.camera;
+  const q = v.quaternion;
+  // The nose (+Z in the body frame — dynamics takes forwardSpeed along +Z),
+  // flattened, and the right that goes with it.
+  let fx = 2 * (q.x * q.z + q.w * q.y);
+  let fz = 1 - 2 * (q.x * q.x + q.y * q.y);
+  const fl = Math.hypot(fx, fz) || 1;
+  fx /= fl; fz /= fl;
+  const rx = fz, rz = -fx;
+  cam.position.set(
+    v.position.x - fx * dist + rx * side,
+    v.position.y + up,
+    v.position.z - fz * dist + rz * side
+  );
+  const t = {
+    x: v.position.x + fx * aimAhead,
+    y: v.position.y + aimY,
+    z: v.position.z + fz * aimAhead,
+  };
+  cam.lookAt(t.x, t.y, t.z);
+  e.ctx.peek('player')?.teleport?.(cam.position, cam.rotation);
+  holdCamera(e, cam.position, t);
+}
+
+/**
+ * RIDGELINE AFB WITHOUT THE FIREFIGHT.
+ *
+ * `game/airbase.js` arms its encounter on `insidePerimeter(focus)`, and every
+ * shot teleports the player onto its camera — so a still composed on the apron
+ * is a still of a klaxon, a guard wave every seven seconds and three
+ * emplacements walking 2100-point shells onto the lens. That is a legitimate
+ * frame, but it is not the flightline, and it is not reproducible: the tableau
+ * would be a different battle every time the settle length moved.
+ *
+ * The module already publishes the state this shot wants — `disabled`, the
+ * `?noassault=1` negative control, documented there as "dressed (parked jets,
+ * tanks, jeeps) but inert". So flip that, stand the encounter down, and
+ * photograph the base. Restored by `shotChrome` for any shot that does not
+ * declare `airbase: true`, so one marketing capture cannot leave the base
+ * switched off under a later review frame.
+ */
+function airbaseInert(e, off) {
+  const A = e.ctx.peek('game')?.airbase;
+  if (!A) return null;
+  if (off) {
+    if (e.__abAssault === undefined) e.__abAssault = A.disabled;
+    A.disabled = true;
+    A.reset?.();
+  } else if (e.__abAssault !== undefined) {
+    A.disabled = e.__abAssault;
+    e.__abAssault = undefined;
+  }
+  return A;
+}
+
+/** The dressed apron, live handles, west to east: `[near … far]` per kind. */
+function airbaseCast(e) {
+  const A = airbaseInert(e, true);
+  const live = (v) => v?.position && !v.destroyed;
+  return {
+    jets: (A?.jets ?? []).filter(live),
+    tanks: (A?.tanks ?? []).map((t) => t?.v).filter(live),
+    jeeps: (A?.jeeps ?? []).filter(live),
+  };
+}
+
+/**
+ * Stand off a ROW of parked machines and look down it.
+ *
+ * The row is the composition: three jets on 92 m stands, or three tanks on
+ * 52 m ones, read as a receding line with the hangar band behind them — depth
+ * that no single subject on an apron the size of Ridgeline's can give you.
+ *
+ * Everything derives from the live handles, never from the field-local
+ * layout: `world.airbase` owns that frame and re-deriving it here would be the
+ * second owner of a spatial fact (and would silently lie the day the survey
+ * re-sites the base). `back` is metres behind the near machine along the row,
+ * `side` metres off it — NEGATIVE is the side its nose points at, i.e. the
+ * taxiway, which is the side that puts the hangars BEHIND the subject.
+ */
+function frameRow(e, list, { back = 40, side = -40, eye = 4.5, aim = 1, aimUp = 2.5, aimBias = 0 } = {}) {
+  if (!list || list.length < 2) return false;
+  const near = list[list.length - 1];
+  const far = list[0];
+  let dx = far.position.x - near.position.x;
+  let dz = far.position.z - near.position.z;
+  const l = Math.hypot(dx, dz) || 1;
+  dx /= l; dz /= l;
+  // Right of "down the row". For the apron rows this points away from the
+  // runway, so a negative `side` stands the lens on the taxiway side.
+  const rx = dz, rz = -dx;
+  const cam = e.ctx.camera;
+  cam.position.set(
+    near.position.x - dx * back + rx * side,
+    near.position.y + eye,
+    near.position.z - dz * back + rz * side
+  );
+  const a = list[Math.min(aim, list.length - 1)];
+  const t = {
+    x: a.position.x + rx * aimBias,
+    y: a.position.y + aimUp,
+    z: a.position.z + rz * aimBias,
+  };
+  cam.lookAt(t.x, t.y, t.z);
+  e.ctx.peek('player')?.teleport?.(cam.position, cam.rotation);
+  holdCamera(e, cam.position, t);
+  return true;
+}
+
+/**
+ * THE THREE BROTHERS' OWN CARS, STOOD TOGETHER.
+ *
+ * `kessel` / `pickup` / `suv` are hero-only classes with single-colour hero
+ * paint pools (grey K5, red Ranger, white 4Runner — `specs.js`), so spawning
+ * them by name is all it takes to get each brother's actual car. They never
+ * appear in the traffic mix, which is also why no existing frame has ever had
+ * more than one of them in it.
+ *
+ * Placed on a shallow arc rather than in a rank: a straight row of three at
+ * one yaw is a dealership photograph, and the near flanks occlude each other.
+ * `spread` is the arc's radius about the hub, `splay` how far the outer two
+ * are swung round toward the lens, and every car is dropped onto
+ * `world.heightAt` + its own `comY` and then CHOCKED — brake and handbrake,
+ * exactly like `debugPose('beauty')`, because a capture settles for twenty
+ * seconds and a forecourt has camber on it.
+ */
+function stageCars(e, hub, cars) {
+  const veh = e.ctx.peek('vehicles');
+  const w = e.ctx.peek('world');
+  if (!veh?.spawn || !w?.heightAt) return [];
+  releaseStagedCars(e);
+  const out = (e.__shotCars = []);
+  for (const c of cars) {
+    const x = hub.x + c.dx;
+    const z = hub.z + c.dz;
+    const comY = veh.specOf?.(c.type)?.comY ?? 0.6;
+    const gy = w.heightAt(x, z) ?? 0;
+    const v = veh.spawn(c.type, _vec.set(x, gy + comY + 0.05, z), c.yaw, { plate: c.plate });
+    if (!v) continue;
+    v._staged = true;
+    v.engineOn = false;
+    v.input.brake = 1;
+    v.input.handbrake = true;
+    out.push(v);
+  }
+  return out;
+}
+
+function releaseStagedCars(e) {
+  const list = e.__shotCars;
+  if (!list?.length) return;
+  e.__shotCars = null;
+  const veh = e.ctx.peek('vehicles');
+  for (const v of list) {
+    try { veh?.despawn?.(v, { hard: true }); } catch { /* a shot must never take the boot down */ }
+  }
+}
+
+/**
+ * The brothers' cars at the DeCarlo Body Shop, framed from the cars.
+ *
+ * The hub is placed off the camera the shot's `onRoad` block has already
+ * snapped to the street outside the shop, so the group stands on the forecourt
+ * whatever the generator did with that lot — the same reason `onRoad` exists at
+ * all. The lens then goes back to a low three-quarter on the hub.
+ */
+function frameBoyzCars(e, {
+  ahead = 15, offset = 0, spread = 3.9, splay = 0.5, depth = 1.9,
+  dist = 12.5, eye = 1.5, swing = 0.62, aimY = 1.1,
+} = {}) {
+  const cam = e.ctx.camera;
+  cam.updateMatrixWorld();
+  const m = cam.matrixWorld.elements;
+  const fl = Math.hypot(m[8], m[10]) || 1;
+  const fx = -m[8] / fl;
+  const fz = -m[10] / fl;
+  const rx = -fz;
+  const rz = fx;
+  const hub = { x: cam.position.x + fx * ahead + rx * offset, z: cam.position.z + fz * ahead + rz * offset };
+  // The cars face back down the camera's own axis, splayed. An actor looks
+  // down -Z and a vehicle's nose is +Z, so "facing the lens" is the camera's
+  // BACKWARD vector: atan2(-fx, -fz).
+  const face = Math.atan2(-fx, -fz);
+  const cars = stageCars(e, hub, [
+    { type: 'suv', plate: 'DCB 001', dx: -rx * spread, dz: -rz * spread, yaw: face - splay },
+    { type: 'pickup', plate: 'DCB 002', dx: fx * depth, dz: fz * depth, yaw: face },
+    { type: 'kessel', plate: 'DCB 003', dx: rx * spread, dz: rz * spread, yaw: face + splay },
+  ]);
+  if (!cars.length) return false;
+  // Three-quarter, low, off the hub — and off to the side the arc opens
+  // toward, so the near car reads as a flank and a face rather than a nose.
+  const ox = -fx * Math.cos(swing) + rx * Math.sin(swing);
+  const oz = -fz * Math.cos(swing) + rz * Math.sin(swing);
+  const gy = e.ctx.peek('world')?.heightAt?.(hub.x, hub.z) ?? cam.position.y;
+  cam.position.set(hub.x + ox * dist, gy + eye, hub.z + oz * dist);
+  e.ctx.peek('player')?.teleport?.(cam.position, cam.rotation);
+  cam.position.set(hub.x + ox * dist, gy + eye, hub.z + oz * dist);
+  const t = { x: hub.x, y: gy + aimY, z: hub.z };
+  cam.lookAt(t.x, t.y, t.z);
+  holdCamera(e, cam.position, t);
+  return true;
+}
+
+/**
+ * Frame a BOAT with the skyline behind it — the lens on the far side of the
+ * hull FROM the city, so the frame has a near subject, a river and a skyline.
+ *
+ * THE DOCK FLEET WAS THE FIRST CHOICE AND IS THE WRONG ONE.
+ * `freeroam._seedDockVehicles` moors a Riverjack at each of the three slips at
+ * boot, so a subject already exists — but `findWaterSpot` moors it wherever
+ * the water search lands, and at the South Side Docks that is hard against a
+ * bridge pier. Three framings were drafted from it and in all three the
+ * PIER is the photograph: a 20 m concrete block dead centre with the boat as a
+ * dark sliver under it. A marketing frame cannot be hostage to where a spawn
+ * search happened to stop, so the hull is staged mid-channel instead, on the
+ * Monongahela's own published centreline, and held there kinematically for
+ * the same reason the aircraft are.
+ */
+function frameBoat(e, { at, yaw = 0, toward = [-232, 64], dist = 22, eye = 2.6, side = 6, aimPast = 90, aimY = 22 } = {}) {
+  const v = stageKinematic(e, { type: 'boat', at, yaw });
+  if (!v) return false;
+  // Toward the city, flattened: the axis the whole composition is strung on.
+  let ax = toward[0] - v.position.x;
+  let az = toward[1] - v.position.z;
+  const al = Math.hypot(ax, az) || 1;
+  ax /= al; az /= al;
+  const rx = -az;
+  const rz = ax;
+  const cam = e.ctx.camera;
+  cam.position.set(
+    v.position.x - ax * dist + rx * side,
+    v.position.y + eye,
+    v.position.z - az * dist + rz * side
+  );
+  const t = {
+    x: v.position.x + ax * aimPast,
+    y: v.position.y + aimY,
+    z: v.position.z + az * aimPast,
+  };
+  cam.lookAt(t.x, t.y, t.z);
+  e.ctx.peek('player')?.teleport?.(cam.position, cam.rotation);
+  holdCamera(e, cam.position, t);
+  return true;
+}
+
+/**
+ * STAND OFF A SHOPFRONT AND LOOK ALONG IT — a frame composed on the FRONTAGE
+ * LINE, not on the carriageway.
+ *
+ * THE ROAD GRAPH IS THE WRONG AUTHORITY HERE, and the first draft proved it.
+ * `onRoad` stands the lens on a lane centre and aims down the carriageway at
+ * `eye * 0.55`, which is right for a driving shot and wrong for a shopfront:
+ * MEASURED at 1280x720 outside the body shop, the bottom 55% of the picture was
+ * empty tarmac, the near fascia was 40 m off the lens, and the frame's largest
+ * object was a signal mast. That is the exact critic finding the marketing set
+ * exists to answer — "the bottom 40-60% of the frame is a featureless flat
+ * ground plane with nothing on it".
+ *
+ * `world.lots` publishes what this shot actually cares about: `frontage`, the
+ * segment the shopfront was built on (`world/lots.js`), which is the line
+ * `props/layout.js:_frontage` hangs the fascia, the blade, the awning and the
+ * lit window off. MEASURED on the body shop's own block: the frontage stands
+ * 20 m off the lane-0 centre, so a camera placed off the LANE is 20 m from
+ * where the signs are and a camera placed off the FRONTAGE is where you asked
+ * for.
+ *
+ * Everything below is in the frontage's own frame: `u` along the wall, `n` out
+ * of it into the street.
+ *
+ *   near       the anchor the shot is about — a POI or safehouse coordinate.
+ *              The lot whose frontage midpoint is nearest it wins.
+ *   back/out   the camera, metres back along the wall and out from it. `out`
+ *              is what sets the angle the wall is read at: on this block, 16 m
+ *              out and 20 m back is 27 degrees, which shows a shopfront's face
+ *              AND lets the row recede. Under about 12 degrees the frontage is
+ *              edge-on and the type on it is unreadable.
+ *   aimAhead   where down the wall the aim lands, so the row runs to a
+ *              vanishing point instead of sitting square.
+ *   aimOut     off the wall toward the street: swings the lens back across the
+ *              carriageway so the far pavement and its lamps close the frame.
+ *   aimY       metres above the frontage's own ground. The fascia band sits at
+ *              3.15-4.05 m and the blades at 3.3-4.7 (`props/layout.js`), so
+ *              this is the number that decides whether the picture is signage
+ *              or asphalt.
+ *   markAhead / markSide
+ *              where the brother stands, down the view axis and to its right.
+ *              Resolved here and consumed at `shot:applied` through
+ *              `shot.player.at` — the same contract `framePursuit` uses, and
+ *              the only way to place him against a composition `apply` has
+ *              just derived.
+ *
+ * `shot` is a PARAMETER for the same reason it is on `framePursuit`: the helper
+ * writes the mark back onto the shot it is composing, and reading a shot by
+ * name from inside is how one shot ends up staging another one's actor.
+ */
+function frameFrontage(e, {
+  near, back = 20, out = 16, eye = 1.62, aimAhead = 8, aimOut = 2, aimY = 4.6,
+  markAhead = 0, markSide = 0,
+} = {}, shot = null) {
+  if (shot?.player) shot.player.at = null;
+  const w = e.ctx.peek('world');
+  const lots = w?.lots;
+  if (!lots?.length || !near) return false;
+  let lot = null;
+  let bestD = Infinity;
+  for (let i = 0; i < lots.length; i++) {
+    const fr = lots[i].frontage;
+    if (!fr) continue;
+    const mx = (fr[0][0] + fr[1][0]) * 0.5;
+    const mz = (fr[0][1] + fr[1][1]) * 0.5;
+    const d = Math.hypot(mx - near[0], mz - near[1]);
+    if (d < bestD) {
+      bestD = d;
+      lot = lots[i];
+    }
+  }
+  // 60 m is the forecourt radius plus a lot depth: past that the "anchor" is
+  // fronting some other street and the frame would be of somewhere else.
+  if (!lot || bestD > 60) return false;
+  const fr = lot.frontage;
+  const mx = (fr[0][0] + fr[1][0]) * 0.5;
+  const mz = (fr[0][1] + fr[1][1]) * 0.5;
+  let ux = fr[1][0] - fr[0][0];
+  let uz = fr[1][1] - fr[0][1];
+  const ul = Math.hypot(ux, uz) || 1;
+  ux /= ul;
+  uz /= ul;
+  /**
+   * WHICH WAY IS ALONG, AND WHICH WAY IS OUT — neither can be read off the
+   * winding. `lots.js` emits both rows of a block u0 -> u1, so the segment's
+   * direction is the generator's business and is right half the time;
+   * `_frontage` in `props` decides OUT from the lot centroid for exactly this
+   * reason, and this decides ALONG from the world axes so a number tuned here
+   * cannot silently reverse the composition on a rebuild.
+   */
+  if (ux < 0 || (ux === 0 && uz < 0)) {
+    ux = -ux;
+    uz = -uz;
+  }
+  let nx = uz;
+  let nz = -ux;
+  if (nx * (mx - lot.cx) + nz * (mz - lot.cz) < 0) {
+    nx = -nx;
+    nz = -nz;
+  }
+  const g = (x, z) => w.heightAt?.(x, z) ?? 0;
+  const px = mx - ux * back + nx * out;
+  const pz = mz - uz * back + nz * out;
+  const tx = mx + ux * aimAhead + nx * aimOut;
+  const tz = mz + uz * aimAhead + nz * aimOut;
+  const cam = e.ctx.camera;
+  const target = { x: tx, y: g(mx, mz) + aimY, z: tz };
+  cam.position.set(px, g(px, pz) + eye, pz);
+  cam.lookAt(target.x, target.y, target.z);
+  // Teleport, then re-assert: the player rig re-derives the camera from the
+  // player on the frames after a teleport (see `holdCamera`).
+  e.ctx.peek('player')?.teleport?.(cam.position, cam.rotation);
+  cam.position.set(px, g(px, pz) + eye, pz);
+  cam.lookAt(target.x, target.y, target.z);
+  holdCamera(e, cam.position, target);
+
+  if (shot?.player && (markAhead || markSide)) {
+    let fx = tx - px;
+    let fz = tz - pz;
+    const fl = Math.hypot(fx, fz) || 1;
+    fx /= fl;
+    fz /= fl;
+    const kx = px + fx * markAhead - fz * markSide;
+    const kz = pz + fz * markAhead + fx * markSide;
+    shot.player.at = [kx, g(kx, kz) + 0.2, kz];
+  }
+  return true;
+}
+
 /* =======================================================================
  * MARKETING SHOTS — the set that goes in the repo's README.
  * =======================================================================
@@ -1150,9 +1773,38 @@ const MARKETING_SHOTS = {
     doc: 'Downtown in a storm at eye level with a brother walking it — wet asphalt, lit windows, traffic left in deliberately because a living street is the point.',
   },
   mkt_incline: {
-    pos: [-424, 46, 458], look: [-556, 62, 372], fov: 54, time: 7.1, ground: true,
+    /**
+     * SAME LENS POSITION, LOWER AIM — the smallest change that puts the FOOT of
+     * the hillside tower in the picture.
+     *
+     * `buildings` asked for a frame that shows a terraced foundation apron
+     * (`archetypes.js:buildTerrace`), on the grounds that no shot in the set
+     * has one, and this is the shot with the hillside tower in it. The old aim
+     * (`look` y +62, fov 54) put the tower's base at NDC y -0.86 — 49 px off
+     * the bottom edge at 720p — and the funicular's lower station at -1.06,
+     * i.e. out of frame entirely. Both are now in: MEASURED at 1280x720 with
+     * the new aim, the tower foot lands at -0.37 and the lower station at
+     * -0.44, and the second car standing at that station is in the photograph
+     * for the first time.
+     *
+     * WHAT IT CANNOT SHOW, and this is the honest half. I measured every lot
+     * within 300 m through `world.lots` + `world.heightAt` — the apron is
+     * revealed exactly as far as the ground falls away from the lot's own pad,
+     * so the fall IS the exposure. The tower's lot falls -0.7 m (its pad is at
+     * 8.2 and the lowest ground just outside its footprint is 8.4): its apron
+     * is entirely under the pavement, which is `buildTerrace`'s documented
+     * "correct when it is buried" case rather than a defect. What this frame
+     * does carry is the riverside blocks under the bluff, which fall 3.1-4.4 m
+     * (lots 3, 5, 6) — a base band of about 16 px at 190 m. The deep aprons in
+     * this quarter are under the Mt. Washington houses (up to 17.8 m of fall,
+     * at (-268, 556)), which is behind this lens and wants a shot of its own.
+     *
+     * `ground: true`, so `look` y is metres ABOVE the terrain at the aim point
+     * — 38 over the 12 m bench the tower stands on.
+     */
+    pos: [-424, 46, 458], look: [-540, 38, 350], fov: 50, time: 7.1, ground: true,
     weather: 'fog', viewmodel: false, hud: false, marketing: true,
-    doc: 'The Duquesne Incline climbing Mt. Washington out of dawn river fog — the funicular, the cliff, and the city behind it.',
+    doc: 'The Duquesne Incline climbing Mt. Washington out of dawn river fog — both cars on the trestle, one of them standing at the lower station, the hillside tower rooted beside it and the city on the far bank.',
   },
   mkt_searchlight: {
     // Same base and the same frameBeam parameters as the review
@@ -1195,6 +1847,157 @@ const MARKETING_SHOTS = {
     // review `hero` it shares a pose with, so the two stay comparable.
     player: { dist: 18, state: 'idle' },
     doc: 'A Golden Triangle avenue in clear afternoon light with a brother in it — the one bright frame, and the closest thing to a box-art shot.',
+  },
+
+  /* ---- wave two: the verbs — fly, fight, chase, drive, and the water ---- */
+
+  mkt_afb: {
+    // The pre-pose only has to put the streaming camera on the right side of
+    // the map; `frameRow` then composes on the jets that are actually parked.
+    pos: [-330, 10, -1380], look: [-520, 12, -1330], fov: 52, time: 18.7, ground: true,
+    weather: 'scattered', viewmodel: false, hud: false, marketing: true, airbase: true,
+    // REVERSED, and that is a lighting decision. The stands run east-west and
+    // the golden-hour sun sits at the west end of them: shot down the row from
+    // the east the whole frame is a flare with three black jets in it (drafted,
+    // measured by eye, discarded). From the WEST end the same row is front-lit,
+    // the sun is behind the lens, and the hangar band is the far side of the
+    // apron rather than a silhouette. With the list reversed the row direction
+    // flips too, so `side` is now POSITIVE toward the taxiway.
+    apply: (e) => frameRow(e, airbaseCast(e).jets.slice().reverse(), { back: 23, side: 12, eye: 6.8, aim: 1, aimUp: 2.6, aimBias: -26 }),
+    noCrowd: true,
+    shutter: (e) => e.ctx.peek('peds')?.debugStage?.('none'),
+    doc: 'Ridgeline AFB at golden hour, from the west end of the flightline — a parked jet in the near field, the rest of the row and the armour stands behind it, the hangar band, the tower and the city on the horizon. The assault encounter is held in its published inert state so this is the base, not the firefight.',
+  },
+  mkt_flight: {
+    pos: [-26, 192, 380], look: [-560, 90, 60], fov: 54, time: 17.3,
+    weather: 'scattered', viewmodel: false, hud: false, marketing: true, stagesKinematic: true,
+    apply: (e) => {
+      // Down the Monongahela toward the confluence at (-600, 40): the one
+      // heading that puts all three rivers, the Point and the Golden Triangle
+      // in the same frame with bridges under the wing.
+      const v = stageKinematic(e, { type: 'twinplane', at: [-44, 234, 364], yaw: -2.21, pitch: 0.02, roll: -0.17 });
+      // A cruising twin with two dead props is a glider. See `spoolStaged`.
+      spoolStaged(e, v);
+      frameAircraft(e, v, { dist: 19, up: 4.2, side: -9, aimAhead: 105, aimY: -42 });
+    },
+    doc: 'A Meridian twin at 234 m over the Monongahela, gently banked and heading for the confluence — the Point, the bridges and the Golden Triangle underneath it, and both propellers turned into discs. The flyable half of the game, from outside the cockpit.',
+  },
+  mkt_heli: {
+    pos: [-400, 210, -92], look: [-232, 96, 60], fov: 56, time: 19.7,
+    weather: 'scattered', viewmodel: false, hud: false, marketing: true, stagesKinematic: true,
+    apply: (e) => {
+      const v = stageKinematic(e, { type: 'newsheli', at: [-380, 205, -70], yaw: 0.834, pitch: -0.04, roll: 0.15 });
+      // A banked helicopter with a parked disc is a model on a stand. See
+      // `spoolStaged`.
+      spoolStaged(e, v);
+      frameAircraft(e, v, { dist: 14, up: 3.4, side: 6, aimAhead: 80, aimY: -25 });
+    },
+    doc: 'The Skywatch news helicopter over downtown at dusk, banking toward the Triangle — a rotor blurred into a real disc, skyline behind. Deliberately not the police searchlight: this is the city at height, not the wanted system.',
+  },
+  mkt_tanks: {
+    pos: [-330, 10, -1330], look: [-520, 12, -1300], fov: 60, time: 6.9, ground: true,
+    weather: 'fog', viewmodel: false, hud: false, marketing: true, airbase: true,
+    apply: (e) => frameRow(e, airbaseCast(e).tanks, { back: 8, side: -6.2, eye: 1.1, aim: 1, aimUp: 0.9, aimBias: 14 }),
+    // No civilians inside the wire. See `shutter` / `noCrowd` in `shotChrome`.
+    noCrowd: true,
+    shutter: (e) => e.ctx.peek('peds')?.debugStage?.('none'),
+    doc: 'A Bulwark on the Ridgeline apron at dawn, lens at gun height and eight metres off its front quarter — the barrel rakes the frame, the next tank in the row sits under it, the hangar band is behind. Low and close because armour photographed from standing height is a shed.',
+  },
+  mkt_boyzcars: {
+    pos: [632, 6, -464], look: [644, 5, -492], fov: 58, time: 18.3, ground: true,
+    onRoad: { near: [632, -464], eye: 1.6, aheadM: 26 },
+    clearTraffic: 30, weather: 'clear', viewmodel: false, hud: false, marketing: true, stagesCars: true,
+    /*
+     * NO CROWD, and the reason is the harness rather than taste. `peds`
+     * composes its ambient population around the PLAYER, and every shot
+     * teleports the player onto its own camera — so a street-level marketing
+     * frame gets the crowd built around the lens. MEASURED here: a pedestrian
+     * standing 2 m in front of the camera, filling a third of the frame and
+     * covering the middle car. The three hero cars are the subject; the living
+     * street is `mkt_rain_street`'s job, and that shot keeps its traffic.
+     */
+    noCrowd: true,
+    shutter: (e) => e.ctx.peek('peds')?.debugStage?.('none'),
+    apply: (e) => frameBoyzCars(e, { ahead: 24, offset: 2.5, spread: 3.5, splay: 0.5, depth: 1.8, dist: 9.8, eye: 1.45, swing: -0.2, aimY: 0.95 }),
+    doc: `The three brothers' own cars together at the DeCarlo Body Shop in late light — Carson's white 4Runner-style SUV, Aidan's red pickup and Dylan's grey Kessel fastback. Hero classes that never appear in traffic, so this is the only frame in the set that can have all three in it.`,
+  },
+  mkt_chase: {
+    // Same anchor as the review `pursuit` shot, which was MEASURED as the one
+    // place on this avenue where all four cruisers stage inside a lane width
+    // of the quarry's own line. NO `clearTraffic`: the pre-shutter sweep would
+    // despawn the entire frozen tableau.
+    pos: [-232, 5, 150], look: [-232, 12, -40], fov: 48, time: 21.3, ground: true,
+    onRoad: { near: [-232, 124], eye: 1.35, aheadM: 46 },
+    weather: 'storm', viewmodel: false, hud: false, marketing: true, pursuitShot: true,
+    apply: (e) => framePursuit(e, { dist: 9.5, side: 2.6, eye: 1.2, aimAhead: 30, aimY: 2.2 }, SHOTS.mkt_chase),
+    doc: 'A three-star pursuit in the rain — the fleeing car in the near field and four lit lightbars stacked up the avenue behind it. Wet asphalt doubles every strobe.',
+  },
+  mkt_boat: {
+    pos: [-150, 6, 300], look: [-240, 20, 90], fov: 52, time: 19.2,
+    weather: 'scattered', viewmodel: false, hud: false, marketing: true, stagesKinematic: true,
+    // Mid-channel on the Monongahela: the river's own published polyline runs
+    // (-32, 344) -> (-336, 184), and this is a point on it, 200 m off the
+    // Golden Triangle. Nose turned up-river toward the confluence.
+    apply: (e) => frameBoat(e, {
+      at: [-191, 0.2, 260], yaw: -1.35, toward: [-236, 60],
+      dist: 9.5, eye: 2.1, side: 2.5, aimPast: 55, aimY: 11,
+    }),
+    doc: 'A Riverjack mid-channel on the Monongahela at last light, the Golden Triangle silhouetted 200 m off its bow — the water half of the game, and Carson’s half of the story.',
+  },
+  /* ---- wave three: what the city SAYS ---- */
+
+  mkt_butler: {
+    // The pre-pose only has to put the streaming camera on the right block;
+    // `frameFrontage` composes on the frontage the body shop actually stands on.
+    pos: [632, 6, -464], look: [660, 8, -500], fov: 44, time: 19.75, ground: true,
+    clearTraffic: 24, weather: 'clear', viewmodel: false, hud: false, marketing: true,
+    // 19.75 IS A MEASUREMENT, not a mood. `props._driveLights` runs every
+    // emissive in the sign kit off the sun with
+    // `mix = 1 - clamp((sunAltitude + 0.05) / 0.19)`, and a sweep of the sky
+    // clock puts sunset at 19.75 and full lit at 20.25. At 19.75 the mix is
+    // 0.73 — the fascias, the channel letters and the shop windows are lit
+    // while the sun is still on the brick and there is colour left in the sky.
+    // Half an hour later (20.05, drafted and discarded) the mix is 0.97 and the
+    // frame is a dark street with bright signs on it, which is a night shot and
+    // is the one this set already has three of.
+    /**
+     * AIDAN, because this is his street: the body shop is his safehouse and
+     * Duke Marrow's crew wants this block. `state: 'idle'` because a shot
+     * settles for hundreds of frames and every other state is a scripted input
+     * that walks the subject somewhere different each run.
+     *
+     * `dist` is the FALLBACK mark. The real one is resolved by `frameFrontage`
+     * onto the pavement in front of the shopfront and written to
+     * `player.at` — `dist` only applies if that helper bails, in which case 11 m
+     * down the pre-pose's own axis is still a man in a street rather than a face
+     * against the lens.
+     *
+     * `brother` persists after the shot: `setBrother` rebuilds the body and
+     * nothing puts it back. Harmless as captured — `tools/screenshots.mjs` runs
+     * every shot in its own browser process — but a hand-driven session that
+     * applies this and then another `player:` shot will photograph Aidan in it.
+     */
+    player: { dist: 11, state: 'idle', brother: 'aidan' },
+    /*
+     * NO CROWD, for the reason `mkt_boyzcars` documents: `peds` composes its
+     * ambient population around the PLAYER and every shot teleports the player
+     * onto its own camera, so a street-level frame gets the crowd built around
+     * the lens. MEASURED on two drafts of this shot: a pedestrian's head filled
+     * the left third of the picture in both, at a different place each time.
+     * The life in this frame is Aidan, staged on a mark.
+     */
+    noCrowd: true,
+    shutter: (e) => e.ctx.peek('peds')?.debugStage?.('none'),
+    apply: (e) => frameFrontage(e, {
+      near: [632, -464], back: 22, out: 17, eye: 1.62,
+      aimAhead: 0, aimOut: 5, aimY: 4.4, markAhead: 12, markSide: 1.5,
+    }, SHOTS.mkt_butler),
+    doc: 'Butler Street at lighting-up time — Aidan on the pavement outside his own body shop, its fascia lit, the frontage running away down the block. The signage system as a photograph: shop names in real type, channel letters, lit windows.',
+  },
+  mkt_fountain: {
+    pos: [-408, 4.5, 64], look: [-452, 12, 46], fov: 50, time: 16.8, ground: true,
+    weather: 'scattered', viewmodel: false, hud: false, marketing: true,
+    doc: 'The Point fountain in late afternoon from the plaza east of it — the plume centred, the basin and its crowd in the near field, and the confluence with the West End crossing behind. Judge the jet: it should read as water, not as a smoke column.',
   },
 };
 
@@ -1442,6 +2245,10 @@ export function installShotApi(engine, { capture, lockstep = false } = {}) {
       function () {
         this._last = fake;
         fake += 1000 / 60;
+        // BEFORE the frame, not after: `syncTransforms` runs inside this step
+        // and is what copies `rotorPhase` onto the rotor pivots, so a phase
+        // written afterwards is a phase the frame did not draw.
+        tickStagedSpool(this);
         return orig.call(this, fake);
       })(engine.step);
   }
@@ -1635,6 +2442,14 @@ export function installShotApi(engine, { capture, lockstep = false } = {}) {
       textures: r?.renderer?.info.memory.textures ?? 0,
       geometries: r?.renderer?.info.memory.geometries ?? 0,
       ms: engine.time.dt * 1000,
+      /**
+       * Did the staged aircraft's rotor actually spool? `null` = this shot never
+       * asked, `false` = it asked and `vehicles.debugSpool` is not on this tree
+       * yet, `true` = it ran. Published so `tools/screenshots.mjs` can say which
+       * of the three happened instead of a capture silently shipping a frozen
+       * disc — see `spoolStaged`.
+       */
+      spool: engine.__shotSpool ?? null,
       // The RESOLVED camera pose. `onRoad` shots re-derive their camera from
       // the road graph at apply time, so when the graph changes — new lots, a
       // re-cut corridor — a shot silently relocates. Two capture sets then

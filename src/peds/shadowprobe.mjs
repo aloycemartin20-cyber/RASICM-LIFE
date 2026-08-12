@@ -106,6 +106,41 @@ const CONDITIONS = [
 const SHOTS = args.shot ? [String(args.shot)] : ['street', 'crowd'];
 
 /**
+ * ────────────────────────────────────────────────────────────────────────────
+ * THE PLAYER IS THE FIFTH ARM, AND HE IS A SEPARATE SWITCH.
+ * ────────────────────────────────────────────────────────────────────────────
+ * The brother had no contact mark at all until this wave: `GroundShadows` was
+ * reachable only from `peds`, and every `street`, `crowd` and `character` frame
+ * this project has shot has a man standing on a pavement with pedestrians three
+ * metres behind him wearing a mark he does not have. He wears one now, out of
+ * THE SAME POOL as the crowd: `peds` fills and CLOSES that pool inside its own
+ * `lateUpdate` and the registry sorts `player` ahead of it, so the player
+ * SUBMITS an actor record into a queue `GroundShadows.begin()` leaves alone and
+ * `end()` drains (he ran a second instance of the whole class for this until
+ * the queue existed — two draws and 32 KiB of duplicate bake).
+ *
+ * His submission is still its own switch, so it still gets its own arm: one
+ * more capture of the same frozen frame with `player.groundShadow` off and
+ * everything else — including the crowd's pool — untouched. Everything about
+ * the measurement is the ped path's: the footprint is the set of pixels that
+ * MOVED between the two arms rather than a projection of the pool's own
+ * transforms, the crop is centred on the DRAWN body (the character root's world
+ * position, which is not a quantity the shadow code computes), the exposure
+ * drift is measured on open road either side and divided out, and the
+ * assertion is the operator's own invariant: a transmittance may only multiply
+ * DOWN.
+ *
+ * It carries the same two failure modes as the ped gate, and both are checked:
+ * a mark that BRIGHTENS the road (the historical lerp defect, which this pool
+ * would inherit wholesale because it inherits the material), and a mark that is
+ * not in the picture at all — which is what "the player has no contact shadow"
+ * measured as, and what a regression in the submit path would look like.
+ *
+ * `--noplayer` skips the extra capture.
+ */
+const PLAYER = !args.noplayer;
+
+/**
  * `--nostage` is the ABLATION for the staging, not the gate's negative control.
  *
  * Said plainly because it is easy to overclaim here: the gate's negative
@@ -398,6 +433,91 @@ async function run(shot, cond) {
   await page.evaluate(() => window.__ENGINE__.ctx.peek('peds').ground.setMode('multiply'));
 
   /*
+   * THE PLAYER ARM. One more capture of the same frozen frame, differing from
+   * `multiply` by exactly one switch: his own pool. The crowd's stays on, so
+   * anything a pedestrian's mark contributes to this crop is identical in both
+   * images and drops out of the difference by construction.
+   */
+  let player = null;
+  if (PLAYER) {
+    const has = await page.evaluate(() => {
+      const p = window.__ENGINE__.ctx.peek('player');
+      if (!p?.groundShadow?.setMode) return null;
+      const cam = window.__ENGINE__.ctx.camera;
+      const root = p.character3D;
+      if (!root) return null;
+      root.updateWorldMatrix(true, false);
+      const m = root.matrixWorld.elements;
+      // The DRAWN body's own origin — the character root is at his feet. Not
+      // `player.position` (the capsule) and emphatically not the pool's
+      // instance matrices, which is the reading that would agree with itself.
+      const fx = m[12], fy = m[13], fz = m[14];
+      const el = cam.projectionMatrix.clone().multiply(cam.matrixWorldInverse).elements;
+      const px = (x, y, z) => {
+        const cw = el[3] * x + el[7] * y + el[11] * z + el[15];
+        if (cw <= 0) return null;
+        return {
+          x: ((el[0] * x + el[4] * y + el[8] * z + el[12]) / cw * 0.5 + 0.5),
+          y: (1 - ((el[1] * x + el[5] * y + el[9] * z + el[13]) / cw * 0.5 + 0.5)),
+        };
+      };
+      const c = px(fx, fy, fz);
+      if (!c) return null;
+      // ~1.2 m of ground around his feet: the body blob is 0.76 m across and
+      // the foot patches sit inside it.
+      const R = 1.2;
+      const pts = [c];
+      for (const [ox, oz] of [[R, 0], [-R, 0], [0, R], [0, -R], [R, R], [-R, -R], [R, -R], [-R, R]]) {
+        const q = px(fx + ox, fy, fz + oz);
+        if (q) pts.push(q);
+      }
+      const dx = fx - cam.position.x, dy = fy - cam.position.y, dz = fz - cam.position.z;
+      return {
+        dist: +Math.sqrt(dx * dx + dy * dy + dz * dz).toFixed(2),
+        u0: Math.min(...pts.map((q) => q.x)), u1: Math.max(...pts.map((q) => q.x)),
+        v0: Math.min(...pts.map((q) => q.y)), v1: Math.max(...pts.map((q) => q.y)),
+        mode: p.groundShadow.mode,
+        // He is IN the crowd's pool now, so there are no instance counts of his
+        // own to report — the honest pair is "did this actor go into the pool
+        // on the frame being photographed" and how full that pool is.
+        submitted: p.groundShadow.submitted === true,
+        instances: {
+          body: p.groundShadow.pool?.body.mesh.count ?? 0,
+          feet: p.groundShadow.pool?.feet.mesh.count ?? 0,
+        },
+      };
+    });
+    if (!has) {
+      player = { error: 'no player.groundShadow, or the body is not in this frame' };
+    } else {
+      await page.evaluate(() => {
+        window.__ENGINE__.ctx.peek('player').groundShadow.setMode('off');
+        const taa = window.__ENGINE__.ctx.peek('render')?.taa;
+        if (taa) { taa.index = 0; taa.reset?.(); }
+      });
+      await pump(CONVERGE);
+      const buf = await page.screenshot({ type: 'png' });
+      arms.playerOff = PNG.sync.read(buf);
+      if (KEEP) writeFileSync(join(KEEP, `${shot}-${cond.id}-playerOff.png`), buf);
+      await page.evaluate(() => {
+        window.__ENGINE__.ctx.peek('player').groundShadow.setMode('multiply');
+        const taa = window.__ENGINE__.ctx.peek('render')?.taa;
+        if (taa) { taa.index = 0; taa.reset?.(); }
+      });
+      await pump(CONVERGE);
+      const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+      const crop = {
+        dist: has.dist,
+        x0: Math.round(clamp(has.u0 * W - 25, 0, W - 2)),
+        x1: Math.round(clamp(has.u1 * W + 25, 1, W - 1)),
+        y0: Math.round(clamp(has.v0 * H - 25, 0, H - 2)),
+        y1: Math.round(clamp(has.v1 * H + 25, 1, H - 1)),
+      };
+      player = measurePlayer(crop, has, arms);
+    }
+  }
+
+  /*
    * Take the first candidate whose crop actually contains a mark. An earlier
    * cut took the nearest candidate unconditionally, found a 0 px footprint on
    * `combat` because the subject was behind a prop, skipped every arm — and
@@ -427,12 +547,97 @@ async function run(shot, cond) {
   }
   out.tried = roi.candidates.length;
   out.staged = stagedInfo;
+  out.player = player;
   results.push(out);
 }
 
 /* ------------------------------------------------------------------ */
 /* the measurement                                                     */
 /* ------------------------------------------------------------------ */
+
+/**
+ * The player's mark: `multiply` (his pool on) against `playerOff` (his pool
+ * off, everything else identical), inside a crop centred on his DRAWN body.
+ *
+ * Same three disciplines as the ped path, for the same three reasons:
+ *   - the FOOTPRINT is the pixels that moved between the two arms, never a
+ *     projection of the pool's own instance matrices (rule 12);
+ *   - the exposure DRIFT is measured on the strips either side of the mark,
+ *     which his pool cannot reach, and subtracted — a few thousand darkened
+ *     pixels move the metered key and the adaptation answers everywhere;
+ *   - the NOISE FLOOR is measured, from `off` vs `repeat` over this same crop.
+ *     Those two arms differ only by having been taken twice, and his pool was
+ *     on in both, so they bound what this harness can resolve here.
+ */
+function measurePlayer(crop, info, arms) {
+  const live = arms.multiply, offArm = arms.playerOff, a1 = arms.off, a2 = arms.repeat;
+  const rw = crop.x1 - crop.x0, rh = crop.y1 - crop.y0;
+  const idx = (x, y) => (y * live.width + x) * 4;
+  const TH = 3;
+  const mask = new Uint8Array(rw * rh);
+  const blob = [];
+  for (let y = 0; y < rh; y++) {
+    for (let x = 0; x < rw; x++) {
+      const i = idx(crop.x0 + x, crop.y0 + y);
+      const d = Math.max(
+        Math.abs(live.data[i] - offArm.data[i]),
+        Math.abs(live.data[i + 1] - offArm.data[i + 1]),
+        Math.abs(live.data[i + 2] - offArm.data[i + 2])
+      );
+      if (d > TH) { mask[y * rw + x] = 1; blob.push(i); }
+    }
+  }
+  // Reference road: the crop's own margin, minus anything the mark touched.
+  const side = [];
+  for (let y = 0; y < rh; y++) {
+    for (let x = 0; x < rw; x++) {
+      if (!mask[y * rw + x] && (x < 12 || x >= rw - 12)) side.push(idx(crop.x0 + x, crop.y0 + y));
+    }
+  }
+  const out = {
+    dist: info.dist, crop, instances: info.instances, submitted: info.submitted,
+    footprintPx: blob.length,
+  };
+  if (!blob.length || !side.length) return out;
+  const meanOf = (png, list) => {
+    let s = 0;
+    for (const i of list) s += lum(png.data[i], png.data[i + 1], png.data[i + 2]);
+    return s / list.length;
+  };
+  const driftOf = (png) => meanOf(png, side) - meanOf(offArm, side);
+  let floorT = 1;
+  if (a1 && a2) {
+    const rd = meanOf(a2, side) - meanOf(a1, side);
+    for (const i of blob) {
+      const d = lum(a2.data[i], a2.data[i + 1], a2.data[i + 2]) -
+                lum(a1.data[i], a1.data[i + 1], a1.data[i + 2]) - rd;
+      if (d > floorT) floorT = d;
+    }
+  }
+  const drift = driftOf(live);
+  let raised = 0;
+  let worst = 0;
+  for (const i of blob) {
+    const d = lum(live.data[i], live.data[i + 1], live.data[i + 2]) -
+              lum(offArm.data[i], offArm.data[i + 1], offArm.data[i + 2]) - drift;
+    if (d > floorT) raised++;
+    if (d > worst) worst = d;
+  }
+  const b = stats(live, blob);
+  const bOff = stats(offArm, blob);
+  const s = stats(live, side);
+  out.noiseFloor = +floorT.toFixed(2);
+  out.drift = +drift.toFixed(3);
+  out.under = b.linear;
+  out.underOff = bOff.linear;
+  out.side = s.linear;
+  out.delta = +(b.linear - bOff.linear).toFixed(3);
+  out.ratio = +(b.linear / Math.max(1e-6, s.linear)).toFixed(3);
+  out.raised = raised;
+  out.raisedPct = +((100 * raised) / blob.length).toFixed(1);
+  out.worst = +worst.toFixed(1);
+  return out;
+}
 
 function measure(shot, cond, roi, instances, arms, frozen) {
   const off = arms.off, lerp = arms.lerp, mul = arms.multiply, rep = arms.repeat;
@@ -641,6 +846,17 @@ try {
 const pad = (s, n) => String(s).padEnd(n);
 let fails = 0;
 let measured = 0;
+let playerMeasured = 0;
+let playerFails = 0;
+/**
+ * A contact mark under a man 8-11 m from the lens is thousands of pixels — the
+ * ped path's own floor is 200 px for subjects out to 45 m, and the player is
+ * always the nearest figure in these two shots because they stage him. 200 is
+ * therefore generous and it is the same number, deliberately: a floor that
+ * differs between two measurements of the same phenomenon invites the reader to
+ * wonder which one is the real bar.
+ */
+const PLAYER_MIN_PX = 200;
 console.log('');
 console.log('PED GROUND-CONTACT SHADOW — measured on the emitted frame');
 console.log('linear x255; "under" = pixels the pool moved, "side" = open road on the same rows');
@@ -675,6 +891,37 @@ for (const r of results) {
       `${pad(`${a.raisedPct}% (max +${a.worst})`, 15)}${verdict}`
     );
   }
+  /* ---- the player's own pool ---- */
+  const p = r.player;
+  if (PLAYER) {
+    if (!p || p.error) {
+      console.log(`    ${pad('PLAYER', 10)}UNMEASURED — ${p?.error ?? 'no arm captured'}`);
+      fails++;
+      playerFails++;
+    } else if (p.footprintPx < PLAYER_MIN_PX) {
+      // This is the defect the feature exists for: a brother standing on a
+      // pavement with nothing under him. An absence has to be able to fail.
+      console.log(
+        `    ${pad('PLAYER', 10)}NO CONTACT MARK — ${p.footprintPx} px of ${PLAYER_MIN_PX} at ` +
+        `${p.dist} m, crop ${p.crop.x0},${p.crop.y0}..${p.crop.x1},${p.crop.y1}, ` +
+        `submitted ${p.submitted}, pool ${p.instances.body} body + ${p.instances.feet} foot instances`
+      );
+      fails++;
+      playerFails++;
+    } else {
+      const brightens = p.raisedPct > 0.5;
+      if (brightens) { fails++; playerFails++; }
+      playerMeasured++;
+      console.log(
+        `    ${pad('PLAYER', 10)}${pad(p.under, 9)}${pad(p.side, 9)}${pad('-', 9)}` +
+        `${pad((p.delta > 0 ? '+' : '') + p.delta, 9)}` +
+        `${pad((p.drift > 0 ? '+' : '') + p.drift, 8)}` +
+        `${pad(`${p.raisedPct}% (max +${p.worst})`, 15)}` +
+        `${brightens ? 'BRIGHTENS — a shadow that lights the road' : 'darkens only'}` +
+        ` · ${p.footprintPx} px at ${p.dist} m, bar +${p.noiseFloor}`
+      );
+    }
+  }
   console.log('');
 }
 const flagOk = flagCheck && flagCheck.none === 'multiply' &&
@@ -686,6 +933,14 @@ console.log('');
 if (measured === 0) {
   console.log('  NO CONDITION PRODUCED A MEASURABLE FOOTPRINT — this run proves nothing.');
   fails++;
+}
+if (PLAYER) {
+  console.log(`  PLAYER pool: ${playerMeasured}/${results.length} condition(s) with a measurable ` +
+    `contact mark under the brother${playerFails ? `, ${playerFails} red` : ''}`);
+  if (playerMeasured === 0) {
+    console.log('  THE PLAYER HAS NO CONTACT MARK IN ANY CONDITION — this is the defect, not a harness fault.');
+  }
+  console.log('');
 }
 console.log(fails === 0
   ? `PASS (${measured} condition${measured === 1 ? '' : 's'} measured) — the fixed blend only ever ` +
