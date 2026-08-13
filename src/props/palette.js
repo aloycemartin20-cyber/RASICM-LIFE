@@ -572,6 +572,92 @@ export const SURFACES = {
     },
   },
 
+  // ------------------------------------------------------------ COLOR PARK --
+  /**
+   * AEROSOL, IN QUANTITY — the eight cans Color Park is painted out of, plus
+   * the tarmac they are sprayed on. See `props/colorpark.js`.
+   *
+   * WHY THESE ARE THEIR OWN KEYS AND NOT `tag_a..d`. There are four aerosol
+   * surfaces in this file and they are authored for a TAG: a scrawl a metre
+   * across on a rowhouse gable, at a wear and grime that says "this has been
+   * here two winters". A legal wall is the opposite claim — the paint is
+   * fresh, it is the brightest thing in the frame, and there is 150 m of it —
+   * so it wants its own tints and a fraction of the weathering. Tinted
+   * variants of ONE bake (`metal_painted`, the same one every painted sign in
+   * the city already resolves onto), so eight more colours cost eight material
+   * records and zero extra texture memory. That is the whole reason this file
+   * is a table of tints (see the header).
+   *
+   * `polygonOffset` on every one of them: they lie ON a surface — the tarmac
+   * on the terrain, the murals on the retaining wall — and a millimetre of
+   * depth bias is cheaper and steadier than lifting them until the shadow
+   * separates.
+   */
+  cp_tarmac: {
+    name: 'road_asphalt_worn', opts: {
+      scale: 3.2, tint: 0x2b2a2c, vertexMasks: true, ...wear(0.55, 0.8, 0.45),
+      roughness: [1, 0.06, 0.62],
+      three: { polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 },
+    },
+  },
+  cp_pink: {
+    name: 'metal_painted', opts: {
+      scale: 0.9, tint: 0xff2f7a, vertexMasks: true, ...wear(0.26, 0.3, 0.22),
+      roughness: [0.85, 0.03, 0.32], wearMaterial: [0.6, 0, 0, 0.4], ...PAINTED,
+      three: { metalness: 0.09, polygonOffset: true, polygonOffsetFactor: -6, polygonOffsetUnits: -6 },
+    },
+  },
+  cp_teal: {
+    name: 'metal_painted', opts: {
+      scale: 0.9, tint: 0x18e0c8, vertexMasks: true, ...wear(0.26, 0.3, 0.22),
+      roughness: [0.85, 0.03, 0.32], wearMaterial: [0.6, 0, 0, 0.4], ...PAINTED,
+      three: { metalness: 0.09, polygonOffset: true, polygonOffsetFactor: -6, polygonOffsetUnits: -6 },
+    },
+  },
+  cp_yellow: {
+    name: 'metal_painted', opts: {
+      scale: 0.9, tint: 0xffd21e, vertexMasks: true, ...wear(0.26, 0.3, 0.22),
+      roughness: [0.85, 0.03, 0.32], wearMaterial: [0.6, 0, 0, 0.4], ...PAINTED,
+      three: { metalness: 0.09, polygonOffset: true, polygonOffsetFactor: -6, polygonOffsetUnits: -6 },
+    },
+  },
+  cp_blue: {
+    name: 'metal_painted', opts: {
+      scale: 0.9, tint: 0x2b6bff, vertexMasks: true, ...wear(0.26, 0.3, 0.22),
+      roughness: [0.85, 0.03, 0.32], wearMaterial: [0.6, 0, 0, 0.4], ...PAINTED,
+      three: { metalness: 0.09, polygonOffset: true, polygonOffsetFactor: -6, polygonOffsetUnits: -6 },
+    },
+  },
+  cp_orange: {
+    name: 'metal_painted', opts: {
+      scale: 0.9, tint: 0xff7418, vertexMasks: true, ...wear(0.26, 0.3, 0.22),
+      roughness: [0.85, 0.03, 0.32], wearMaterial: [0.6, 0, 0, 0.4], ...PAINTED,
+      three: { metalness: 0.09, polygonOffset: true, polygonOffsetFactor: -6, polygonOffsetUnits: -6 },
+    },
+  },
+  cp_green: {
+    name: 'metal_painted', opts: {
+      scale: 0.9, tint: 0x63e02a, vertexMasks: true, ...wear(0.26, 0.3, 0.22),
+      roughness: [0.85, 0.03, 0.32], wearMaterial: [0.6, 0, 0, 0.4], ...PAINTED,
+      three: { metalness: 0.09, polygonOffset: true, polygonOffsetFactor: -6, polygonOffsetUnits: -6 },
+    },
+  },
+  /** The two cans every writer owns: an outline black and a highlight white. */
+  cp_black: {
+    name: 'metal_painted', opts: {
+      scale: 0.9, tint: 0x101014, vertexMasks: true, ...wear(0.24, 0.34, 0.28),
+      roughness: [0.92, 0.03, 0.36], wearMaterial: [0.6, 0, 0, 0.4], ...PAINTED,
+      three: { metalness: 0.09, polygonOffset: true, polygonOffsetFactor: -8, polygonOffsetUnits: -8 },
+    },
+  },
+  cp_white: {
+    name: 'metal_painted', opts: {
+      scale: 0.9, tint: 0xf2f4ef, vertexMasks: true, ...wear(0.3, 0.38, 0.28),
+      roughness: [0.9, 0.03, 0.34], wearMaterial: [0.6, 0, 0, 0.4], ...PAINTED,
+      three: { metalness: 0.09, polygonOffset: true, polygonOffsetFactor: -8, polygonOffsetUnits: -8 },
+    },
+  },
+
   // ---------------------------------------------------------- road decals --
   /**
    * Everything here lies ON the road, so it renders after it. `world` already

@@ -20,9 +20,9 @@ arsenal unreachable from the keyboard.
 
 | key | action |
 |---|---|
-| `W A S D` / arrows | move — **on foot this RUNS, no key held** (see auto-run below) · drive · **helicopter: `W`/`S` tilt the disc fore/aft, `A`/`D` are the tail pedals** |
-| `Alt` (hold) | **walk** — the slow gait, since full deflection is the run |
-| `Shift` | run on foot (optional now — auto-run already does it) · nitro in a car · **helicopter: DESCEND** |
+| `W A S D` / arrows | move — **on foot this JOGS, no key held** (see the three gaits below) · drive · **helicopter: `W`/`S` tilt the disc fore/aft, `A`/`D` are the tail pedals** |
+| `Alt` (hold) | **walk** — the slow gait |
+| `Shift` | **run on foot** — 39 % faster than the default jog · nitro in a car · **helicopter: DESCEND** |
 | `Space` | jump on foot · handbrake in a car · **helicopter: CLIMB** |
 | `C` | crouch — **not `Ctrl`**: see the note below the table |
 | **`F`** | **the contextual action** — enter / exit / carjack / swap vehicle / sleep at a safehouse / interact |
@@ -44,34 +44,55 @@ arsenal unreachable from the keyboard.
 Mouse drag rotates the camera; wheel zooms the chase distance (radius clamped
 8–30, pitch 0.35–1.42 rad).
 
-**AUTO-RUN: `W` is the run. `Alt` is the walk. `Shift` is optional.** Reported
-as *"I always need to hold in the run button to move fast enough"*, and the
-report was describing an asymmetry rather than a preference: a **gamepad** has
-auto-sprinted at full stick since the controls were remapped
-(`movement.latchInput` reads `|stick.moveY| > 0.94`), and the keyboard — where
-that axis is always zero — was left out of the line. So a pad ran at 6.4–7.9 m/s
-for free while WASD topped out at the 3.35 m/s jog unless `Shift` was held.
-Full deflection now means the same thing on both devices.
+**THREE GAITS ON THE MOVE KEY: `Alt` walks, `W` jogs, `Shift` runs.** This has
+been reported from both ends. First: *"I always need to hold in the run button
+to move fast enough"* — a real asymmetry, because a **gamepad** has auto-run at
+full stick since the controls were remapped (`movement.latchInput` reads
+`|stick.moveY| > 0.94`) while the keyboard was left out of that line, so a pad
+ran at 6.4–7.9 m/s for free and WASD topped out at the 3.35 m/s analogue jog.
+The fix gave `W` the whole run speed and left `Shift` emitting the same number,
+and the owner played that build and filed the other half: *"player walks a
+little too fast and run doesn't seem to do anything now."* Both sentences are
+one bug — a control that cannot change the speed is a dead control, and with
+nothing above it the default gait has to carry the top speed.
+
+So `W` alone is a **jog**: `MOVE.autoJogScale` (0.72) of the brother's authored
+run, which is a person moving with purpose rather than a person being chased.
+`Shift` is the run again and is worth holding.
 
 What each control is worth on foot, on this build (`src/player/feeltest.mjs`
-measures every one of them off the emitted body position, Carson):
+measures every one of them off the emitted body position, Carson;
+`src/player/moveprobe.mjs` measures all three tiers for all three brothers
+through a real browser):
 
 | input | speed | notes |
 |---|---|---|
-| `W` | **6.40 m/s** | the brother's DESIGN.md run speed — 6.4 / 6.9 / 7.9 by brother |
-| `Shift`+`W` | 6.40 m/s | identical. `Shift` still forces the run; it is never wrong to hold and never required |
+| `W` | **4.61 m/s** | THE DEFAULT. 0.72 × the brother's run: **4.61 / 4.97 / 5.69** for Carson / Aidan / Dylan |
+| `Shift`+`W` | **6.40 m/s** | the brother's DESIGN.md run speed — **6.4 / 6.9 / 7.9** by brother. +39 % over the jog, every brother |
 | `Alt`+`W` | 1.72 m/s | the walk |
-| stick, part-deflected | 1.72 → 3.35 m/s | the analogue ramp is untouched; the jog lives here and has no keyboard binding |
-| `C` then `W` | 1.48 m/s | crouch beats the run, and `Alt` is not needed to hold it |
-| `RMB`+`W` | 1.90 m/s | aiming drops the run on the frame the button goes down |
+| stick, part-deflected | 1.72 → 3.35 m/s | the analogue ramp, untouched. A stick at its stop gets the RUN, not the jog: a pad has no button bindings at all (see below) |
+| `C` then `W` | 1.48 m/s | crouch beats both gaits, and `Alt` is not needed to hold it |
+| `RMB`+`W` | 1.90 m/s | aiming drops the gait on the frame the button goes down |
+
+The rungs are far enough apart to feel under the thumb — 1.72 → 4.61 → 6.40 —
+and `src/player/feeltest.mjs` gates the two GAPS as well as the three speeds,
+because three correct absolute numbers can still have a dead key between them.
+That is exactly what the reported build had: its own measurement recorded
+`Shift`+`W` at *"6.400 (delta 0.000)"* and read it as a pass.
 
 `Shift` keeps its binding on purpose rather than being reused as the walk
 modifier: the same action carries the **vehicle nitro**, the pad's own
-full-stick sprint, and probes outside `src/player/` that press it
+full-stick run, and probes outside `src/player/` that press it
 (`src/weapons/arsenalprobe.mjs --sprint`). `Alt` is where GTA V puts
 *character walk slowly*, and it is not `Ctrl` — the modifier-key rule below is
 about `Ctrl` reaching the browser, and `Input._onKeyDown` cancels everything
 that is not `Ctrl`/`Meta`.
+
+**A gamepad has no middle gait.** `ACTIONS` in `src/core/input.js` binds
+keyboard codes only and `_pollGamepad` reads axes and no buttons, so a stick at
+its stop is the pad's ONLY route to the run and it lands straight on the top
+tier. That is a binding gap rather than a movement one; closing it means giving
+the pad a sprint button, and until then a pad plays the game at 6.4–7.9 m/s.
 
 **Looking up: the reticle reaches 72°, not 34°.** Reported as *"cannot shoot at
 police helicopter while on foot — the view range is limited and cannot aim that

@@ -31,6 +31,31 @@ export function wrapAngle(a) {
   return a - Math.PI;
 }
 
+/**
+ * A/B hatch for the placement resolve, same shape as `world/roadmesh.js`'s
+ * hatches. `?nostandfix=1`, or `OW_NO_STAND_FIX=1` headless, puts `placePlayer`
+ * back exactly as it shipped: the caller's height is obeyed even when it is
+ * under the road, and no deferred unstick is armed for anything but a brother
+ * switch. It is the NEGATIVE CONTROL for the teleport assertion in
+ * `src/game/interactprobe.mjs` and is never reachable in normal play — a fix
+ * you cannot un-apply is a fix you cannot prove (ARCHITECTURE.md rule 12).
+ */
+let _legacyStand = null;
+export function legacyStand() {
+  if (_legacyStand !== null) return _legacyStand;
+  _legacyStand = false;
+  try {
+    if (typeof location !== 'undefined' && new URLSearchParams(location.search).get('nostandfix') === '1') {
+      _legacyStand = true;
+    }
+  } catch { /* no location */ }
+  try {
+    if (typeof process !== 'undefined' && process?.env?.OW_NO_STAND_FIX === '1') _legacyStand = true;
+  } catch { /* no process */ }
+  if (_legacyStand) console.warn('[game] LEGACY PLACEMENT — no deck-hinted floor, no deferred unstick on a teleport');
+  return _legacyStand;
+}
+
 export function dist2(ax, az, bx, bz) {
   const dx = ax - bx;
   const dz = az - bz;
@@ -245,6 +270,8 @@ export class WorldQuery {
     this._lane = { x: 0, y: 0, z: 0, yaw: 0, ok: false };
     this._playerPos = new THREE.Vector3();
     this._half = 1400; // resolved from world.CITY_SIZE at init
+    /** Reused by `standSpot` — rule 5, `placePlayer` runs on every switch. */
+    this._stand = { x: 0, y: 0, z: 0 };
   }
 
   init() {
@@ -345,6 +372,66 @@ export class WorldQuery {
   }
 
   /**
+   * THE SURFACE A TELEPORT LANDS ON, with the deck hint that decides it.
+   *
+   * `world.walkableHeightAt(x, z)` called with NO `y` says so in its own note:
+   * "without it a bridge deck more than a couple of metres off the ground is
+   * ignored". Every teleport destination is exactly that call — the cheat menu
+   * computes its own height and hands it down as `yOverride` — so a pin on a
+   * bridge resolved to the RIVERBANK TWENTY METRES BELOW THE DECK. MEASURED
+   * over every teleport target in the build the owner played: all twelve
+   * bridges put the player under their own span (Fort Pitt at y 7.45 with the
+   * deck 12.4 m overhead and 16 of 16 bearings blocked by the piers; the 31st
+   * Street pin in the water, deck 23.4 m up).
+   *
+   * The hint comes off the road graph, which is the one authority that knows a
+   * bridge is a bridge — see the ladder below for why one hint is not enough.
+   *
+   * The physics down-ray is then reconciled the way `cheats.groundY` documents
+   * — HIGHER wins, because the analytic field cannot see a car-park roof and
+   * the ray cannot see the kerb — and it is fired from only 6 m above the
+   * analytic answer, so "higher" can find a deck you should be standing on and
+   * cannot find a tower roof two hundred metres up. At a teleport the
+   * destination's collision has not streamed yet and the ray simply misses,
+   * which is why the analytic answer has to be right on its own.
+   */
+  standSpot(x, z, out = this._stand) {
+    out.x = x;
+    out.z = z;
+    const w = this.world;
+    let t = NaN;
+    try { t = w?.heightAt?.(x, z); } catch { t = NaN; }
+    if (!Number.isFinite(t)) t = 0;
+    // COPY the deck height out immediately: `nearestEdge` returns a REUSED
+    // record and `walkableHeightAt` calls it again below.
+    let ny = NaN;
+    const ne = w?.roads?.nearestEdge?.(x, z, 40);
+    if (ne?.edge && Number.isFinite(ne.y)) ny = ne.y;
+    // A LADDER OF HINTS, because one is not enough. `nearestEdge` without a `y`
+    // answers with the edge nearest IN PLAN, and under a river crossing that is
+    // routinely the quay road at ground level rather than the deck 15 m up — so
+    // a single hint read off it puts the player back under the bridge, which is
+    // exactly the failure this is here to close (MEASURED: the Fort Pitt pin,
+    // 14.1 m under its own deck). Each rung is a height a deck could plausibly
+    // be at; `walkableHeightAt` only ever returns one when the point is inside
+    // that carriageway's own width (`ne.dist > hw + 0.33 + sw` -> terrain), so a
+    // rung can find a deck you are standing under and cannot invent one. The
+    // highest answer wins, which is the same direction — and for the same
+    // reason — as the ray/analytic reconciliation below. The 30 m top rung is
+    // the tallest crossing in the city with room to spare.
+    let y = t;
+    for (const hint of [NaN, ny, t + 8, t + 18, t + 30]) {
+      let h = NaN;
+      try { h = w?.walkableHeightAt?.(x, z, hint); } catch { h = NaN; }
+      if (Number.isFinite(h) && h > y) y = h;
+    }
+    if (!Number.isFinite(y)) y = t;
+    const ry = this.physics?.groundHeight?.(x, z, y + 6);
+    out.y = Number.isFinite(ry) && ry > y ? ry : y;
+    return out;
+  }
+
+  /**
    * Put the player's feet at (x, z) on the ground, facing `yaw`.
    *
    * `player.teleport` takes an EYE position — feet + stand-eye * body scale.
@@ -355,24 +442,48 @@ export class WorldQuery {
    * seated player leaves the game measuring from a car that is still parked
    * a kilometre away. That is what made a `chase` staged at the boathouse
    * report "the target got away" on its first frame.
+   *
+   * TWO THINGS ARE ADDED HERE BECAUSE THIS IS THE ONE PLACE EVERY PLACEMENT
+   * GOES THROUGH — a brother switch (`characters.restore`), a mission stage, a
+   * boss arena and the cheat teleport all land on this method:
+   *
+   *   the floor is never below the walkable surface. A caller may pass a
+   *   height that is simply wrong about where the ground is (`cheats._teleport`
+   *   computes one without a deck hint; a save writes `pos[1] = 0`), and the
+   *   result was the player standing under a bridge or under the street.
+   *   `standSpot` is the deck-aware answer and this only ever raises him.
+   *
+   *   the deferred unstick is ARMED. `Director.armUnstick` exists because a
+   *   point can only be judged once the city around it has streamed, and until
+   *   now only the brother switch asked for it — so a cheat teleport into a
+   *   sealed shell had no rescue at all. That is the owner's report: teleport
+   *   to the incline and you stand INSIDE the lower station, 10 of 16 bearings
+   *   blocked at ankle height with its roof 9.2 m overhead, and nothing ever
+   *   comes to get you. With this armed the same teleport measures 0 of 16
+   *   blocked on the station forecourt 12 m away.
    */
   placePlayer(x, z, yaw = 0, yOverride = null) {
     const p = this.player;
     if (!p) return false;
     if (p.inVehicle) p.vehicles?.abort?.(p.movement);
-    const y = yOverride ?? this.groundY(x, z) + 0.06;
+    let y = yOverride ?? this.groundY(x, z) + 0.06;
+    if (!legacyStand()) {
+      const s = this.standSpot(x, z);
+      if (Number.isFinite(s.y) && y < s.y + 0.02) y = s.y + 0.06;
+    }
+    let ok = false;
     if (p.movement?.teleport) {
       p.movement.teleport(x, y, z, yaw);
       p.rig?.reset?.(p.movement.anchorHeight, p.movement.position, yaw);
-      return true;
-    }
-    if (p.teleport) {
+      ok = true;
+    } else if (p.teleport) {
       const scale = p.brother?.build?.scale ?? 1;
       this._v.set(x, y + 1.66 * scale, z);
       p.teleport(this._v, yaw);
-      return true;
+      ok = true;
     }
-    return false;
+    if (ok && !legacyStand()) this.ctx.peek('game')?.director?.armUnstick?.();
+    return ok;
   }
 
   /* ---------------------------------------------------------------- POI -- */

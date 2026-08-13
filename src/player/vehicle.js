@@ -685,7 +685,9 @@ export class VehicleHandler {
     }
     this.t = 0;
     this._jacked = false;
-    m.sprinting = false;
+    // Both committed gaits — you do not arrive at the door still running OR
+    // still jogging. See `Movement._endCommittedGait`.
+    m._endCommittedGait();
     return true;
   }
 

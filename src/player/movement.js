@@ -16,13 +16,24 @@
  *   idle · walk · jog · sprint · stop · turn · crouch · jump · fall · stumble ·
  *   mantle · vault · swim · drive
  *
- * AUTO-RUN. Full deflection IS the run — `sprinting` latches off the movement
- * magnitude with no key held (`MOVE.autoRunMag`), which is what a gamepad has
- * always done here and what the keyboard was missing. Shift still forces it,
- * the WALK modifier (Alt) suppresses it and gives you `walkSpeed`, and ADS
- * drops it on the frame the button goes down. `_updateSprint` is the whole of
- * it; `targetSpeed` did not change at all, because the run was already what
- * `sprinting` meant.
+ * THREE TIERS ON THE MOVE KEY, and they are three sibling booleans:
+ * `walking` (Alt) · `jogging` (W alone, full deflection) · `sprinting` (Shift,
+ * or a pad stick at its stop). Each owns one line of `targetSpeed` and they are
+ * read in that order, top down, so a player mashing Shift AND Alt gets the run;
+ * ADS, the crouch, the guard and a swing all beat every one of them.
+ * `jogging` and `sprinting` are mutually exclusive by construction, while
+ * `walking` is only the modifier's raw state. `_updateSprint` is the whole read.
+ *
+ * `jogging` is the DEFAULT and it is worth `MOVE.autoJogScale` of the brother's
+ * authored run, so Shift buys a real 39 %. It was not always: the auto-run wave
+ * gave full deflection the whole run speed and left Shift emitting the same
+ * number, which is the build the owner reported as "walks a little too fast and
+ * run doesn't seem to do anything now".
+ *
+ * `sprinting` therefore means THE AUTHORED RUN and nothing slower — that is
+ * what everything downstream reads it as (the HUD pip, the weapon spread
+ * multiplier, `weapons`' ADS gate), and at the jog tier all of those are
+ * correctly off.
  *
  * `stop` and `turn` exist purely so the animator has something to key off; they
  * are not gates — every transition here is interruptible on the next step.
@@ -64,12 +75,13 @@ const FELL_THROUGH_MIN = 0.55;
 const FELL_THROUGH_MAX = 6.0;
 
 /**
- * What a raised guard costs you: a fraction of the JOG, exclusive with the
- * sprint in both directions. A guard can never be sprinted through, and the
- * sprint never latches while the guard is up in the first place. Both halves are
- * enforced — `_updateSprint` refuses to latch, and `targetSpeed` returns the
- * reduced number even if something else in the build were to set `sprinting`
- * behind its back.
+ * What a raised guard costs you: a fraction of `MOVE.jogSpeed`, exclusive with
+ * both committed gaits in both directions. A guard can never be run or jogged
+ * through, and neither tier latches while the guard is up in the first place.
+ * Both halves are enforced — `_updateSprint` refuses to latch (the guard is one
+ * of the terms in `gaitOk`), and `targetSpeed` returns the reduced number ahead
+ * of either tier even if something else in the build were to set them behind
+ * its back.
  *
  * It is a RATIO rather than an absolute speed so that it tracks the jog:
  * 3.35 * 0.45 = 1.508 m/s. The constant lives here rather than in `tuning.js`.
@@ -97,20 +109,29 @@ export class Movement {
     this.stance = 'stand';
     this.stanceWant = 'stand';
     this.crouchBlend = 0;
+    /**
+     * TOP TIER: the brother's authored run speed, and only ever that. True when
+     * the sprint control is held (Shift, or a pad stick past `autoRunMag` —
+     * `latchInput` folds the pad into `cmd.sprintHeld`). Mutually exclusive
+     * with `jogging` below, so "am I sprinting" stays a question with a
+     * meaningful answer for the HUD, the weapon spread and the ADS gate.
+     */
     this.sprinting = false;
     /**
-     * True when the run engaged off the stick alone, with no key held. Purely
-     * informational — `sprinting` is the state everything else reads — but it
-     * is what a gate needs to tell "the player ran" from "the player held
-     * Shift and ran".
+     * MIDDLE TIER: full deflection with no key held, worth
+     * `MOVE.autoJogScale` of the run. This is what W alone does and it is the
+     * gait the game is mostly played in.
      */
-    this.autoRunning = false;
+    this.jogging = false;
     /**
-     * NEGATIVE CONTROL for auto-run: false puts the keyboard back on the jog
-     * and makes Shift compulsory again, which is the build the owner reported.
-     * `src/player/feeltest.mjs` and `moveprobe.mjs` both drive it.
+     * NEGATIVE CONTROL for the middle tier: false drops W back onto the
+     * analogue ramp (3.35 m/s at full deflection) and makes Shift the only way
+     * to move fast, which is the build that shipped before auto-run.
+     * `src/player/feeltest.mjs` and `moveprobe.mjs` both drive it; the name is
+     * kept from the auto-run wave so those two keep working unchanged.
      */
     this.autoRun = true;
+    /** BOTTOM TIER: the WALK modifier (Alt). */
     this.walking = false;
     this.grounded = true;
     this.wasGrounded = true;
@@ -283,6 +304,16 @@ export class Movement {
     return STANCE[this.stance].anchor * this.bodyScale;
   }
 
+  /**
+   * What the MIDDLE tier is worth for the active brother, in m/s. The one place
+   * `sprintSpeed * MOVE.autoJogScale` is written down, so a probe or a HUD that
+   * wants to know what W alone buys asks rather than recomputing it — and a
+   * probe that recomputed it could not catch the scale being wrong.
+   */
+  get jogSpeed() {
+    return this.sprintSpeed * MOVE.autoJogScale;
+  }
+
   /* ==================================================================== */
   /* input                                                                */
   /* ==================================================================== */
@@ -349,10 +380,15 @@ export class Movement {
     cmd.crouchPressed = crouch && !prev.crouch;
     cmd.crouchHeld = crouch;
     cmd.usePressed = use && !prev.use;
-    // The pad's own full-deflection term stays on this line even though
-    // `_updateSprint` now auto-runs off `mag`: `sprintHeld` is read by two
-    // other things — the crouch stand-up in `_updateStance` and the swim
-    // sprint — and removing it would quietly change both for a pad.
+    // The pad's own full-deflection term is what gives a stick the TOP tier at
+    // all. `ACTIONS` in `src/core/input.js` binds keyboard codes only and
+    // `_pollGamepad` reads axes and no buttons, so a stick at its stop is the
+    // ONLY route a pad has to the run — which is also why a pad gets no middle
+    // tier and lands straight on `sprintSpeed`. That is a binding gap, not a
+    // movement one, and fixing it means giving the pad a sprint button.
+    // `sprintHeld` is read by two other things as well (the crouch stand-up in
+    // `_updateStance` and the swim sprint), the second reason it belongs on
+    // this line rather than inside `_updateSprint`.
     cmd.sprintHeld = input.action('sprint') || Math.abs(input.stick.moveY) > 0.94;
     cmd.walkHeld = input.action('walk');
     cmd.ads = input.ads;
@@ -575,7 +611,7 @@ export class Movement {
       this.stanceWant = 'stand';
       this.stance = 'stand';
       this.character.height = STANCE.stand.height;
-      this.sprinting = false;
+      this._endCommittedGait();
       this.mantleMotion.end();
     } else if (this.swimming && this.waterDepth < S.exitDepth) {
       this.swimming = false;
@@ -658,28 +694,52 @@ export class Movement {
   }
 
   /**
-   * AUTO-RUN: full deflection IS the run, no key held. See `MOVE.autoRunMag`.
+   * The three tiers, resolved once per step. See the file header.
    *
-   * `cmd.ads` and not `this.aiming` is the aim term here, deliberately. The
-   * aim STATE is a ramp — `player._updateAds` walks `adsAmount` toward 1 with a
-   * 0.085 s time constant and `aiming` only turns on past 0.35 — so keying the
-   * suppression off it would leave the run latched for the first ~50 ms of
-   * every right-click. That matters more than it sounds: `weapons` gates its
-   * own ADS blend on `player.sprinting` (`wantAds = st.ads && !st.sprint`), and
-   * with the run engaging on its OWN there is no key to release to break the
-   * tie. The raw button drops the run on the frame it is pressed, and the ramp
-   * then has a clear path up. Holding Shift still wins over the button, exactly
-   * as it did before — that half is unchanged.
+   * `gaitOk` is the whole of what a committed gait needs and both tiers share
+   * it, so they can never disagree about whether a crouch, a swing, a guard or
+   * a stumble has taken the run away — the previous form asked those questions
+   * on one line only and the other tier had to be trusted to follow.
+   *
+   * The two tiers are EXCLUSIVE, sprint first: holding Shift while W is at its
+   * stop is a run, not a run and a jog at once, and `targetSpeed` therefore
+   * reads them in that order too.
+   *
+   * `cmd.ads` and not `this.aiming` is the aim term on the jog tier,
+   * deliberately. The aim STATE is a ramp — `player._updateAds` walks
+   * `adsAmount` toward 1 with a 0.085 s time constant and `aiming` only turns
+   * on past 0.35 — so keying the suppression off it would leave the tier
+   * latched for the first ~50 ms of every right-click. That matters more than
+   * it sounds: `weapons` gates its own ADS blend on `player.sprinting`, and a
+   * gait that engages on its OWN has no key to release to break the tie. The
+   * raw button drops it on the frame it is pressed and the ramp then has a
+   * clear path up. A key beats a modifier, so Shift still wins over the button.
+   *
+   * Both tiers survive going airborne (`grounded || <the tier itself>`) — a
+   * jump must not silently demote the gait it was launched from.
    */
   _updateSprint(cmd, mag) {
     this.walking = cmd.walkHeld;
-    this.autoRunning =
-      this.autoRun && mag > MOVE.autoRunMag && !cmd.walkHeld && !cmd.ads;
-    this.sprinting =
-      (cmd.sprintHeld || this.autoRunning) && mag > 0.45 && this.stance === 'stand' &&
-      !this.aiming && !this.melee && !this._guarding && this.stumbleTime <= 0 &&
-      (this.grounded || this.sprinting);
-    this.autoRunning = this.autoRunning && this.sprinting;
+    const gaitOk =
+      mag > 0.45 && this.stance === 'stand' && !this.aiming && !this.melee &&
+      !this._guarding && this.stumbleTime <= 0;
+    this.sprinting = cmd.sprintHeld && gaitOk && (this.grounded || this.sprinting);
+    this.jogging =
+      !this.sprinting && this.autoRun && mag > MOVE.autoRunMag &&
+      !cmd.walkHeld && !cmd.ads && gaitOk && (this.grounded || this.jogging);
+  }
+
+  /**
+   * Drop every committed gait at once. Called from the places that take the
+   * capsule out of the player's hands — a ledge, a car seat, deep water, a
+   * stumble, a teleport — where `_updateSprint` either does not run at all
+   * (see `step`: driving and mantling both return early) or would run a frame
+   * too late. Clearing one tier and forgetting the other is exactly the bug
+   * this method exists to make unwriteable.
+   */
+  _endCommittedGait() {
+    this.sprinting = false;
+    this.jogging = false;
   }
 
   /** Speed the character is asking for this step. */
@@ -693,11 +753,15 @@ export class Movement {
     if (this._guarding) return MOVE.jogSpeed * BLOCK_SLOW * mag;
     if (this.stance === 'crouch') return MOVE.crouchSpeed * mag;
     if (this.aiming) return MOVE.aimSpeed * mag;
+    // The three tiers, in the order `_updateSprint` resolves them. None scales
+    // with `mag`: past `MOVE.autoRunMag` the stick is at its stop by
+    // definition, and a held Shift means the run at any deflection over 0.45.
     if (this.sprinting) return this.sprintSpeed;
-    // The WALK modifier (Alt). It is checked AFTER the sprint for the same
-    // reason the sprint is checked after the crouch: `_updateSprint` already
-    // refuses to auto-run while it is held, so the only way to be sprinting and
-    // walking at once is to hold Shift, and an explicit key beats a modifier.
+    if (this.jogging) return this.jogSpeed;
+    // The WALK modifier (Alt). It is checked AFTER the two above for the same
+    // reason they are checked after the crouch: `_updateSprint` already refuses
+    // the jog tier while it is held, so the only way to be walking and fast at
+    // once is to hold Shift, and an explicit key beats a modifier.
     if (this.walking) return MOVE.walkSpeed * mag;
     // Analog: the first 62 % of stick travel is a walk, the rest ramps to a jog.
     const m = mag;
@@ -864,7 +928,7 @@ export class Movement {
   _beginStumble(strength) {
     if (this.stumbleTime > MOVE.stumble.time * 0.5) return;
     this.stumbleTime = MOVE.stumble.time * clamp01(strength);
-    this.sprinting = false;
+    this._endCommittedGait();
   }
 
   /** Public: `vehicle.js` throws the actor out of a moving car into a tumble. */
@@ -936,7 +1000,7 @@ export class Movement {
     this.velocity.set(0, 0, 0);
     c.velocity.x = c.velocity.y = c.velocity.z = 0;
     this._jumpBuffer = 0;
-    this.sprinting = false;
+    this._endCommittedGait();
     this.mantleEvent.pending = true;
     this.mantleEvent.kind = kind === LEDGE_VAULT ? 'vault' : 'mantle';
     this.mantleEvent.height = r.obstacleHeight;
@@ -1098,7 +1162,7 @@ export class Movement {
     if (this.character) this.character.enabled = !on;
     if (on) {
       this.velocity.set(0, 0, 0);
-      this.sprinting = false;
+      this._endCommittedGait();
       this.swimming = false;
       this.stance = this.stanceWant = 'stand';
       if (seatPos) {
@@ -1136,7 +1200,7 @@ export class Movement {
   teleport(x, y, z, yaw) {
     if (!this.character) return;
     this.mantleMotion.end();
-    this.sprinting = false;
+    this._endCommittedGait();
     this.swimming = false;
     this.submerged = false;
     this.drowning = false;

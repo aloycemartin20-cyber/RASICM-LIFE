@@ -358,6 +358,68 @@ const MIN_SECTION = 180;
  */
 const STOP_NAMES = ['TRIANGLE YARD', 'STRIP MARKET', 'BUTLER STREET', 'FOUNDRY TERMINUS'];
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * STOP FURNITURE — the shelter, the platform and the name board
+ * ══════════════════════════════════════════════════════════════════════════
+ *
+ * THE REPORT: "trolly station facade is in the middle of the street".
+ *
+ * A STOP MARK IS NOT A PLACE TO STAND, and the whole defect is in that one
+ * sentence. `planStops` deliberately SNAPS every interior mark onto a ROAD
+ * CROSSING — that is the fix for "I never see the trolley", because the
+ * player is on the streets — so a stop is by construction the point where a
+ * rail line and a carriageway intersect. MEASURED on the shipped graph, the
+ * four marks against the nearest drivable centreline:
+ *
+ *   TRIANGLE YARD      5.07 m from a 7.2 m street
+ *   STRIP MARKET      18.53 m from a 6.0 m alley
+ *   BUTLER STREET      1.52 m from a 15.2 m arterial   <- inside the lanes
+ *   FOUNDRY TERMINUS   0.32 m from a 7.2 m street      <- inside the lanes
+ *
+ * Anything built AT the mark therefore stands on the carriageway at two of the
+ * four stops, and at Butler Street it stands in the middle of a four-lane
+ * road. So the furniture is not built at the mark: it is built on the
+ * PAVEMENT SIDE of the rail, which is what a platform is.
+ *
+ * WHICH SIDE, AND HOW FAR, ARE BOTH SOLVED RATHER THAN AUTHORED. The rail runs
+ * down a street, so both sides of it are candidates; the pavement is whichever
+ * one has room. Each candidate is pushed out along the rail's normal until it
+ * clears BOTH envelopes — the tram's own (a 2.6 m body plus its sway) and
+ * every carriageway within reach (each road's own emitted `width`, so a
+ * four-lane arterial pushes further than an alley) — and the side that clears
+ * by more wins. A stop that cannot clear both at any offset gets no furniture
+ * at all rather than furniture in the road.
+ *
+ * `src/vehicles/tramprobe.mjs` gates it: CLEARANCE measures the emitted
+ * anchors against the emitted graph with its own carriageway arithmetic.
+ */
+
+/**
+ * Half-width of the tram's swept envelope, metres. The body is 2.6 m across
+ * (`makeTransit.hw` = 1.30) and a bogie-steered carriage swings past that on a
+ * curve, so the platform edge stands off 2.2 m from the rail centreline and
+ * the furniture behind it further again.
+ */
+const RAIL_HALF = 2.2;
+
+/** Metres of clear ground between the furniture and any carriageway edge. */
+const KERB_CLEAR = 1.0;
+
+/**
+ * Offsets from the rail centreline to try, nearest first. The first is a
+ * platform hard against the tram — the doors open onto it — and the rest are
+ * for a stop where the rail runs IN the carriageway, which is what a
+ * street-running trolley does and what Butler Street is: the rail is 1.5 m off
+ * the centreline of a 15.2 m arterial, so the nearest ground that is not
+ * tarmac is 9 m away and the stop is a KERBSIDE one, the way it was in the
+ * city this is a portrait of. Anything under 4.2 m is inside the tram's own
+ * envelope and is not offered.
+ */
+const PLATFORM_OFF = [4.2, 6.0, 8.0, 10.5, 13.0, 15.5];
+
+/** The platform slab, metres: along the rail, across it, and its lift. */
+const PLATFORM = { len: 11.0, wide: 2.6, rise: 0.16 };
+
 /**
  * A/B hatch, same shape as `legacyPave` in `src/world/roadmesh.js`:
  * `?owOneTram=1` / `OW_ONE_TRAM=1` puts the single car back on the full line.
@@ -500,6 +562,170 @@ function planStops(line, roads, cars) {
   });
 }
 
+/**
+ * Unit tangent of `line` at arc `s`, in XZ.
+ */
+function tangentAt(line, s, out) {
+  let i = 0;
+  while (i < line.cum.length - 2 && line.cum[i + 1] < s) i++;
+  const a = line.pts[i];
+  const b = line.pts[Math.min(i + 1, line.pts.length - 1)];
+  const dx = b.x - a.x;
+  const dz = b.z - a.z;
+  const l = Math.hypot(dx, dz) || 1;
+  out.x = dx / l;
+  out.z = dz / l;
+  return out;
+}
+
+/**
+ * Distance from (x, z) to the nearest DRIVABLE carriageway EDGE — negative
+ * when the point is on the tarmac. Each edge is measured against its own
+ * emitted `width`, so an alley and a six-lane parkway are not treated alike.
+ */
+function carriagewayDist(roads, x, z) {
+  let best = Infinity;
+  const edges = roads?.edges;
+  if (!edges) return best;
+  for (let k = 0; k < edges.length; k++) {
+    const e = edges[k];
+    if (!e || e.rail) continue;
+    const na = roads.nodes[e.a];
+    const nb = roads.nodes[e.b];
+    if (!na || !nb) continue;
+    const dx = nb.x - na.x;
+    const dz = nb.z - na.z;
+    const L2 = dx * dx + dz * dz;
+    let t = L2 > 1e-9 ? ((x - na.x) * dx + (z - na.z) * dz) / L2 : 0;
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    const d = Math.hypot(x - (na.x + dx * t), z - (na.z + dz * t)) - (e.width ?? 7) * 0.5;
+    if (d < best) best = d;
+  }
+  return best;
+}
+
+/**
+ * Solve the platform side and offset for every stop. Writes `stop.platform` =
+ * `{ x, y, z, nx, nz, side, off, clear }`, or leaves it null when neither side
+ * of the rail has room — see the block comment over `RAIL_HALF`.
+ */
+function planPlatforms(line, roads, stops, world) {
+  const tan = { x: 0, z: 0 };
+  const at = { x: 0, y: 0, z: 0 };
+  for (const st of stops) {
+    let best = null;
+    /**
+     * SEARCHED ALONG THE LINE AS WELL AS ACROSS IT, and the reason is a real
+     * stop rather than a tidier loop. MEASURED on the shipped graph: at BUTLER
+     * STREET the rail runs PARALLEL to a 15.2 m arterial for its whole reach,
+     * so stepping sideways off the mark gains 0.35 m of clearance per 2.5 m of
+     * offset and never gets off the tarmac — the nearest clear ground square to
+     * the mark is over 30 m away, which is not a stop, it is a field. Sliding
+     * up the LINE instead finds the point where the road diverges, and a shelter
+     * a dozen metres up the platform from where the doors open is what a tram
+     * stop looks like anyway. Nearest to the mark wins.
+     */
+    for (const ds of [0, 12, -12, 24, -24, 36, -36]) {
+      const s = st.s + ds;
+      if (s < 0 || s > line.length) continue;
+      pointAt(line, s, at);
+      tangentAt(line, s, tan);
+      // The rail's normal, in XZ. Both signs are candidates: a trolley street
+      // has a pavement on each side and only the graph knows which one is free.
+      const nx = -tan.z;
+      const nz = tan.x;
+      for (const side of [1, -1]) {
+        for (const off of PLATFORM_OFF) {
+          const x = at.x + nx * side * off;
+          const z = at.z + nz * side * off;
+          if (world?.isWater?.(x, z)) continue;
+          const y = world?.heightAt?.(x, z);
+          if (!Number.isFinite(y)) continue;
+          // The platform slab reaches PLATFORM.wide/2 either side of the
+          // anchor, so both its EDGES have to clear both envelopes — the
+          // centre clearing them is not the question.
+          const nearRail = off - PLATFORM.wide * 0.5;
+          const road = carriagewayDist(roads, x, z) - PLATFORM.wide * 0.5;
+          if (nearRail < RAIL_HALF || road < KERB_CLEAR) continue;
+          const clear = Math.min(nearRail - RAIL_HALF, road - KERB_CLEAR);
+          // Nearest offset that qualifies wins on each side; between the two
+          // sides, the one with more room round it.
+          if (!best || clear > best.clear) {
+            best = { x, y, z, nx: nx * side, nz: nz * side, side, off, ds, clear,
+              yaw: Math.atan2(tan.x, tan.z) };
+          }
+          break;
+        }
+      }
+      if (best) break;
+    }
+    st.platform = best;
+  }
+  return stops;
+}
+
+/**
+ * The furniture itself: a platform slab, a shelter on four posts with a glazed
+ * back, and the line's name board. One merged group per stop, added to the
+ * vehicle system's root and registered with physics as a static — a canopy a
+ * player walks through is the same defect as a floor he falls through.
+ */
+function buildStopFurniture(sys, stop, group) {
+  const p = stop.platform;
+  if (!p) return;
+  const mats = sys.mats;
+  if (!mats) return;
+  const steel = mats.paint(0x2f3a3c, { finish: 'satin', flake: 0.4, clearcoat: 0.2, wear: 0.5 });
+  const deck = mats.paint(0x8f8d86, { finish: 'matte', flake: 0.2, clearcoat: 0, wear: 0.8 });
+  const pane = mats.glass({ tint: 0x9aa6b4, opacity: 0.32 });
+  const add = (geo, mat, x, y, z, ry) => {
+    const m = new THREE.Mesh(geo, mat);
+    m.position.set(x, y, z);
+    m.rotation.y = ry;
+    m.castShadow = true;
+    m.receiveShadow = true;
+    m.matrixAutoUpdate = false;
+    m.updateMatrix();
+    group.add(m);
+    return m;
+  };
+  const yaw = p.yaw;
+  const c = Math.cos(yaw);
+  const s = Math.sin(yaw);
+  // Local (along the rail, across it) -> world.
+  const X = (a, b) => p.x + a * s + b * p.nx;
+  const Z = (a, b) => p.z + a * c + b * p.nz;
+
+  // The platform: a kerbed slab the doors open onto.
+  add(new THREE.BoxGeometry(PLATFORM.wide, PLATFORM.rise, PLATFORM.len), deck,
+    p.x, p.y + PLATFORM.rise * 0.5, p.z, Math.atan2(p.nx, p.nz));
+  // A tactile edge strip on the rail side, because every platform has one.
+  add(new THREE.BoxGeometry(0.34, 0.02, PLATFORM.len), steel,
+    X(0, -PLATFORM.wide * 0.5 + 0.22), p.y + PLATFORM.rise + 0.01,
+    Z(0, -PLATFORM.wide * 0.5 + 0.22), Math.atan2(p.nx, p.nz));
+
+  // The shelter: four posts, a canopy and a glazed back to the weather.
+  const post = new THREE.CylinderGeometry(0.055, 0.065, 2.45, 8);
+  for (const a of [-1.55, 1.55]) {
+    for (const b of [-0.62, 0.62]) {
+      add(post, steel, X(a, b), p.y + PLATFORM.rise + 1.225, Z(a, b), 0);
+    }
+  }
+  add(new THREE.BoxGeometry(1.72, 0.09, 3.7), steel,
+    X(0, 0.06), p.y + PLATFORM.rise + 2.49, Z(0, 0.06), Math.atan2(p.nx, p.nz));
+  add(new THREE.BoxGeometry(0.03, 1.85, 3.3), pane,
+    X(0, 0.66), p.y + PLATFORM.rise + 1.32, Z(0, 0.66), Math.atan2(p.nx, p.nz));
+  // The bench inside it.
+  add(new THREE.BoxGeometry(0.42, 0.06, 2.4), steel,
+    X(0, 0.44), p.y + PLATFORM.rise + 0.46, Z(0, 0.44), Math.atan2(p.nx, p.nz));
+
+  // The name board, on its own post at the up-line end.
+  add(new THREE.CylinderGeometry(0.045, 0.05, 2.9, 8), steel,
+    X(2.6, 0.2), p.y + PLATFORM.rise + 1.45, Z(2.6, 0.2), 0);
+  add(new THREE.BoxGeometry(0.06, 0.46, 1.5), mats.plate(stop.name.slice(0, 12)),
+    X(2.6, 0.2), p.y + PLATFORM.rise + 2.62, Z(2.6, 0.2), Math.atan2(p.nx, p.nz));
+}
+
 /* ------------------------------------------------------------- service -- */
 
 /**
@@ -526,6 +752,9 @@ export class TramService {
     /** The stop marks, in order along the line. */
     this.stops = [];
     this.line = null;
+    /** The stop furniture group, once built, and its collider handles. */
+    this.furniture = null;
+    this._furnitureCol = null;
     /** Car 0's handles, kept so every existing reader still works unchanged. */
     this.vehicle = null;
     this.mover = null;
@@ -610,6 +839,14 @@ export class TramService {
     const fits = Math.max(1, Math.floor((line.length - 2 * CLEAR) / MIN_SECTION));
     const cars = Math.min(want, fits);
     this.stops = planStops(line, roads, cars);
+    /**
+     * The furniture stands on the PAVEMENT SIDE of the rail, not on the mark.
+     * See the block over `RAIL_HALF` for the measurement that forced it. The
+     * anchors are solved even when the geometry is not built (a headless bench
+     * has no material system), because `tramprobe.mjs` gates the ANCHORS.
+     */
+    planPlatforms(line, roads, this.stops, world);
+    this._buildFurniture(ctx);
 
     const spec = this.sys.specOf ? this.sys.specOf('tram') : null;
     const comY = spec?.comY ?? 1.15;
@@ -670,7 +907,36 @@ export class TramService {
     return true;
   }
 
+  /**
+   * One group for every stop's furniture, added once. Registered with physics
+   * as a static: a canopy a player walks through is the same defect as a floor
+   * he falls through, and this system already owns the only geometry in
+   * `vehicles` that never moves.
+   *
+   * No-ops without a material system, which is what every headless bench has —
+   * the anchors are still solved, so the gate still has something to measure.
+   */
+  _buildFurniture(ctx) {
+    if (this.opts.noFurniture || this.furniture || !this.sys.mats) return;
+    const g = new THREE.Group();
+    g.name = 'tram_stops';
+    for (const st of this.stops) buildStopFurniture(this.sys, st, g);
+    if (!g.children.length) return;
+    (this.sys.root ?? ctx?.scene)?.add(g);
+    this.furniture = g;
+    this._furnitureCol = this.sys.physics?.addStaticGroup?.(g, 'metal') ?? null;
+  }
+
   dispose() {
+    if (this.furniture) {
+      if (this._furnitureCol) {
+        for (const h of this._furnitureCol) this.sys.physics?.removeStatic?.(h);
+      }
+      this.furniture.parent?.remove(this.furniture);
+      this.furniture.traverse((o) => { if (o.isMesh) o.geometry?.dispose(); });
+      this.furniture = null;
+      this._furnitureCol = null;
+    }
     // The vehicles themselves are despawned by VehicleSystem.dispose's sweep.
     for (const c of this.cars) { if (c.vehicle) c.vehicle.transit = null; }
     this.cars.length = 0;

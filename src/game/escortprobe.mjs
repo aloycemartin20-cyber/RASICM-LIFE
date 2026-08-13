@@ -479,11 +479,25 @@ const main = { steps: 0, wet: 0, samples: 0, offRoad: 0, worstRoad: 0, maxAmbush
     `${M.def?.no} ${M.def?.name}, truck at (${ally?.position.x.toFixed(0)}, ${ally?.position.z.toFixed(0)}), ` +
     `dest ${dest.name} (${dest.x}, ${dest.z}), ${straight.toFixed(0)} m as the crow flies`);
 
+  // The wet band's t-position moves whenever either safehouse is re-sited
+  // (sh_dylan moved off the cliff in the R3 spawn work), so the precondition
+  // scans the WHOLE line rather than pinning two historical t-values. What it
+  // guards is unchanged: this chapter must remain a hard river-crossing case,
+  // or the routed/control arms below stop testing anything.
+  let wetT = -1;
+  let wetRun = 0;
+  for (let t = 0; t <= 1.0001; t += 0.01) {
+    if (inTheRiver(poi.x + (dest.x - poi.x) * t, poi.z + (dest.z - poi.z) * t)) {
+      wetRun++;
+      if (wetRun >= 3 && wetT < 0) wetT = t;
+    } else wetRun = 0;
+  }
   check('THE PRE-FIX BLOCKER: the straight line between the two safehouses is in the Monongahela',
-    inTheRiver(poi.x + (dest.x - poi.x) * 0.75, poi.z + (dest.z - poi.z) * 0.75) &&
-    inTheRiver(poi.x + (dest.x - poi.x) * 0.80, poi.z + (dest.z - poi.z) * 0.80),
-    `t=0.75 (${(poi.x + (dest.x - poi.x) * 0.75).toFixed(0)}, ${(poi.z + (dest.z - poi.z) * 0.75).toFixed(0)}) and ` +
-    `t=0.80 both read as open water`);
+    wetT >= 0,
+    wetT >= 0
+      ? `a >=3-sample wet band starts at t=${wetT.toFixed(2)} ` +
+        `(${(poi.x + (dest.x - poi.x) * wetT).toFixed(0)}, ${(poi.z + (dest.z - poi.z) * wetT).toFixed(0)})`
+      : 'no wet band found — this route no longer crosses a river and the probe tests nothing');
 
   check('the chapter now carries a hard clock', M.hasTimer === true && M.timer > 60,
     `${M.timer.toFixed(0)} s armed`);

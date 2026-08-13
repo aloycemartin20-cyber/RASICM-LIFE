@@ -104,7 +104,7 @@
  */
 import { chromium } from 'playwright';
 import { spawn, execSync } from 'node:child_process';
-import { existsSync, writeFileSync, mkdirSync, statSync } from 'node:fs';
+import { existsSync, writeFileSync, mkdirSync, statSync, rmSync, cpSync, symlinkSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import net from 'node:net';
 
@@ -123,6 +123,15 @@ const REPS = Number(arg('reps', 3));
 const FRAMES = Number(arg('frames', 300));
 const GATE = arg('gate', false) === true;
 const DRIVE = arg('drive', false) === true;
+/**
+ * `--trace` adds `?owJobTrace=1` to a `--drive` run: every build job is timed
+ * and attributed to its push site. An ATTRIBUTION pass, never a graded one —
+ * the tracing itself costs a stack capture per push, so its milliseconds are
+ * not the build's milliseconds.
+ */
+const TRACE = arg('trace', false) === true;
+/** `--shots=<dir>` writes mid-drive PNGs. See the capture block in `measureDrive`. */
+const SHOTS = arg('shots', null);
 const AB = arg('ab', null);
 const JSON_OUT = arg('json', null);
 const VERBOSE = arg('v', false) === true;
@@ -176,6 +185,48 @@ async function freePort() {
     if (!(await portOpen(p))) return p;
   }
   throw new Error('no free port');
+}
+
+/**
+ * ATTRIBUTION ONLY — the dev server, so a stack frame names a real file.
+ *
+ * `vite preview` serves the production bundle, in which every push site in the
+ * game is `index-<hash>.js:15753`. That is fine for TIMING (it is the build the
+ * player runs) and useless for ASKING WHOSE JOB THIS IS. `--trace` therefore
+ * runs unbundled, where the stack says `/src/buildings/index.js:1084`, and its
+ * milliseconds are NOT comparable to a graded run — dev is unminified and
+ * module-per-request. Attribution and grading are two different questions and
+ * this file answers them off two different servers on purpose.
+ */
+async function startDev(dir) {
+  /*
+   * OFF A SNAPSHOT, NOT THE WORKING TREE.
+   *
+   * The dev server has HMR, and on a checkout more than one agent is working
+   * in, somebody else's save mid-run is a full page reload — MEASURED here as
+   * `Execution context was destroyed` twice in a row, which is a 6-minute run
+   * thrown away for a reason that has nothing to do with the measurement.
+   * Copying `src/` and the three files vite needs, with `node_modules`
+   * symlinked, costs about a second and makes the pass reproducible.
+   */
+  const snap = resolve(SELF_ROOT, 'node_modules/.cache/perfcheck-trace');
+  rmSync(snap, { recursive: true, force: true });
+  mkdirSync(snap, { recursive: true });
+  for (const f of ['src', 'index.html', 'vite.config.js', 'package.json']) {
+    const from = resolve(dir, f);
+    if (existsSync(from)) cpSync(from, resolve(snap, f), { recursive: true });
+  }
+  symlinkSync(resolve(dir, 'node_modules'), resolve(snap, 'node_modules'), 'dir');
+  const port = await freePort();
+  const bin = resolve(dir, 'node_modules/.bin/vite');
+  const proc = spawn(existsSync(bin) ? bin : resolve(SELF_ROOT, 'node_modules/.bin/vite'),
+    ['--port', String(port), '--strictPort'], { cwd: snap, stdio: 'ignore' });
+  for (let i = 0; i < 300; i++) {
+    await new Promise((r) => setTimeout(r, 200));
+    if (await portOpen(port)) return { port, proc };
+  }
+  proc.kill();
+  throw new Error(`vite dev never came up for ${dir}`);
 }
 
 async function startPreview(dir) {
@@ -308,37 +359,87 @@ const SCENE_STATE = ({ moving }) => {
  * rule 12 says not to grade on. It is here so a hitch can be attributed to the
  * queue or acquitted, and the grading is done on `dt` and `geoDelta`.
  *
- * The route runs downtown -> east across the Golden Triangle and out past
- * Lawrenceville: dense tiles, sector road mesh, bridges and the terrain
- * collision patch's 48 m snap all cross it.
+ * FOUR MECHANISMS, FOUR COLUMNS — added when the owner reported tearing at
+ * speed "since the new districts landed", because `geoDelta` alone cannot tell
+ * a tile BUILD overrun from an ATTACH burst from a shader compile from a GC
+ * pause, and all four present as one >25 ms frame:
+ *
+ *   geoDelta   geometry uploads landing on this frame (build or attach)
+ *   attached   `world`'s own count of sector meshes let into the scene this
+ *              frame — the ATTACH half of geoDelta, separated from the build
+ *              half, so `SECTOR_ATTACH_PER_FRAME` can be convicted or cleared
+ *   progDelta  `renderer.info.programs.length` change — a shader compiling
+ *              mid-drive is a 30 ms frame with geoDelta 0 and nothing to do
+ *              with any streaming budget
+ *   heapMB     `performance.memory.usedJSHeapSize` — a hitch on a frame where
+ *              the heap DROPS is a collection, i.e. allocation pressure
+ *              upstream, not a build that ran long. THE WEAKEST OF THE FOUR,
+ *              and it must be read as such: MEASURED across a 1900-frame drive
+ *              it returned 527.4 MB on every single frame, first to last. A
+ *              figure that never moves is a quantised or stale one, so this
+ *              column can ACQUIT nothing — it can only ever convict, by moving.
+ *
+ * THE ROUTE runs the new content the report names, as a polyline at constant
+ * ground speed: GOLDEN TRIANGLE -> OAKLAND -> SOUTH SIDE. The old route went
+ * downtown-east past Lawrenceville and could not see the R2 districts at all,
+ * so it graded a city the player was not complaining about. Downtown's denser
+ * podium blocks, Oakland's campus grid and the Cathedral, the Mon crossing on
+ * its new bridge steel, and the terrain collision patch's 48 m snap all cross
+ * it.
  */
-const DRIVE_SCRIPT = ({ frames, mps, from, dir }) =>
+const DRIVE_SCRIPT = ({ frames, mps, route, from = 0 }) =>
   new Promise((done) => {
     const e = window.__ENGINE__;
     const ctx = e.ctx;
     const pl = ctx.peek('player');
     const w = ctx.peek('world');
     const r = ctx.peek('render')?.renderer;
+    // Leg lengths, so `t` metres along the polyline is one lookup and no
+    // allocation per frame.
+    const legs = [];
+    for (let k = 1; k < route.length; k++) {
+      legs.push(Math.hypot(route[k][0] - route[k - 1][0], route[k][1] - route[k - 1][1]));
+    }
+    const at = (s) => {
+      let k = 0;
+      while (k < legs.length - 1 && s > legs[k]) { s -= legs[k]; k++; }
+      const f = legs[k] > 0 ? Math.min(1, s / legs[k]) : 0;
+      return [route[k][0] + (route[k + 1][0] - route[k][0]) * f,
+        route[k][1] + (route[k + 1][1] - route[k][1]) * f];
+    };
     const out = [];
     let i = 0;
     let last = performance.now();
     let prevGeo = r?.info.memory.geometries ?? 0;
+    let prevProg = r?.info.programs?.length ?? 0;
     const step = () => {
       const now = performance.now();
       const dt = now - last;
       last = now;
-      const t = i / 60;
-      const x = from[0] + dir[0] * mps * t;
-      const z = from[1] + dir[1] * mps * t;
-      const y = (w?.walkableHeightAt?.(x, z) ?? 2) + 1.4;
-      pl?.teleport?.({ x, y, z });
+      const p = at(((from + i) / 60) * mps);
+      const y = (w?.walkableHeightAt?.(p[0], p[1]) ?? 2) + 1.4;
+      pl?.teleport?.({ x: p[0], y, z: p[1] });
       const geo = r?.info.memory.geometries ?? 0;
+      const prog = r?.info.programs?.length ?? 0;
       out.push({
         i, dt, geoDelta: geo - prevGeo,
         calls: r?.info.render.calls ?? 0,
         buildMs: +(w?._stats?.buildMs ?? 0).toFixed(1),
+        attached: w?._stats?.attached ?? -1,
+        pending: w?.queue?.pending ?? -1,
+        // Jobs the queue ran this frame. `buildMs` high with `ran` 1 is ONE
+        // job that overran the budget — the queue budgets between jobs, never
+        // inside one — and that is a different defect from `ran` 40 small ones.
+        ran: w?.queue?.ran ?? -1,
+        // The static-BVH republish, which is NOT in `buildMs` and never was in
+        // any budget. See `world.update`.
+        physMs: +(w?._stats?.physMs ?? 0).toFixed(1),
+        progDelta: prog - prevProg,
+        heapMB: performance.memory
+          ? +(performance.memory.usedJSHeapSize / 1048576).toFixed(1) : 0,
       });
       prevGeo = geo;
+      prevProg = prog;
       if (++i >= frames) return done(out);
       requestAnimationFrame(step);
     };
@@ -346,7 +447,8 @@ const DRIVE_SCRIPT = ({ frames, mps, from, dir }) =>
   });
 
 async function measureDrive(dir, label, extra = '') {
-  const { port, proc } = await startPreview(dir);
+  if (TRACE) extra = extra ? `${extra}&owJobTrace=1` : 'owJobTrace=1';
+  const { port, proc } = TRACE ? await startDev(dir) : await startPreview(dir);
   const browser = await chromium.launch({
     args: ['--use-angle=metal', '--ignore-gpu-blocklist', '--enable-gpu', '--mute-audio',
       '--disable-frame-rate-limit'],
@@ -365,53 +467,173 @@ async function measureDrive(dir, label, extra = '') {
         const ctx = window.__ENGINE__.ctx;
         const w = ctx.peek('world');
         ctx.peek('player')?.teleport?.({ x: from[0], y: (w?.walkableHeightAt?.(from[0], from[1]) ?? 2) + 1.4, z: from[1] });
-      }, { from: DRIVE_FROM });
-      await page.evaluate(FRAME_TIMER, 180);
+      }, { from: DRIVE_ROUTE[0] });
+      /**
+       * THE STANDING FRAME, on the same page, one second before the drive.
+       *
+       * Without it a drive p50 is uninterpretable: 52 ms could be the streaming
+       * this file exists to measure, or it could be that something else on the
+       * machine is using the GPU (MEASURED on this one — load average 6 and
+       * three other Chromium probes). Standing still at the start of the route
+       * streams nothing, so `baseP50` is the machine, `p50` is the machine plus
+       * the drive, and only their RATIO is a statement about the code.
+       */
+      const warm = await page.evaluate(FRAME_TIMER, 180);
+      const ws = warm.slice(60).sort((a, b) => a - b);
+      const baseP50 = +pct(ws, 0.5).toFixed(2);
       const rows = await page.evaluate(DRIVE_SCRIPT,
-        { frames: DRIVE_FRAMES, mps: DRIVE_MPS, from: DRIVE_FROM, dir: DRIVE_DIR });
+        { frames: DRIVE_FRAMES, mps: DRIVE_MPS, route: DRIVE_ROUTE });
       const dts = rows.map((r) => r.dt).sort((a, b) => a - b);
       const hitches = rows.filter((r) => r.dt > HITCH_MS)
         .sort((a, b) => b.dt - a.dt);
       out.runs.push({
+        baseP50,
         p50: +pct(dts, 0.5).toFixed(2),
         p95: +pct(dts, 0.95).toFixed(2),
         p99: +pct(dts, 0.99).toFixed(2),
         max: +dts[dts.length - 1].toFixed(2),
         hitches: hitches.length,
+        /**
+         * The comparable number. The recorded pre-R2 rate is "6 per 25 s", and
+         * the route is now longer than 25 s of driving, so a raw count off this
+         * route is not the same measurement. `perDrive` normalises to 25 s of
+         * DRIVEN time (the script advances `i/60` seconds of route per frame,
+         * so this is a property of the route and not of the frame rate).
+         */
+        per25s: +(hitches.length * (25 / (DRIVE_FRAMES / 60))).toFixed(1),
         withGeo: hitches.filter((h) => h.geoDelta > 0).length,
+        withAttach: hitches.filter((h) => h.attached > 0).length,
+        withProg: hitches.filter((h) => h.progDelta > 0).length,
+        /** Hitches on a frame the heap SHRANK: a collection, not a build. */
+        withGC: hitches.filter((h) => {
+          const prev = rows[h.i - 1];
+          return prev && h.heapMB > 0 && h.heapMB < prev.heapMB - 1;
+        }).length,
         worstGeoDelta: rows.reduce((m, r) => Math.max(m, r.geoDelta), 0),
+        worstAttach: rows.reduce((m, r) => Math.max(m, r.attached), 0),
         worstHitchGeoDelta: hitches.length ? Math.max(...hitches.map((h) => h.geoDelta)) : 0,
-        top: hitches.slice(0, 6).map((h) => ({ f: h.i, ms: +h.dt.toFixed(1), geoDelta: h.geoDelta, buildMs: h.buildMs })),
+        top: hitches.slice(0, 6).map((h) => ({
+          f: h.i, ms: +h.dt.toFixed(1), geoDelta: h.geoDelta, buildMs: h.buildMs,
+          attached: h.attached, progDelta: h.progDelta, pending: h.pending,
+        })),
+        // Every frame, but only into the JSON: on a machine other work is using
+        // (which this one always is) the ms column is the load average and the
+        // WORK columns are the measurement. Attribution needs all of them.
+        rows: JSON_OUT ? rows : undefined,
       });
+      /**
+       * MID-DRIVE FRAMES, and the point is that nothing waits for them.
+       *
+       * `tools/capture.mjs` gates its shutter on `world.streamingIdle()`, which
+       * is right for a gallery shot and wrong for this question: "is content
+       * arriving late at 45 m/s" is a question about the frame the player gets
+       * WHILE the queue is still working. So this drives to a checkpoint and
+       * photographs whatever is on the screen at that instant.
+       *
+       * Back to the start first, so the checkpoints are reached by driving to
+       * them rather than found already resident from the timed run.
+       */
+      if (SHOTS && rep === REPS - 1) {
+        mkdirSync(resolve(String(SHOTS)), { recursive: true });
+        await page.evaluate(({ from }) => {
+          const ctx = window.__ENGINE__.ctx;
+          const w = ctx.peek('world');
+          ctx.peek('player')?.teleport?.({ x: from[0], y: (w?.walkableHeightAt?.(from[0], from[1]) ?? 2) + 1.4, z: from[1] });
+        }, { from: DRIVE_ROUTE[0] });
+        await page.evaluate(FRAME_TIMER, 180);
+        let at = 0;
+        for (const [name, frame] of DRIVE_SHOTS) {
+          await page.evaluate(DRIVE_SCRIPT,
+            { frames: frame - at, mps: DRIVE_MPS, route: DRIVE_ROUTE, from: at });
+          at = frame;
+          const file = resolve(String(SHOTS), `drive-${name}.png`);
+          await page.screenshot({ path: file });
+          console.log(`  mid-drive frame  ${file}  (f${frame}, no settle wait)`);
+        }
+      }
+      if (TRACE) {
+        out.trace = await page.evaluate(() => {
+          const t = window.__ENGINE__.ctx.peek('world')?._jobTrace;
+          if (!t) return null;
+          return [...t.entries()]
+            .map(([k, v]) => ({ site: k, n: v.n, ms: +v.ms.toFixed(0), worst: +v.worst.toFixed(1), over: v.over }))
+            .sort((a, b) => b.worst - a.worst).slice(0, 16);
+        });
+      }
     }
   } finally {
     await browser.close();
     proc.kill();
   }
   out.p50 = +median(out.runs.map((r) => r.p50)).toFixed(2);
+  out.baseP50 = +median(out.runs.map((r) => r.baseP50)).toFixed(2);
   out.hitches = median(out.runs.map((r) => r.hitches));
+  out.per25s = +median(out.runs.map((r) => r.per25s)).toFixed(1);
+  out.withAttach = median(out.runs.map((r) => r.withAttach));
+  out.withGeo = median(out.runs.map((r) => r.withGeo));
   out.worstGeoDelta = Math.max(...out.runs.map((r) => r.worstGeoDelta));
+  out.worstAttach = Math.max(...out.runs.map((r) => r.worstAttach));
   out.worstHitchGeoDelta = Math.max(...out.runs.map((r) => r.worstHitchGeoDelta));
   out.maxMs = Math.max(...out.runs.map((r) => r.max));
   return out;
 }
 
-/** Downtown, heading east-north-east out through Lawrenceville. */
-const DRIVE_FROM = [-232, 64];
-const DRIVE_DIR = [0.94, -0.34];
+/**
+ * THE ROUTE, as a polyline: GOLDEN TRIANGLE -> OAKLAND -> SOUTH SIDE.
+ *
+ * The three district centres out of `src/world/plan.js` — the R2 content the
+ * play report is about, in the order the report names them. 1425 m of route,
+ * 31.7 s at 45 m/s. `DRIVE_FRAMES` covers the whole polyline and no more: a
+ * drive that stops short grades a route nobody agreed on, and one that runs
+ * past the end parks the anchor at the last waypoint and measures a still city.
+ *
+ * KNOWN, and visible in `--shots`' South Side frame: the anchor follows
+ * `walkableHeightAt`, so where leg 2 crosses the Monongahela it goes down the
+ * river channel rather than over the Birmingham Bridge. That still streams the
+ * crossing (bridges, water, both banks' terrain) and it is still 45 m/s of ring
+ * churn, but the South Side STREET grid is sampled from the bank rather than
+ * driven through. A route that wanted the deck would need the anchor pinned to
+ * the bridge surface, not the ground.
+ */
+const DRIVE_ROUTE = [[-232, 64], [520, 40], [160, 608]];
 const DRIVE_MPS = 45;
-const DRIVE_FRAMES = 1500;
+const DRIVE_FRAMES = (() => {
+  let m = 0;
+  for (let k = 1; k < DRIVE_ROUTE.length; k++) {
+    m += Math.hypot(DRIVE_ROUTE[k][0] - DRIVE_ROUTE[k - 1][0], DRIVE_ROUTE[k][1] - DRIVE_ROUTE[k - 1][1]);
+  }
+  return Math.ceil((m / DRIVE_MPS) * 60);
+})();
 /** A frame past this is a hitch a player feels. */
 const HITCH_MS = 25;
+/**
+ * Where `--shots` photographs the drive: leaving downtown, arriving in Oakland
+ * (end of leg 1, 752 m in), and over the Mon into the South Side. The three
+ * places the R2 content is, taken at speed with the queue still working.
+ */
+const DRIVE_SHOTS = [['downtown', 300], ['oakland', 1000], ['southside', 1700]];
 
 function printDrive(a) {
-  console.log(`\n${a.label} — scripted drive ${DRIVE_MPS} m/s x ${DRIVE_FRAMES} frames, ${a.runs.length} runs`);
-  console.log('  run    p50     p95     p99     max  hitches  w/geo  worstGeoDelta(hitch)');
+  console.log(`\n${a.label} — scripted drive ${DRIVE_MPS} m/s x ${DRIVE_FRAMES} frames ` +
+    `(${(DRIVE_FRAMES / 60).toFixed(1)} s of route), ${a.runs.length} runs`);
+  console.log('  run  stand    p50     p95     p99     max  hitches  /25s  w/geo  w/attach  w/prog  w/GC  worstGeo(hitch)  worstAttach');
   a.runs.forEach((r, i) => {
-    console.log(`  ${String(i + 1).padEnd(3)}${f(r.p50)}  ${f(r.p95)}  ${f(r.p99)}  ${f(r.max)}  ` +
-      `${f(r.hitches, 7)}  ${f(r.withGeo, 5)}  ${f(r.worstGeoDelta, 8)} (${r.worstHitchGeoDelta})`);
-    for (const h of r.top) console.log(`        f${h.f} ${h.ms} ms  geoDelta ${h.geoDelta}  world buildMs ${h.buildMs}`);
+    console.log(`  ${String(i + 1).padEnd(3)}${f(r.baseP50)}${f(r.p50)}  ${f(r.p95)}  ${f(r.p99)}  ${f(r.max)}  ` +
+      `${f(r.hitches, 7)}  ${f(r.per25s, 4)}  ${f(r.withGeo, 5)}  ${f(r.withAttach, 8)}  ` +
+      `${f(r.withProg, 6)}  ${f(r.withGC, 4)}  ${f(r.worstGeoDelta, 8)} (${r.worstHitchGeoDelta})  ${f(r.worstAttach, 6)}`);
+    for (const h of r.top) {
+      console.log(`        f${h.f} ${h.ms} ms  geoDelta ${h.geoDelta}  attached ${h.attached}  ` +
+        `progDelta ${h.progDelta}  world buildMs ${h.buildMs}  queue ${h.pending}`);
+    }
   });
+  if (a.trace) {
+    console.log('  build jobs by WORST single run (attribution pass — these ms include the tracing).');
+    console.log('  `over` = runs that alone spent the whole frame build budget:');
+    for (const t of a.trace) {
+      console.log(`    ${String(t.site).padEnd(56)} worst ${f(t.worst, 7)} ms   n ${f(t.n, 6)}   ` +
+        `over ${f(t.over, 5)}   total ${f(t.ms, 6)} ms`);
+    }
+  }
 }
 
 /* ─────────────────────────────────────────────────────────── measuring ──── */
@@ -745,6 +967,10 @@ if (DRIVE) {
     printDrive(b);
     console.log(`\n  worst geoDelta on a hitch:  A ${a.worstHitchGeoDelta}  ->  B ${b.worstHitchGeoDelta}`);
     console.log(`  hitches (>${HITCH_MS} ms), median run:  A ${a.hitches}  ->  B ${b.hitches}`);
+    console.log(`  hitches per 25 s of route:  A ${a.per25s}  ->  B ${b.per25s}`);
+    console.log(`  of those, on an attach frame:  A ${a.withAttach}  ->  B ${b.withAttach}`);
+    console.log(`  worst meshes attached in one frame:  A ${a.worstAttach}  ->  B ${b.worstAttach}`);
+    console.log(`  p50:  A ${a.p50} ms  ->  B ${b.p50} ms   (standing still, same page: A ${a.baseP50} -> B ${b.baseP50})`);
     console.log(`  worst frame:  A ${a.maxMs} ms  ->  B ${b.maxMs} ms`);
     payload = { mode: 'drive-ab', a, b };
   } else {

@@ -400,7 +400,8 @@ export class PlayerSystem {
     console.info(
       `[player] ${this.brother.name} · ${tri} tris / ${this.character.boneList.length} bones · ` +
       `spawn ${spawn.feet.x.toFixed(1)}, ${spawn.feet.y.toFixed(2)}, ${spawn.feet.z.toFixed(1)} · ` +
-      `run ${this.brother.runSpeed} (default) / jog ${MOVE.jogSpeed} / walk ${MOVE.walkSpeed} m/s · ` +
+      `run ${this.brother.runSpeed} (Shift) / jog ${(this.brother.runSpeed * MOVE.autoJogScale).toFixed(2)} ` +
+      `(default) / walk ${MOVE.walkSpeed} m/s · ` +
       `hp ${this.brother.health}/armour ${this.brother.armour} · jump ${JUMP_SPEED.toFixed(2)} m/s`
     );
   }
@@ -798,7 +799,8 @@ export class PlayerSystem {
       // corpse jogging.
       this.vehicles.abort(m);
       m.scriptedInput = null;
-      m.sprinting = false;
+      // Both committed gaits, not just the top one — see `_endCommittedGait`.
+      m._endCommittedGait();
       m.melee = false;
       m.cancelMantle();
       m.velocity.x *= 0.25;
@@ -1780,7 +1782,7 @@ export class PlayerSystem {
     } else {
       this.movement.latchInput(-2);
       this.movement.velocity.set(0, 0, 0);
-      this.movement.sprinting = false;
+      this.movement._endCommittedGait();
       this.movement.cancelMantle();
       this.movement.scriptedInput = null;
       this.adsAmount = 0;
@@ -1837,6 +1839,10 @@ export class PlayerSystem {
     };
     switch (name) {
       case 'idle': m.scriptedInput = null; break;
+      /* The three keyboard gaits, and the names are now literally true: full
+       * deflection with no modifier IS the jog tier (`MOVE.autoJogScale`), so
+       * `jog` here emits 4.61-5.69 m/s rather than the analogue ramp's 3.35 or
+       * — as it did between the auto-run wave and this one — the whole run. */
       case 'walk': scripted(0, 1, { walk: true }); break;
       case 'jog': scripted(0, 1, {}); break;
       case 'sprint': scripted(0, 1, { sprint: true }); break;

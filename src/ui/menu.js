@@ -63,8 +63,7 @@ const SFX_BUSES = ['weapons', 'foley', 'ambience', 'sirens', 'vehicles', 'voice'
 const CONTROL_GROUPS = [
   ['ON FOOT', [
     [['W', 'A', 'S', 'D'], '', 'Move'],
-    [['SHIFT'], '', 'Run (optional — W already runs)'],
-    [['ALT'], '', 'Walk'],
+    [['SHIFT'], '', 'Run (39% faster than W)'],
     [['ALT'], '', 'Walk'],
     [['SPACE'], '', 'Jump'],
     [['C'], '', 'Crouch'],

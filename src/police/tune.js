@@ -226,6 +226,61 @@ export const TUNE = {
    * of the chase.
    */
   directCool: 6,
+  /**
+   * DIRECT MODE MAY ONLY LEAVE THE ROAD WHERE THE ROAD GOES.
+   *
+   * The owner's report was a dozen cruisers wrecked on the grass of one park
+   * during a five-star chase. `_chooseGoal` hands out direct mode at up to
+   * 85 m with line of sight, and line of sight ACROSS A PARK is exactly the
+   * case where the straight line and the road network disagree the most: at
+   * five stars eight cars hold eight bearings around one quarry, every one of
+   * them sees it over open lawn, and every one of them drives at it through
+   * the trees. They arrive as a pile, at the same spot, from eight directions.
+   *
+   * So a unit further than `directFinal` from its goal must be able to get
+   * there ON THE CARRIAGEWAY, sampled every `directStep` metres FROM ITS OWN
+   * POSITION and allowed `directVerge` metres of kerb overhang (a lane's worth
+   * of clipping the apex, which is a chase, not a shortcut across a lawn).
+   * `directStep` is 8 m rather than a stride long enough to straddle a small
+   * park — see the sampling note in `Unit._directLegal`. Inside
+   * `directFinal` the test is skipped: at contact range a route is useless,
+   * the PIT and the box-in are supposed to leave the tarmac, and the car is
+   * going slowly enough that hitting something is a nudge.
+   *
+   * The corridor answer is latched for `directHold` seconds (`_directOkT`) —
+   * `roads.nearestEdge` is a spatial-hash query and this would otherwise run
+   * ~6 of them per unit per tick, 60 times a second, for the whole fleet.
+   */
+  directFinal: 26,
+  directStep: 8,
+  directVerge: 3.0,
+  directHold: 0.35,
+
+  /* -------------------------------------------------------- the wrecks -- */
+  /**
+   * A WRECKED CRUISER IS SCENERY, AND SCENERY HAS A BUDGET.
+   *
+   * `retireUnit(u, 'wrecked')` drops the unit and leaves the shell standing —
+   * deliberately, because a cruiser you wrote off should still be there when
+   * you drive back past it. Nothing ever collected them: over a long chase
+   * every write-off stayed, forever, and the ones that died crossing a park
+   * stayed on the grass. `traffic` solved the identical problem for civilian
+   * wrecks years ago (`_ageAbandoned`: a cap of five and a 45 s far timer);
+   * these are the same numbers asked of a cruiser.
+   *
+   * Two clocks, because the two cases read differently to a player:
+   *   · ON the carriageway a wreck is a landmark of what you did, and it is
+   *     also in the way, so it lingers `wreckLinger` seconds.
+   *   · OFF the carriageway — the reported defect — it is litter on a lawn and
+   *     goes at `wreckLingerOff`.
+   * Either way it goes ONLY when nobody can see it: further than
+   * `wreckSeeDist` from the camera, or with no clear ray to it.
+   */
+  wreckLinger: 90,
+  wreckLingerOff: 20,
+  wreckSeeDist: 140,
+  /** Hard cap on tracked shells; over it, the oldest unseen one goes early. */
+  wreckCap: 6,
 
   /* ---------------------------------------------------------- tactics -- */
   /** Re-assign roles at this rate. */

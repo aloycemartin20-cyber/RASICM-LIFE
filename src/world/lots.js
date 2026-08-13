@@ -1,4 +1,4 @@
-import { DISTRICT_BY_ID, LANDMARKS, TILE, lerp, clamp01 } from './plan.js';
+import { DISTRICT_BY_ID, LANDMARKS, TILE, lerp, clamp01, siteDist } from './plan.js';
 
 /**
  * WORLD — block subdivision.
@@ -83,6 +83,114 @@ const SIDE_SETBACK = { tower: 1.4, block: 0.35, industrial: 0.6, shop: 0, house:
  * pixel of the shorter one's facade.
  */
 const MAX_COVER = 0.25;
+
+/**
+ * ═════════════════════════════════════════════════════════════════════════
+ * THE LANDMARK RESERVE, ENFORCED ON THE LOT AND NOT ON THE BLOCK
+ * ═════════════════════════════════════════════════════════════════════════
+ *
+ * THE REPORT: "there is a building directly on top of the point fountain".
+ *
+ * Three things were supposed to keep a generated building off a landmark and
+ * none of them is a test of the LOT against the SITE:
+ *
+ *   1. `netgen` drops a block whose CENTRE is within 6 m of a site
+ *      (`nearestSiteDist(b.cx, b.cz) < 6`). A downtown block is about
+ *      65 x 95 m, so a block whose centre is 40 m clear is kept and half of
+ *      it is still inside the reserve — and every lot cut out of that half
+ *      is inside it too. A centre test cannot see a 95 m polygon.
+ *   2. `netgen.reserveLandmarks` keeps CORRIDORS off the site. Corridors are
+ *      not buildings.
+ *   3. `buildings._plans` skips a lot when `landmarkClaims(fp[0], fp[1])` —
+ *      a RADIAL test, at ONE VERTEX of the footprint. A downtown lot is
+ *      46 m deep, so the far corner of a lot sitting squarely on the Point
+ *      is up to 48 m from the vertex being asked about; with the claim at
+ *      62 m the lot centre can be well inside the 46 m basin while the
+ *      vertex reads clear. That guard also lives in another subsystem, which
+ *      is the deeper defect: `world` publishes where a landmark is, so
+ *      `world` is where "no lot may stand on one" belongs.
+ *
+ * WHAT THE DENSITY WAVE CHANGED. `downtown` went to `park: 0.0` and 14-26 m
+ * frontages, which is why this surfaced now and not before: a whole-block
+ * park roll used to eat a fraction of the blocks near a landmark outright,
+ * and 26-54 m lots produced two fat lots per block edge instead of five thin
+ * ones. Narrow lots mean more independent draws per block and therefore far
+ * more chances for one of them to land in the reserve with its first vertex
+ * outside it. MEASURED over 40 random city seeds with only the old guards:
+ * 476 lots overlapping a landmark site that `landmarkClaims` did not catch,
+ * in 40 of 40 seeds — the incline's trestle corridor worst at 49 over 12
+ * seeds, then the mill, Ironwood, the Steel Tower and Glasshouse Court.
+ *
+ * So the rule is enforced HERE, on the polygon, against `plan.siteDist` —
+ * the same exact rounded-box field the reservation and the ring roads are
+ * built from. No lot may intersect a landmark site, whatever its kind: a
+ * park lot on the Point is as wrong as a tower, because `props` plants it
+ * and `buildings` paves it.
+ */
+const SITE_MARGIN = 2;
+
+/**
+ * How finely a footprint edge is walked when asking the site field. The
+ * smallest site in the table is `lm_glass`'s 5 m corner radius, so 1.5 m
+ * cannot step over one; the interior is covered by the anchor test below
+ * rather than by a fill, which is what makes this O(perimeter).
+ */
+const SITE_STEP = 1.5;
+
+/**
+ * NEGATIVE CONTROL, in the same shape as `archetypes.js`'s `?owNoPgh=1`:
+ * `?owNoLmReserve=1` ships the city with the reserve OFF so a probe can watch
+ * its own assertion go red inside one build. Node has no `location`, so every
+ * headless probe gets the reserve ON unless it says otherwise.
+ */
+const NO_LM_RESERVE =
+  typeof location !== 'undefined' && /[?&]owNoLmReserve=1/.test(location.search);
+
+/** Winding-agnostic point-in-polygon, XZ. */
+function pointInPoly(poly, x, z) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const a = poly[i];
+    const b = poly[j];
+    if ((a[1] > z) !== (b[1] > z)
+      && x < ((b[0] - a[0]) * (z - a[1])) / (b[1] - a[1]) + a[0]) inside = !inside;
+  }
+  return inside;
+}
+
+/**
+ * True when `poly` reaches within `SITE_MARGIN` of ANY landmark site.
+ *
+ * Two questions, because a polygon and a rounded box can overlap without
+ * either one's outline touching the other's: walk the footprint edges through
+ * the site field, then ask whether the site's own anchor is inside the
+ * footprint (a lot that swallows a small site whole).
+ *
+ * Exported so a probe can ask the same question of an emitted footprint
+ * without re-deriving the field — and so the assertion cannot silently drift
+ * from the rule (ARCHITECTURE.md rule 12 is satisfied on the other side: the
+ * probes measure emitted geometry, not this predicate).
+ */
+export function lotHitsLandmark(poly) {
+  for (const lm of LANDMARKS) {
+    const s = lm.site;
+    if (!s) continue;
+    for (let i = 0; i < poly.length; i++) {
+      const a = poly[i];
+      const b = poly[(i + 1) % poly.length];
+      const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      const n = Math.max(1, Math.ceil(len / SITE_STEP));
+      for (let k = 0; k < n; k++) {
+        const t = k / n;
+        if (siteDist(lm, a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t) < SITE_MARGIN) {
+          return lm;
+        }
+      }
+    }
+    if (pointInPoly(poly, lm.x + s.ox, lm.z + s.oz)) return lm;
+  }
+  return null;
+}
 
 function signedArea(poly) {
   let a = 0;
@@ -332,6 +440,23 @@ function push(out, b, d, poly, frontage, kind, area, terrain, rng, index) {
   cx /= poly.length;
   cz /= poly.length;
   if (terrain.waterDist(cx, cz) < 4) return;
+  /**
+   * A landmark's ground is the landmark's. See the note on SITE_MARGIN — this
+   * is a test of the whole FOOTPRINT against the exact site field, because
+   * every guard that preceded it tested a single point.
+   *
+   * ASKED HERE, ACTED ON AT THE BOTTOM, and that is deliberate. Rejecting a
+   * lot before the height draws would skip `rng.float()` calls and reshuffle
+   * every lot in the city downstream of the reserve — MEASURED on the shipped
+   * seed: 8 districts moved by 20-60 lots each, in both directions, from
+   * dropping 90. The same reasoning as the setback note above: a lot that
+   * cannot be built is not a reason to re-roll Lawrenceville. So the polygon
+   * is still entered in the overlap index (its ground is reserved, and any
+   * neighbouring block's lot that wanted it stays rejected exactly as before),
+   * it still draws its height and it still spends a lot number; only the
+   * record is withheld.
+   */
+  const onLandmark = NO_LM_RESERVE ? null : lotHitsLandmark(poly);
   // One piece of ground, one lot. See the note on MAX_COVER — this is the only
   // place in the plan that can see two blocks at once, so it is the only place
   // the question can be asked.
@@ -361,6 +486,7 @@ function push(out, b, d, poly, frontage, kind, area, terrain, rng, index) {
   const floors = height > 0 ? Math.max(1, Math.round(height / 3.65)) : 0;
 
   const id = _lotId++;
+  if (onLandmark) return;
   out.push({
     id,
     tx: Math.floor(cx / TILE),

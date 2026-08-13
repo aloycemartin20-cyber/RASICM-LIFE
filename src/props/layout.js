@@ -7,6 +7,7 @@ import {
   streetPlateText, neonWordProto, SIGN_WORDS, BANNER_WORDS,
 } from './kit_sign.js';
 import { KIT_SPECIES } from './kit_green.js';
+import { paintColorPark } from './colorpark.js';
 
 /**
  * PROPS — the placement solver.
@@ -721,9 +722,11 @@ export class Layout {
   /**
    * COLOR PARK. Nothing is planted on the painted apron — the apron is the
    * point — so this is a screen of trees along the inland edge behind the
-   * legal wall, plus benches and bins on the trail between the slabs and the
-   * river. The wall is at v = HV - 3.4 and the trail at v = -0.86 HV; both
-   * numbers come off the same `site` the geometry is built from.
+   * retaining wall, plus benches and bins on the trail between the paint and
+   * the river, and then the PAINT ITSELF (`props/colorpark.js`: the tarmac
+   * skin, the pieces on it, the murals on the wall). The wall face is at
+   * v = HV - 3.0 and the trail at v = -0.86 HV; both numbers come off the same
+   * `site` the geometry is built from, on both sides of the subsystem line.
    */
   _bankPlanting(B, bx, lod, lm, seed) {
     const HU = lm.site?.hx ?? 76;
@@ -745,6 +748,12 @@ export class Layout {
       const [x, z] = W(u, -HV * 0.86 + 2.6);
       this._parkSeat(B, bx, seed, i, x, z, yaw + Math.PI);
     }
+    /**
+     * THE PAINT. LOD 0 only — the whole point of it is 3 cm of relief read at
+     * walking distance, and the impostor tier has no business carrying 6 000
+     * triangles of aerosol.
+     */
+    paintColorPark(B, bx, lm, this.world, seed);
   }
 
   /* ================================================================== */

@@ -984,9 +984,32 @@ export class BuildingSystem {
     const blocks = new Map();
     for (const lot of rec.lots) {
       if (!lot || lot.kind === 'park' || lot.kind === 'lot') continue;
-      // Never build a generated lot through a landmark.
-      const fp = lot.footprint?.[0];
-      if (fp && landmarkClaims(fp[0], fp[1])) continue;
+      /**
+       * Never build a generated lot through a landmark — asked of the WHOLE
+       * FOOTPRINT, not of one corner of it.
+       *
+       * THE REPORT: "there is a building directly on top of the point
+       * fountain". `world/lots.js` now refuses to emit such a lot at all,
+       * against the exact site field, and that is where the rule belongs —
+       * `world` is the authority on where a landmark is. This stays as the
+       * belt to that pair of braces, because `CLAIM` is generous where a
+       * builder reaches past its published `site` (the mill's gantries, the
+       * incline's trestle) and only this side knows that.
+       *
+       * It used to read `landmarkClaims(footprint[0][0], footprint[0][1])` —
+       * ONE VERTEX. A downtown lot is 46 m deep and, since the density wave,
+       * as little as 14 m wide, so the far corner of a lot standing squarely
+       * on a site is up to 48 m from the vertex being asked about; every
+       * radius in `CLAIM` is smaller than that plus the site itself. A test
+       * of one point on a 46 m polygon is not a test of the polygon.
+       */
+      const fp = lot.footprint;
+      if (fp && fp.length) {
+        let claimed = false;
+        for (let i = 0; i < fp.length && !claimed; i++) claimed = landmarkClaims(fp[i][0], fp[i][1]);
+        if (!claimed && Number.isFinite(lot.cx)) claimed = landmarkClaims(lot.cx, lot.cz);
+        if (claimed) continue;
+      }
       /**
        * Clipped once per tile load — `_plans` is memoised on the record and
        * both LOD builds read the same list, so the two meshes cannot disagree

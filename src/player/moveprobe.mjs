@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * MOVEPROBE — the jump arc and the sprint latch, measured on the real build.
+ * MOVEPROBE — the jump arc and the gait tiers, measured on the real build.
  *
  * Two player reports produced this file:
  *
@@ -39,11 +39,15 @@
  * active brother's DESIGN.md run speed, not against whatever the code asked
  * for.
  *
- * ONE SCENARIO HOLDS NO KEY AT ALL. Since `MOVE.autoRunMag`, full deflection
- * IS the run — the report behind it was "I always need to hold in the run
- * button to move fast enough" — so `W alone, no Shift (auto-run)` is scored by
- * the same two criteria as the eleven rows that still hold Shift. The pair is
- * the point: W is enough, and Shift has not stopped working.
+ * ONE SCENARIO HOLDS NO KEY AT ALL, AND IT IS SCORED AS ITS OWN TIER. Full
+ * deflection engages a committed gait with no key held; Shift promotes it to
+ * the brother's authored run. `W alone, no Shift (jog tier)` therefore asserts
+ * `jogging` and `MOVE.autoJogScale` of the run, while the eleven rows that hold
+ * Shift assert `sprinting` and the whole run — and every row asserts that the
+ * OTHER tier never latched. Two opposite reports produced that shape: "I always
+ * need to hold in the run button to move fast enough", and then, on the build
+ * that answered it, "player walks a little too fast and run doesn't seem to do
+ * anything now". A single-tier score cannot be red for both.
  *
  * THE SPRINT SUITE NOW CHOOSES ITS OWN GROUND, and that is not housekeeping.
  * `sites()` classifies TERRAIN, and a flat tile can have a bench on it; an
@@ -378,7 +382,10 @@ try {
           const L = m.__mpLog;
           if (L) L.push({
             y: m.position.y, g: m.grounded ? 1 : 0, s: m.state,
-            sp: m.horizontalSpeed, run: m.sprinting ? 1 : 0,
+            // Both committed tiers, separately: `run` is Shift's, `jog` is what
+            // W alone latches. They are mutually exclusive by construction, so
+            // a trace where both read 1 on the same step is itself a defect.
+            sp: m.horizontalSpeed, run: m.sprinting ? 1 : 0, jog: m.jogging ? 1 : 0,
             ads: P().adsProgress, aim: m.aiming ? 1 : 0, vy: m.velocity.y, h,
             // So a sprint dropout can be attributed rather than guessed at.
             st: m.stumbleTime > 0 ? 1 : 0, bl: m.blocked ? 1 : 0,
@@ -406,8 +413,12 @@ try {
         const wp = e.ctx.peek('weapons');
         return {
           y: m.position.y, grounded: m.grounded, state: m.state, stance: m.stance,
-          sprinting: m.sprinting, aiming: m.aiming, ads: p.adsProgress,
+          sprinting: m.sprinting, jogging: m.jogging, aiming: m.aiming, ads: p.adsProgress,
+          // `run` is the brother's authored top tier, `jogTier` what W alone is
+          // worth. Both read off the movement system rather than recomputed
+          // here — a probe that recomputes the scale cannot catch it drifting.
           speed: m.horizontalSpeed, brother: p.brother?.id, run: m.sprintSpeed,
+          jogTier: m.jogSpeed,
           weapon: wp?.current?.id ?? null, wcls: wp?.current?.cls ?? null,
           wads: wp?.adsProgress ?? null, hp: p.health?.value ?? null,
           fov: p.rig?.fov ?? null, boom: p.rig?.collideRadius ?? null,
@@ -749,10 +760,10 @@ try {
     }
 
     /**
-     * One attempt: from a standing start, hold Shift+W and see whether the
-     * character reaches a sprint. Both halves are measured on the emitted
-     * motion — `sprinting` is the state machine's own claim, `speed` is the
-     * distance it actually covered.
+     * One attempt: from a standing start, hold Shift+W (or W alone) and see
+     * which TIER the character reaches. Both halves are measured on the emitted
+     * motion — `sprinting`/`jogging` are the state machine's own claim, `speed`
+     * is the distance it actually covered.
      */
     const attempt = async (setup, { shift = true } = {}) => {
       await page.evaluate(([x, z]) => window.__MP__.clearSite(x, z), [open.x, open.z]);
@@ -768,11 +779,21 @@ try {
       const t = await trace;
       const tail = t.slice(Math.floor(t.length * 0.5));
       const st = await page.evaluate(() => window.__MP__.state());
+      // Which flag this attempt is entitled to: Shift claims the top tier, W
+      // alone claims the middle one. Scoring the W-alone row against `sprinting`
+      // is exactly what made it green on the build the owner reported as having
+      // a dead Shift key.
+      const key = shift ? 'run' : 'jog';
       return {
-        everSprinted: t.some((r) => r.run === 1),
-        heldSprint: tail.filter((r) => r.run === 1).length / Math.max(1, tail.length),
+        tier: key,
+        everSprinted: t.some((r) => r[key] === 1),
+        heldSprint: tail.filter((r) => r[key] === 1).length / Math.max(1, tail.length),
+        // A tier is only itself if the OTHER one never latched: W alone
+        // reaching `sprinting` would be the auto-run wave's bug returning.
+        bledOver: t.some((r) => r[shift ? 'jog' : 'run'] === 1),
         topSpeed: Math.max(...t.map((r) => r.sp)),
         runSpeed: st.run,
+        wantSpeed: shift ? st.run : st.jogTier,
         ads: Math.max(...t.map((r) => r.ads)),
         aimed: tail.some((r) => r.aim === 1),
         weapon: st.weapon, wcls: st.wcls,
@@ -786,14 +807,24 @@ try {
     scenarios.push({ name: 'baseline (spawn weapon)', setup: null });
 
     /**
-     * 1b. NO KEY AT ALL. "I always need to hold in the run button to move fast
-     * enough" — this is the scenario that report names, scored by the same two
-     * criteria as every other row (the state held for the second half of the
-     * trial, AND 85 % of the brother's DESIGN.md run speed off the emitted
-     * motion). Every other row here still holds Shift, so the pair says both
-     * things at once: W alone is enough, and Shift has not stopped working.
+     * 1b. NO KEY AT ALL — the MIDDLE tier, scored on its own flag and its own
+     * speed rather than on the run's.
+     *
+     * This row has been re-baselined twice by two opposite reports. It arrived
+     * as "I always need to hold in the run button to move fast enough" and was
+     * scored against `sprinting` and 85 % of the brother's run, which is what
+     * W alone emitted at the time. The owner then played that build and filed
+     * the other half: "player walks a little too fast and run doesn't seem to
+     * do anything now" — and this row could not have caught it, because a W
+     * that emits the run speed is exactly what it was asserting.
+     *
+     * So it now asserts the tier: `jogging` held for the second half, speed at
+     * `MOVE.autoJogScale` of the run and NOT at the run, and `sprinting` never
+     * latched at all (`bledOver`). Every other row still holds Shift and still
+     * demands the full run, so the set says all three things at once — W alone
+     * moves you, Shift is worth holding, and neither one is the other.
      */
-    scenarios.push({ name: 'W alone, no Shift (auto-run)', setup: null, shift: false });
+    scenarios.push({ name: 'W alone, no Shift (jog tier)', setup: null, shift: false });
 
     // 2. One per weapon class — the player's own hypothesis.
     const byCls = { melee: 'pipe', light: 'smg', precise: 'harpoon', explosive: 'rocket' };
@@ -858,13 +889,20 @@ try {
       process.stderr.write(`\rmoveprobe: sprint ${++scDone}/${scenarios.length} scenarios  (${sc.name})            `);
       const runs = [];
       for (let i = 0; i < REPS; i++) runs.push(await attempt(sc.setup, { shift: sc.shift !== false }));
-      const pass = runs.filter((r) => r.heldSprint > 0.6 && r.topSpeed > r.runSpeed * 0.85).length;
+      /* Three conditions, all on the emitted motion: the tier's own flag held
+       * through the back half, the tier's own speed reached (85 %, the same bar
+       * the run has always had), and the OTHER tier never latched — a ceiling
+       * as well as a floor, so a jog that quietly became a run fails here. */
+      const pass = runs.filter((r) =>
+        r.heldSprint > 0.6 && r.topSpeed > r.wantSpeed * 0.85 && !r.bledOver).length;
       rows.push({
-        name: sc.name, reps: runs.length, pass,
+        name: sc.name, reps: runs.length, pass, tier: runs[0].tier,
         rate: pass / runs.length,
         ever: runs.filter((r) => r.everSprinted).length,
+        bled: runs.filter((r) => r.bledOver).length,
         topSpeed: dist(runs.map((r) => r.topSpeed)),
         runSpeed: runs[0].runSpeed,
+        wantSpeed: runs[0].wantSpeed,
         ads: dist(runs.map((r) => r.ads)),
         weapon: runs[0].weapon, wcls: runs[0].wcls,
       });
@@ -939,6 +977,8 @@ try {
       excludedStumble: changes.filter((c) => c.stumbled).length,
       topSpeed: dist(usable.map(() => (rows[0]?.runSpeed ?? 0))),
       runSpeed: (await page.evaluate(() => window.__MP__.state())).run,
+      wantSpeed: (await page.evaluate(() => window.__MP__.state())).run,
+      tier: 'run', bled: 0,
       ads: dist([0]),
     });
 
@@ -1059,7 +1099,7 @@ try {
   /* ==================================================================== */
 
   if (ONLY === 'all' || ONLY === 'brothers') {
-    process.stderr.write('\rmoveprobe: brothers sprint speeds                                          ');
+    process.stderr.write('\rmoveprobe: brothers, three tiers each                                      ');
     /**
      * GET OUT OF THE CAR FIRST.
      *
@@ -1074,25 +1114,40 @@ try {
     });
     await pump(30);
     const open = await page.evaluate(() => window.__MP__.sites(1).flat[0] ?? null);
+    /**
+     * ALL THREE TIERS PER BROTHER, on the same ground, back to back.
+     *
+     * The ladder is per-brother by construction — the jog is a fraction OF the
+     * authored run (`MOVE.autoJogScale`), so it inherits the run's spread and
+     * the brothers stay distinguishable at the gait they are actually played
+     * in. That claim is only worth anything measured, and only measured
+     * together: three separate absolute rows can all be right while the two
+     * gaps between them are wrong, which is precisely the shape of the bug this
+     * pass fixed.
+     */
+    const leg = async (keys) => {
+      await page.evaluate(([x, z]) => window.__MP__.place(x, z, 0), [open.x, open.z]);
+      await page.evaluate(() => window.__MP__.settle(120));
+      const trace = page.evaluate((f) => window.__MP__.rec(f), 110);
+      for (const k of keys) await page.keyboard.down(k);
+      await pump(105);
+      for (const k of [...keys].reverse()) await page.keyboard.up(k);
+      const t = await trace;
+      return Math.max(...t.map((r) => r.sp));
+    };
     const out = [];
     for (const id of ['carson', 'aidan', 'dylan']) {
       await page.evaluate((b) => window.__MP__.setBrother(b), id);
       await pump(30);
       await page.evaluate((w) => window.__MP__.setWeapon(w), 'pipe');
       await pump(20);
-      await page.evaluate(([x, z]) => window.__MP__.place(x, z, 0), [open.x, open.z]);
-      await page.evaluate(() => window.__MP__.settle(120));
-      const trace = page.evaluate((f) => window.__MP__.rec(f), 110);
-      await page.keyboard.down('ShiftLeft');
-      await page.keyboard.down('KeyW');
-      await pump(105);
-      await page.keyboard.up('KeyW');
-      await page.keyboard.up('ShiftLeft');
-      const t = await trace;
+      const walk = await leg(['AltLeft', 'KeyW']);
+      const jog = await leg(['KeyW']);
+      const run = await leg(['ShiftLeft', 'KeyW']);
       const st = await page.evaluate(() => window.__MP__.state());
       out.push({
-        id, spec: st.run,
-        topSpeed: Math.max(...t.map((r) => r.sp)),
+        id, spec: st.run, jogSpec: st.jogTier,
+        walk, jog, run, topSpeed: run,
         fov: st.fov, boom: st.boom,
       });
     }
@@ -1140,12 +1195,14 @@ if (report.jump) {
 }
 
 if (report.sprint) {
-  console.log('\n=== SPRINT — pass rate over repeats (pass = held sprint AND reached 85% of the brother run speed) ===');
+  console.log('\n=== GAIT TIERS — pass rate over repeats (pass = held the tier\'s own flag,');
+  console.log('    reached 85% of the tier\'s own speed, and never latched the other tier) ===');
   for (const r of report.sprint) {
     const flag = r.rate === 1 ? 'PASS' : r.rate === 0 ? 'FAIL' : 'FLAKY';
     console.log(
-      `  ${flag.padEnd(6)} ${String(Math.round(r.rate * 100)).padStart(3)}%  ${r.name.padEnd(34)} ` +
-      `top ${f2(r.topSpeed.med)}/${f2(r.runSpeed)} m/s  ads ${f2(r.ads.max)}` +
+      `  ${flag.padEnd(6)} ${String(Math.round(r.rate * 100)).padStart(3)}%  ${(r.tier ?? 'run').padEnd(4)} ` +
+      `${r.name.padEnd(32)} top ${f2(r.topSpeed.med)}/${f2(r.wantSpeed ?? r.runSpeed)} m/s  ads ${f2(r.ads.max)}` +
+      (r.bled ? `  ${r.bled} bled into the other tier` : '') +
       (r.dropoutFrames !== undefined ? `  worst gap ${r.dropoutFrames} steps` : '') +
       (r.excludedStumble ? `  (${r.excludedStumble} trials excluded: hit something)` : '')
     );
@@ -1171,9 +1228,13 @@ if (report.nitro) {
 }
 
 if (report.brothers) {
-  console.log('\n=== BROTHERS — sprint speed reached vs DESIGN.md ===');
+  console.log('\n=== BROTHERS — the three tiers reached, m/s (Alt+W · W · Shift+W) ===');
   for (const b of report.brothers) {
-    console.log(`  ${b.id.padEnd(8)} spec ${f2(b.spec)}  reached ${f2(b.topSpeed)} m/s  camFov ${f2(b.fov)}  boom ${f2(b.boom)}`);
+    console.log(
+      `  ${b.id.padEnd(8)} walk ${f2(b.walk)}  jog ${f2(b.jog)}/${f2(b.jogSpec)}  ` +
+      `run ${f2(b.run)}/${f2(b.spec)}   Shift buys +${f2(b.run - b.jog)} ` +
+      `(${((b.run / Math.max(0.01, b.jog) - 1) * 100).toFixed(0)}%)  camFov ${f2(b.fov)}  boom ${f2(b.boom)}`
+    );
   }
 }
 
@@ -1222,10 +1283,18 @@ if (report.jump) {
 
 if (report.sprint) {
   const bad = report.sprint.filter((r) => r.rate < GATE.sprintRate);
-  gate('sprint engages in every state that should allow it',
+  gate('each gait tier engages in every state that should allow it',
     bad.length === 0,
     bad.length ? bad.map((r) => `${r.name} ${Math.round(r.rate * 100)}%`).join('; ')
       : `${report.sprint.length} scenarios, all 100%`);
+  /* The tiers must not leak into each other. Its own gate rather than a term
+   * inside the row above, so a build where W silently latches the run says so
+   * in one line instead of hiding inside a pass rate. */
+  const bled = report.sprint.filter((r) => (r.bled ?? 0) > 0);
+  gate('no scenario reaches a tier its input did not ask for',
+    bled.length === 0,
+    bled.length ? bled.map((r) => `${r.name} ${r.bled}/${r.reps}`).join('; ')
+      : `${report.sprint.length} scenarios clean`);
 }
 
 if (report.nitro && !report.nitro.err) {
@@ -1255,14 +1324,41 @@ if (report.nitro && !report.nitro.err) {
 }
 
 if (report.brothers) {
-  const off = report.brothers.filter((b) => Math.abs(b.topSpeed - b.spec) > 0.25);
-  gate('each brother reaches his own DESIGN.md run speed',
+  const off = report.brothers.filter((b) => Math.abs(b.run - b.spec) > 0.25);
+  gate('each brother reaches his own DESIGN.md run speed on Shift',
     off.length === 0,
-    report.brothers.map((b) => `${b.id} ${f2(b.topSpeed)}/${f2(b.spec)}`).join('  '));
-  const speeds = report.brothers.map((b) => b.topSpeed);
+    report.brothers.map((b) => `${b.id} ${f2(b.run)}/${f2(b.spec)}`).join('  '));
+  const jogOff = report.brothers.filter((b) => Math.abs(b.jog - b.jogSpec) > 0.25);
+  gate('each brother\'s W-alone jog is his own tier',
+    jogOff.length === 0,
+    report.brothers.map((b) => `${b.id} ${f2(b.jog)}/${f2(b.jogSpec)}`).join('  '));
+  /**
+   * THE GAP, PER BROTHER — the gate for the report this pass came from.
+   *
+   * "run doesn't seem to do anything now" is not a claim about any single
+   * speed, it is a claim about the DIFFERENCE, and on the build he played this
+   * difference was 0.00 m/s for all three brothers. 1.5 m/s is the bar because
+   * it is roughly a walk's worth of speed: below that the key is a nudge.
+   */
+  const flat = report.brothers.filter((b) => b.run - b.jog < 1.5);
+  gate('Shift is worth a tier on every brother',
+    flat.length === 0,
+    report.brothers.map((b) => `${b.id} +${f2(b.run - b.jog)}`).join('  '));
+  const ladder = report.brothers.filter((b) => !(b.walk < b.jog && b.jog < b.run));
+  gate('walk < jog < run for every brother',
+    ladder.length === 0,
+    report.brothers.map((b) => `${b.id} ${f2(b.walk)}/${f2(b.jog)}/${f2(b.run)}`).join('  '));
+  const speeds = report.brothers.map((b) => b.run);
   gate('the brothers are actually different speeds',
     Math.max(...speeds) - Math.min(...speeds) > 1.0,
     `${f2(Math.min(...speeds))} .. ${f2(Math.max(...speeds))} m/s`);
+  /* The jog tier inherits the run's spread because it is a fraction of it —
+   * assert that, or a future flat jog speed would erase the cast at the gait
+   * the game is mostly played in and no other gate here would notice. */
+  const jogs = report.brothers.map((b) => b.jog);
+  gate('the brothers stay different at the JOG tier too',
+    Math.max(...jogs) - Math.min(...jogs) > 0.7,
+    `${f2(Math.min(...jogs))} .. ${f2(Math.max(...jogs))} m/s`);
 }
 
 if (checks.length) {

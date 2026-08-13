@@ -2312,8 +2312,34 @@ class SectorBuild {
         // grade at the sample's own arc along it — not one number for the whole
         // corner. At p = 0 that is exactly arc R on A, which is exactly where
         // `_kerb` starts, so the two agree to the millimetre.
-        const yA = A.grade * (T.r * Math.cos(T.ang - A.ang));
-        const yB = C.B.grade * (T.r * Math.cos(C.a0 + C.phi - T.ang));
+        //
+        // THE PROJECTION IS CLAMPED TO THE FRONT OF THE ARM. `T.r * cos(...)`
+        // is the sample's arc ALONG the arm, and it goes NEGATIVE the moment
+        // the boundary sweeps more than a quarter turn off that arm — which
+        // happens on every wide corner: the outside corner of a two-arm node
+        // sweeps nearly the whole circle, and `T.r` out there is the
+        // turning-head radius, up to 1.7 x the pad. An arm's linear ramp
+        // describes the ground in FRONT of its own mouth and nothing else, so
+        // behind the mouth the grade was being run BACKWARDS down the hill: a
+        // corner sample on the uphill side of a descending arm was being lifted
+        // instead of dropped, which is a sign error, not a shape choice.
+        //
+        // MEASURED on the emitted graph (the reproduction is in the wave notes,
+        // not in the tree): 474 of 3305 nodes move, the count of nodes whose
+        // fillet boundary leaves the node by more than 2 m falls 68 -> 61 and by
+        // more than 1 m 404 -> 396, and the biggest single correction is node
+        // 363 (a dead end on a 24% arm), -3.31 m -> +0.78 m. IT DOES NOT MOVE
+        // THE WORST CASE, which stays 7.07 m at node 204: that one is a
+        // POSITIVE projection 25.5 m out and is the pad boundary honestly
+        // following a steep arm, i.e. a question about how far `PAD_RMAX` may
+        // reach on a grade rather than about this expression.
+        //
+        // `max(0, ...)` is exactly neutral at p = 0 and p = 1, where the
+        // projection is the arm's own inset R and positive by construction, so
+        // the seam with `_kerb` and the straight run is untouched to the
+        // millimetre — which is the promise the paragraph above makes.
+        const yA = A.grade * Math.max(0, T.r * Math.cos(T.ang - A.ang));
+        const yB = C.B.grade * Math.max(0, T.r * Math.cos(C.a0 + C.phi - T.ang));
         out.push({
           ang: T.ang,
           r: T.r,

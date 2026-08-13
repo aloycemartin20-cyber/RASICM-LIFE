@@ -1069,6 +1069,31 @@ export class TrafficSystem {
       if (a.t > 45 && far) {
         this.vehicles.despawn(a.v);
         this._abandoned.splice(i, 1);
+        continue;
+      }
+      /**
+       * ...AND THE ONE ON THE LAWN GOES EARLY.
+       *
+       * `far` is measured from the traffic ANCHOR, which is the player: the
+       * whole point of a wreck ager keyed on distance is to keep the shells
+       * you can see. But the owner's report is a park full of cars a hundred
+       * metres from where he was standing, and a wreck that is 460 m from the
+       * player is not the one he photographed.
+       *
+       * A wreck OFF THE CARRIAGEWAY is not scenery, it is litter — nothing put
+       * it there on purpose and no road leads to it — so it goes on the
+       * shorter clock as soon as it is out of frame. Off-road is asked of the
+       * ROAD GRAPH (rule 12: never of the driver, who no longer exists), and
+       * out-of-frame is the director's own screen test, the one the spawner
+       * trusts not to pop a car in.
+       */
+      if (a.t > TUNE.wreckOffRoad && !this.director.visible(ctx, p.x, p.z)) {
+        const ne = this.world?.roads?.nearestEdge?.(p.x, p.z, 60);
+        const half = a.v.spec?.half?.x ?? 1;
+        if (!ne?.edge || ne.dist - ne.edge.width * 0.5 - half > 0.5) {
+          this.vehicles.despawn(a.v);
+          this._abandoned.splice(i, 1);
+        }
       }
     }
   }

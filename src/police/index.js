@@ -220,6 +220,25 @@ export class PoliceSystem {
     this._runners = [];
     this._debugFollow = false;
     this.gripScale = 1;
+    /**
+     * Shells of cruisers that were written off, `{ v, t, off }`. See
+     * `_ageWrecks` and `TUNE.wreckLinger`.
+     */
+    this._wrecks = [];
+    this._wreckTimer = 0;
+    /**
+     * NEGATIVE-CONTROL hatches for `src/police/pursuitprobe.mjs --control`,
+     * both default-off, same pattern as `traffic`'s `debugNo*` set. They put
+     * the two defects the owner photographed back into the LIVE build, so the
+     * probe's assertions are proved able to fail without an edit:
+     *   debugNoRoadHold   `Unit._directLegal` always says yes, so a unit with
+     *                     line of sight drives at the quarry across whatever
+     *                     is in between (the park pile-up).
+     *   debugNoWreckAge   `_ageWrecks` collects nothing, so written-off
+     *                     cruisers stand where they died for the whole run.
+     */
+    this.debugNoRoadHold = false;
+    this.debugNoWreckAge = false;
 
     /* preallocated scratch — nothing below allocates per frame */
     this._rayA = new THREE.Vector3();
@@ -715,6 +734,7 @@ export class PoliceSystem {
     this._air(dt, ctx);
     this._respray(dt);
     this._panic(dt);
+    this._ageWrecks(dt, ctx);
 
     if (this.meter.level === 0 && (this.units.length || this.officers.lawCount)) this._standDownAll();
   }
@@ -928,9 +948,14 @@ export class PoliceSystem {
     if (!v) return;
     // A destroyed cruiser stays in the road as a landmark of what you did; a
     // culled one is removed because it is far away and nobody can see it.
+    // ...but "stays" used to mean FOREVER, and that is the owner's park full
+    // of wrecked cruisers: nothing in this system ever collected a shell, so a
+    // five-star chase left one everywhere a cruiser died. `_ageWrecks` picks
+    // them up on a timer, off the road first, and only out of sight.
     if (reason === 'wrecked') {
       v.lightbarOn = false;
       v.isPolice = false;
+      this._trackWreck(v);
       return;
     }
     /**
@@ -956,6 +981,102 @@ export class PoliceSystem {
       return;
     }
     this.vehicles?.despawn(v);
+  }
+
+  /**
+   * Start the clock on a shell this system is walking away from.
+   *
+   * `wasPolice` is a permanent mark and is never cleared: `isPolice` has to go
+   * false the moment the unit is dropped (the fleet must stop treating it as
+   * one of ours, and `traffic` must stop yielding to it), but a probe asking
+   * "how many of the wrecks in this park were cruisers" needs an answer that
+   * survives that, and so does this list after a save/load drops it.
+   */
+  _trackWreck(v) {
+    if (!v || this._wrecks.some((w) => w.v === v)) return;
+    v.wasPolice = true;
+    this._wrecks.push({ v, t: 0 });
+  }
+
+  /**
+   * COLLECT THE SHELLS.
+   *
+   * The owner photographed a park with a dozen cars wrecked in it during a
+   * five-star chase. Half of that is the routing (`Unit._directLegal`); this is
+   * the other half — nothing ever removed a written-off cruiser, so every one
+   * of them was still there at the end of the chase however long it ran.
+   *
+   * The rules, and each is there for a reason a player would notice:
+   *   · OFF the carriageway a shell is litter on a lawn: `wreckLingerOff`.
+   *     ON it, a shell is a landmark and an obstacle worth driving around:
+   *     `wreckLinger`.
+   *   · Nothing goes while it can be seen — further than `wreckSeeDist` OR no
+   *     clear ray. A wreck that pops out of the frame is a worse defect than
+   *     the pile it was collected from.
+   *   · Over `wreckCap` shells, the oldest unseen one goes early whatever its
+   *     clock says. This is `traffic._ageAbandoned`'s cap of five, asked of a
+   *     fleet that at five stars is bigger than five.
+   *   · A shell the player has since climbed into is not a shell. The despawn
+   *     chokepoint refuses it anyway; dropping it here stops us asking.
+   *
+   * Runs at 2 Hz from `update`, never from an event handler — `vehicles`
+   * emits `vehicle:destroyed` from inside its own collision walk, and
+   * despawning there splices the array being walked (the same note
+   * `traffic._ageAbandoned` carries).
+   */
+  _ageWrecks(dt, ctx) {
+    if (this.debugNoWreckAge) return;      // negative control: collect nothing
+    this._wreckTimer += dt;
+    if (this._wreckTimer < 0.5) return;
+    const step = this._wreckTimer;         // real elapsed, not the nominal 0.5
+    this._wreckTimer = 0;
+    if (!this._wrecks.length) return;
+
+    const cam = _cam;
+    ctx.camera.getWorldPosition(cam);
+    const roads = this.roads;
+
+    // The oldest unseen shell is remembered as the RECORD, not as an index:
+    // this loop splices as it walks, so any index taken on an earlier pass is
+    // pointing at a different entry by the end of it.
+    let unseenOldest = null;
+    let unseenAge = -1;
+    for (let i = this._wrecks.length - 1; i >= 0; i--) {
+      const w = this._wrecks[i];
+      const v = w.v;
+      // Gone by some other hand (a mission teardown, a full dispose), or taken
+      // over by the player: not ours to age any more.
+      if (!v || !v.model?.root?.parent || this.isPlayerCar(v) || v.isMission) {
+        this._wrecks.splice(i, 1);
+        continue;
+      }
+      w.t += step;
+
+      let off = false;
+      if (roads?.nearestEdge) {
+        const ne = roads.nearestEdge(v.position.x, v.position.z, 60);
+        const half = v.spec?.half?.x ?? 1;
+        off = !ne?.edge || ne.dist - ne.edge.width * 0.5 - half > 0.5;
+      }
+      const d = cam.distanceTo(v.position);
+      const seen = d < TUNE.wreckSeeDist && this.rayVisible(cam, v.position, 0.8);
+      if (seen) continue;
+
+      if (w.t > (off ? TUNE.wreckLingerOff : TUNE.wreckLinger)) {
+        this._wrecks.splice(i, 1);
+        this.vehicles?.despawn(v);
+        continue;
+      }
+      if (w.t > unseenAge) { unseenAge = w.t; unseenOldest = w; }
+    }
+
+    if (this._wrecks.length > TUNE.wreckCap && unseenOldest) {
+      const k = this._wrecks.indexOf(unseenOldest);
+      if (k >= 0) {
+        this._wrecks.splice(k, 1);
+        this.vehicles?.despawn(unseenOldest.v);
+      }
+    }
   }
 
   /**
@@ -1412,6 +1533,28 @@ export class PoliceSystem {
     out.heli = this.heli.active;
     out.spiked = this.blocks.spiked.size;
     out.fleetTarget = this.dispatch.fleetTarget();
+    /**
+     * The shells this system is still carrying, and how many of them are off
+     * the carriageway — the quantity the owner's screenshot is a picture of.
+     * Positions included: a pile is a cluster, and a cluster needs coordinates
+     * before anyone can argue about whose edge it is on.
+     */
+    out.wrecks = [];
+    const wroads = this.roads;
+    for (const w of this._wrecks) {
+      const v = w.v;
+      if (!v?.position) continue;
+      let off = false;
+      if (wroads?.nearestEdge) {
+        const ne = wroads.nearestEdge(v.position.x, v.position.z, 60);
+        const half = v.spec?.half?.x ?? 1;
+        off = !ne?.edge || ne.dist - ne.edge.width * 0.5 - half > 0.5;
+      }
+      out.wrecks.push({
+        x: +v.position.x.toFixed(1), z: +v.position.z.toFixed(1),
+        t: +w.t.toFixed(1), off,
+      });
+    }
     out.quarry = q.valid
       ? {
         x: +q.position.x.toFixed(2), z: +q.position.z.toFixed(2),

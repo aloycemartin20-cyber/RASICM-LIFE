@@ -77,17 +77,22 @@
  * shooter directly ahead is almost collinear with the camera-to-body axis, so
  * that is the one direction the parallax bug could not corrupt.
  *
- * The table is longer than 54 now — the gait block was re-baselined when full
- * deflection became the RUN (`MOVE.autoRunMag`), and the counts above are the
- * three-bug control as it was measured, not a claim about today's total. That
- * control has NOT been re-run since; treat the eight named rows as the live
- * part of it and the 46/54 as history.
+ * The table is longer than 54 now — the gait block has been re-baselined twice,
+ * once when full deflection became the RUN and again when the run went back
+ * behind Shift and W settled on the middle tier (`MOVE.autoJogScale`). The
+ * counts above are the three-bug control as it was measured, not a claim about
+ * today's total. That control has NOT been re-run since; treat the eight named
+ * rows as the live part of it and the 46/54 as history.
  *
  * The gait block carries its own control INSIDE the run, which is the pattern
- * to copy: `NEG CONTROL: auto-run off = jog` drives the identical key at the
- * identical site with `movement.autoRun = false` and requires 3.35 m/s. Between
- * that row and `W alone runs` (6.4 m/s), no single edit to `tuning.js` can make
- * both green — which is what the pair is for.
+ * to copy: `NEG CONTROL: auto-run off = analogue jog` drives the identical key
+ * at the identical site with `movement.autoRun = false` and requires 3.35 m/s.
+ * Between that row, `W alone jogs` (4.61) and `Shift+W runs` (6.40), no single
+ * edit to `tuning.js` can make all three green — which is what the set is for.
+ *
+ * EVERY ROW THAT COVERS GROUND RUNS ON A HUNTED RUNWAY (`findRunway`). Four
+ * rows were red when this pass started and none of them was about movement: the
+ * bench was scoring a wall 8 m out. See the comment on `RUN_SITE`.
  *
  * ──────────────────────────────────────────────────────────────────────────
  * WHY THIS IS NOT IN THE GATE
@@ -211,22 +216,37 @@ function report(r, wallSeconds) {
    * 4.57 / 4.2 / 3.66 / 7.01 / 8.38 / 2.44 numbers were the inherited CoD
    * ladder and are gone. tuning.js authors walk 1.72 / jog 3.35 / crouch 1.48
    * / aim 1.9, and DESIGN.md gives the sprint per brother. ------------------ */
-  row('W alone runs', r.gait.run, '6.4 m/s (Carson)', near(r.gait.run, 6.4, 0.15),
-    'THE row this section exists for: "I always need to hold in the run button to move fast enough". ' +
-    'W and no modifier now emits DESIGN.md\'s run speed for the default brother. Fails loudly if the ' +
-    'default brother changes — which is a review, not a bug.');
-  row('NEG CONTROL: auto-run off = jog', r.gait.jogNoAuto, '3.35 m/s',
+  /* THREE TIERS, THREE ROWS, AND THE TWO GAPS BETWEEN THEM. The tier rows on
+   * their own can all be satisfied by one wrong number in `tuning.js`; the gap
+   * rows cannot, which is why they are here. `Shift is worth a tier` is the row
+   * the owner's report ("run doesn't seem to do anything now") would have
+   * caught: on the build he played it measured 0.000. */
+  row('W alone jogs', r.gait.jog, '4.61 m/s (0.72 x Carson)', near(r.gait.jog, 4.608, 0.15),
+    'THE DEFAULT GAIT. `MOVE.autoJogScale` (0.72) x the brother\'s DESIGN.md run. Re-baselined from ' +
+    '6.4: the auto-run wave gave W the whole run speed, which the owner reported as "walks a little ' +
+    'too fast". Fails loudly if the default brother changes — a review, not a bug.');
+  row('Shift+W runs', r.gait.run, '6.4 m/s (Carson)', near(r.gait.run, 6.4, 0.15),
+    'DESIGN.md\'s run speed for the default brother, unchanged. What Shift is FOR.');
+  row('Shift is worth a tier', r.gait.run - r.gait.jog, '> +1.50 m/s',
+    r.gait.run - r.gait.jog > 1.5,
+    'THE row for "run doesn\'t seem to do anything now" — on the reported build this measured 0.000 ' +
+    'because both inputs returned `sprintSpeed`. 1.79 m/s for Carson, 1.93 for Aidan, 2.21 for Dylan: ' +
+    'a fixed 39 % of the run, since the jog is a fraction OF it.');
+  row('NEG CONTROL: auto-run off = analogue jog', r.gait.jogNoAuto, '3.35 m/s',
     near(r.gait.jogNoAuto, 3.35, 0.12),
-    'Same key, same site, `movement.autoRun = false`. This is what makes the row above mean ' +
-    'something: raising `jogSpeed` would pass that one and fail this one.');
-  row('Shift agrees with the default', r.gait.shift - r.gait.run, '0 +-0.05 m/s',
-    near(r.gait.shift, r.gait.run, 0.05),
-    'Shift is still bound and still forces the run — it is now never WRONG to hold and never required.');
+    'Same key, same site, `movement.autoRun = false`, which drops W back onto the analogue ramp. ' +
+    'This is what makes the two rows above mean something: raising `jogSpeed` to fake the jog tier ' +
+    'passes the first and fails this one, and no single edit to `tuning.js` can turn all three green.');
   row('walk modifier speed', r.gait.walk, '1.72 m/s', near(r.gait.walk, 1.72, 0.12),
-    'Alt (ACTIONS.walk). Where the slow gait went when full deflection became the run.');
-  row('right = run speed', r.gait.right, '= run +-0.1', near(r.gait.right, r.gait.run, 0.1),
-    'GTA re-facing: the body turns and runs, there is no strafe penalty unless aiming.');
-  row('back = run speed', r.gait.back, '= run +-0.1', near(r.gait.back, r.gait.run, 0.1));
+    'Alt (ACTIONS.walk). The bottom tier, untouched by any of this.');
+  row('the walk is a tier below the jog', r.gait.jog - r.gait.walk, '> +1.50 m/s',
+    r.gait.jog - r.gait.walk > 1.5,
+    'The other gap. Together with the row above it, the ladder is legible: 1.72 -> 4.61 -> 6.40, and ' +
+    'no two rungs can collapse into each other without one of these two rows going red.');
+  row('right = jog speed', r.gait.right, '= jog +-0.1', near(r.gait.right, r.gait.jog, 0.1),
+    'GTA re-facing: the body turns and moves, there is no strafe penalty unless aiming. D alone is ' +
+    'full deflection too, so it gets the same tier W does.');
+  row('back = jog speed', r.gait.back, '= jog +-0.1', near(r.gait.back, r.gait.jog, 0.1));
   row('crouch speed', r.gait.crouch, '1.48 m/s', near(r.gait.crouch, 1.48, 0.12));
   row('aim speed', r.gait.aim, '1.90 m/s', near(r.gait.aim, 1.9, 0.12));
   row('time to 3.0 m/s', r.gait.t30, '0.09-0.30 s', r.gait.t30 > 0.09 && r.gait.t30 < 0.3,
@@ -236,11 +256,17 @@ function report(r, wallSeconds) {
     r.gait.stopWalk > 0.08 && r.gait.stopWalk < 0.3);
   row('stop time from the run', r.gait.stopRun, '0.40-0.85 s',
     r.gait.stopRun > 0.4 && r.gait.stopRun < 0.85,
-    'Re-baselined, not relaxed: this is the old "stop time from sprint" band, and it now applies to ' +
-    'the DEFAULT gait because the default gait is the run. `hardStopSpeed` (4.2) is what selects it.');
+    'Measured at the SHIFT site now that Shift is the run again — the band itself is the original ' +
+    'one and has not moved. `hardStopSpeed` (4.2) is what selects the planted stop.');
   row('the run stop has weight', r.gait.stopRun - r.gait.stopWalk, '> +0.20 s',
     r.gait.stopRun - r.gait.stopWalk > 0.2,
     'A run must roll off, not stop dead — the difference IS the weight.');
+  row('the stops ladder with the tiers', r.gait.stopJog, 'walk < jog < run',
+    r.gait.stopJog > r.gait.stopWalk && r.gait.stopJog < r.gait.stopRun,
+    'An ORDERING, not an invented band: the jog tier (4.61) is above `hardStopSpeed` so it plants ' +
+    'like the run does, but it carries less speed into the plant and must therefore land between the ' +
+    'two. Measured 0.117 / 0.417 / 0.733 s. This is the row that fails if the jog tier is ever tuned ' +
+    'under 4.2 and quietly loses its planted stop.');
   row('air control ratio', r.air.controlRatio, '0.15-0.40', r.air.controlRatio > 0.15 && r.air.controlRatio < 0.4);
 
   /* ---- FOV, read off the EMITTED camera. Third person wants ~62 deg from an
@@ -281,8 +307,8 @@ function report(r, wallSeconds) {
   row('footsteps / 10 m walking', r.steps.walk, '9-15', r.steps.walk >= 9 && r.steps.walk <= 15,
     'The WALK modifier. GAIT.walk authors a 1.42 m stride at 1.72 m/s, i.e. ~14 plants per 10 m.');
   row('footsteps / 10 m running', r.steps.run, '6-10', r.steps.run >= 6 && r.steps.run <= 10,
-    'W alone. This is the old "/ 10 m sprint" row: the default gait is the run now, so the default ' +
-    'gait is what has the sprint\'s stride.');
+    'Shift+W. Back on the Shift key with the run: the animator interpolates the reference gaits by ' +
+    'SPEED, so this row follows the tier rather than the key, and the tier is Shift\'s again.');
   row('run step gap', r.steps.runGap, '1.00-1.60 m', r.steps.runGap > 1.0 && r.steps.runGap < 1.6,
     'RATCHET on the upper bound. Goal is 1.32 m — GAIT.sprint authors a 2.64 m stride, i.e. two plants ' +
     'per stride. Same family as the foot-slide RATCHETs in src/peds/gaitprobe.mjs (jog and run share the ' +
@@ -294,17 +320,18 @@ function report(r, wallSeconds) {
     'Two emitted signals against each other: the footstep event stream against the emitted body position. ' +
     'Authored strides are 1.42 m walking and 2.64 m running, i.e. gaps of 0.71 and 1.32.');
   row('footstep surfaces', r.steps.surfaces.join(','), 'non-empty', r.steps.surfaces.length > 0);
-  row('camera bob at the jog', r.bob.jogNoAuto, '0.005-0.05 m',
+  row('camera bob at the analogue jog', r.bob.jogNoAuto, '0.005-0.05 m',
     r.bob.jogNoAuto > 0.005 && r.bob.jogNoAuto < 0.05,
     'Emitted camera height over the emitted feet, detrended with a 21-frame moving average so road camber ' +
-    'cancels. THE SAME MEASUREMENT AND THE SAME BAND as before auto-run — the gait is now pinned with ' +
-    '`movement.autoRun = false` instead of by the key, because the detrend window covers 2.2 m at the run ' +
-    'and above CAMERA.orbit.autoSpeed the orbit auto-centres, so at the default gait this number stops ' +
-    'being the footstep channel at all. Measured: 0.019 here, 0.003 at the walk, 0.134 at the run.');
-  row('the run bobs harder than the jog', r.bob.run - r.bob.jogNoAuto, '> 0 m',
-    r.bob.run > r.bob.jogNoAuto,
+    'cancels. THE SAME MEASUREMENT AND THE SAME BAND it has always had, still pinned with ' +
+    '`movement.autoRun = false` rather than by a key: the detrend window covers 2.2 m at the run, and ' +
+    'above CAMERA.orbit.autoSpeed (3.4) the orbit auto-centres, so at either committed tier this number ' +
+    'stops being the footstep channel on its own. The walk and the run are measured too, and ordered ' +
+    'by the two rows below.');
+  row('the tiers bob in order', r.bob.run - r.bob.jogNoAuto, 'walk < jog(auto off) < run',
+    r.bob.walk < r.bob.jogNoAuto && r.bob.jogNoAuto < r.bob.run,
     'POSITIVE CONTROL for the row above, and the gate on CAMERA.step.sprintScale: a faster gait must move ' +
-    'the lens more, not less.');
+    'the lens more, not less, at every rung.');
   row('no bob standing still', r.bob.idle, '< 0.004 m', r.bob.idle < 0.004,
     'NEGATIVE CONTROL for both rows above.');
 
@@ -553,6 +580,60 @@ function runBench() {
   /** Headings where an axis-aligned test slab is hit square-on. */
   const AXIS_YAWS = [0, Math.PI, Math.PI / 2, -Math.PI / 2];
 
+  /**
+   * ONE LONG RUNWAY, HUNTED ONCE, FOR EVERY ROW THAT COVERS GROUND.
+   *
+   * The gait, footstep and bob blocks used to run at `place(0)` — the spawn,
+   * whatever is in front of it. That was survivable while the default gait was
+   * a 3.35 m/s jog and the windows were 80 frames (5.6 m). It stopped being
+   * survivable twice over: the auto-run wave took the default to 6.4 m/s and
+   * the windows to 120-170 frames, and the R2 content wave then built a denser
+   * downtown around the spawn. MEASURED on the build this pass started from,
+   * four rows were red and not one of them was about movement — the character
+   * was running into a wall 8 m out and the bench was scoring the wall:
+   *
+   *   stop time from the run   0.150 s   (should be 0.733 — he was already stopped)
+   *   the run stop has weight  0.033 s   (the difference between two crashes)
+   *   sprint widens the frame  1.121 deg (fov read after the crash, not at speed)
+   *   sprint jump keeps speed  0.304 m/s (jumped into the wall)
+   *
+   * So the runway is now a MEASURED property of the site rather than an
+   * assumption about it: try every spawn, a few lanes either side and the four
+   * cardinal headings, keep the deepest clear capsule cast, and re-place there
+   * for every long row. `notes` prints what it found, which is the number to
+   * look at first if these rows ever go strange again.
+   */
+  const RUN_SITE = { lane: 0, idx: 0, yaw: 0, room: 0 };
+  const RUNWAY_DEPTHS = [26, 22, 18, 15, 12, 10, 8, 6];
+  const findRunway = () => {
+    for (let idx = 0; idx < 8; idx++) {
+      const sp = world?.spawn?.(idx);
+      const yaws = [...new Set([sp?.yaw ?? 0, ...AXIS_YAWS])];
+      for (const yaw of yaws) {
+        for (const lane of [0, 3, -3]) {
+          place(lane, idx, yaw);
+          for (const d of RUNWAY_DEPTHS) {
+            if (d <= RUN_SITE.room) break;
+            if (clearAhead(d)) {
+              RUN_SITE.lane = lane; RUN_SITE.idx = idx; RUN_SITE.yaw = yaw; RUN_SITE.room = d;
+              break;
+            }
+          }
+          if (RUN_SITE.room >= RUNWAY_DEPTHS[0]) break;
+        }
+        if (RUN_SITE.room >= RUNWAY_DEPTHS[0]) break;
+      }
+      if (RUN_SITE.room >= RUNWAY_DEPTHS[0]) break;
+    }
+    notes.push(
+      `runway: ${RUN_SITE.room.toFixed(0)} m clear at spawn ${RUN_SITE.idx} lane ${RUN_SITE.lane} ` +
+      `heading ${(RUN_SITE.yaw * 180 / Math.PI).toFixed(0)} deg ` +
+      `(a 2 s run at 6.4 m/s covers 11.9 m; under that, every long row is measuring a wall)`
+    );
+  };
+  /** Re-place at the hunted runway. Same signature contract as `place`. */
+  const placeRun = () => place(RUN_SITE.lane, RUN_SITE.idx, RUN_SITE.yaw);
+
   const events = { steps: [], lands: [], states: [], mantles: [] };
   eng.events.on('player:footstep', (e) =>
     events.steps.push({ surface: e.surface, running: e.running, x: e.position.x, z: e.position.z }));
@@ -649,52 +730,69 @@ function runBench() {
   const out = { notes };
 
   /* ---- gaits ---------------------------------------------------------- */
+  findRunway();
   out.gait = {};
-  place(0);
+  placeRun();
   {
-    /* THE DEFAULT GAIT — W and nothing else. It used to be the jog; auto-run
-     * makes it the brother's run speed, which is what "I always need to hold in
-     * the run button to move fast enough" was asking for. Every row that used
-     * to be labelled `jog` here is this measurement re-baselined, not a
-     * threshold moved to suit a build. */
+    /* THE DEFAULT GAIT — W and nothing else. `MOVE.autoJogScale` of the
+     * brother's run, 4.61 m/s for Carson. It was 3.35 before the auto-run wave
+     * and 6.40 after it; this is the middle tier that puts something back on
+     * the other side of Shift. */
     let t30 = -1;
     const t = eng.time.elapsed;
-    out.gait.run = topSpeed(['KeyW'], 120, () => {
+    out.gait.jog = topSpeed(['KeyW'], 120, () => {
       if (t30 < 0 && p.horizontalSpeed >= 3.0) t30 = eng.time.elapsed - t;
     });
     out.gait.t30 = t30;
+    out.gait.jogTravel = forwardTravel();
+    out.gait.stopJog = stopTime(200);
+  }
+  settle(); placeRun();
+  out.gait.right = topSpeed(['KeyD'], 120);
+  settle(); placeRun();
+  out.gait.back = topSpeed(['KeyS'], 120);
+  settle(); placeRun();
+  {
+    /* THE RUN — Shift, and only Shift, on a keyboard. The FOV is taken as the
+     * MAXIMUM over the window rather than off the last frame: the boom and the
+     * lens both lag the speed, and reading them after the window has ended (or
+     * after the runway has run out) reports the tail of the return, which is
+     * how `sprint widens the frame` came to read +1.1 deg on a build whose
+     * camera was working perfectly. */
+    let fovMax = 0;
+    out.gait.run = topSpeed(['KeyW', 'ShiftLeft'], 120, () => {
+      if (cam.fov > fovMax) fovMax = cam.fov;
+    });
+    out.fov = { sprint: fovMax };
+    out.gait.runTravel = forwardTravel();
     out.gait.stopRun = stopTime(200);
   }
-  settle(); place(0);
-  out.gait.right = topSpeed(['KeyD'], 120);
-  settle(); place(0);
-  out.gait.back = topSpeed(['KeyS'], 120);
-  settle(); place(0);
+  settle(); placeRun();
   {
-    // Shift is still bound and still forces the run. With auto-run it can only
-    // ever agree with the default; the row exists to prove it does not FIGHT
-    // it, which is the failure mode of a half-applied change.
-    out.gait.shift = topSpeed(['KeyW', 'ShiftLeft'], 120);
-    out.fov = { sprint: cam.fov };
-  }
-  settle(); place(0);
-  {
-    // The WALK modifier (Alt). This is where the former default speed went.
+    // The WALK modifier (Alt). The bottom tier.
     out.gait.walk = topSpeed(['KeyW', 'AltLeft'], 90);
     out.gait.stopWalk = stopTime(120);
   }
-  settle(); place(0);
+  settle(); placeRun();
   {
-    /* NEGATIVE CONTROL, in the bench rather than in a separate run: with
-     * auto-run switched off, W has to fall back to exactly the jog the build
-     * shipped with. It is what makes the 6.4 above attributable — if the run
+    /* NEGATIVE CONTROL, in the bench rather than in a separate run: with the
+     * middle tier switched off, W has to fall back to exactly the analogue
+     * ramp's ceiling. It is what makes the 4.61 above attributable — if the jog
      * row went green because somebody raised `jogSpeed`, this row goes red. */
     p.movement.autoRun = false;
     out.gait.jogNoAuto = topSpeed(['KeyW'], 90);
     settle();
     p.movement.autoRun = true;
   }
-  settle(); place(0);
+  /* What the two committed tiers ACTUALLY covered in their 2 s windows, printed
+   * next to the runway they had. If either number ever approaches the runway,
+   * the rows above have stopped being about the gait — that is the whole
+   * failure this pass found, made visible without having to rediscover it. */
+  notes.push(
+    `gait travel in 2 s: jog ${out.gait.jogTravel.toFixed(2)}m · run ${out.gait.runTravel.toFixed(2)}m ` +
+    `(runway ${RUN_SITE.room} m)`
+  );
+  settle(); placeRun();
   {
     dn('KeyC'); step(2); up('KeyC'); step(30);
     out.gait.crouch = topSpeed(['KeyW'], 70);
@@ -733,7 +831,9 @@ function runBench() {
     out.jump = { apex, airTime: air };
   }
   // Jumping out of a sprint must not eat the speed. (Was "slide cancel".)
-  settle(); place(0);
+  // On the hunted runway: 90 frames of run is 8.7 m before the jump is even
+  // pressed, and at `place(0)` this row was scoring a wall at 0.304 m/s.
+  settle(); placeRun();
   {
     dn('KeyW'); dn('ShiftLeft');
     step(90);
@@ -821,48 +921,61 @@ function runBench() {
       surfaces: [...new Set(events.steps.map((s) => s.surface))],
     };
   };
-  /* The two gaits a keyboard can now produce. It used to be W against
-   * Shift+W; with auto-run those are the same gait, so the stride comparison
-   * has to be the RUN against the WALK modifier or it compares a thing to
-   * itself and can only ever report zero. */
-  settle(); place(0); step(20);
+  /* All THREE tiers, on the hunted runway — each of these walks 10 m and the
+   * spawn does not have 10 m in front of it any more. The gated comparison is
+   * still the run against the walk (the two extremes, and the largest signal);
+   * the jog tier is measured alongside them so the note carries the whole
+   * ladder and a collapsed middle rung is visible without a code change. */
+  settle(); placeRun(); step(20);
   const walkSteps = stepsPer10m(['KeyW', 'AltLeft']);
-  settle(); place(0); step(20);
-  const runSteps = stepsPer10m(['KeyW']);
+  settle(); placeRun(); step(20);
+  const jogSteps = stepsPer10m(['KeyW']);
+  settle(); placeRun(); step(20);
+  const runSteps = stepsPer10m(['KeyW', 'ShiftLeft']);
   out.steps = {
-    walk: walkSteps.count, run: runSteps.count,
-    walkGap: walkSteps.gap, runGap: runSteps.gap,
-    walkDist: walkSteps.dist, runDist: runSteps.dist,
-    surfaces: [...new Set([...walkSteps.surfaces, ...runSteps.surfaces])],
+    walk: walkSteps.count, jog: jogSteps.count, run: runSteps.count,
+    walkGap: walkSteps.gap, jogGap: jogSteps.gap, runGap: runSteps.gap,
+    walkDist: walkSteps.dist, jogDist: jogSteps.dist, runDist: runSteps.dist,
+    surfaces: [...new Set([...walkSteps.surfaces, ...jogSteps.surfaces, ...runSteps.surfaces])],
   };
-  notes.push(`footsteps: walk ${walkSteps.count} over ${walkSteps.dist.toFixed(2)}m ` +
-    `(mean gap ${walkSteps.gap.toFixed(2)}m), run ${runSteps.count} over ` +
-    `${runSteps.dist.toFixed(2)}m (mean gap ${runSteps.gap.toFixed(2)}m)`);
+  const stepNote = (n, s) =>
+    `${n} ${s.count} over ${s.dist.toFixed(2)}m (mean gap ${s.gap.toFixed(2)}m)`;
+  notes.push('footsteps per 10 m: ' + [
+    stepNote('walk', walkSteps), stepNote('jog', jogSteps), stepNote('run', runSteps),
+  ].join(' · '));
 
-  /* The bob is measured at the WALK, not at the default gait, and the reason is
-   * worth writing down. `camResidual` detrends with a 21-frame (0.35 s) moving
-   * average, which is 0.6 m of travel at a walk and 2.2 m at a run — and above
-   * `CAMERA.orbit.autoSpeed` (3.4 m/s) the orbit ALSO starts auto-centring,
-   * which moves the boom vertically for reasons that have nothing to do with
-   * footsteps. Measured on this build: 0.019 m at the jog with auto-run off,
-   * 0.134 m at the run. The 0.134 is not a defect and it is not new — it is
-   * what this row would always have read had it been pointed at a sprint — but
-   * it is not the footstep channel either. The walk is where that channel is
-   * observable on its own, and the ordering row below is what keeps the fast
-   * gait honest. */
-  settle(); place(0); step(25);
+  /* The GATED bob row is the analogue jog, not the default gait, and the reason
+   * is worth writing down. `camResidual` detrends with a 21-frame (0.35 s)
+   * moving average, which is 0.6 m of travel at a walk and 2.2 m at a run — and
+   * above `CAMERA.orbit.autoSpeed` (3.4 m/s) the orbit ALSO starts
+   * auto-centring, which moves the boom vertically for reasons that have
+   * nothing to do with footsteps. Both committed tiers are above that speed, so
+   * neither of them is the footstep channel on its own. The analogue jog is
+   * where that channel is observable alone, and the ordering row is what keeps
+   * the fast gaits honest.
+   *
+   * The RUN window is sized to the hunted runway rather than fixed at 170
+   * frames: 170 frames at 6.4 m/s is 18 m, which the spawn-adjacent streets no
+   * longer have. It is an amplitude (half peak-to-peak of a detrended signal),
+   * so a shorter window costs resolution, not comparability — but it must stay
+   * well clear of the 21-frame detrend, hence the floor. */
+  const bobFrames = Math.max(90, Math.min(170, Math.floor((RUN_SITE.room * 0.8) / 6.4 * 60)));
+  settle(); placeRun(); step(25);
   out.bob = { walk: camResidual(170, ['KeyW', 'AltLeft']) };
-  settle(); place(0); step(25);
-  out.bob.run = camResidual(170, ['KeyW']);
-  settle(); place(0); step(25);
+  settle(); placeRun(); step(25);
+  out.bob.run = camResidual(bobFrames, ['KeyW', 'ShiftLeft']);
+  settle(); placeRun(); step(25);
+  out.bob.jog = camResidual(bobFrames, ['KeyW']);
+  settle(); placeRun(); step(25);
   out.bob.idle = camResidual(170, []);
-  settle(); place(0); step(25);
+  settle(); placeRun(); step(25);
   p.movement.autoRun = false;
   out.bob.jogNoAuto = camResidual(170, ['KeyW']);
   p.movement.autoRun = true;
   notes.push(`camera bob (detrended, half peak-to-peak): walk ${out.bob.walk.toFixed(3)}m · ` +
-    `jog with auto-run off ${out.bob.jogNoAuto.toFixed(3)}m · run ${out.bob.run.toFixed(3)}m · ` +
-    `idle ${out.bob.idle.toFixed(3)}m`);
+    `analogue jog, auto-run off ${out.bob.jogNoAuto.toFixed(3)}m · jog tier ${out.bob.jog.toFixed(3)}m · ` +
+    `run ${out.bob.run.toFixed(3)}m · idle ${out.bob.idle.toFixed(3)}m ` +
+    `(fast windows ${bobFrames} frames, sized to the runway)`);
 
   /* ---- stance, proven by geometry the body either fits through or not --- */
   settle();

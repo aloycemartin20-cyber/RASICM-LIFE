@@ -290,6 +290,20 @@ export const TUNE = {
    */
   despawnR: 460,
   /**
+   * ...and the shorter clock for a wreck that ended up OFF the carriageway,
+   * whatever `despawnR` says about how near the player it is.
+   *
+   * The owner photographed a park beside the Smithfield Street Bridge approach
+   * with a dozen cars wrecked in it during a five-star chase — none of them
+   * 460 m from him, so the `despawnR` clause could never have collected one.
+   * Twenty seconds is long enough that a wreck he is driving away from is
+   * still behind him when he looks back, and short enough that a chase cannot
+   * build a scrapyard on a lawn. Only ever applied out of frame; see
+   * `_ageAbandoned`. The police fleet's shells run the same rule from
+   * `police/tune.js` `wreckLingerOff`.
+   */
+  wreckOffRoad: 20,
+  /**
    * Recycle a surplus driver beyond this even if it is on screen; inside it,
    * only when nobody can see it go. Scored on `Director.fieldDist`, which is
    * the distance to the nearer of the anchor and the far ring's centre — so

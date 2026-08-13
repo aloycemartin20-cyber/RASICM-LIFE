@@ -192,9 +192,19 @@ function project(line, x, z, out) {
 /* Harness: the REAL TramService on a stub vehicle system              */
 /* ================================================================== */
 
+/**
+ * The `world` façade the service is allowed to see. `heightAt`/`isWater` are
+ * here because the stop furniture has to stand on dry ground it can measure —
+ * without them the platform solver has nothing to seat a platform on and the
+ * CLEARANCE gate below would pass vacuously on four missing anchors.
+ */
 function makeCtx() {
   return {
-    peek: (id) => (id === 'world' ? { roads: graph } : null),
+    peek: (id) => (id === 'world' ? {
+      roads: graph,
+      heightAt: (x, z) => terrain.heightAt(x, z),
+      isWater: (x, z) => terrain.isWater(x, z),
+    } : null),
     events: { emit() {} },
     time: {},
   };
@@ -607,6 +617,85 @@ if (tracks.length) {
   check('every car is kinematic and awake for the collision pass',
     svc.cars.every((c) => c.vehicle.kinematic === true && c.vehicle.sleeping === false),
     svc.cars.map((c) => `${c.vehicle.kinematic}/${c.vehicle.sleeping}`).join(' '));
+
+  /* ---- STOP FURNITURE CLEARANCE --------------------------------------- */
+  /**
+   * THE REPORT: "trolly station facade is in the middle of the street".
+   *
+   * A stop mark is SNAPPED TO A ROAD CROSSING on purpose, so anything built at
+   * the mark is on the carriageway by construction — MEASURED on this graph,
+   * BUTLER STREET's mark is 1.52 m from the centreline of a 15.2 m arterial
+   * and FOUNDRY TERMINUS's is 0.32 m from a 7.2 m street. The furniture is
+   * therefore offset to the pavement side, and this is the gate on that.
+   *
+   * RULE 12. Nothing below calls `tram.js`'s `carriagewayDist`, reads
+   * `PLATFORM_OFF` or asks the service whether it thinks it cleared anything.
+   * It takes the EMITTED anchor off each stop and measures it against the
+   * emitted graph with carriageway arithmetic written here — each edge against
+   * its own `width`, the rail against the tram's own body from `transit.hw`.
+   */
+  const HALF_BODY = svc.cars[0]?.transit?.hw ?? 1.3;
+  const SLAB = 1.3;              // half the platform slab, across the rail
+  let worstRoad = Infinity;
+  let worstRail = Infinity;
+  let placed = 0;
+  const rows = [];
+  for (const st of svc.stops) {
+    const p = st.platform;
+    if (!p) { rows.push(`${st.name}: none`); continue; }
+    placed++;
+    // Into the carriageway of every drivable edge, its own width.
+    let road = Infinity;
+    for (const e of graph.edges) {
+      if (!e || e.rail) continue;
+      const na = graph.nodes[e.a];
+      const nb = graph.nodes[e.b];
+      if (!na || !nb) continue;
+      const dx = nb.x - na.x;
+      const dz = nb.z - na.z;
+      const L2 = dx * dx + dz * dz;
+      let t = L2 > 1e-9 ? ((p.x - na.x) * dx + (p.z - na.z) * dz) / L2 : 0;
+      t = t < 0 ? 0 : t > 1 ? 1 : t;
+      road = Math.min(road,
+        Math.hypot(p.x - (na.x + dx * t), p.z - (na.z + dz * t)) - (e.width ?? 7) * 0.5 - SLAB);
+    }
+    // ...and into the tram's own envelope, measured on the extracted LINE.
+    const pr = { s: 0, lat: 0, railY: 0 };
+    project(LINE, p.x, p.z, pr);
+    const rail = pr.lat - SLAB - HALF_BODY;
+    worstRoad = Math.min(worstRoad, road);
+    worstRail = Math.min(worstRail, rail);
+    rows.push(`${st.name}: ${road.toFixed(2)} m off tarmac, ${rail.toFixed(2)} m off the car`);
+  }
+  check('every stop gets furniture on ground it can stand on',
+    placed === svc.stops.length, `${placed}/${svc.stops.length} — ${rows.join('; ')}`);
+  check('CLEARANCE: no stop furniture stands on a carriageway',
+    worstRoad > 0, `worst ${worstRoad.toFixed(2)} m clear of the nearest kerb face`);
+  check('CLEARANCE: ...nor inside the tram\'s own envelope',
+    worstRail > 0, `worst ${worstRail.toFixed(2)} m clear of the widest point of a car`);
+  /**
+   * THE NEGATIVE CONTROL, and it is the whole point of the two checks above:
+   * the same measurement taken AT THE MARK — where the furniture used to go —
+   * has to go red, or the gate is measuring the graph rather than the fix.
+   */
+  let markRoad = Infinity;
+  for (const st of svc.stops) {
+    for (const e of graph.edges) {
+      if (!e || e.rail) continue;
+      const na = graph.nodes[e.a];
+      const nb = graph.nodes[e.b];
+      if (!na || !nb) continue;
+      const dx = nb.x - na.x;
+      const dz = nb.z - na.z;
+      const L2 = dx * dx + dz * dz;
+      let t = L2 > 1e-9 ? ((st.x - na.x) * dx + (st.z - na.z) * dz) / L2 : 0;
+      t = t < 0 ? 0 : t > 1 ? 1 : t;
+      markRoad = Math.min(markRoad,
+        Math.hypot(st.x - (na.x + dx * t), st.z - (na.z + dz * t)) - (e.width ?? 7) * 0.5 - SLAB);
+    }
+  }
+  check('CONTROL: furniture AT the mark would stand on the carriageway',
+    markRoad < 0, `at the marks: ${markRoad.toFixed(2)} m — negative is inside the lanes`);
 }
 
 /* ================================================================== */

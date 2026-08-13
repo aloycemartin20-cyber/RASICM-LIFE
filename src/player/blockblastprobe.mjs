@@ -665,15 +665,17 @@ try {
       B.rmb(false);
       m.scriptedInput = null;
       /**
-       * AUTO-RUN AND THE REFERENCE GAIT. `BLOCK_SLOW` is authored as a fraction
-       * of `MOVE.jogSpeed`, so the row this ratio is taken against has to BE
-       * the jog — and since `MOVE.autoRunMag`, a full stick is the RUN. The
-       * unguarded reference therefore turns auto-run off for the length of its
-       * own row (the same switch `feeltest.mjs` uses) instead of quietly
-       * measuring a 6.4 m/s run and calling it a jog: that would have taken the
-       * ratio to 0.235 and this file would have reported the guard as a defect.
-       * The guarded rows leave it ON, because the guard has to beat whatever
-       * gait the player can actually reach.
+       * THE REFERENCE GAIT. `BLOCK_SLOW` is authored as a fraction of
+       * `MOVE.jogSpeed` (3.35), so the row this ratio is taken against has to
+       * BE that gait — and a full stick has not produced it since
+       * `MOVE.autoRunMag`: it produced the whole run, and now produces the
+       * middle tier (`MOVE.autoJogScale`, 4.61-5.69). Either way it is not
+       * 3.35. The unguarded reference therefore turns the tier off for the
+       * length of its own row (the same switch `feeltest.mjs` uses) instead of
+       * quietly measuring a committed gait and calling it a jog: against the
+       * 6.4 m/s run that took the ratio to 0.235 and this file reported the
+       * guard as a defect. The guarded rows leave it ON, because the guard has
+       * to beat whatever gait the player can actually reach.
        */
       m.autoRun = !noAuto;
       pl.teleport?.({ x: home.x, y: home.y + 1.6, z: home.z }, { x: 0, y: 0, z: 0 });

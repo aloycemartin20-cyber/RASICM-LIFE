@@ -823,12 +823,23 @@ export class FreeRoam {
       // Down-runway offset (nose points this way) and the perpendicular apron.
       const along = (d) => [af.x + s * d, af.z + c * d];
       const beside = (d, a) => [af.x + c * d + s * a, af.z - s * d + c * a];
-      const [px, pz] = along(-len * 0.32);
-      const plane = this.wq.spawnVehicle('plane', px, pz, af.yaw);
-      const [hx, hz] = beside(wid * 0.5 + 12, len * 0.12);
-      const heli = this.wq.spawnVehicle('heli', hx, hz, af.yaw);
-      if (plane) this._airportVehicles.push(plane);
-      if (heli) this._airportVehicles.push(heli);
+      /**
+       * A FLIGHTLINE, not a lone pair — the owner asked twice. Fixed-wings
+       * park nose-to-tail down the apron edge; rotorcraft take their own row
+       * on the far side. Classes vary so the line reads as a working field
+       * (sportplane/jet only where the runway can plausibly launch them).
+       */
+      const wings = len >= 360 ? ['plane', 'sportplane', 'plane', 'jet'] : ['plane', 'sportplane', 'plane'];
+      wings.forEach((kind, i) => {
+        const [px, pz] = beside(wid * 0.5 + 16, len * (-0.30 + i * 0.16));
+        const v = this.wq.spawnVehicle(kind, px, pz, af.yaw);
+        if (v) this._airportVehicles.push(v);
+      });
+      for (let i = 0; i < 2; i++) {
+        const [hx, hz] = beside(-(wid * 0.5 + 14), len * (0.04 + i * 0.14));
+        const heli = this.wq.spawnVehicle('heli', hx, hz, af.yaw);
+        if (heli) this._airportVehicles.push(heli);
+      }
     }
   }
 

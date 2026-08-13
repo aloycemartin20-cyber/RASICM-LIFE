@@ -216,7 +216,7 @@ export const LANDMARKS = [
 export const SAFEHOUSES = [
   { id: 'sh_boathouse', name: "CARSON'S BOATHOUSE", x: 88, z: 560, owner: 'carson' },
   { id: 'sh_bodyshop', name: 'DECARLO BODY SHOP', x: 632, z: -464, owner: 'aidan' },
-  { id: 'sh_garage', name: "DYLAN'S GARAGE", x: -504, z: 432, owner: 'dylan' },
+  { id: 'sh_garage', name: "DYLAN'S GARAGE", x: -560, z: 552, owner: 'dylan' },
   { id: 'sh_apartment', name: 'TRIANGLE APARTMENT', x: -264, z: 96, owner: null },
   { id: 'sh_loft', name: 'SHORE LOFT', x: -192, z: -672, owner: null },
 ];

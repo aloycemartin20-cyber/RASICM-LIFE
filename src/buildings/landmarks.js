@@ -1717,27 +1717,80 @@ function ironwoodPark(T, lib, lm, rng, gy, groundAt) {
 
 // ---------------------------------------------------------------- Color Park --
 /**
- * COLOR PARK — the legal wall, on the Monongahela's south bank.
+ * COLOR PARK — the legal wall on the Monongahela's south bank, and the one
+ * place in Steel City where the paint is the POINT rather than the decay.
  *
- * The one place in Steel City where the paint is the POINT rather than the
- * decay. Everywhere else in this city aerosol is a symptom — `props/layout.js`
- * puts tags on the blank end wall of a rowhouse because the block is going
- * under. Here the slabs were poured to be painted: bays of concrete stood on
- * end in a row along the trail, each one a flat colour under twenty years of
- * other people's, plus the ramps and ledges the skaters wore into the apron
- * and a low bank wall between it and the water.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * THE REPORT, AND WHAT WAS ACTUALLY WRONG
+ * ─────────────────────────────────────────────────────────────────────────────
+ * "color park is glitchy (panels laying everywhere, player falls through the
+ * ground) and does not look like spraypaint".
  *
- * THE COLOURS ARE ALL EXISTING PALETTE KEYS. `paint_*`, `brick_glazed*` and
- * the three `neon_*` all resolve onto bakes the city already makes resident,
- * so a riot of colour on the river bank costs zero extra texture memory —
- * which is the whole reason `buildings/palette.js` is a table of tinted
- * variants rather than a table of bakes.
+ * All three are the same mistake made twice: FLAT BOXES SAMPLED AT ONE POINT
+ * STANDING ON A BANK THAT FALLS 3.5 m.
+ *
+ *   THE FALL-THROUGH. The apron was ten `roof_tar` boxes, each `HV * 1.35` =
+ *   21.6 m deep across the slope and each seated on ONE ground sample taken at
+ *   its own centre (v = 0). MEASURED on the shipped terrain, across the band
+ *   those boxes covered: the ground runs 8.5 m at v = 0 and 4.9 m at
+ *   v = -10.8, so the slab's far edge stood up to 2.6 m in the air. It carried
+ *   no collider — deliberately, so as not to build a floor — so a player
+ *   walked onto a surface that was visibly solid and dropped to the terrain
+ *   underneath it. That is exactly "falls through the ground", and it was
+ *   authored in.
+ *
+ *   THE PANELS. Ten free-standing 11.5 x 3.5 m concrete slabs on end, jogged a
+ *   metre in and out. A "legal wall" made of separate panels standing in open
+ *   ground reads as panels lying about in a field, because that is what it is.
+ *
+ *   THE PAINT. Flat rectangles of opaque colour, hard-edged, one per box. No
+ *   aerosol has a straight edge.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * WHAT IT IS NOW, AND WHO OWNS WHICH HALF
+ * ─────────────────────────────────────────────────────────────────────────────
+ * The park is PAINTED ASPHALT and A WALL WITH MURALS ON IT, and those are two
+ * different subsystems:
+ *
+ *   HERE (`buildings`)   the hard landscape only — one continuous retaining
+ *                        wall along the inland edge, the skate ledges, the
+ *                        trail, the bank wall and rail over the water, and the
+ *                        excursion landing. Everything stands ON the ground it
+ *                        samples and everything that encloses mass collides.
+ *                        NOTHING here is a floor and nothing here is paint.
+ *   `src/props/colorpark.js`   the asphalt skin and every drop of paint on it,
+ *                        as GROUND-CONFORMING meshes (a vertex per sample of
+ *                        `world.heightAt`, not a box seated on one), plus the
+ *                        murals on this wall's face. No collision at all: the
+ *                        ground a player walks on at Color Park is the terrain
+ *                        that was already there, and only the terrain.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * THE SHARED FRAME, AND WHY IT IS COPIED RATHER THAN IMPORTED
+ * ─────────────────────────────────────────────────────────────────────────────
+ * `props` cannot import this module (ARCHITECTURE.md rule 2) and must not
+ * guess where this wall is. Both sides therefore derive every number from the
+ * SAME published `world.landmarks` entry — `site.hx`, `site.hz`, `site.yaw` —
+ * through the same three expressions, which are stated here and repeated
+ * verbatim in `props/colorpark.js`:
+ *
+ *   WALL_FACE_V = HV - 3.0     the retaining wall's park-facing face
+ *   APRON_V     = [-HV * 0.38, HV - 3.2]   the painted asphalt band
+ *   TRAIL_V     = -HV * 0.86   the riverside trail (unchanged)
+ *
+ * If the site moves or turns, both sides move with it. If someone edits one of
+ * the three, `props/colorparkprobe.mjs` reports the murals as unbacked.
  */
-const COLORPARK_PAINTS = [
-  'paint_red', 'paint_teal', 'paint_ochre', 'paint_blue',
-  'paint_slag', 'paint_green', 'hazard_yellow', 'brick_glazed',
-  'brick_glazed_green', 'neon_amber', 'neon_teal', 'paint_cream',
-];
+
+/** The retaining wall's park-facing face, in site-local v. See the note above. */
+const CP_WALL_FACE_V = (HV) => HV - 3.0;
+
+/**
+ * The cans the skate ledges are painted with. Existing `buildings/palette.js`
+ * keys, so five painted decks cost no new material — the same accounting note
+ * that governs the rest of this file.
+ */
+const LEDGE_PAINT = ['paint_red', 'paint_teal', 'hazard_yellow', 'paint_blue', 'paint_green'];
 
 function colorPark(T, lib, lm, rng, gy, groundAt) {
   const F = siteAxes(lm, 0.489);
@@ -1745,115 +1798,102 @@ function colorPark(T, lib, lm, rng, gy, groundAt) {
   const HU = lm.site?.hx ?? 76;
   const HV = lm.site?.hz ?? 16;
 
-  /* ---- the apron, and the paint on it ----------------------------------- */
+  /* ---- the retaining wall: ONE wall, not ten panels --------------------- */
   /**
-   * ONE ASPHALT SLAB, THEN PAINT IN PATCHES ON TOP OF IT — and the second half
-   * of that is the whole difference between a graffiti park and a car park.
+   * A legal wall is the side of something. This is the retaining wall that
+   * holds Carson Street's embankment up off the bank, so it is continuous, it
+   * is founded 1.8 m into the ground (nothing can show daylight under it
+   * however the bank falls away) and every segment sits on its own sample.
    *
-   * The first cut laid fourteen full-depth bays of flat colour end to end,
-   * each 9.7 x 21.6 m. Photographed from the trail it read as a municipal
-   * play surface: enormous rectangles, edge to edge, every one a different
-   * hue, nothing underneath. Real painted asphalt is the opposite shape — a
-   * dark, worn ground with pieces on it, of wildly different sizes, some
-   * overlapping, plenty of asphalt still showing between them, because every
-   * patch was put there by a different person on a different day.
-   *
-   * So: one continuous tarred apron, then forty-odd patches sized 3.5-11 m
-   * from a hash, laid over it at 4-8 mm of lift. The lift is stepped per patch
-   * so two overlapping pieces cannot z-fight, which is the same reason the
-   * later piece looks painted OVER the earlier one rather than through it.
+   * The top line is SMOOTHED over five samples spanning 12 m rather than
+   * following each segment's own ground: a poured wall is built to a level and
+   * the ground does what it likes underneath, and a top edge that copies the
+   * terrain reads as a fence rather than as concrete.
    */
-  const APRON_SEGS = 10;
-  for (let i = 0; i < APRON_SEGS; i++) {
-    const u = -HU + 4 + ((i + 0.5) / APRON_SEGS) * (HU * 2 - 8);
-    const wx = F.x(u, 0);
-    const wz = F.z(u, 0);
-    box(T, 'roof_tar', wx, ga(wx, wz) + 0.05, wz, (HU * 2 - 8) / APRON_SEGS + 0.1, 0.1, HV * 1.35, -F.yaw, [0.7, 0.65, 0.4]);
-  }
-  const PATCHES = 44;
-  for (let i = 0; i < PATCHES; i++) {
-    const h0 = fbm3(i * 3.7, 1.3, 0.5, 2);
-    const h1 = fbm3(0.9, i * 2.9, 2.1, 2);
-    const h2 = fbm3(2.3, 0.4, i * 5.1, 2);
-    const u = -HU + 5 + h0 * (HU * 2 - 10);
-    const v = (h1 - 0.5) * HV * 1.15;
-    const wx = F.x(u, v);
-    const wz = F.z(u, v);
-    const w = 3.5 + h2 * 7.5;
-    const d = 2.6 + h0 * 5.4;
-    const key = COLORPARK_PAINTS[Math.floor(h2 * 97 + i * 5) % COLORPARK_PAINTS.length];
-    // 0.004 m of lift per patch index: enough to order them, far too little to
-    // trip over. The apron itself is 0.10 m, so nothing here leaves the slab.
-    box(T, key, wx, ga(wx, wz) + 0.104 + (i % 9) * 0.004, wz, w, 0.02, d,
-      -F.yaw + (h1 - 0.5) * 0.5, [0.8, 0.55, 0.35]);
-  }
-
-  /* ---- the legal wall: standing slabs down the inland edge --------------- */
-  /**
-   * Ten concrete panels on end, 3.4 m high, staggered in and out by a metre so
-   * the run has depth and there are corners to paint round. Each carries a
-   * painted field on BOTH faces — nobody paints one side of a legal wall — and
-   * the panel itself stays grey concrete at the edges, which is what makes the
-   * paint read as paint rather than as a coloured wall.
-   */
-  for (let i = 0; i < 10; i++) {
-    const u = -HU + 8 + (i / 9) * (HU * 2 - 16);
-    const jog = (i % 2 === 0 ? 1 : -1) * 1.1;
-    const wx = F.x(u, HV - 3.4 + jog);
-    const wz = F.z(u, HV - 3.4 + jog);
-    const g = ga(wx, wz);
-    const w = 11.5;
-    box(T, 'concrete_wall', wx, g + 1.75, wz, w, 3.5, 0.55, -F.yaw, [0.55, 0.7, 0.35], _sharedChamfer());
-    for (const sv of [-1, 1]) {
-      const key = COLORPARK_PAINTS[(i * 7 + (sv > 0 ? 3 : 0)) % COLORPARK_PAINTS.length];
-      const fx = wx - Math.sin(F.yaw) * sv * 0.30;
-      const fz = wz + Math.cos(F.yaw) * sv * 0.30;
-      // The ground coat: nearly the whole panel, leaving a hand's width of raw
-      // concrete at the edges so the paint reads as paint rather than as a
-      // coloured wall. 0.025 m proud of a 0.55 m panel.
-      box(T, key, fx, g + 1.85, fz, w - 0.6, 3.0, 0.05, -F.yaw, [0.8, 0.5, 0.35]);
-      // two pieces over it, different sizes and heights: a wall nobody has
-      // finished with. The second is deliberately smaller and higher.
-      const k2 = COLORPARK_PAINTS[(i * 11 + 5 + (sv > 0 ? 1 : 0)) % COLORPARK_PAINTS.length];
-      const k3 = COLORPARK_PAINTS[(i * 17 + 2 + (sv > 0 ? 5 : 0)) % COLORPARK_PAINTS.length];
-      box(T, k2, fx + Math.cos(F.yaw) * (i % 3 - 1) * 2.4, g + 1.6 + (i % 2) * 0.55, fz + Math.sin(F.yaw) * (i % 3 - 1) * 2.4,
-        w * 0.46, 1.7, 0.05, -F.yaw, [0.85, 0.45, 0.3]);
-      box(T, k3, fx + Math.cos(F.yaw) * ((i + 2) % 4 - 1.5) * 2.6, g + 2.5 - (i % 3) * 0.4, fz + Math.sin(F.yaw) * ((i + 2) % 4 - 1.5) * 2.6,
-        w * 0.3, 1.0, 0.05, -F.yaw, [0.9, 0.4, 0.3]);
+  const WALL_V = CP_WALL_FACE_V(HV);
+  const WSEG = 3.0;
+  const wallU0 = -HU + 3;
+  const wallU1 = HU - 3;
+  const wallN = Math.max(4, Math.round((wallU1 - wallU0) / WSEG));
+  const wallSeg = (wallU1 - wallU0) / wallN;
+  const smoothG = (u) => {
+    let s = 0;
+    for (let k = -2; k <= 2; k++) {
+      const uu = Math.max(wallU0, Math.min(wallU1, u + k * 3));
+      s += ga(F.x(uu, WALL_V + 0.45), F.z(uu, WALL_V + 0.45));
     }
-    // the buttress that stops a 3.5 m panel being a domino
-    box(T, 'concrete_dark', wx, g + 0.55, wz, 1.0, 1.1, 2.4, -F.yaw, [0.6, 0.75, 0.4], _sharedChamfer());
-    T.box('concrete', wx, g + 1.75, wz, w, 3.5, 0.9, -F.yaw);
+    return s / 5;
+  };
+  for (let i = 0; i < wallN; i++) {
+    const u = wallU0 + (i + 0.5) * wallSeg;
+    const wx = F.x(u, WALL_V + 0.45);
+    const wz = F.z(u, WALL_V + 0.45);
+    const g = smoothG(u);
+    // Founded 1.8 m down, 3.3 m of it above the smoothed line: one prism, so
+    // there is no seam for the ground to show through however it falls.
+    box(T, 'concrete_wall', wx, g + 0.75, wz, wallSeg + 0.06, 5.1, 0.9, -F.yaw, [0.55, 0.7, 0.35]);
+    // The coping: every poured wall in this valley has one, and it is what
+    // stops the top edge reading as a cut-off box.
+    box(T, 'concrete_dark', wx, g + 3.38, wz, wallSeg + 0.18, 0.16, 1.12, -F.yaw, [0.6, 0.8, 0.45],
+      _sharedChamfer());
+    T.box('concrete', wx, g + 0.75, wz, wallSeg + 0.06, 5.1, 0.9, -F.yaw);
+    // A buttress every fourth bay, on the EMBANKMENT side, so it never eats
+    // into the face the murals go on.
+    if (i % 4 === 2) {
+      const bx = F.x(u, WALL_V + 1.5);
+      const bz = F.z(u, WALL_V + 1.5);
+      box(T, 'concrete_dark', bx, g + 0.4, bz, 0.9, 3.0, 1.4, -F.yaw, [0.6, 0.75, 0.4], _sharedChamfer());
+      T.box('concrete', bx, g + 0.4, bz, 0.9, 3.0, 1.4, -F.yaw);
+    }
   }
 
-  /* ---- the ledges and the quarter pipe the apron grew ------------------- */
+  /* ---- the ledges and rails the apron grew ------------------------------ */
+  /**
+   * Skate furniture, on the flat of the shelf. Each stands on its own ground
+   * sample and is 7.5 m long, so the worst cross-fall under one is centimetres
+   * — the failure the apron had is not reachable at this size. Collided,
+   * because a man can stand on a ledge.
+   */
   for (let i = 0; i < 5; i++) {
     const u = -HU + 20 + i * 26;
-    const wx = F.x(u, -HV * 0.35);
-    const wz = F.z(u, -HV * 0.35);
+    const wx = F.x(u, -HV * 0.12);
+    const wz = F.z(u, -HV * 0.12);
     const g = ga(wx, wz);
     box(T, 'precast', wx, g + 0.28, wz, 7.5, 0.56, 1.2, -F.yaw, [0.7, 0.75, 0.4], _sharedChamfer());
-    box(T, COLORPARK_PAINTS[(i * 3 + 2) % COLORPARK_PAINTS.length], wx, g + 0.58, wz, 7.5, 0.06, 1.2, -F.yaw, [0.8, 0.5, 0.3]);
+    /**
+     * A LEDGE'S OWN TOP SURFACE, painted here rather than in `props`. Every
+     * other drop of paint in this park is on the ground or on the wall face,
+     * which is what `props/colorparkprobe.mjs` can gate as a total claim; a
+     * deck standing 0.56 m proud would have to be carved out of that sweep by
+     * a rule keyed to this loop's own coordinates. So the ledge paints itself.
+     */
+    box(T, LEDGE_PAINT[i % LEDGE_PAINT.length], wx, g + 0.575, wz, 7.4, 0.03, 1.1,
+      -F.yaw, [0.85, 0.5, 0.3]);
+    // The steel coping every ledge in every skate park in the world wears.
     box(T, 'steel_light', wx, g + 0.58, wz, 7.6, 0.09, 0.16, -F.yaw, [0.75, 0.4, 0.2]);
     T.box('concrete', wx, g + 0.28, wz, 7.5, 0.6, 1.2, -F.yaw);
   }
 
   /* ---- the trail, and the bank wall between it and the river ------------- */
   walkStrip(T, 'roof_tar', F, ga, -HU + 2, -HV * 0.86, HU - 2, -HV * 0.86, 3.2, 0.07, [0.6, 0.6, 0.35]);
-  for (let i = 0; i < 16; i++) {
-    const u = -HU + (i / 15) * HU * 2;
+  // 24 bays rather than 16: the same 152 m of bank, sampled half again as
+  // often, so a wall that follows a falling bank steps in 60 mm rather than
+  // 100 mm and never lifts off it.
+  const BANK_N = 24;
+  for (let i = 0; i < BANK_N; i++) {
+    const u = -HU + (i / (BANK_N - 1)) * HU * 2;
     const wx = F.x(u, -HV - 1.4);
     const wz = F.z(u, -HV - 1.4);
     const g = ga(wx, wz);
-    box(T, 'stone_soot', wx, g + 0.42, wz, (HU * 2) / 15 + 0.2, 0.9, 0.7, -F.yaw, [0.7, 0.8, 0.4], _sharedChamfer());
+    box(T, 'stone_soot', wx, g + 0.42, wz, (HU * 2) / (BANK_N - 1) + 0.2, 0.9, 0.7, -F.yaw, [0.7, 0.8, 0.4], _sharedChamfer());
     // a rail on top of the bank wall, because the drop behind it is the river
-    if (i < 15) {
+    if (i < BANK_N - 1) {
       for (const h of [0.72, 1.1]) {
-        box(T, 'steel_dark', wx, g + 0.42 + h, wz, (HU * 2) / 15 + 0.2, 0.06, 0.06, -F.yaw, [0.6, 0.5, 0.3]);
+        box(T, 'steel_dark', wx, g + 0.42 + h, wz, (HU * 2) / (BANK_N - 1) + 0.2, 0.06, 0.06, -F.yaw, [0.6, 0.5, 0.3]);
       }
       box(T, 'steel_dark', wx, g + 1.0, wz, 0.09, 1.2, 0.09, -F.yaw, [0.6, 0.5, 0.3]);
     }
-    T.box('concrete', wx, g + 0.9, wz, (HU * 2) / 15 + 0.2, 1.8, 0.7, -F.yaw);
+    T.box('concrete', wx, g + 0.9, wz, (HU * 2) / (BANK_N - 1) + 0.2, 1.8, 0.7, -F.yaw);
   }
 
   /* ---- the landing: a timber pier off the trail for the excursion boats -- */

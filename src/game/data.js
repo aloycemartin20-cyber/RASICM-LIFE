@@ -125,7 +125,7 @@ export const GAS_STATIONS = [
 export const SAFEHOUSES = [
   { id: 'sh_aidan', name: 'DeCarlo Body Shop', x: 632, z: -464, owner: 'aidan', worldId: 'sh_bodyshop' },
   { id: 'sh_carson', name: "Carson's Boathouse", x: 88, z: 560, owner: 'carson', worldId: 'sh_boathouse' },
-  { id: 'sh_dylan', name: "Dylan's Garage", x: -504, z: 432, owner: 'dylan', worldId: 'sh_garage' },
+  { id: 'sh_dylan', name: "Dylan's Garage", x: -560, z: 552, owner: 'dylan', worldId: 'sh_garage' },
   { id: 'sh_dt', name: 'Triangle Apartment', x: -264, z: 96, owner: null, worldId: 'sh_apartment', respect: 300 },
   { id: 'sh_north', name: 'Shore Loft', x: -192, z: -672, owner: null, worldId: 'sh_loft', respect: 600 },
 ];

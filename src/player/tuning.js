@@ -4,9 +4,10 @@
  * Calibrated against Grand Theft Auto V's on-foot and in-car cameras. Where a
  * value is a direct measurement off GTA V footage it says so.
  *
- *   walk            ~1.7 m/s   (WALK modifier held, or stick barely deflected)
- *   jog             ~3.3 m/s   (mid stick only — the keyboard has no jog)
- *   run             6.4-7.9    (per brother, DESIGN.md "run speed") — THE DEFAULT
+ *   walk            ~1.7 m/s   (WALK modifier — Alt — or stick barely deflected)
+ *   analogue jog    ~3.3 m/s   (mid stick only; the keyboard steps over it)
+ *   jog             4.6-5.7    (W alone: `MOVE.autoJogScale` x the run) — THE DEFAULT
+ *   run             6.4-7.9    (SHIFT, or full stick: DESIGN.md "run speed")
  *   crouch walk     ~1.5 m/s
  *   jump apex       ~0.62 m
  *   camera distance 3.4 m at rest -> 4.6 m at sprint, 1.6 m aiming
@@ -149,33 +150,56 @@ export const MOVE = {
   sprintSpeed: 6.9,
 
   /**
-   * AUTO-RUN. Push the stick (or W) all the way and you RUN — no key held.
-   *
-   * Reported by the owner as "I always need to hold in the run button to move
-   * fast enough", and he was describing a real asymmetry rather than a taste:
-   * `latchInput` has ALWAYS auto-sprinted a gamepad at full deflection
-   * (`Math.abs(input.stick.moveY) > 0.94`), and the keyboard — where
-   * `input.stick` is all zeroes — was simply left out of that line. A player on
-   * WASD therefore topped out at `jogSpeed` (3.35 m/s) unless Shift was held,
-   * while a player on a pad got 6.4-7.9 for free. This is the SAME threshold,
-   * applied to the movement magnitude instead of to one raw pad axis, so both
-   * devices now cross it at the same place and a full diagonal counts too
-   * (`|moveY|` alone reads 0.71 on a diagonal and used to refuse).
+   * FULL DEFLECTION. The magnitude at which W (or a stick at its stop) stops
+   * being the analogue ramp and engages a committed gait.
    *
    * 0.94 and not 1.0: a stick never quite reaches its stop, and not lower,
    * because everything under it must stay reachable as an analogue gait —
-   * below this the ramp in `targetSpeed` still runs walk -> jog.
+   * below this the ramp in `targetSpeed` still runs walk -> jog. It is the same
+   * threshold the pad has always used (`|stick.moveY| > 0.94` in `latchInput`),
+   * applied to the movement magnitude instead of to one raw axis, so both
+   * devices cross it in the same place and a full diagonal counts too
+   * (`|moveY|` alone reads 0.71 on a diagonal and used to refuse).
    *
-   * Shift is UNCHANGED and still forces the run at any magnitude over 0.45.
-   * It was deliberately not repurposed as the walk modifier: the same action
-   * carries the vehicle nitro (`NITRO`, on the sprint control), the gamepad
-   * full-stick sprint, and three probes outside this subsystem that press it
-   * (`src/weapons/arsenalprobe.mjs --sprint` among them). Holding it now buys
-   * nothing on foot, which is the point — it is never WRONG to hold, so the
-   * muscle memory the report describes keeps working while it stops being
-   * required. The walk lives on the WALK modifier (Alt, `ACTIONS.walk`).
+   * The name is `autoRunMag` and stays that way: it is quoted by name from
+   * outside this subsystem (`src/weapons/arsenalprobe.mjs`), which cannot be
+   * edited from here, so a rename would only leave a stale reference behind.
    */
   autoRunMag: 0.94,
+
+  /**
+   * THE MIDDLE TIER. What W alone is worth, as a fraction of the brother's
+   * authored run speed: Carson 4.61, Aidan 4.97, Dylan 5.69 m/s.
+   *
+   * There are three gaits a keyboard can ask for and they must be three
+   * different speeds. The auto-run wave gave full deflection the WHOLE run and
+   * left Shift bound to the same number, which the owner then reported from the
+   * other end: "player walks a little too fast and run doesn't seem to do
+   * anything now". Both halves of that are one bug — a control that cannot
+   * change the speed is a dead control, and with nothing above it the default
+   * has to carry the top speed and therefore feels rushed.
+   *
+   * 0.72 rather than some rounder number, from three directions that agree:
+   *
+   *   - it puts Carson at 4.61 m/s, a 5:24 mile. That is a real person moving
+   *     with purpose and late for something; 6.4 is a person being chased.
+   *   - it sits clear of both neighbours on every brother, which is what makes
+   *     the ladder legible under the thumb: 1.72 walk -> 4.61-5.69 jog ->
+   *     6.4-7.9 run. The SMALLEST step on it is 1/0.72 = 1.39x (jog to run, the
+   *     same ratio for all three by construction); the walk to the jog is
+   *     2.68x. Shift is worth +1.79 to +2.21 m/s, i.e. 39 % for holding a key.
+   *   - it is above `MOVE.hardStopSpeed` (4.2) for all three, so the default
+   *     gait keeps the planted stop it has had since the auto-run wave, and
+   *     above `FOOTSTEP.runSpeed` so the feet still sound like running feet.
+   *
+   * Scaling the RUN rather than authoring a fourth absolute is deliberate: the
+   * brothers are meant to feel different to move (DESIGN.md), and a flat jog
+   * speed would erase that difference at the one gait the player spends most of
+   * the game in. `jogSpeed` (3.35) is untouched — it is the analogue ramp's
+   * ceiling and the negative control both probes drive `autoRun = false` to
+   * reach.
+   */
+  autoJogScale: 0.72,
   crouchSpeed: 1.48,
   swimSpeed: 2.1,
   swimSprint: 3.4,
@@ -869,7 +893,17 @@ export const HEALTH = {
 export const FOOTSTEP = {
   lateral: 0.13,
   probe: 0.9,
-  runSpeed: 4.6,
+  /**
+   * Above this the plant is a RUNNING plant — louder sample, bigger scuff.
+   *
+   * 4.2 and not the 4.6 it was: the middle tier (`MOVE.autoJogScale`) puts
+   * Carson at 4.608 m/s, eight millimetres per second above the old value, so
+   * the DEFAULT gait sat exactly on the threshold and any camber, friction
+   * patch or turn flipped the footsteps between walking and running mid-stride.
+   * 4.2 clears all three brothers' jog tiers (4.61 / 4.97 / 5.69) with margin
+   * and is the same "above a jog" line `MOVE.hardStopSpeed` draws.
+   */
+  runSpeed: 4.2,
   landHold: 0.12,
 };
 

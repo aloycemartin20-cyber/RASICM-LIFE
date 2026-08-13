@@ -538,7 +538,45 @@ export const DOCKS = wave([
 export const SAFEHOUSES = [
   { id: 'sh_boathouse', name: "Carson's Boathouse", x: 88, z: 560 },
   { id: 'sh_bodyshop', name: 'DeCarlo Body Shop', x: 632, z: -464 },
-  { id: 'sh_garage', name: "Dylan's Garage", x: -504, z: 432 },
+  /**
+   * DYLAN'S GARAGE MOVED OFF THE BLUFF FACE, and it had to.
+   *
+   * The authored point was (-504, 432). The owner's report — "dylan starts in
+   * the wall" — is that coordinate exactly: MEASURED on the analytic terrain it
+   * stands at 92.0 m on the Mt. Washington CLIFF, `slopeAt(...,3)` = 0.77 (the
+   * `world.isOpen` reject bar is 0.62), on a face that climbs from 15 m at
+   * z = 380 to 101 m at z = 440. The nearest drivable edge is 20.1 m away at
+   * (-513, 450) and its deck is 102 m — TEN METRES ABOVE the safehouse. So the
+   * one thing a start point has to be, a piece of ground beside a street, it
+   * was not: `Director.groundPose` walks 2-16 m off that clifftop lane looking
+   * for pavement and lands on the corridor's own stepped retaining skirt, which
+   * is the "settle race" flake — the ankle probe reads bearings blocked because
+   * a road cut into a 77% slope IS a wall on its downhill side.
+   *
+   * The replacement is SURVEYED, not eyeballed, by the `groundtruthprobe`
+   * method (a pristine analytic terrain — `generateCity` mutates the
+   * heightfield, so each seed gets its own — plus the real emitted graph, over
+   * the same six seeds), and it is the best point on the plateau that satisfies
+   * what a start has to BE, on ALL SIX:
+   *
+   *   slope     0.039 worst over a 12 m forecourt ring (vs 0.77 before)
+   *   relief    1.2 m of height spread over a 26 m ring — this is the one that
+   *             fails on a bluff lip and passes nowhere near one, and it is the
+   *             criterion the old point could never have met
+   *   road      nearest drivable edge 11.4-11.6 m on every seed, outside
+   *             `corridorHalfWidth('street', 2) + 3` = 9.3 m so `resolvePoi`
+   *             keeps it (moved 0 m) rather than walking the forecourt away
+   *   deck      that edge's deck within 0.5 m of the ground he stands on
+   *
+   * It is 48 m up his own street from the Incline Diner (-560, 504) and 119 m
+   * from the incline's upper station, so it is still his corner of the hill.
+   *
+   * `src/game/data.js` `sh_dylan` and `src/ui/data.js` `sh_garage` MUST carry
+   * the same coordinate — `game` owns what a safehouse DOES and `ui` draws the
+   * pin, `world` owns whether the ground under it is somewhere you can stand.
+   * Those two are another subsystem's files; see the handoff note.
+   */
+  { id: 'sh_garage', name: "Dylan's Garage", x: -560, z: 552 },
   { id: 'sh_apartment', name: 'Triangle Apartment', x: -264, z: 96 },
   { id: 'sh_loft', name: 'Shore Loft', x: -192, z: -672 },
 ];

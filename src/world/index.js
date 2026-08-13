@@ -76,6 +76,20 @@ const STALE_TILE_LOADS = _qs?.get('owStaleTileLoads') === '1';
  * machine that is also doing something else.
  */
 const NO_AMORTISE = _qs?.get('owNoAmortise') === '1';
+/**
+ * `?owJobTrace=1` — TIME EVERY BUILD JOB AND NAME ITS PUSH SITE.
+ *
+ * `world._stats.buildMs` says the queue overran; it cannot say WHICH job, and
+ * the queue is shared — `buildings`, `props` and this subsystem all push into
+ * it. A 100 ms frame with `ran === 1` is one job, and until this existed the
+ * only way to find out whose was to guess.
+ *
+ * Off by default and it must stay that way: it costs an `Error` per push (a
+ * stack capture) and a clock read per job, which is exactly the kind of
+ * measurement that changes what it measures. `tools/perfcheck.mjs` turns it on
+ * for an attribution pass and off for the graded one.
+ */
+const JOB_TRACE = _qs?.get('owJobTrace') === '1';
 
 /**
  * Run `fn` with a render target bound, so every program compiled inside it gets
@@ -199,6 +213,59 @@ const SECTOR_ATTACH_PER_FRAME = 6;
  * amortised and this one always is.
  */
 const TCOL_ROWS_PER_JOB = 12;
+
+/**
+ * ROAD SECTOR CHUNKS — units of work one sector build job does, and a recorded
+ * NEGATIVE RESULT about making them adaptive, so nobody spends the afternoon
+ * again.
+ *
+ * `SectorBuild.step(n)` does `n` units and returns whether it finished. 8 for
+ * the visible sector, 24 for the collision-only one. Neither was ever measured
+ * when it was authored; both are now. MEASURED on the scripted drive through
+ * the R2 districts (`tools/perfcheck.mjs --drive --trace`), against a
+ * `q.tileBuildBudgetMs` of 5 ms — `over` is jobs that alone spent the whole
+ * frame's budget:
+ *
+ *     visible pump   (step 8)    worst 10.5 ms   over  8 of 822 jobs
+ *     collision pump (step 24)   worst  9.6 ms   over  1 of 296 jobs
+ *
+ * Both exceed the budget occasionally, so both were made to RETARGET off what
+ * the previous slice of the same job cost. Two versions, each A/B'd against its
+ * own `?owFixedChunk=1` control on one build:
+ *
+ *   grow and shrink (double when clear, halve when over) — WORSE. Collision
+ *     pump worst 9.8 -> 14.0 ms, jobs 291 -> 134. Cost per unit is wildly
+ *     non-uniform WITHIN a sector, so a run of empty units doubles the chunk
+ *     and the next dense junction is met at 64 units instead of 24. Growth
+ *     reacts to the past and pays in the future.
+ *   shrink only, authored count as a ceiling — NO EFFECT. over 8 -> 10 and
+ *     1 -> 1, worst 10.5 ms both arms.
+ *
+ * The second one is the informative failure: a sector job lives for only a
+ * handful of slices, so there is no history to learn from before it is done.
+ * Per-job adaptation cannot work here whatever the control law is.
+ *
+ * AND IT WOULD NOT HAVE MATTERED. Of the ~151 jobs that overran the budget on
+ * one drive, these two pumps are 9; `buildings`' per-tile build is ~90 (worst
+ * 133 ms) and the terrain clipmap ~45 (worst 26 ms). The streaming budgets in
+ * this file are not where the frames are going — see the two followups filed
+ * with the wave that measured this.
+ */
+const SECTOR_CHUNK = 8;
+const COL_CHUNK = 24;
+
+/**
+ * How far past `q.tileBuildBudgetMs` one frame's queue drain has to go before
+ * it counts as a rule-8 overrun, and how many of them buy one console warning.
+ *
+ * 3x, not 1.01x: the budget is checked BETWEEN jobs, so the last job of a frame
+ * legitimately carries the drain a little past it every time the queue is busy,
+ * and a tripwire that fires on the normal case is a tripwire people mute. 3x is
+ * a job that is too big to be a job. 30 frames because a handful during the
+ * first ring around a spawn is the streamer doing its job, and a rate is not.
+ */
+const OVERRUN_FACTOR = 3;
+const OVERRUN_WARN_AT = 30;
 
 /**
  * THE SAFETY NET — a coarse ground sheet over the WHOLE city, resident from
@@ -377,6 +444,7 @@ export class WorldSystem {
 
     /* ---- 4. streaming state -------------------------------------------- */
     this.queue = new JobQueue();
+    if (JOB_TRACE) this._installJobTrace();
     this._tiles = new RingTracker(TILE);
     this._sectors = new RingTracker(SECTOR);
     this._far = new Map(); // sectorKey -> mesh (low-detail road ribbon)
@@ -395,7 +463,16 @@ export class WorldSystem {
      * first. Drained by `_pumpAttach` at a fixed number of meshes per frame.
      */
     this._attachQ = [];
-    this._stats = { sectors: 0, tiles: 0, tris: 0, buildMs: 0 };
+    /**
+     * `attached` is the meshes `_pumpAttach` let into the scene THIS frame, and
+     * it exists so a hitch can be attributed: `geoDelta` alone cannot separate
+     * a build job that uploaded geometry from an attach burst that did.
+     * `tools/perfcheck.mjs --drive` reads it. A label, never an assertion.
+     */
+    this._stats = {
+      sectors: 0, tiles: 0, tris: 0, buildMs: 0, attached: 0, physMs: 0,
+      overruns: 0, worstBuildMs: 0,
+    };
     this._now = typeof performance !== 'undefined' ? () => performance.now() : () => Date.now();
     this._camPos = new THREE.Vector3();
     this._v = new THREE.Vector3();
@@ -570,17 +647,31 @@ export class WorldSystem {
     // Capture mode budgets the queue in JOBS, not milliseconds — see
     // DET_JOBS_PER_FRAME. Play keeps its wall-clock budget untouched, because a
     // frame that overruns is a stutter.
-    this.queue.run(q.tileBuildBudgetMs ?? 5, this._now, this._jobBudget(ctx));
+    const budgetMs = q.tileBuildBudgetMs ?? 5;
+    this.queue.run(budgetMs, this._now, this._jobBudget(ctx));
     // AFTER the queue, and outside its budget on purpose: this is a per-frame
     // COUNT of geometry uploads, and its cost lands in the renderer rather than
     // here. See `_streamSectors`.
     this._pumpAttach();
     this._stats.buildMs = this._now() - t0;
+    if (this._stats.buildMs > this._stats.worstBuildMs) this._stats.worstBuildMs = this._stats.buildMs;
+    this._noteOverrun(ctx, budgetMs);
 
+    /**
+     * The static BVH republish, and it is OUTSIDE `buildMs` on purpose — it is
+     * not a build job, it is one indivisible O(tris) rebuild of the collision
+     * world. Timed separately because it is the one per-frame step in this
+     * subsystem that `q.tileBuildBudgetMs` has never covered, and at speed it
+     * fires on a fixed 12-frame cadence for as long as road collision is
+     * streaming. `tools/perfcheck.mjs --drive` reads `physMs`.
+     */
+    this._stats.physMs = 0;
     if (this._physDirty && ctx.time.frame - this._physFrame > 12) {
       this._physFrame = ctx.time.frame;
       this._physDirty = false;
+      const p0 = this._now();
       this.physics?.rebuildStatic?.();
+      this._stats.physMs = this._now() - p0;
     }
 
     // Idle bookkeeping for `streamingIdle()` / the capture harness.
@@ -611,6 +702,100 @@ export class WorldSystem {
   _jobBudget(ctx) {
     if (ctx.config.deterministic !== true || WALL_CLOCK_BUILD) return 0;
     return DET_JOBS_OVERRIDE > 0 ? DET_JOBS_OVERRIDE : DET_JOBS_PER_FRAME;
+  }
+
+  /**
+   * Wrap `queue.push` so every job — this subsystem's, `buildings`', `props`'
+   * — is timed and carries the file:line that pushed it. See `JOB_TRACE`.
+   *
+   * Patched onto the queue instance rather than built into `JobQueue`, because
+   * a diagnostic that only runs under a query flag has no business in the class
+   * every frame of every session goes through.
+   *
+   * `world._jobTrace` is `{ label -> { n, ms, worst, over } }`, read by
+   * `tools/perfcheck.mjs --drive --trace`.
+   */
+  _installJobTrace() {
+    const q = this.queue;
+    const world = this;   // the wrappers below are NAMED functions, for the stack
+    const trace = new Map();
+    this._jobTrace = trace;
+    const push = q.push.bind(q);
+    /**
+     * The push site, as the two innermost `/src/` frames that are neither this
+     * wrapper nor the queue itself.
+     *
+     * TWO, not one, and both filters earned their place by producing a wrong
+     * answer first:
+     *   - `world/streaming.js` is the queue RUNNING a job, never its author, so
+     *     every self-requeuing pump attributed to the runner's one line.
+     *   - `buildings` and `props` reach the queue through `world.schedule()`,
+     *     so the innermost frame for their work is always this file's funnel
+     *     and every job in the game attributed to that one line instead.
+     * The pair disambiguates both without a heuristic about which file matters.
+     */
+    const site = () => {
+      const s = (new Error().stack ?? '').split('\n');
+      const hits = [];
+      for (let i = 2; i < s.length && hits.length < 2; i++) {
+        if (s[i].includes('owJobTrace')) continue;
+        // The `?...` is not optional padding: the dev server this runs against
+        // hangs `?t=<mtime>` / `?import` on module URLs, and a pattern that
+        // wanted `.js:` immediately attributed 5093 of 5193 jobs to "?".
+        const m = s[i].match(/\/src\/([\w./-]+\.js)(?:\?[^\s:)]*)?:(\d+):\d+/);
+        if (!m || /world\/streaming\.js/.test(m[1])) continue;
+        hits.push(`${m[1]}:${m[2]}`);
+      }
+      return hits.join(' < ') || '?';
+    };
+    q.push = function owJobTracePush(fn, priority = 4) {
+      const where = site();
+      return push(function owJobTraceRun() {
+        const t0 = performance.now();
+        fn();
+        const ms = performance.now() - t0;
+        let e = trace.get(where);
+        if (!e) trace.set(where, (e = { n: 0, ms: 0, worst: 0, over: 0 }));
+        e.n++;
+        e.ms += ms;
+        if (ms > e.worst) e.worst = ms;
+        // `over` is the number that matters for rule 8: how many times this
+        // push site produced a job that alone spent the WHOLE frame's build
+        // budget. A worst case is one bad tile; `over` is a rate.
+        if (ms > (world.ctx?.config?.q?.tileBuildBudgetMs ?? 5)) e.over++;
+      }, priority);
+    };
+  }
+
+  /**
+   * RULE 8'S TRIPWIRE — count the frames on which the shared build queue spent
+   * several times the budget it was handed, and say so once.
+   *
+   * `q.tileBuildBudgetMs` has always been a promise the queue could not keep:
+   * it budgets BETWEEN jobs and never inside one, so a single indivisible job
+   * spends whatever it likes and nothing anywhere reports that it did. That is
+   * how a content wave lands a 90 ms tile build and the only evidence is a
+   * player saying the game stutters at speed. This subsystem owns the queue, so
+   * it owns noticing.
+   *
+   * Costs one comparison per frame — `buildMs` is already measured. It names no
+   * culprit on purpose: attribution needs `--drive --trace`, and a per-job
+   * timer in the shipping path is exactly the measurement that changes what it
+   * measures. `world._stats.overruns` is the number; probes can read it.
+   *
+   * NEVER under `config.deterministic`: the budget there is denominated in
+   * JOBS, so `buildMs` is not being compared against anything.
+   */
+  _noteOverrun(ctx, budgetMs) {
+    if (ctx.config.deterministic === true || this._stats.buildMs <= budgetMs * OVERRUN_FACTOR) return;
+    this._stats.overruns++;
+    if (this._stats.overruns !== OVERRUN_WARN_AT) return;
+    console.warn(
+      `[world] the build queue has now overrun its ${budgetMs} ms budget by more than ` +
+        `${OVERRUN_FACTOR}x on ${OVERRUN_WARN_AT} frames (worst ${this._stats.worstBuildMs.toFixed(0)} ms). ` +
+        'A single build job cannot be preempted, so this is one job somewhere that is too big — ' +
+        'run `node tools/perfcheck.mjs --drive --trace` to find whose.'
+    );
   }
 
   /** ARCHITECTURE.md: amortised build job, respects the frame budget. */
@@ -745,7 +930,7 @@ export class WorldSystem {
             this._sectorJobs--;
             return;
           }
-          if (!rec.job.step(8)) {
+          if (!rec.job.step(SECTOR_CHUNK)) {
             this.queue.push(pump, pri);
             return;
           }
@@ -834,7 +1019,7 @@ export class WorldSystem {
             this._colJobs--;
             return;
           }
-          if (!rec.job.step(24)) {
+          if (!rec.job.step(COL_CHUNK)) {
             this.queue.push(pump, pri);
             return;
           }
@@ -877,6 +1062,7 @@ export class WorldSystem {
    */
   _pumpAttach() {
     let left = SECTOR_ATTACH_PER_FRAME;
+    this._stats.attached = 0;
     while (left > 0 && this._attachQ.length) {
       const rec = this._attachQ[0];
       if (!rec.pend) { this._attachQ.shift(); continue; }
@@ -884,6 +1070,7 @@ export class WorldSystem {
       for (; rec.pendI < end; rec.pendI++) {
         rec.group.add(rec.pend[rec.pendI]);
         left--;
+        this._stats.attached++;
       }
       if (rec.pendI < rec.pend.length) return;
       rec.pend = null;

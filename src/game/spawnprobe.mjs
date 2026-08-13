@@ -41,6 +41,30 @@ page.on('pageerror', (e) => errs.push(String(e.message).slice(0, 160)));
 const pump = (n) =>
   page.evaluate((k) => new Promise((d) => { let i = 0; const t = () => (++i >= k ? d() : requestAnimationFrame(t)); requestAnimationFrame(t); }), n);
 
+/**
+ * WAIT FOR THE CITY TO ARRIVE BEFORE MEASURING, and this is not politeness.
+ *
+ * Every check below reads the COLLISION world. Static collision streams in
+ * around the player, so a fixed 20-frame pump after a switch samples whatever
+ * happened to have loaded — the same trap this file's own note describes for
+ * the raw spawn point, one sector closer. MEASURED on the build this was added
+ * to: `dylan @ 13:00` reported 11 of 16 bearings blocked on one run and 0 on
+ * the next FROM THE IDENTICAL POSITION (-471.2, 12.0, 303.8), because the
+ * embankment beside him had or had not streamed at the shutter. A probe whose
+ * answer depends on that is a coin toss with a PASS printed on it.
+ *
+ * Waiting for `world.streamingIdle` also lets `Director.tickUnstick` run — the
+ * deferred rescue is gated on the same predicate, so before this the probe was
+ * measuring a placement the game had not finished making.
+ */
+const settle = async (frames = 30) => {
+  for (let i = 0; i < 60; i++) {
+    if (await page.evaluate(() => window.__ENGINE__?.ctx?.peek('world')?.streamingIdle?.() === true)) break;
+    await pump(10);
+  }
+  await pump(frames);
+};
+
 /** Where is the player standing, and on what? */
 const sample = (label) =>
   page.evaluate((l) => {
@@ -137,7 +161,7 @@ try {
     await page.evaluate(() => { try { localStorage.clear(); } catch { /* private mode */ } });
     await page.reload({ waitUntil: 'domcontentloaded' });
     await page.waitForFunction('window.__READY__===true', null, { timeout: 120000 });
-    await pump(60);
+    await settle(60);
     check(await sample(`boot ${run + 1}`));
 
     /*
@@ -168,7 +192,7 @@ try {
             g.save.chars[who].pos = null;
             g.characters.switchTo(who);
           }, [hour, id]);
-          await pump(20);
+          await settle();
           check(await sample(`${id} @ ${hour}:00`));
         }
       }
@@ -198,7 +222,7 @@ try {
           g.characters.activeId = 'aidan';
           g.characters.switchTo('carson');
         }, [x, z]);
-        await pump(20);
+        await settle();
         check(await sample(`rescued from water ${x},${z}`));
       }
 

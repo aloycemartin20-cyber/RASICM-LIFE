@@ -63,6 +63,16 @@ const SITES = {
   southside: { near: [160, 608], doc: 'South Side — Carson Street arterial' },
   bridge: { near: [-150, -20], doc: 'Sixth Street Bridge approach — a chokepoint' },
   mtwash: { near: [-528, 464], doc: 'Mt. Washington — hills and bends' },
+  /**
+   * The two sites the R2 content wave added streets to, and the one the owner
+   * filed a report against. A sweep that only ever stands downtown cannot
+   * convict or exonerate an edge in Oakland, and "the harness is green" then
+   * means "the harness is green WHERE IT STANDS" — which is not what a
+   * carriageway ratchet is read as.
+   */
+  smithfield: { near: [-110, 296], doc: 'Smithfield St Bridge north approach — the reported pile-up' },
+  oakland: { near: [520, 40], doc: 'Oakland campus grid — the R2 street work, Cathedral ring' },
+  ironwood: { near: [676, 164], doc: 'Ironwood Park drive — a ring road around 84 m of lawn' },
 };
 
 const MINUTES = Number(args.minutes ?? 1);
@@ -294,7 +304,16 @@ check(
   R.offroad.pct < 2.2,
   'cars stay on the carriageway (RATCHET 2.2, goal 1.5)',
   `${R.offroad.pct.toFixed(2)}% of samples with a wheel past the kerb, worst ${R.offroad.max.toFixed(2)} m over` +
-    (R.offroad.worst ? ` [${JSON.stringify(R.offroad.worst)}]` : '')
+    (R.offroad.worst ? ` [${JSON.stringify(R.offroad.worst)}]` : '') +
+    /**
+     * ...and WHERE. One cell holding most of the samples is a broken edge and
+     * belongs to whoever owns the road network; a scatter across the grid is
+     * the drivers' own kerb-clipping and belongs here.
+     */
+    (R.offroad.cells?.length
+      ? `\n        offenders by 40 m cell: ` +
+        R.offroad.cells.map((c) => `(${c.at}) ${c.pct}% n=${c.n} cars=${c.cars} max=${c.max}m ${c.kind}#${c.ei}`).join('  ')
+      : '')
 );
 /**
  * LANE KEEPING IS NOW MEASURED AGAINST THE EMITTED LANE GEOMETRY (rule 12):
@@ -520,6 +539,17 @@ function installProbe() {
     roadN: 0,
     roadMax: -99,
     worst: null,
+    /**
+     * WHERE the off-carriageway samples are, not just how many.
+     *
+     * A single percentage cannot tell a fleet that clips 27 kerbs all over a
+     * grid apart from a fleet that drives one broken edge into a park — and
+     * those are opposite bugs with opposite owners. Bucketed into 40 m cells
+     * (about one city block face), keyed on the sample's own position, and
+     * carrying the id of the graph edge each offender was nearest to so a
+     * convicted cell names an EDGE with coordinates rather than a vibe.
+     */
+    offCells: new Map(),
     carFrames: 0,
     speedSum: 0,
     speeding: 0,
@@ -841,7 +871,23 @@ function installProbe() {
             links: d._count,
           };
         }
-        if (over > 0.5) S.offroad++;
+        if (over > 0.5) {
+          S.offroad++;
+          // 40 m cells, on the SAMPLE's position: a cluster is what a broken
+          // edge looks like from here, and a scatter is what kerb-clipping
+          // looks like. `ei` is the graph's own edge index, which is what a
+          // followup to the world owner has to name.
+          const key = `${Math.round(v.position.x / 40) * 40},${Math.round(v.position.z / 40) * 40}`;
+          const cell = S.offCells.get(key) ?? { n: 0, max: 0, cars: new Set(), kind: '?', ei: -1 };
+          cell.n++;
+          if (over > cell.max) {
+            cell.max = over;
+            cell.kind = ne.edge ? ne.edge.kind : '?';
+            cell.ei = ne.edge ? roads.edges.indexOf(ne.edge) : -1;
+          }
+          cell.cars.add(d.id);
+          S.offCells.set(key, cell);
+        }
       }
 
       const limit = d._count > 0 ? traffic.lanes.limit(d._edge(0)) : 30;
@@ -1112,6 +1158,14 @@ function installProbe() {
           pct: S.roadN ? (S.offroad / S.roadN) * 100 : 0,
           max: S.roadMax,
           worst: S.worst,
+          /** Top offender cells, worst first. See `offCells`. */
+          cells: [...S.offCells.entries()]
+            .map(([k, c]) => ({
+              at: k, n: c.n, cars: c.cars.size, max: +c.max.toFixed(2), kind: c.kind, ei: c.ei,
+              pct: S.roadN ? +((c.n / S.roadN) * 100).toFixed(2) : 0,
+            }))
+            .sort((a, b) => b.n - a.n)
+            .slice(0, 8),
         },
         stuck: {
           worst: S.stopWorst, over20: S.stopOver20, ctx: S.stopCtx,

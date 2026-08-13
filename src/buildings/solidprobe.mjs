@@ -150,6 +150,14 @@ const MAP = typeof args.map === 'string' ? args.map : args.map ? '*' : '';
  * `--nokerb` turns the guard off so the residual can be attributed.
  */
 const NOKERB = !!args.nokerb;
+/**
+ * `--noreserve` is the NEGATIVE CONTROL FOR GATE 5, and it is one flag over
+ * `--url=owNoLmReserve=1`: it ships the city with `world/lots.js`'s landmark
+ * reserve OFF and nothing else changed, so the run measures the reserve and
+ * not the wave that happened to land with it. Gate 5 must go red, and the run
+ * exits 0 only if it does — same contract as `--legacy` for gate 1.
+ */
+const NORESERVE = !!args.noreserve;
 
 const log = (...a) => { if (!JSON_OUT) console.log(...a); };
 const results = [];
@@ -650,6 +658,85 @@ const free = (built) => {
   for (const cm of built.colMeshes ?? []) cm.geometry?.dispose();
 };
 
+/* ====================================================================== */
+/* THE LANDMARK RESERVE — does any GENERATED building stand on a site?    */
+/* ====================================================================== */
+/**
+ * THE REPORT: "there is a building directly on top of the point fountain".
+ *
+ * RULE 12. Nothing below reads \`world/lots.js\`'s predicate, \`landmarkClaims\`,
+ * or any reserve constant. It reads the EMITTED TRIANGLES of each generated
+ * building — the ones the camera photographs — and measures them against the
+ * site table \`world\` publishes, with the rounded-box field written out again
+ * here. If \`plan.js\` and this file ever disagree about what \`yaw\`, \`hx\` or
+ * \`ox\` mean, this goes red rather than agreeing with itself.
+ *
+ * The sites are the LANDMARK's ground, not a courtesy margin: \`site\` is the
+ * footprint each landmark actually occupies (measured off its own geometry,
+ * see the table in \`world/plan.js\`), so one triangle of a generated building
+ * inside one is a building standing in the fountain basin.
+ */
+const SITES = (world.landmarks ?? []).filter((l) => l && l.site).map((l) => ({
+  id: l.id,
+  x: l.x + (l.site.ox ?? 0),
+  z: l.z + (l.site.oz ?? 0),
+  hx: l.site.hx ?? 0,
+  hz: l.site.hz ?? 0,
+  r: l.site.r ?? 0,
+  c: Math.cos(l.site.yaw ?? 0),
+  s: Math.sin(l.site.yaw ?? 0),
+  reach: Math.hypot(l.site.hx ?? 0, l.site.hz ?? 0) + (l.site.r ?? 0),
+}));
+/** Signed distance to one site, negative inside. Written independently. */
+const sdSite = (S, x, z) => {
+  const dx = x - S.x, dz = z - S.z;
+  const qx = Math.abs(dx * S.c + dz * S.s) - S.hx;
+  const qz = Math.abs(-dx * S.s + dz * S.c) - S.hz;
+  const ax = qx > 0 ? qx : 0, az = qz > 0 ? qz : 0;
+  return Math.sqrt(ax * ax + az * az) + Math.min(Math.max(qx, qz), 0) - S.r;
+};
+/**
+ * Deepest intrusion of a built lot's DRAWN geometry into any site, or null.
+ * Cheap-rejected on the plan centroid first: a building whose centroid is
+ * further from a site than the site's reach plus the widest lot in the city
+ * (the mill's 78 m frontage on a 62 m depth) cannot reach it, so the vertex
+ * walk only ever runs in a landmark's own neighbourhood.
+ */
+const LOT_REACH = 110;
+const _sv = new V3();
+const _sm = new M4();
+function siteBreach(built, cx, cz) {
+  let near = null;
+  for (const S of SITES) {
+    if (sdSite(S, cx, cz) >= LOT_REACH) continue;
+    (near = near ?? []).push(S);
+    lotsNearSites[S.id] = (lotsNearSites[S.id] ?? 0) + 1;
+  }
+  if (!near) return null;
+  let worst = null;
+  const scan = (geo, mat) => {
+    const pos = geo.attributes?.position; if (!pos) return;
+    for (let i = 0; i < pos.count; i++) {
+      _sv.fromBufferAttribute(pos, i).applyMatrix4(mat);
+      for (const S of near) {
+        const d = sdSite(S, _sv.x, _sv.z);
+        if (d < 0 && (!worst || d < worst.d)) worst = { d, id: S.id, x: _sv.x, z: _sv.z };
+      }
+    }
+  };
+  built.group.updateMatrixWorld(true);
+  built.group.traverse((o) => {
+    if (!o.isMesh && !o.isInstancedMesh) return;
+    const g = o.geometry; if (!g) return;
+    if (o.isInstancedMesh) {
+      for (let k = 0; k < o.count; k++) { o.getMatrixAt(k, _sm); _sm.premultiply(o.matrixWorld); scan(g, _sm); }
+    } else scan(g, o.matrixWorld);
+  });
+  return worst;
+}
+const breaches = [];
+const lotsNearSites = {};
+
 /* ---- generated lots -------------------------------------------------- */
 const keys = [...(world._lotsByTile?.keys() ?? [])];
 const useKeys = ARG.tiles ? keys.slice(0, ARG.tiles) : keys;
@@ -667,6 +754,13 @@ for (const key of useKeys) {
       B.buildPlan(T, plan, 0);
       built = T.build(null);
     } catch (err) { buildFail++; continue; }
+    try {
+      const br = siteBreach(built, plan.centroid[0], plan.centroid[1]);
+      if (br && breaches.length < 60) {
+        breaches.push({ arch: plan.arch, lm: br.id, pen: +(-br.d).toFixed(2),
+          x: +br.x.toFixed(1), z: +br.z.toFixed(1) });
+      } else if (br) breaches.push(null);
+    } catch (err) { /* one building's vertices must not end the sweep */ }
     try {
       const m = measure(built, plan.centroid[0], plan.centroid[1],
         ARG.map && (ARG.map === "*" || ARG.map === "ghost" || ARG.map === plan.arch) && !mapped ? ARG.map : false);
@@ -697,7 +791,9 @@ for (const lm of LANDMARKS) {
 }
 
 return { perArch, perLm, ghosts: ghosts.slice(0, 40), ghostN: ghosts.length,
-         buildings, tilesSeen, planFail, buildFail, mapped };
+         buildings, tilesSeen, planFail, buildFail, mapped,
+         breaches: breaches.filter(Boolean), breachN: breaches.length,
+         lotsNearSites, siteN: SITES.length };
 `;
 
 /* ==================================================================== */
@@ -722,7 +818,8 @@ try {
    * control (see `facadeOpts` in facade.js) with the stream left exactly where
    * this build put it, so the two runs differ by the geometry alone.
    */
-  const extraQuery = typeof args.url === 'string' ? `&${String(args.url).replace(/^[?&]/, '')}` : '';
+  const extraQuery = (typeof args.url === 'string' ? `&${String(args.url).replace(/^[?&]/, '')}` : '')
+    + (NORESERVE ? '&owNoLmReserve=1' : '');
   await page.goto(`http://127.0.0.1:${port}/?q=low&prewarm=0&capture=1&lockstep=1${extraQuery}`,
     { waitUntil: 'domcontentloaded' });
   await page.waitForFunction('window.__READY__===true', null, { timeout: 180000 });
@@ -827,6 +924,28 @@ try {
     `${LANDMARK_IDS.length - lmOpen}/${LANDMARK_IDS.length} enclose massing, ` +
     `${lmOpen} open (the fountain plaza and the incline trestle; ratchet 2)`);
 
+  /**
+   * GATE 5 — THE LANDMARK RESERVE.
+   *
+   * "Zero" is the only defensible bar: a site is the ground a hand-authored
+   * building already stands on, so one generated wall inside one is a wall
+   * inside the Point Fountain's basin. Reported alongside it is how many
+   * generated buildings were tested in each landmark's neighbourhood, because
+   * a sweep that happened to examine nothing would pass silently.
+   */
+  const nearRows = Object.entries(R.lotsNearSites ?? {}).sort((a, b) => b[1] - a[1]);
+  log(`\n  generated buildings tested within 110 m of each of the ${R.siteN} sites:`);
+  log('   ' + (nearRows.length ? nearRows.map(([k, v]) => `${k} ${v}`).join('   ') : 'none — the sweep saw no landmark'));
+  const byLm = {};
+  for (const b of R.breaches) byLm[b.lm] = (byLm[b.lm] ?? 0) + 1;
+  rec('5 RESERVE  no generated building stands on a landmark site',
+    R.breachN === 0 && nearRows.length >= 6,
+    R.breachN === 0
+      ? `0 of ${R.buildings} buildings intrude; ${nearRows.length} sites had neighbours tested`
+      : `${R.breachN} building(s) inside a site — ${Object.entries(byLm).map(([k, v]) => `${k} x${v}`).join(', ')}` +
+        `; worst ${R.breaches.map((b) => b.pen).reduce((a, b) => Math.max(a, b), 0)} m, ` +
+        `e.g. ${R.breaches.slice(0, 3).map((b) => `${b.arch} ${b.pen} m into ${b.lm} at (${b.x}, ${b.z})`).join('; ')}`);
+
   if (R.mapped) {
     log(`\n  drawn footprint of a failing ${R.mapped.arch} at (${R.mapped.x.toFixed(0)}, ${R.mapped.z.toFixed(0)}):`);
     for (const r of R.mapped.rows) log('    ' + r);
@@ -845,6 +964,13 @@ try {
     log(broke
       ? '  negative control OK: without the volume shell, SEALED fails'
       : '  NEGATIVE CONTROL DID NOT REPRODUCE — this gate is not measuring anything');
+    exitCode = broke ? 0 : 1;
+  }
+  if (NORESERVE) {
+    const broke = results.some((r) => !r.ok && /^5 /.test(r.name));
+    log(broke
+      ? '  negative control OK: with the landmark reserve off, RESERVE fails'
+      : '  NEGATIVE CONTROL DID NOT REPRODUCE — gate 5 is not measuring anything');
     exitCode = broke ? 0 : 1;
   }
 } catch (e) {

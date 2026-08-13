@@ -113,6 +113,11 @@ export class Unit {
     this._interceptCool = 0;
     /** Seconds of road-network discipline owed after an unstick. */
     this._directCool = 0;
+    /** Latched answer of `_directLegal`, and how long it is still good for. */
+    this._directOk = true;
+    this._directOkT = 0;
+    this._dirGx = 0;
+    this._dirGz = 0;
     /** Unbroken seconds without moving, whatever the reason. */
     this._frozenT = 0;
     /** How many times this unit has been written off as wedged. */
@@ -154,6 +159,8 @@ export class Unit {
     this._holdT = 0;
     this._interceptCool = 0;
     this._directCool = 0;
+    this._directOk = true;
+    this._directOkT = 0;
     this._frozenT = 0;
     this._giveUps = 0;
     this.deployed = false;
@@ -468,7 +475,7 @@ export class Unit {
         } else {
           this._holdT = 0;
           out.set(this.holdPose.x, 0, this.holdPose.z);
-          return d < 34 ? 'direct' : 'path';
+          return d < 34 && this._directLegal(dt, out.x, out.z) ? 'direct' : 'path';
         }
       } else {
         this.role = ROLE.CHASE;
@@ -506,7 +513,7 @@ export class Unit {
     if (this.role === ROLE.INTERCEPT && this.holdPose) {
       out.set(this.holdPose.x, 0, this.holdPose.z);
       const d = Math.hypot(v.position.x - this.holdPose.x, v.position.z - this.holdPose.z);
-      return d < 40 ? 'direct' : 'path';
+      return d < 40 && this._directLegal(dt, out.x, out.z) ? 'direct' : 'path';
     }
 
     /* ---- PIT: aim through the quarry's rear quarter ------------------- */
@@ -515,7 +522,10 @@ export class Unit {
       out.copy(q.position)
         .addScaledVector(_tmp, this.pitSide * 2.6)
         .addScaledVector(q.forward, -q.halfLength * 0.55);
-      return 'direct';
+      // A PIT is a contact manoeuvre, so this is normally inside `directFinal`
+      // and the test is a no-op. A PIT assigned from 60 m across a lawn is not
+      // a PIT, it is the pile-up — route to it and try again when we arrive.
+      return this._directLegal(dt, out.x, out.z) ? 'direct' : 'path';
     }
 
     /* ---- FLANK: come alongside, offset laterally --------------------- */
@@ -525,7 +535,7 @@ export class Unit {
       out.copy(q.position)
         .addScaledVector(_tmp, this.pitSide * 5.2)
         .addScaledVector(q.forward, lead);
-      return dist < 70 && this.los ? 'direct' : 'path';
+      return dist < 70 && this.los && this._directLegal(dt, out.x, out.z) ? 'direct' : 'path';
     }
 
     /* ---- CHASE / RESPOND --------------------------------------------- */
@@ -557,10 +567,91 @@ export class Unit {
      * So every time the unstick fires, improvisation is suspended for
      * `TUNE.directCool` seconds and the unit drives the road network, which is
      * drivable by construction.
+     *
+     * ...and `_directLegal` is the other half of the same lesson, learned from
+     * the owner's park pile-up: sight of the quarry is not evidence that a car
+     * can get there. Improvisation is now bounded by the carriageway until the
+     * final `TUNE.directFinal` metres.
      */
     const direct = dist < (this.role === ROLE.CHASE ? 85 : 45) && this.los &&
       !(this._directCool > 0);
-    return direct ? 'direct' : 'path';
+    return direct && this._directLegal(dt, out.x, out.z) ? 'direct' : 'path';
+  }
+
+  /**
+   * MAY THIS UNIT LEAVE THE ROAD NETWORK TO GET TO `gx, gz`?
+   *
+   * The rule the owner's report asks for: hold the roads until a SHORT FINAL
+   * APPROACH. Inside `TUNE.directFinal` the answer is always yes — that is
+   * contact range, where a route is useless and the PIT and the box-in are
+   * meant to leave the tarmac. Beyond it, the straight line has to be a line a
+   * car could drive: sampled every `TUNE.directStep` metres against the road
+   * graph, each sample within `TUNE.directVerge` of some carriageway.
+   *
+   * This is the difference between a cruiser cutting a corner through a
+   * junction (every sample is on tarmac; still allowed, still what makes a
+   * chase read as improvised) and a cruiser crossing a park at 25 m/s because
+   * it can SEE the quarry across the lawn (samples in the middle are 30 m from
+   * any road; refused, and it drives the park drive instead).
+   *
+   * Latched for `TUNE.directHold` seconds — see the note on that tunable for
+   * why this may not run at the control rate. The answer is recomputed
+   * immediately whenever the goal moves more than a car length, so a quarry
+   * that turns off the road is not chased on a stale yes.
+   *
+   * `sys.debugNoRoadHold` is the negative control (`pursuitprobe --control`):
+   * with it set this always says yes and the pre-fix behaviour is back.
+   */
+  _directLegal(dt, gx, gz) {
+    const sys = this.sys;
+    if (sys.debugNoRoadHold) return true;
+    const v = this.vehicle;
+    const dx = gx - v.position.x;
+    const dz = gz - v.position.z;
+    const d = Math.hypot(dx, dz);
+    if (d <= TUNE.directFinal) return true;
+    const roads = sys.roads;
+    // No graph to hold to (a probe stub, a torn-down scene): the old behaviour
+    // is the only behaviour available, and refusing everything would park the
+    // fleet.
+    if (!roads?.nearestEdge) return true;
+
+    this._directOkT -= dt;
+    const moved = Math.hypot(gx - this._dirGx, gz - this._dirGz) > 5;
+    if (this._directOkT > 0 && !moved) return this._directOk;
+    this._directOkT = TUNE.directHold;
+    this._dirGx = gx;
+    this._dirGz = gz;
+
+    /**
+     * SAMPLED FROM THE CAR ITSELF, `i = 0`, not from the first step out.
+     *
+     * MEASURED with the loop starting at `i = 1`: a cruiser standing 7 m out
+     * on the lawn at the Smithfield approach, 34 m from a quarry it could see,
+     * still emitted 'direct' — every sample it took was over the far side of
+     * the park, near enough to a kerb to pass, and the one place the test
+     * needed to look was the place the car was already standing. A car that is
+     * off the carriageway NOW cannot be allowed to improvise; it has to rejoin
+     * the network first, which is the whole rule.
+     *
+     * ...and stepped at `directStep` with a cap of 12 rather than 8: three
+     * samples over 34 m is a 11 m stride, and a park 20 m across fits between
+     * two of those with room to spare.
+     */
+    const n = Math.min(12, Math.max(2, Math.ceil(d / TUNE.directStep)));
+    let ok = true;
+    for (let i = 0; i <= n; i++) {
+      const t = i / n;
+      const x = v.position.x + dx * t;
+      const z = v.position.z + dz * t;
+      const hit = roads.nearestEdge(x, z, 80);
+      if (!hit?.edge || hit.dist - hit.edge.width * 0.5 > TUNE.directVerge) {
+        ok = false;
+        break;
+      }
+    }
+    this._directOk = ok;
+    return ok;
   }
 
   _atHold() {

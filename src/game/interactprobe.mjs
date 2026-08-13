@@ -97,7 +97,10 @@ const settle = async (frames = 20) => {
 };
 
 try {
-  await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'domcontentloaded', timeout: 90000 });
+  // `?cheats=1` is the seam the teleport area needs — `ui.cheats` is null
+  // without it (see the header of `src/ui/cheats.js`). It only builds the menu
+  // layer; nothing else in this file changes behaviour under it.
+  await page.goto(`http://127.0.0.1:${port}/?cheats=1`, { waitUntil: 'domcontentloaded', timeout: 90000 });
   await page.waitForFunction('window.__READY__===true', null, { timeout: 120000 });
   await pump(120);
   await run(`
@@ -1105,6 +1108,203 @@ try {
   rec('respect unlocks it and the ring opens',
     unlocked.has && !/LOCKED/.test(unlockedPrompt?.text ?? ''),
     `${unlocked.unlocks.join(', ')} · ${unlockedPrompt?.text ?? 'no prompt'}`);
+
+  /* =================================================================== */
+  area = 'teleport';
+  /* =================================================================== */
+  /*
+   * "TELEPORTING TO THE INCLINE CAUSES THE PLAYER TO GET STUCK UNDER THE
+   * BUILDING AND CAN'T GET OUT" — the owner's report, measured.
+   *
+   * Every destination the cheat menu offers is taken for real, the city is
+   * allowed to STREAM (this is the whole point: a spawn or a teleport is vetted
+   * against collision that does not exist yet, so the only honest place to ask
+   * is standing on it, after `world.streamingIdle`), and then two questions:
+   *
+   *   floor     the feet are not below `world.walkableHeightAt`. This is the
+   *             bridge class: a pin on a deck resolved to the RIVERBANK under
+   *             it, because `walkableHeightAt` with no `y` hint says so in its
+   *             own note — "a bridge deck more than a couple of metres off the
+   *             ground is ignored". All twelve bridges failed this.
+   *   bearings  at least `TP_BAR` of 16 bearings at ankle height are a way out,
+   *             by the same 2 m rule `spawnprobe` uses. This is the incline
+   *             class: INSIDE the lower station, 10 of 16 blocked, its roof
+   *             9.2 m overhead, and no rescue ever came because only a brother
+   *             switch armed `Director.armUnstick` — a cheat teleport did not.
+   *
+   * RATCHETED (rule 13), not absolute: a handful of destinations are the middle
+   * of a landmark whose interior is wider than the 30 m rescue ring — the Old
+   * Blast Furnace pin is 72 m inside its own site — and those are a POI-table
+   * question, not a placement one. The count may only go down.
+   */
+  const TP_BAR = 8;
+  /**
+   * How many destinations may still fail the bearings test.
+   *
+   * A RATCHET (rule 13), and it is checked against a measurement taken in the
+   * SAME RUN rather than against a number written down once: the control arm
+   * below walks the identical list with the fix switched off, so the pair is
+   * immune to the machine, to streaming order and to the seed. Before the fix,
+   * every bridge pin put the player under its own span and six landmark pins
+   * put him inside the building.
+   */
+  const TP_MAX_STUCK = 8;
+  /**
+   * ...and the control must be at least this bad, or the pair proves nothing.
+   * It walks the bridge and landmark groups only — see `ctlList`.
+   */
+  const TP_MIN_CONTROL_STUCK = 10;
+  /** Feet may sit this far under the analytic surface (kerb camber, settle). */
+  const TP_FLOOR_TOL = 0.35;
+
+  /**
+   * Where he ended up, and whether he can leave.
+   *
+   * `blocked` is `spawnprobe`'s rule exactly: of sixteen bearings at ankle
+   * height, how many meet a wall within 2 m or ground one step up 1.2 m out.
+   * `floor` is `walkableHeightAt` with NO hint — deliberately, because the
+   * question here is "is he under the street", and the hinted answer would call
+   * legitimate ground beneath a bridge a violation. The deck election the fix
+   * actually makes is asserted analytically at the end, where it is exact.
+   */
+  const tpSample = () => page.evaluate(() => {
+    const e = window.__ENGINE__;
+    const w = e.ctx.peek('world');
+    const ph = e.ctx.peek('physics');
+    const pos = e.ctx.peek('player').feetPosition ?? e.ctx.peek('player').position;
+    const mask = ph.MASK?.WORLD;
+    let blocked = 0;
+    const H = pos.y + 0.40;
+    for (let i = 0; i < 16; i++) {
+      const a = (i / 16) * Math.PI * 2;
+      const dx = Math.cos(a);
+      const dz = Math.sin(a);
+      const h = ph.raycast({ x: pos.x, y: H, z: pos.z }, { x: dx, y: 0, z: dz }, 8, mask);
+      if (h?.hit) { if (h.distance < 2) blocked++; continue; }
+      const gy = ph.groundHeight?.(pos.x + dx * 1.2, pos.z + dz * 1.2, 200, mask);
+      if (Number.isFinite(gy) && gy - pos.y > 0.42) blocked++;
+    }
+    const floor = w.walkableHeightAt(pos.x, pos.z);
+    return {
+      x: +pos.x.toFixed(1), y: +pos.y.toFixed(2), z: +pos.z.toFixed(1), blocked,
+      wet: w.isWater(pos.x, pos.z) === true,
+      under: +((Number.isFinite(floor) ? floor : pos.y) - pos.y).toFixed(2),
+    };
+  });
+
+  /** Teleport, let the city arrive, let the deferred unstick have its say. */
+  const tpTo = async (x, z) => {
+    await page.evaluate(([px, pz]) => window.__ENGINE__.ctx.peek('ui').cheats._teleport(px, pz), [x, z]);
+    for (let i = 0; i < 40; i++) {
+      if (await page.evaluate(() => window.__ENGINE__.ctx.peek('world')?.streamingIdle?.() === true)) break;
+      await pump(8);
+    }
+    // `streamingIdle` can flicker true a frame before the sector under his feet
+    // lands, and `Director.tickUnstick` is gated on the same predicate, so give
+    // the deferred rescue frames to run and then confirm once more.
+    await pump(24);
+    if (!(await page.evaluate(() => window.__ENGINE__.ctx.peek('world')?.streamingIdle?.() === true))) {
+      for (let i = 0; i < 20; i++) {
+        if (await page.evaluate(() => window.__ENGINE__.ctx.peek('world')?.streamingIdle?.() === true)) break;
+        await pump(8);
+      }
+      await pump(24);
+    }
+    return tpSample();
+  };
+
+  /** Walk the whole list once. Returns the rows and the two counts. */
+  const tpSweep = async (targets) => {
+    const rows = [];
+    for (const t of targets) rows.push({ t, r: await tpTo(t.x, t.z) });
+    return {
+      rows,
+      // A DOCK IS EXEMPT FROM THE FLOOR TEST, deliberately: `world/plan.js`
+      // sites all four of them IN the channel so a hull moored on one floats,
+      // so `heightAt` there is river BED and the man swims. Wet is the right
+      // answer at a dock pin and never anywhere else.
+      sunk: rows.filter((r) => !r.r.wet && r.r.under > TP_FLOOR_TOL),
+      stuck: rows.filter((r) => 16 - r.r.blocked < TP_BAR),
+    };
+  };
+
+  const tpTargets = await page.evaluate(() => {
+    const c = window.__ENGINE__.ctx.peek('ui')?.cheats;
+    if (!c) return null;
+    return c._teleportTargets().map((t) => ({ name: t.name, group: t.group, x: t.x, z: t.z }));
+  });
+  rec('the cheat menu publishes a teleport list', Array.isArray(tpTargets) && tpTargets.length > 20,
+    tpTargets ? `${tpTargets.length} destinations` : 'no cheat menu (needs ?cheats=1)');
+
+  const fixArm = await tpSweep(tpTargets ?? []);
+  const nRows = fixArm.rows.length;
+  rec('every teleport lands ON the walkable surface, not under it',
+    nRows > 0 && fixArm.sunk.length === 0,
+    `${nRows - fixArm.sunk.length}/${nRows} on the floor (${fixArm.rows.filter((r) => r.r.wet).length} wet, exempt)` +
+      (fixArm.sunk.length ? ` — under it: ` + fixArm.sunk.map((r) => `${r.t.name} ${r.r.under} m`).join(', ') : ''));
+  rec(`every teleport leaves ${TP_BAR}/16 bearings to walk out of`,
+    nRows > 0 && fixArm.stuck.length <= TP_MAX_STUCK,
+    `${nRows - fixArm.stuck.length}/${nRows} clear (RATCHET <= ${TP_MAX_STUCK})` +
+      (fixArm.stuck.length ? ` — stuck: ` + fixArm.stuck.map((r) => `${r.t.name} ${r.r.blocked}/16`).join(', ') : ''));
+  const incline = fixArm.rows.find((r) => /INCLINE/.test(r.t.name) && r.t.group === 'LANDMARK');
+  rec('the Duquesne Incline is somewhere you can stand',
+    !!incline && 16 - incline.r.blocked >= TP_BAR,
+    incline ? `${incline.r.blocked}/16 blocked at ${incline.r.x}, ${incline.r.y}, ${incline.r.z}` : 'not offered');
+
+  /**
+   * THE NEGATIVE CONTROL — the same page, the same list, in the same run, with
+   * `?nostandfix=1`: the hatch in `src/game/util.js` that puts `placePlayer`
+   * back exactly as it shipped. If the failures do not come back, none of the
+   * three checks above is measuring anything (ARCHITECTURE.md rule 12).
+   */
+  await page.goto(`http://127.0.0.1:${port}/?cheats=1&nostandfix=1`, { waitUntil: 'domcontentloaded', timeout: 90000 });
+  await page.waitForFunction('window.__READY__===true', null, { timeout: 120000 });
+  await pump(120);
+  // The control walks the CLASSES the fix targets — every bridge pin and every
+  // landmark — rather than all 80-odd destinations: the gas stations and
+  // safehouses were already fine on both arms, and a second full sweep doubles
+  // the wall clock of this file for rows that cannot move.
+  const ctlList = (tpTargets ?? []).filter((t) => t.group === 'BRIDGE' || t.group === 'LANDMARK');
+  const ctlArm = await tpSweep(ctlList);
+  const ctlInc = ctlArm.rows.find((r) => /INCLINE/.test(r.t.name) && r.t.group === 'LANDMARK');
+  const fixSame = fixArm.rows.filter((r) => r.t.group === 'BRIDGE' || r.t.group === 'LANDMARK');
+  const fixSameStuck = fixSame.filter((r) => 16 - r.r.blocked < TP_BAR);
+  rec('N1 NEGATIVE CONTROL: with the fix off, the same rows strand him',
+    ctlArm.stuck.length >= TP_MIN_CONTROL_STUCK && ctlArm.stuck.length > fixSameStuck.length,
+    `${ctlArm.stuck.length}/${ctlArm.rows.length} stuck without the fix against ${fixSameStuck.length}/${fixSame.length} with it` +
+      ` — e.g. ` + ctlArm.stuck.slice(0, 6).map((r) => `${r.t.name} ${r.r.blocked}/16`).join(', '));
+  rec('N2 NEGATIVE CONTROL: with the fix off, the incline traps him again',
+    !!ctlInc && 16 - ctlInc.r.blocked < TP_BAR,
+    ctlInc ? `${ctlInc.r.blocked}/16 blocked (fixed arm: ${incline?.r.blocked}/16)` : 'not measured');
+
+  /**
+   * ...and the deck election itself, asserted ANALYTICALLY so no streaming race
+   * can touch it. `standSpot` walks a ladder of height hints; the plain call is
+   * the one `cheats.groundY` makes and the one that put the player on the
+   * riverbank. On a bridge pin the two must disagree by most of a span.
+   */
+  const deck = await page.evaluate(() => {
+    const e = window.__ENGINE__;
+    const w = e.ctx.peek('world');
+    const wq = e.ctx.peek('game').wq;
+    const out = [];
+    for (const b of (w.bridges ?? [])) {
+      // `world.bridges` publishes the two dry anchors; mid-span is where the
+      // deck is highest over the channel and is the only point that matters.
+      if (!Array.isArray(b.a) || !Array.isArray(b.b)) continue;
+      const x = (b.a[0] + b.b[0]) / 2;
+      const z = (b.a[1] + b.b[1]) / 2;
+      const plain = w.walkableHeightAt(x, z);
+      const s = wq.standSpot(x, z);
+      out.push({ name: b.name ?? b.id, lift: +(s.y - plain).toFixed(2) });
+    }
+    return out;
+  });
+  const lifted = deck.filter((d) => d.lift > 4);
+  rec('a bridge pin resolves to the DECK, not the bank under it',
+    deck.length > 0 && lifted.length >= Math.ceil(deck.length * 0.5),
+    `${lifted.length}/${deck.length} bridge pins lift onto their own deck; worst lift ` +
+      `${Math.max(0, ...deck.map((d) => d.lift)).toFixed(2)} m over the un-hinted answer`);
 
   /* ---- report ------------------------------------------------------- */
   const pass = results.filter((r) => r.ok).length;
