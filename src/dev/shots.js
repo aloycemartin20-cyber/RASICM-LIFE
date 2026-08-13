@@ -877,6 +877,50 @@ const STEEL_CITY_SHOTS = {
     doc: 'South Side riverfront at morning — water shading, river fog, industrial bank.',
   },
 
+  // ---- OAKLAND, COLOR PARK and the painted bridges ----
+  oakland: {
+    pos: [452, 2.4, -34], look: [508, 42, 24], fov: 70, time: 17.0, ground: true,
+    weather: 'overcast',
+    viewmodel: false,
+    doc: 'Oakland from the west end of the quad: the Cathedral of Steel on its lawn with the collegiate ranges either side. Tests the gothic pier profile at close range and that the tower stands ON the plinth, not in it.',
+  },
+  cathedral: {
+    pos: [300, 34, -230], look: [508, 84, 24], fov: 34, time: 18.9, ground: true,
+    weather: 'scattered',
+    viewmodel: false,
+    doc: 'The Cathedral of Steel from the Strip side, ~135 m out — the "visible for miles" read. If the tower does not separate from the Oakland roofline here, the silhouette has failed.',
+  },
+  oakland_air: {
+    pos: [520, 250, 430], look: [560, 30, 60], fov: 60, time: 16.4,
+    weather: 'scattered',
+    viewmodel: false,
+    doc: 'Aerial over Oakland — the campus grid, the quad, the Cathedral, Ironwood Park and the ring roads the landmark reserve laid round both of them, in one frame.',
+  },
+  ironwood: {
+    pos: [610, 2.4, 126], look: [676, 12, 164], fov: 62, time: 17.6, ground: true,
+    weather: 'overcast',
+    viewmodel: false,
+    doc: 'Ironwood Park from the park drive: the bandstand, the path loop, the pond and the planting. Tests that props plants the site and buildings paves it, once each.',
+  },
+  colorpark: {
+    pos: [366, 2.6, 690], look: [253, 7, 626], fov: 66, time: 18.2, ground: true,
+    weather: 'scattered',
+    viewmodel: false,
+    doc: 'Color Park, looking upstream along the legal wall — painted bays, the tagged slabs, the trail and the Monongahela behind the bank wall.',
+  },
+  sisters: {
+    pos: [-330, 15, -173], look: [140, 24, -300], fov: 42, time: 18.6,
+    weather: 'scattered',
+    viewmodel: false,
+    doc: 'The three sister bridges from the downtown bank of the Allegheny — Sixth, Seventh and Ninth, three identical suspension spans, all Aztec gold. This is the shot that proves the bridge paint is per-span.',
+  },
+  bluespan: {
+    pos: [316, 4, 690], look: [232, 26, 476], fov: 46, time: 17.2, ground: true,
+    weather: 'overcast',
+    viewmodel: false,
+    doc: 'The Birmingham Bridge from the South Side flats — the blue truss, against the gold of the downtown trio two kilometres downstream.',
+  },
+
   // ---- lighting / weather sweeps ----
   sunset: {
     // Pulled back onto the Mt. Washington ridge and raised. The old position sat

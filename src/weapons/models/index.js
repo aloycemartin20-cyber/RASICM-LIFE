@@ -2,9 +2,10 @@ import { buildFists, buildPipe, buildWrench, buildCrowbar } from './melee.js';
 import { buildNailGun, buildTackCannon, buildPaintCannon, buildShopSmg } from './light.js';
 import { buildFlareGun, buildSpearGun, buildRivetGun, buildHarpoon } from './precise.js';
 import { buildNitroLauncher, buildDepthCharge, buildScrapRocket, buildEmpCoil } from './explosive.js';
+import { buildPistol, buildPumpShotgun } from './firearms.js';
 
 /**
- * The sixteen improvised weapons, by id.
+ * The eighteen weapons, by id: sixteen improvised tools and two real guns.
  *
  * Every builder takes a deterministic `Rng` (ARCHITECTURE rule 4) and returns:
  *
@@ -35,6 +36,10 @@ export const MODEL_BUILDERS = {
   pipe: buildPipe,
   wrench: buildWrench,
   crowbar: buildCrowbar,
+
+  /* The two REAL guns — see `firearms.js` for why they are not `light.js`. */
+  pistol: buildPistol,
+  shotgun: buildPumpShotgun,
 
   nailgun: buildNailGun,
   tackgun: buildTackCannon,

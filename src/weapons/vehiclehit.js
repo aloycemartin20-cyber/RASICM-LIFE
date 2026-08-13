@@ -132,6 +132,22 @@ export class VehicleHitTest {
     this.stats = { tests: 0, hits: 0, damage: 0 };
 
     /**
+     * THE TWO TRANSFERS, PUBLISHED ON THE INSTANCE.
+     *
+     * They are module constants and a harness cannot import this file without
+     * importing the engine with it, so a gate that wanted to check the scale
+     * end to end had exactly one option: hardcode a number. `arsenalprobe.mjs`
+     * did — it carried a `0.6` that was the SINGLE coefficient this file
+     * replaced with `transfer x actorDamageScale`, and it went red the moment
+     * `vehicles` re-tuned `ACTOR_TO_VEHICLE`. Which is the failure the header
+     * of this file already forbids in the other direction ("never copied here,
+     * because the day the body scale moves this file must not be the place that
+     * silently disagrees") — the same rule has to run both ways.
+     */
+    this.bulletTransfer = BULLET_TRANSFER;
+    this.meleeTransfer = MELEE_TRANSFER;
+
+    /**
      * THE LAST HIT, IN BOTH CURRENCIES. Preallocated (rule 5) and overwritten
      * by every `_apply` — read it on the line after the call, never stash the
      * reference.

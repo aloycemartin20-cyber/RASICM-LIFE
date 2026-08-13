@@ -95,6 +95,13 @@ const HOLD = {
 /**
  * Where a holstered weapon rides. The model's own `holster` node supplies the
  * fine offset; this is the bone it hangs off and the coarse placement.
+ *
+ * Keyed on `def.class` — with `def.sling` as an override, because the class is
+ * a BALANCE taxonomy (rate/damage/range) and carry position is a question of
+ * LENGTH. The pump shotgun is a `light` weapon by every number in its row and a
+ * metre long, and a metre of gun slung off the hips at `light`'s +0.13 m of Z
+ * puts the muzzle through the character's thigh; it carries across the back
+ * like the speargun does.
  */
 const SLING = {
   /**
@@ -286,7 +293,7 @@ export class WeaponRig {
       gripOff: new THREE.Vector3(),
       slingQuat: new THREE.Quaternion(),
       slingOff: new THREE.Vector3(),
-      slingBone: (SLING[def.class] ?? SLING.light).bone,
+      slingBone: (SLING[def.sling ?? def.class] ?? SLING.light).bone,
       /**
        * The support hand's IK target, in WEAPON space. Every one of the sixteen
        * models authors this and, until now, nothing read it — which is why at
@@ -325,7 +332,7 @@ export class WeaponRig {
     entry.aimQuat.setFromEuler(this._e);
     entry.gripOff.fromArray(hold.grip ?? [0, 0, 0]);
 
-    const sl = SLING[def.class] ?? SLING.light;
+    const sl = SLING[def.sling ?? def.class] ?? SLING.light;
     const hs = n.holster ?? { pos: [0, 0, 0], rot: [0, 0, 0] };
     this._e.set(
       sl.rot[0] + (hs.rot?.[0] ?? 0),
@@ -638,11 +645,20 @@ export class WeaponRig {
       p.trigger.rotation.x = n.triggerPull * this.triggerT;
     }
 
-    /* bolt: fires back and returns; held open on an empty magazine */
-    if (p.bolt && n.boltTravel) {
+    /**
+     * The reciprocating mass: fires back and returns, held open when empty.
+     *
+     * On the improvised guns that is a welded BOLT knob; on the pistol
+     * (`models/firearms.js`) it is the SLIDE, which is the same channel with
+     * the name the part actually has — a model that called its slide a bolt
+     * would be lying to the next reader for the sake of one `??`.
+     */
+    const recip = p.bolt ?? p.slide;
+    const recipTravel = n.boltTravel ?? n.slideTravel;
+    if (recip && recipTravel) {
       const back = Math.max(this.boltHold, Math.sin(this.boltCycle * Math.PI) * 1.0);
-      p.bolt.position.set(
-        n.boltTravel[0] * back, n.boltTravel[1] * back, n.boltTravel[2] * back
+      recip.position.set(
+        recipTravel[0] * back, recipTravel[1] * back, recipTravel[2] * back
       );
     }
 

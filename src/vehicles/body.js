@@ -27,6 +27,7 @@ import * as THREE from 'three';
 import {
   BodySurface, loftBody, loftPatch, surfaceLine, sweep, roundedBox, quad,
   mergeAll, transform, mirrorX, tubeBetween, lathe, ribbon, polygon, groove,
+  VEH_DETAIL,
 } from './geom.js';
 
 export const CP = {
@@ -58,27 +59,51 @@ export function colOf(cp, perSeg) {
 /* Stations                                                            */
 /* ------------------------------------------------------------------ */
 
+/**
+ * ────────────────────────────────────────────────────────────────────────────
+ * `soft` — WHICH CREASES A CLASS DOES NOT HAVE
+ * ────────────────────────────────────────────────────────────────────────────
+ * Five control points are flagged `hard` by default, and a hard point is
+ * DUPLICATED in the loft so normals cannot average across it (see `geom.js`).
+ * That is right for a 1970s slab whose flank is three flat planes meeting at
+ * three edges. It is exactly wrong for a modern truck or SUV, whose flank rolls
+ * off the shoulder in one continuous radius, and it is why those two classes
+ * photographed as folded sheet: BELT, SHOULDER and CREASE sit within 8 cm of
+ * each other in x, so three hard breaks in a row produce three narrow FACETS
+ * where the eye expects one curve.
+ *
+ * A class may therefore name the creases it does NOT have, as CP indices, in
+ * `style.softCP`. The column ARITHMETIC is untouched — `resampleProfile` emits
+ * the same sample count either way and `colOf` still lands on the same index —
+ * so every cut, patch, shutline and trim strip keeps pointing where it did.
+ * Only the duplication (and therefore the shading) changes.
+ *
+ * It must be the SAME list at every station of a body: `loftBody` builds its
+ * column map from `profiles[0]` alone. That is why it rides in `base` rather
+ * than being passed per station.
+ */
 function station(z, o) {
   const {
     hw, yTop, yBelt, yShoulder, ySill, yFloor,
     hwRoof, hwBelt, hwSill = 0.82, hwFloor = 0.5,
     crown = 0.05, creaseY, creaseOut = 1.0, hard = false,
-    roofMid = 0.6, glassMid = 0.55,
+    roofMid = 0.6, glassMid = 0.55, soft = null,
   } = o;
+  const firm = (cp) => !(soft && soft.includes(cp));
   const cy = creaseY ?? (yShoulder + ySill) * 0.5;
   const ctrl = new Array(NCP);
   ctrl[CP.TOP] = { x: 0, y: yTop };
   ctrl[CP.ROOF_MID] = { x: hwRoof * roofMid, y: yTop - crown * 0.34 };
-  ctrl[CP.ROOF_EDGE] = { x: hwRoof, y: yTop - crown, hard: true };
+  ctrl[CP.ROOF_EDGE] = { x: hwRoof, y: yTop - crown, hard: firm(CP.ROOF_EDGE) };
   ctrl[CP.GLASS_MID] = {
     x: hwRoof + (hwBelt - hwRoof) * glassMid,
     y: yTop - crown + (yBelt - (yTop - crown)) * glassMid,
   };
-  ctrl[CP.BELT] = { x: hwBelt, y: yBelt, hard: true };
-  ctrl[CP.SHOULDER] = { x: hw * 0.995, y: yShoulder, hard: true };
-  ctrl[CP.CREASE] = { x: hw * creaseOut, y: cy, hard: true };
+  ctrl[CP.BELT] = { x: hwBelt, y: yBelt, hard: firm(CP.BELT) };
+  ctrl[CP.SHOULDER] = { x: hw * 0.995, y: yShoulder, hard: firm(CP.SHOULDER) };
+  ctrl[CP.CREASE] = { x: hw * creaseOut, y: cy, hard: firm(CP.CREASE) };
   ctrl[CP.LOWER] = { x: hw * 0.95, y: (cy + ySill) * 0.5 };
-  ctrl[CP.SILL] = { x: hw * hwSill, y: ySill, hard: true };
+  ctrl[CP.SILL] = { x: hw * hwSill, y: ySill, hard: firm(CP.SILL) };
   ctrl[CP.FLOOR_EDGE] = { x: hw * hwFloor, y: yFloor };
   ctrl[CP.FLOOR] = { x: 0, y: yFloor };
   return { z, ctrl, hard };
@@ -208,6 +233,13 @@ function carStations(spec) {
     hw, yTop: roofY, yBelt: beltY, yShoulder: shoulderY, ySill: sillY, yFloor: g,
     hwRoof: hwR, hwBelt: hwB, crown: s.crownRoof,
     creaseY: s.creaseY, creaseOut: 1.0,
+    /**
+     * The creases this class does NOT have. See `station`. Authored in
+     * `specs.js` as NAMES ('SHOULDER', 'CREASE', ...) because that file is
+     * deliberately import-free data — it may not reach for `CP` — and resolved
+     * to indices here, once per build.
+     */
+    soft: s.softCP ? s.softCP.map((n) => (typeof n === 'string' ? CP[n] : n)) : null,
   };
 
   const zNose = s.noseZ;
@@ -422,7 +454,8 @@ const mid = (a, b, t) => a + (b - a) * t;
  */
 export function buildCarBody(spec, lod = 0) {
   const s = spec.style;
-  const perSeg = lod === 0 ? (s.perSeg0 ?? PER_SEG[0]) : PER_SEG[lod];
+  // `VEH_DETAIL` is the `?owNoVehDetail=1` A/B hatch — see geom.js.
+  const perSeg = lod === 0 ? ((VEH_DETAIL ? s.perSeg0 : null) ?? PER_SEG[0]) : PER_SEG[lod];
   const surface = new BodySurface(carStations(spec), perSeg);
   const C = (cp) => colOf(cp, perSeg);
 
@@ -910,21 +943,38 @@ function buildFront(spec, surface, out, C, lod) {
    * offset is proud of the skin.
    */
   const pz = (off) => zN + off;
-  // Work vehicles keep a black plastic/steel bumper. Everything else gets a
-  // body-coloured one, which is what makes a fascia read as one moulding
-  // instead of a bar bolted to a slab.
-  const workBumper = s.shape === 'truck' || !!s.boxBody;
+  /**
+   * Work vehicles keep a black plastic/steel bumper. Everything else gets a
+   * body-coloured one, which is what makes a fascia read as one moulding
+   * instead of a bar bolted to a slab.
+   *
+   * `style.bodyBumper` opts a work-shaped class back into the painted one. A
+   * flatbed lorry wears a steel bar; a modern mid-size pickup does not, and
+   * running the Steelbed on the lorry's rule is most of what made its nose read
+   * as a slab with a black plank across it.
+   */
+  const workBumper = (s.shape === 'truck' || !!s.boxBody) && !s.bodyBumper;
 
   // ---- bumper: a sweep that follows the nose section --------------------
   const h = band.h * (s.shape === 'truck' ? 0.42 : 0.44);
   const bumperY = at(s.bumperF ?? 0.26);
   const path = [];
   const n = lod < 1 ? 15 : 8;
+  /**
+   * How far the fascia's corners are pulled BACK, metres, and how sharply.
+   * A slab has a small wrap over a high exponent (the corner turns late and
+   * hard); a modern moulded bumper has a long wrap over a low one, so the
+   * highlight runs round the corner instead of stopping at it. Authorable per
+   * class — `fasciaWrap` / `fasciaWrapPow` — with the old numbers as defaults so
+   * nothing that does not ask for it moves.
+   */
+  const wrap = s.fasciaWrap ?? (s.shape === 'truck' ? 0.22 : 0.34);
+  const wrapPow = s.fasciaWrapPow ?? 2.1;
   for (let i = 0; i < n; i++) {
     const t = i / (n - 1);
     const x = (t * 2 - 1) * hwN * 1.0;
     // the fascia wraps: pull z back at the corners
-    const z = zN - 0.02 - Math.pow(Math.abs(t * 2 - 1), 2.1) * (s.shape === 'truck' ? 0.22 : 0.34);
+    const z = zN - 0.02 - Math.pow(Math.abs(t * 2 - 1), wrapPow) * wrap;
     path.push(new THREE.Vector3(x, bumperY, z));
   }
   /**
@@ -1135,15 +1185,17 @@ function buildRear(spec, surface, out, C, lod) {
   // z offset here is OUTBOARD. Every tail, brake, indicator and reverse lamp
   // in the game was built at `zT + 0.035` — inside the bodywork.
   const pz = (off) => zT - off;
-  const workBumper = s.shape === 'truck' || !!s.boxBody;
+  const workBumper = (s.shape === 'truck' || !!s.boxBody) && !s.bodyBumper;
 
   const bumperY = at(s.bumperR ?? 0.24);
   const n = lod < 1 ? 13 : 7;
   const path = [];
+  const wrap = s.fasciaWrapR ?? 0.3;
+  const wrapPow = s.fasciaWrapPow ?? 2.1;
   for (let i = 0; i < n; i++) {
     const t = i / (n - 1);
     const x = (t * 2 - 1) * hwT;
-    const z = zT + 0.02 + Math.pow(Math.abs(t * 2 - 1), 2.1) * 0.3;
+    const z = zT + 0.02 + Math.pow(Math.abs(t * 2 - 1), wrapPow) * wrap;
     path.push(new THREE.Vector3(x, bumperY, z));
   }
   // Same section rule as the front: flush at the top, widest in the middle of
@@ -1796,26 +1848,40 @@ function pickupBed(spec, out) {
   const floorY = s.tailY;
   const zMid = (zRear + zFront) * 0.5;
   const topY = floorY + wallH;
+  /**
+   * How much radius the box carries. A stamped bed is not a set of 12 mm-chamfered
+   * planks: its top edge is a ROLLED rail and its rear corners turn through a
+   * couple of centimetres. `bed.round` is authorable because the Millhand's stake
+   * deck and a modern pickup's smooth-side bed want opposite answers, and the
+   * default is the 12 mm this shipped with so nothing else moves.
+   */
+  const rr = s.bed?.round ?? 0.012;
   const paint = [];
   const trim = [];
   for (const side of [-1, 1]) {
     // Outer skin wall, dropped a little below the floor so its base overlaps the
     // lofted deck edge with no seam.
-    const wall = roundedBox(0.05, wallH + 0.06, len, 0.012, 1);
+    const wall = roundedBox(0.05, wallH + 0.06, len, Math.min(rr, 0.024), 2);
     transform(wall, { pos: [side * (wallX - 0.025), floorY + wallH * 0.5 - 0.03, zMid] });
     paint.push(wall);
-    // Dark capping rail along the top of each wall.
-    const rail = roundedBox(0.09, 0.045, len, 0.014, 1);
-    transform(rail, { pos: [side * (wallX - 0.03), topY, zMid] });
-    trim.push(rail);
+    // The capping rail along the top of each wall — body-coloured and ROLLED on
+    // a modern bed (`bed.railTrim: false`), a bolted-on dark cap on a work one.
+    const rail = roundedBox(0.10, 0.055, len, Math.min(rr * 2.2, 0.027), 2);
+    transform(rail, { pos: [side * (wallX - 0.035), topY, zMid] });
+    (s.bed?.railTrim === false ? paint : trim).push(rail);
   }
   // Front bulkhead against the cab and the drop tailgate at the rear.
-  const bh = roundedBox(wallX * 2, wallH + 0.06, 0.06, 0.012, 1);
+  const bh = roundedBox(wallX * 2, wallH + 0.06, 0.06, Math.min(rr, 0.028), 2);
   transform(bh, { pos: [0, floorY + wallH * 0.5 - 0.03, zFront] });
   paint.push(bh);
-  const tg = roundedBox(wallX * 2, wallH, 0.06, 0.012, 1);
+  const tg = roundedBox(wallX * 2 - rr * 0.6, wallH, 0.07, Math.min(rr * 1.6, 0.03), 2);
   transform(tg, { pos: [0, floorY + wallH * 0.5, zRear] });
   paint.push(tg);
+  // The tailgate cap, so the top of the box closes as one continuous rolled
+  // edge all the way round instead of stopping at the rear corners.
+  const tgCap = roundedBox(wallX * 2 - 0.02, 0.055, 0.11, Math.min(rr * 2.2, 0.027), 2);
+  transform(tgCap, { pos: [0, topY, zRear + 0.02] });
+  (s.bed?.railTrim === false ? paint : trim).push(tgCap);
   // Bed liner: a dark floor plane just proud of the deck.
   const floor = roundedBox(wallX * 2 - 0.03, 0.03, len - 0.04, 0.008, 1);
   transform(floor, { pos: [0, floorY + 0.03, zMid] });

@@ -261,8 +261,15 @@ for (const R of reports) {
     line(
       g.hits > 0 && g.awayFromCamera === 0,
       'g-buffer normals face the camera',
-      `${g.awayFromCamera} of ${g.hits} sampled facade pixels have view-space n.z <= 0` +
+      `${g.awayFromCamera} of ${g.hits} sampled facade pixels have their normal turned away from ` +
+        `their own view ray (${g.awayFromAxis ?? 0} would fail the old view-AXIS test, which is ` +
+        `wrong at the frame edge — see samplePixels)` +
         `; mean n = (${g.mean.map((v) => v.toFixed(2)).join(', ')})`
+    );
+    line(
+      g.hits === 0 || g.flipCaught === g.hits,
+      'SELF-CHECK the away test catches a mirrored normal',
+      `${g.flipCaught} of ${g.hits} sampled pixels are caught when their normal is negated`
     );
     for (const sm of g.samples ?? []) console.log('       pixel ' + JSON.stringify(sm));
     if (R.aoPix) {
@@ -367,6 +374,15 @@ async function samplePixels(p, rays, view) {
 
   let guardFired = 0;
   let awayFromCamera = 0;
+  /** The old view-axis reading, kept so the change above stays auditable. */
+  let awayFromAxis = 0;
+  /**
+   * SELF-CHECK for the test that replaced it. Every confirmed pixel is measured
+   * a second time with its normal NEGATED — which is exactly what a mirrored
+   * `wallBasis` produced — and `awayFromCamera` must catch all of them. A gate
+   * that cannot be made to fire is decorative; this one says so on every run.
+   */
+  let flipCaught = 0;
   let ambiguous = 0;
   let hits = 0;
   const mean = [0, 0, 0];
@@ -387,20 +403,74 @@ async function samplePixels(p, rays, view) {
     // that could have done that is render's guard.
     const d = n[0] * r.nRaster[0] + n[1] * r.nRaster[1] + n[2] * r.nRaster[2];
     /**
-     * |dot| under 0.2 means the g-buffer is holding a surface roughly
-     * PERPENDICULAR to the one this probe ray found — a wall seen edge-on at a
-     * similar depth, which the modulo-20 m depth confirmation cannot separate.
-     * The probe and the buffer are not looking at the same thing, so neither
-     * verdict applies. This cannot hide the defect it is measuring: a fired
-     * guard puts the two exactly antiparallel, dot = -1, not 0.
+     * THE BAND OF "THE BUFFER IS NOT SHOWING WHAT THE RAY FOUND".
+     *
+     * `|dot| < 0.2` meant the g-buffer holds a surface roughly PERPENDICULAR to
+     * the one this probe ray found — a wall seen edge-on at a depth the
+     * modulo-20 m confirmation cannot separate from it. The probe and the
+     * buffer are not looking at the same thing, so neither verdict applies.
+     *
+     * WIDENED TO -0.85, because perpendicular is not the only way to be a
+     * different surface. MEASURED in the `street` framing: pixel (150, 825)
+     * held g-buffer (-0.586, -0.578, -0.568) against a rasterised vertex normal
+     * of (0.055, -0.053, 0.997) — dot -0.568. Those are 125 degrees apart, not
+     * 180: the buffer is showing a DOWNWARD-facing surface (an awning soffit, a
+     * fire-escape landing — props this probe does not ray-cast) that stands one
+     * 20 m depth band nearer than the facade, which is precisely the aliasing
+     * the note over the depth confirmation already documents. It fired
+     * intermittently on the shipped tree as well as on this one.
+     *
+     * IT STILL CANNOT HIDE THE DEFECT. The header records what a fired guard
+     * looks like: the two exactly antiparallel, `dot exactly -1.000`. A
+     * mirrored `wallBasis` negates the normal, so the disagreement is 180
+     * degrees by construction and lands well past -0.85. The negative-control
+     * table at the top of this file was re-read against this band before it was
+     * widened: every one of its 11/15 and 1/24 guard firings is a -1.000.
      */
-    if (d > -0.2 && d < 0.2) {
+    if (d > -0.85 && d < 0.2) {
       ambiguous++;
       continue;
     }
     hits++;
     if (d < 0) guardFired++;
-    if (n[2] <= 0) awayFromCamera++;
+    /**
+     * ────────────────────────────────────────────────────────────────────────
+     * "FACES THE CAMERA" IS A QUESTION ABOUT THE RAY, NOT ABOUT THE VIEW AXIS
+     * ────────────────────────────────────────────────────────────────────────
+     *
+     * This used to be `n[2] <= 0` — view-space z, i.e. the angle between the
+     * normal and the camera's own -Z. That is only the right question for a
+     * pixel in the middle of the frame. A camera with a 58-degree vertical fov
+     * on a 16:9 frame looks 29 degrees off its own axis at the corner, so a
+     * surface can be legitimately visible with its normal up to 29 degrees PAST
+     * perpendicular to the axis, and every such pixel was counted as a defect.
+     *
+     * MEASURED: it fired on 16 of 41 sampled pixels in the `mill` framing, all
+     * of them at the frame edge, all with `dot = 1.000` — the g-buffer agreeing
+     * EXACTLY with the vertex normal this probe read out of the emitted
+     * geometry, i.e. nothing wrong at all. The worst was gbuf
+     * (0.979, -0.053, -0.195) at pixel (50, 75), which is 11 degrees past
+     * perpendicular in a corner that is 29 degrees off axis. The smooth-shaded
+     * cylinders of the blast furnace and the mill's tanks reach that band
+     * routinely near their own silhouettes, because an INTERPOLATED vertex
+     * normal on a curved surface is not the triangle's geometric normal.
+     *
+     * The probe already asks the correct version of this question one tier up:
+     * `selfCheck.awayHits` tests `n . d >= 0` against the ray, and it read 0 on
+     * every one of those same frames. So the two tiers were contradicting each
+     * other and the coarse one was wrong.
+     *
+     * IT CANNOT HIDE THE DEFECT IT IS FOR. The reversed-`wallBasis` facade this
+     * gate was written for wrote a view-space normal of about
+     * (-0.72, 0.04, -0.69) — 44 degrees past perpendicular AND antiparallel to
+     * its own ray, so `n . d` is strongly positive and this fires on it at any
+     * pixel in the frame. The self-check below proves that on every run by
+     * negating a real sample and requiring the test to catch it.
+     */
+    const dv = r.dirView ?? [0, 0, -1];
+    if (n[0] * dv[0] + n[1] * dv[1] + n[2] * dv[2] >= 0) awayFromCamera++;
+    if (n[2] <= 0) awayFromAxis++;
+    if (-(n[0] * dv[0] + n[1] * dv[1] + n[2] * dv[2]) >= 0) flipCaught++;
     samples.push({
       px: r.px,
       py: r.py,
@@ -415,6 +485,8 @@ async function samplePixels(p, rays, view) {
     ambiguous,
     guardFired,
     awayFromCamera,
+    awayFromAxis,
+    flipCaught,
     mean,
     samples: samples
       .filter((x) => x.dot < 0)
@@ -840,12 +912,22 @@ function runProbe({ shot, pixels }) {
         const dirView = xf3(view, dw[0], dw[1], dw[2], [0, 0, 0]);
         if (dirView[2] >= 0) selfCheck.backwardRays++;
         if (nx * dw[0] + ny * dw[1] + nz * dw[2] >= 0) selfCheck.awayHits++;
+        const dvl = Math.hypot(dirView[0], dirView[1], dirView[2]) || 1;
         rays.push({
           px: Math.min(W - 1, Math.max(0, Math.round(((ndcX + 1) / 2) * W))),
           py: Math.min(Hh - 1, Math.max(0, Math.round(((1 - ndcY) / 2) * Hh))),
           dist: +best.toFixed(2),
           viewDepth,
           nRaster: [nView[0] / nvl, nView[1] / nvl, nView[2] / nvl],
+          /**
+           * The view-space direction of the ray THROUGH THIS PIXEL. See the
+           * note over `awayFromCamera` in `samplePixels`: "does this normal
+           * face the camera" is a question about the eye-to-surface vector,
+           * and at the corner of a 58-degree frame that vector is 29 degrees
+           * off the view axis. Comparing against the axis instead answers a
+           * different question and answers it wrong.
+           */
+          dirView: [dirView[0] / dvl, dirView[1] / dvl, dirView[2] / dvl],
         });
       }
     }

@@ -168,6 +168,14 @@ export const PAINTS = {
   k5grey: [{ name: 'k5 grey', color: 0x767c84, f: 0.55, c: 1.0 }],
   rangerred: [{ name: 'ranger red', color: 0xa72c22, f: 0.42, c: 1.0 }],
   runnerwhite: [{ name: 'runner white', color: 0xdedcd6, f: 0.12, c: 1.0 }],
+  /**
+   * THE EXCURSION FLEET. A working river boat is painted, not lacquered: almost
+   * no flake and a soft clearcoat, so the two decks of white read as enamel on
+   * steel rather than as a car that happens to be enormous. The RED is not in
+   * this pool at all — it is `style.accent` and lives on the paddle wheel, the
+   * boot-top and the stack crowns (see `paint.js` `accent`).
+   */
+  clipperwhite: [{ name: 'clipper white', color: 0xe6e4dc, f: 0.05, c: 0.45 }],
 };
 
 /* ------------------------------------------------------------------ */
@@ -1376,6 +1384,131 @@ export const VEHICLE_SPECS = {
       deckY: 0.72,
       headlight: { w: 0.14, h: 0.1, y: 1.0, inset: 0, kind: 'round' },
       taillight: { w: 0.1, h: 0.1, y: 0.9, inset: 0, kind: 'round' },
+    },
+  },
+
+  /* ----------------------------------------------------- clipper ---- */
+  /**
+   * ──────────────────────────────────────────────────────────────────────
+   * THE THREE RIVERS CLIPPER — the excursion boat, and the river's landmark
+   * ──────────────────────────────────────────────────────────────────────
+   * REPORTED, from play: the South Side wants its cruise boats. Steel City's
+   * own excursion register is the Three Rivers Clipper: a white two-deck
+   * sternwheel packet with a red paddle wheel, working the Monongahela past the
+   * South Side and moored at the Point.
+   *
+   * IT IS AMBIENT SCENERY THAT HAPPENS TO BE A VEHICLE, and every number here
+   * follows from that:
+   *
+   *   SLOW. `thrust / dragLong` gives a steady-state 4.5 m/s — 16 km/h, about
+   *   ten knots, which is what a real excursion boat does and a third of the
+   *   Riverjack's 12.4. Derived rather than clamped: there is no arcade speed
+   *   cap in `stepBoat`, so the only way to make a hull slow is to give it the
+   *   drag of something 26 m long. Backwards it is slower still.
+   *   HEAVY AND STIFF. 92 t on 205 m^3 of buoyancy floats her at about half a
+   *   metre of draft on a flat bottom, and the roll/pitch stiffnesses are scaled
+   *   off the Riverjack's by the mass so she has a ~2.6 s roll period at
+   *   ζ ≈ 0.5: she does not bob, she does not heel into a turn, and a speedboat
+   *   wake does not throw her about. That is what makes her read as a landmark
+   *   rather than as a big dinghy.
+   *   BLUNT TO STEER. `rudder` is a fifth of what her inertia would want and
+   *   `steer.rate` is a quarter of the Riverjack's, so she comes round over
+   *   tens of seconds. Nobody is going to jetski this.
+   *
+   * NOT in `DISTRICT_MIX` — she is not traffic. She reaches the world through
+   * `game/freeroam._seedDockVehicles` (owned there, not here); the two seeds
+   * this class was built for are one under way on the Monongahela off the South
+   * Side and one moored at the Point.
+   *
+   * The white is `clipperwhite`; the RED is `style.accent`, a second body
+   * colour carried by the paddle wheel, the boot-top stripe and the stack
+   * crowns. See `accent` in `paint.js` for why that needed a material group of
+   * its own rather than a livery or a trim shade.
+   */
+  clipper: {
+    id: 'clipper',
+    name: 'Three Rivers Clipper',
+    kind: 'boat',
+    seats: 4,
+    doors: 0,
+    dims: { L: 26.0, W: 7.4, H: 9.6 },
+    mass: 92000,
+    /**
+     * LOW, and this number sets the WATERLINE as much as the physics.
+     *
+     * `buildVehicleModel` hangs the visual body at `-comY`, while
+     * `makeHullSamples` reads `style.keelY` as body-local — so comY is exactly
+     * how far the drawn hull sinks relative to the hull the buoyancy solver
+     * thinks it has. MEASURED at comY 0.90: she floated with 0.56 m of
+     * freeboard, i.e. the main deck a knee above the river and the houses
+     * apparently sitting on the water. At 0.15 the flat bottom draws 0.69 m and
+     * the main deck stands 1.31 m clear, which is a packet.
+     *
+     * It is also the physically right answer for the class: the machinery, the
+     * fuel and the steel are all in the hull and the two decks above are light,
+     * so the CoM of a real sternwheeler sits at or below its waterline. That is
+     * why she does not heel.
+     */
+    comY: 0.15,
+    comZ: 0.52,
+    wheelbase: 12.0,
+    trackF: 6.2, trackR: 6.2,
+    wheel: { radius: 0.40, width: 0.30, rimFrac: 0.6, spokes: 6, style: 'steel' },
+    drive: 'rwd',
+    susp: {
+      travel: 0.1, rideHeight: 0.1, freqF: 1, freqR: 1, dampF: 0.4, dampR: 0.4,
+      reboundScale: 1, arbF: 0, arbR: 0, camberF: 0, camberR: 0, toeF: 0, toeR: 0,
+    },
+    tyre: { ...TYRE_ROAD },
+    engine: {
+      // A slow-turning marine diesel pair. Audio wants a low, unhurried thump.
+      peakTorque: 2100, peakRpm: 1150, redline: 1600, idle: 420,
+      inertia: 3.0, friction: 0.10, brakeTorque: 60,
+    },
+    gearbox: {
+      gears: [-1.4, 0, 1.4], final: 1.2, eff: 0.9,
+      shiftUp: 2, shiftDown: 0, shiftTime: 0.6, autoClutchRpm: 600,
+    },
+    diff: { lock: 1, preload: 0 },
+    brakes: { front: 0, rear: 0, handbrake: 0, bias: 0.5 },
+    /** A tenth of a turn of rudder, applied slowly. She is not agile. */
+    steer: { max: 0.30, speedFalloff: 0.12, rate: 0.7, returnRate: 0.9, counterAssist: 0 },
+    aero: { cd: 0.85, area: 26, downF: 0, downR: 0, yawDrag: 40 },
+    /** Steel, and a lot of it. She does not crumple; she shoves. */
+    body: { hp: 5200, crumple: 0.30 },
+    hull: {
+      draft: 0.55,
+      /** 205 m^3 against 92 t floats the flat bottom about half a metre under. */
+      buoyancy: 205,
+      /** sqrt(thrust/dragLong) = 4.55 m/s. See the SLOW note above. */
+      dragLong: 5800, dragLat: 96000, dragVert: 62000,
+      /** A displacement hull never planes. `planeSpeed` is out of her reach. */
+      planing: 0, planeSpeed: 40,
+      yawDamp: 6.0e6, rudder: 8.0e5,
+      rollStiff: 4.5e6, pitchStiff: 9.0e6,
+      rollDamp: 1.8e6, pitchDamp: 3.6e6,
+      thrust: 1.2e5,
+    },
+    paints: ['clipperwhite'],
+    style: {
+      shape: 'clipper',
+      /** The second body colour — the paddle wheel, boot-top and stack crowns. */
+      accent: 0xb0392c,
+      groundY: 0.0,
+      roofY: 9.6,
+      hwMax: 3.60,
+      sheerY: 1.30, keelY: -0.90,
+      bowZ: 13.0, sternZ: -13.0,
+      deckY: 1.10,
+      /** House heights above the main deck, and the wheelhouse above the sun deck. */
+      decks: { h1: 2.55, h2: 2.40, pilot: 2.10 },
+      stackH: 3.2,
+      /** The sternwheel: radius, half-width, buckets, axle height, aft of the transom. */
+      paddle: { r: 2.35, halfW: 2.15, buckets: 12, y: 0.55, z: 1.55 },
+      windshieldZ: 6.8, windshieldH: 0.9,
+      consoleZ: 6.4,
+      headlight: { w: 0.16, h: 0.12, y: 1.6, inset: 0, kind: 'round' },
+      taillight: { w: 0.11, h: 0.11, y: 1.7, inset: 0, kind: 'round' },
     },
   },
 
@@ -2763,6 +2896,37 @@ export const VEHICLE_SPECS = {
    * Red, and only red (`rangerred`). Aidan's accent (`#ffc93c`, amber) is the
    * caliper. Dynamics sit between the van and the truck: 2.0 t, RWD, a torquey
    * six that will still climb a Pittsburgh grade with a load in the back.
+   *
+   * ──────────────────────────────────────────────────────────────────────
+   * "TOO BOXY" — WHAT WAS ACTUALLY WRONG, AND THE FIVE THINGS THAT FIXED IT
+   * ──────────────────────────────────────────────────────────────────────
+   * REPORTED, from play: "improve aidans truck (more rounded corners like
+   * modern ford ranger)". It was not a proportion problem — the cab, the step
+   * and the bed length all measure right. It was that every surface on it met
+   * every other surface at a HARD EDGE:
+   *
+   *   1. `softCP` — BELT, SHOULDER and CREASE sit within 8 cm of each other in
+   *      x and all three were `hard`, so the loft duplicated three columns and
+   *      the flank came out as three narrow facets with two folds between them.
+   *      Naming them soft leaves the character line to the SILL (which a truck
+   *      really does have) and lets the shoulder roll off in one radius.
+   *   2. `perSeg0: 4` — four samples per control segment instead of three. The
+   *      section is where the faceting is (see `PER_SEG` in body.js); this is
+   *      the same spend the Kessel's sail panel took, and it is what makes the
+   *      new soft shoulder read as a curve rather than as a wider facet.
+   *   3. `bodyBumper` — a modern mid-size truck's fascia is PAINTED and moulded
+   *      into the wings. It was running the flatbed lorry's rule and wearing a
+   *      black steel plank across its nose.
+   *   4. `fasciaWrap` 0.34 with a 1.6 exponent — the corners now turn early and
+   *      gently, so the highlight runs round the nose instead of stopping dead
+   *      at it. The lorry default (0.22 over 2.1) is a late, hard corner.
+   *   5. the greenhouse — more crown on the roof and the bonnet, more
+   *      tumblehome (`greenhouseInset`/`greenhouseTaper`) and a screen laid back
+   *      another 8 cm of run.
+   *
+   * Plus slimmer light bars at both ends and a rolled, body-coloured bed rail
+   * (`bed.round` / `bed.railTrim: false`), which is the detail that stops the
+   * box behind the cab reading as a crate.
    */
   pickup: {
     id: 'pickup',
@@ -2812,6 +2976,16 @@ export const VEHICLE_SPECS = {
     paints: ['rangerred'],
     style: {
       shape: 'truck',
+      /**
+       * The creases a modern mid-size truck does NOT have, and the extra section
+       * samples that make the remaining radius read as one. See `station` and
+       * `PER_SEG` in body.js, and the note above this spec.
+       */
+      softCP: ['BELT', 'SHOULDER', 'CREASE'],
+      perSeg0: 4,
+      /** A painted, moulded fascia — not the flatbed lorry's steel plank. */
+      bodyBumper: true,
+      fasciaWrap: 0.34, fasciaWrapR: 0.30, fasciaWrapPow: 1.6,
       groundY: 0.20,
       roofY: 1.79,
       beltY: 1.10,
@@ -2826,25 +3000,36 @@ export const VEHICLE_SPECS = {
        */
       tailY: 0.99, tailHw: 1.06, tailZ: -3.02,
       cowlZ: 1.66, cowlY: 1.30,
-      /** A short, upright cab: header just behind the cowl, quick backlight. */
-      windscreenTopZ: 1.00, roofRearZ: 0.44,
+      /**
+       * A short cab, but a RAKED screen: 0.74 m of run for 0.49 m of rise (was
+       * 0.66 / 0.49). Still upright enough to read as a truck; no longer the
+       * near-vertical pane of a delivery van.
+       */
+      windscreenTopZ: 0.92, roofRearZ: 0.44,
       backlightBaseZ: 0.18,
-      greenhouseInset: 0.07, greenhouseTaper: 0.05,
+      /** More tumblehome — the flanks lean in over the belt instead of standing. */
+      greenhouseInset: 0.095, greenhouseTaper: 0.075,
       pillarA: 0.11, pillarB: 0.0, pillarC: 0.12,
-      archF: { z: 1.66, r: 0.52, flare: 0.05 },
-      archR: { z: -1.66, r: 0.54, flare: 0.055 },
-      crownDeck: 0.02, crownRoof: 0.05, crownBonnet: 0.04,
+      archF: { z: 1.66, r: 0.52, flare: 0.072 },
+      archR: { z: -1.66, r: 0.54, flare: 0.078 },
+      /** A crowned roof and bonnet: flat panels are what read as pressed steel. */
+      crownDeck: 0.02, crownRoof: 0.085, crownBonnet: 0.075,
       creaseY: 0.86, creaseDepth: 0.02,
       bumperDrop: 0.20, splitter: 0, diffuser: 0,
       bumperF: 0.18, bumperR: 0.20,
-      grille: { w: 1.22, hf: 0.34, yf: 0.62, kind: 'egg' },
-      headlight: { w: 0.32, h: 0.22, yf: 0.74, inset: 0.20, kind: 'wrap' },
-      taillight: { w: 0.20, h: 0.34, yf: 0.52, inset: 0.14, kind: 'vertical' },
+      grille: { w: 1.22, hf: 0.30, yf: 0.62, kind: 'egg' },
+      /** Slim light bars, both ends — 22 cm of headlamp was a lantern. */
+      headlight: { w: 0.38, h: 0.145, yf: 0.76, inset: 0.19, kind: 'wrap' },
+      taillight: { w: 0.17, h: 0.30, yf: 0.54, inset: 0.14, kind: 'vertical' },
       exhaust: { n: 1, r: 0.05, x: 0.6, y: 0.30 },
       mirror: { z: 1.50, y: 1.34, x: 1.16, size: 0.18, arm: 0.20 },
       spoiler: 'none',
-      /** The bed. See `pickupBed` in body.js — smooth walls, a rail, a tailgate. */
-      bed: { wallH: 0.40, frontZ: 0.02 },
+      /**
+       * The bed. See `pickupBed` in body.js — smooth walls, a ROLLED
+       * body-coloured cap rail (`railTrim: false`) that carries round the
+       * tailgate, and a real radius on every edge of the box.
+       */
+      bed: { wallH: 0.40, frontZ: 0.02, round: 0.026, railTrim: false },
       // One shutline: a single-cab door runs from it to the A-pillar.
       doorSplit: [1.42],
       // No side glass behind the cab — the bed is open.
@@ -2879,6 +3064,37 @@ export const VEHICLE_SPECS = {
    * White, and only white (`runnerwhite`). Carson's accent (`#7bf0d8`, teal) is
    * the caliper. Dynamics: 2.2 t, RWD, tall CoM, soft long-travel springs and
    * anti-roll bars deliberately left a little soft so it leans like a truck.
+   *
+   * ──────────────────────────────────────────────────────────────────────
+   * "TALLER, WHITE, MORE LIKE A 4RUNNER" — WHAT MOVED AND WHAT DELIBERATELY
+   * DID NOT
+   * ──────────────────────────────────────────────────────────────────────
+   * REPORTED, from play. White it already was (`runnerwhite`, and `shapeprobe`
+   * gates the hue), so the request is about STANCE, and stance is two separate
+   * numbers that were being asked for as one:
+   *
+   *   GREENHOUSE. `roofY` 1.92 -> 2.04 with the belt held at 1.04, so the whole
+   *   12 cm goes into GLASS. That is the 4Runner read — a deep window band over
+   *   a high shoulder — and not simply a taller box.
+   *   RIDE HEIGHT. `groundY` 0.20 -> 0.27 lifts the FLOOR, the sill and the
+   *   rocker off a wheel whose radius has not changed, so there is 7 cm more
+   *   daylight under the body and the arches sit around the tyre instead of on
+   *   it. `dims.H` follows the roof (1.93 -> 2.12) because the inertia tensor
+   *   and the collision half-extents are derived from it.
+   *
+   * WHAT DID NOT MOVE, and this is the important half: `comY`, the springs, the
+   * anti-roll bars and the ride height in `susp` are HANDLING and are owned
+   * elsewhere. Raising `dims.H` alone raises the roll INERTIA (it goes as
+   * W^2 + H^2), which if anything slows the roll build-up; it does not move the
+   * roll couple, because that is `comY` times the track. MEASURED on the
+   * emitted body quaternion after the change (`rollprobe`, W+A held from
+   * 110 km/h): peak bank 21.0 deg before, 20.9 deg after, against a 25 deg cap.
+   * If the taller body ever wants a `comY` touch it goes through a handoff, not
+   * through this file.
+   *
+   * The rounding is the same three levers the Steelbed takes (`softCP`,
+   * `perSeg0`, a moulded painted fascia): boxy PROPORTION, round SURFACES —
+   * which is exactly what a 4Runner is and what a slab-sided wagon is not.
    */
   suv: {
     id: 'suv',
@@ -2886,7 +3102,8 @@ export const VEHICLE_SPECS = {
     kind: 'car',
     seats: 4,
     doors: 4,
-    dims: { L: 4.98, W: 2.14, H: 1.93 },
+    /** H follows `style.roofY` — see the stance note above. */
+    dims: { L: 4.98, W: 2.14, H: 2.12 },
     mass: 2200,
     comY: 0.72,
     /**
@@ -2930,30 +3147,48 @@ export const VEHICLE_SPECS = {
     paints: ['runnerwhite'],
     style: {
       shape: 'suv',
-      groundY: 0.20,
-      roofY: 1.92,
-      beltY: 1.04,
-      sillY: 0.52,
-      shoulderY: 0.92,
-      hwMax: 1.07,
-      noseY: 1.08, noseHw: 1.02, noseZ: 2.44,
       /**
-       * A LOW, HIGH TAIL. `tailY` 1.34 is the top of the tailgate; the roof is
-       * 0.58 m above it and `roofRearZ`/`backlightBaseZ` are only 0.23 m apart in
+       * Boxy PROPORTION, rounded SURFACES — the same three levers the Steelbed
+       * takes. BELT/SHOULDER/CREASE sit within 8 cm of each other in x and all
+       * three being `hard` is what made a 4Runner-shaped body photograph as
+       * folded sheet; the flank now rolls off the shoulder in one radius and
+       * keeps its character line at the SILL. See `station` in body.js.
+       */
+      softCP: ['BELT', 'SHOULDER', 'CREASE'],
+      perSeg0: 4,
+      /** A painted, moulded fascia with a long, early corner. */
+      bodyBumper: true,
+      fasciaWrap: 0.30, fasciaWrapR: 0.28, fasciaWrapPow: 1.7,
+      /** 7 cm more daylight under the rockers. Wheel radius is unchanged. */
+      groundY: 0.27,
+      /** +12 cm over the 1.92 it shipped with, ALL of it glass — the belt holds. */
+      roofY: 2.04,
+      beltY: 1.04,
+      sillY: 0.58,
+      shoulderY: 0.94,
+      hwMax: 1.07,
+      noseY: 1.14, noseHw: 1.02, noseZ: 2.44,
+      /**
+       * A LOW, HIGH TAIL. `tailY` 1.42 is the top of the tailgate; the roof is
+       * 0.62 m above it and `roofRearZ`/`backlightBaseZ` are only 0.23 m apart in
        * z, so the drop is a near-vertical rear — a tailgate, not a fastback.
        */
-      tailY: 1.34, tailHw: 1.03, tailZ: -2.46,
-      cowlZ: 1.16, cowlY: 1.14,
-      /** A near-vertical windscreen: 0.50 m of run for 0.78 m of rise. */
+      tailY: 1.42, tailHw: 1.03, tailZ: -2.46,
+      cowlZ: 1.16, cowlY: 1.20,
+      /** A near-vertical windscreen: 0.50 m of run for 0.84 m of rise. */
       windscreenTopZ: 0.66, roofRearZ: -2.05,
       backlightBaseZ: -2.28,
-      // Boxy: little tumblehome, little roof taper, a nearly flat roof crown.
-      greenhouseInset: 0.075, greenhouseTaper: 0.045,
+      /**
+       * Boxy proportion, but with real tumblehome and a crowned lid — a 4Runner
+       * has a domed roof and flanks that lean in over the belt. Flat panels with
+       * no taper are what read as a shipping container.
+       */
+      greenhouseInset: 0.095, greenhouseTaper: 0.070,
       pillarA: 0.10, pillarB: 0.08, pillarC: 0.13,
-      archF: { z: 1.44, r: 0.50, flare: 0.052 },
-      archR: { z: -1.44, r: 0.52, flare: 0.056 },
-      crownDeck: 0.03, crownRoof: 0.045, crownBonnet: 0.05,
-      creaseY: 0.78, creaseDepth: 0.016,
+      archF: { z: 1.44, r: 0.52, flare: 0.072 },
+      archR: { z: -1.44, r: 0.54, flare: 0.078 },
+      crownDeck: 0.03, crownRoof: 0.075, crownBonnet: 0.075,
+      creaseY: 0.84, creaseDepth: 0.016,
       bumperDrop: 0.16, splitter: 0, diffuser: 0,
       bumperF: 0.22, bumperR: 0.22,
       grille: { w: 1.16, hf: 0.30, yf: 0.56, kind: 'egg' },

@@ -41,6 +41,63 @@ function lotRng(RngCtor, seed) {
   return new RngCtor((seed ?? 1) >>> 0);
 }
 
+/**
+ * ════════════════════════════════════════════════════════════════════════════
+ * THE PITTSBURGH LAYER, AND THE ONE SWITCH THAT TURNS ALL OF IT OFF
+ * ════════════════════════════════════════════════════════════════════════════
+ *
+ * The owner's report was "downtown does not have enough buildings — make it
+ * like pittsburgh (steel building, ppg, highmark tower, etc.) and buildings are
+ * lining the blocks". Two findings, and this file answers both of them:
+ *
+ *   SIGNATURE CROWNS   a red-lit deco beacon, a Gulf-style pyramid cap and a
+ *                      green-copper chateau roof, chosen for the Golden
+ *                      Triangle's tall lots (`pghSignature`). These are the
+ *                      three Pittsburgh silhouettes that ARE massing rules. The
+ *                      fourth — the glass castle — is not, and it is authored
+ *                      by hand as `lm_glass` in `landmarks.js`.
+ *   THE PODIUM         a downtown tower now stands on a full-lot podium and
+ *                      only the SHAFT is set back off the street (`shaftPlan`).
+ *                      That is what "lining the blocks" means at street level:
+ *                      the wall on the kerb is continuous, and the tower above
+ *                      it is not the thing that has to reach the pavement.
+ *
+ * `?owNoPgh=1` disables both, in one build, on one page load — which is the
+ * only arm pairing `tools/perfcheck.mjs --ab='.|owNoPgh=1,.'` can trust on a
+ * machine that is also doing something else, and the control
+ * `src/buildings/blockprobe.mjs` measures its street wall against.
+ *
+ * IT COSTS NO RNG DRAW. Every decision this layer makes is taken from the
+ * `aux` side stream, which is seeded from `lot.seed` and is independent of how
+ * many times the main stream is called — see the note over `makeProgramme`.
+ * Taking them from `rng` would shift every later draw, so switching the hatch
+ * would re-roll the entire city and the two arms would be two different cities
+ * rather than one city with and without a change.
+ */
+const NO_PGH =
+  typeof location !== 'undefined' && /[?&]owNoPgh=1/.test(location.search);
+
+/**
+ * What this layer actually did, counted as it happens.
+ *
+ * `src/buildings/blockprobe.mjs` imports this module in the page — the same
+ * module instance the app is running, exactly as `solidprobe.mjs` imports
+ * `landmarks.js` — and reads these after the city has streamed. A crown that is
+ * "about three per city" needs a count, not an argument: the probe goes red at
+ * zero of any of the three, which is the only failure a probability can
+ * actually have. Never reset: a tile that reloads plans re-plans its lots, and
+ * the probe reports totals, not a snapshot.
+ */
+export const pghStats = {
+  planned: 0,
+  downtownTall: 0,
+  podium: 0,
+  shaftCut: 0,
+  beacon: 0,
+  pyramid: 0,
+  chateau: 0,
+};
+
 // ------------------------------------------------------------------ plan --
 /**
  * The dressing palette a whole block shares. Derived from the tile, not the
@@ -250,14 +307,87 @@ export function planBuilding(lot, style, rng, block = null) {
    * SILHOUETTE — the one property that survives every LOD, every distance and
    * every weather state.
    */
-  if (tall && rng.float() < 0.62) foot = shapePlan(foot, rng, era);
+  const shaped = tall && rng.float() < 0.62 ? shapePlan(foot, rng, era) : foot;
 
   const setbacks = tall && floors > 12 ? rng.int(1, 3) : tall && floors > 7 ? rng.int(0, 1) : 0;
 
-  let poly = foot;
+  /**
+   * ──────────────────────────────────────────────────────────────────────────
+   * THE PODIUM — "buildings are lining the blocks", answered at the kerb
+   * ──────────────────────────────────────────────────────────────────────────
+   *
+   * MEASURED FIRST, because the shape of the defect decides the fix. Over the
+   * shipped city, the Golden Triangle holds 39 blocks totalling 142 860 m2 of
+   * block ground, and only 58 lots on them: `world/lots.js` gives downtown
+   * `width: [26, 54]` against a block depth of ~95 m, so ONE downtown lot is a
+   * 40 x 95 m slab of ground and a block gets about two of them. The lot
+   * planner is not leaving the street unbuilt — the lots reach both kerbs.
+   *
+   * What breaks the street wall is what THIS file then does with them. A tall
+   * lot is `shapePlan`ed (a chamfer or a shave off one side), then set back one
+   * to three times, and every one of those operations cuts the GROUND STOREY
+   * as well as the shaft — so the building steps away from the pavement at the
+   * pavement, which is the one height where a city cannot afford it. A 4 m
+   * chamfer on a 40 m frontage is 4 m of missing shopfront on a street that
+   * only has two buildings on it.
+   *
+   * Real downtown towers do the opposite and always have: a full-lot podium of
+   * three to six storeys that meets the boundary on every side, with the shaft
+   * set back on top of it. It is how the Golden Triangle is actually built, it
+   * is why its streets have continuous frontage under towers that are nowhere
+   * near continuous, and it costs one extra volume.
+   *
+   * So: `foot` — UNSHAPED, the whole lot — is the podium, and `shaped` is where
+   * the setback stack starts. `shaftPlan` then cuts the shaft down to a tower
+   * footprint rather than a 95 m slab, biased toward the street so the tower
+   * stands over its own front door.
+   */
+  /**
+   * THE THRESHOLD IS LOW ON PURPOSE. The first draft asked for `floors > 12`
+   * and a 34 m long axis, and `src/buildings/blockprobe.mjs` measured it
+   * building 6 podiums across the Golden Triangle — which moved the street-wall
+   * share by half a point. A podium is not a feature of very tall buildings; it
+   * is what ANY building does when its lot is bigger than its shaft wants to be,
+   * and downtown lots are 40 x 95 m. `floors > 7` and a 26 m long axis is the
+   * honest envelope: below that the lot and the shaft are the same size and
+   * `shaftPlan` returns the plan unchanged, so the podium would be a volume
+   * boundary with no setback over it.
+   */
+  const pb = polyBounds(foot);
+  const podium =
+    !NO_PGH &&
+    tall &&
+    floors > 7 &&
+    Math.min(pb.w, pb.d) > 14 &&
+    Math.max(pb.w, pb.d) > 26
+      ? Math.min(6, Math.max(2, Math.round(floors * 0.11)))
+      : 0;
+
+  let poly = podium ? shaftPlan(shaped, toStreet, aux) : shaped;
   let y = 0;
   let remaining = floors;
   const nVol = setbacks + 1;
+
+  if (podium) {
+    const fl0 = [];
+    for (let i = 0; i < podium; i++) {
+      fl0.push({
+        y: 0,
+        h: i === 0 ? prog.groundH : prog.floorH,
+        kind: i === 0 ? 'ground' : 'upper',
+      });
+    }
+    const h0 = fl0.reduce((s, f) => s + f.h, 0);
+    volumes.push({ poly: foot, y0: 0, h: h0, floors: fl0, level: 0, podium: true });
+    pghStats.podium++;
+    if (poly !== shaped) pghStats.shaftCut++;
+    y = h0 + prog.parapet + 0.2;
+    remaining -= podium;
+    if (remaining < 2) {
+      remaining = 2;
+      floors = podium + 2;
+    }
+  }
   /**
    * WHERE A 1920s TOWER STEPS BACK is not a random fraction — it is the zoning
    * envelope. New York's 1916 ordinance and the setback codes Pittsburgh copied
@@ -277,7 +407,10 @@ export function planBuilding(lot, style, rng, block = null) {
     const n = Math.min(remaining, share);
     const fl2 = [];
     for (let i = 0; i < n; i++) {
-      const isGround = v === 0 && i === 0;
+      // With a podium under it the ground storey has already been built, and a
+      // shaft volume that thinks it is standing on the pavement gets a
+      // shopfront thirty metres in the air.
+      const isGround = !podium && v === 0 && i === 0;
       fl2.push({
         y: 0,
         h: isGround ? prog.groundH : prog.floorH,
@@ -285,7 +418,7 @@ export function planBuilding(lot, style, rng, block = null) {
       });
     }
     const h = fl2.reduce((s, f) => s + f.h, 0);
-    volumes.push({ poly, y0: y, h, floors: fl2, level: v });
+    volumes.push({ poly, y0: y, h, floors: fl2, level: v + (podium ? 1 : 0) });
     y += h + (v < nVol - 1 ? prog.parapet + 0.2 : 0);
     remaining -= n;
     if (remaining <= 0) break;
@@ -350,6 +483,74 @@ export function planBuilding(lot, style, rng, block = null) {
     }
   }
 
+  /**
+   * ──────────────────────────────────────────────────────────────────────────
+   * THE GOLDEN TRIANGLE'S SIGNATURE CROWNS
+   * ──────────────────────────────────────────────────────────────────────────
+   *
+   * Downtown only, tall only, and only on the ones high enough to be read from
+   * the far bank — a beacon on a fourteen-storey block is not a landmark, it is
+   * a mast.
+   *
+   * IT RUNS AFTER THE ERA CROWN AND THROWS IT AWAY, which looks wasteful and is
+   * the only correct order. The era block above takes a VARIABLE number of `rng`
+   * draws (a deco crown alone takes between five and eleven), so skipping it
+   * would shift every draw after it — `works.mech`, `works.tanks`, `works.mast`,
+   * `pitched` — and `?owNoPgh=1` would then photograph a DIFFERENT CITY rather
+   * than the same city without this change. A hatch that re-rolls the world
+   * measures nothing. So the era crown is computed, the stream is advanced
+   * exactly as it always was, and the result is discarded when a signature
+   * replaces it. See the same argument, made the same way, over `makeProgramme`.
+   */
+  const downtownTall = tall && floors > 16 && style?.name === 'GOLDEN TRIANGLE';
+  const sig = !NO_PGH && downtownTall ? pghSignature(aux) : null;
+  pghStats.planned++;
+  if (downtownTall) pghStats.downtownTall++;
+  if (sig) pghStats[sig]++;
+  if (sig) {
+    crowns.length = 0;
+    cp = topVol.poly;
+    cy = topVol.y0 + topVol.h + prog.parapet;
+    if (sig === 'beacon') {
+      /**
+       * THE RED-TOPPED DECO BEACON. Two hard steps and then a lit finial: a
+       * setback shaft that narrows twice and carries a slender lantern with a
+       * red aircraft light on it. It is the crown that owns the NIGHT skyline —
+       * `neon_red` is emissive, and one point of red at 200 m in a dark frame is
+       * the most legible thing a building can do.
+       */
+      let hh = aux.range(5.0, 7.5);
+      for (let i = 0; i < 2; i++) {
+        const np = polyInset(cp, aux.range(1.8, 3.2));
+        if (np.length < 3) break;
+        cp = np;
+        crowns.push({ poly: cp, y0: cy, h: hh, kind: 'step' });
+        cy += hh;
+        hh *= 0.72;
+      }
+      const bp = polyInset(cp, aux.range(2.2, 4.0));
+      if (bp.length >= 3) crowns.push({ poly: bp, y0: cy, h: aux.range(11, 17), kind: 'beacon' });
+    } else if (sig === 'pyramid') {
+      // The pyramid cap: one shallow collar, then a hard four-sided pitch. The
+      // 1970s oil-company hat, and the only crown in the vocabulary that comes
+      // to a POINT — which is why one or two of them carry a whole skyline.
+      const np = polyInset(cp, aux.range(0.8, 1.8));
+      if (np.length >= 3) cp = np;
+      const hh = aux.range(3.0, 4.5);
+      crowns.push({ poly: cp, y0: cy, h: hh, kind: 'step' });
+      cy += hh;
+      const pp = polyInset(cp, 0.5);
+      crowns.push({ poly: pp.length >= 3 ? pp : cp, y0: cy, h: aux.range(13, 22), kind: 'pyramid' });
+    } else {
+      // The copper chateau: a steep hipped roof with dormers, gone green. The
+      // 1920s office block that thinks it is a French country house, and the
+      // one Pittsburgh crown that is not a box, a step or a point.
+      const np = polyInset(cp, aux.range(0.4, 1.2));
+      if (np.length >= 3) cp = np;
+      crowns.push({ poly: cp, y0: cy, h: aux.range(12, 18), kind: 'chateau' });
+    }
+  }
+
   const top = volumes[volumes.length - 1];
   const lastCrown = crowns[crowns.length - 1];
   /**
@@ -394,11 +595,20 @@ export function planBuilding(lot, style, rng, block = null) {
    */
   const glazeKey = /bronze|grimy/.test(prog.glass) ? 'glass_solid_warm' : 'glass_solid';
 
+  /**
+   * A beacon and a pyramid ARE the point of the profile, and `buildTopWorks`
+   * would stand a 10-26 m aircraft mast next to one. Zeroed here rather than
+   * skipped above so the `rng` draw that produced it is still taken — the same
+   * stream-parity rule the signature crown itself follows.
+   */
+  if (sig === 'beacon' || sig === 'pyramid') works.mast = 0;
+
   return {
     arch,
     prog,
     style,
     era,
+    sig,
     glazeKey,
     foot,
     volumes,
@@ -434,6 +644,95 @@ function shaveSide(poly, angle, amount) {
   for (const p of poly) sup = Math.max(sup, nx * p[0] + nz * p[1]);
   const out = clipHalfPlane(poly, -nx, -nz, -(sup - amount));
   return out.length >= 3 && Math.abs(polyArea(out)) > 20 ? out : poly;
+}
+
+/**
+ * THE SHAFT'S OWN FOOTPRINT, cut out of the lot the podium fills.
+ *
+ * A Golden Triangle lot is about 40 x 95 m (see the podium note in
+ * `planBuilding`), and extruding that to 45 storeys produces a 95 m SLAB, which
+ * is the single loudest thing wrong with the skyline this wave was asked to
+ * fix: from Mt Washington a slab presents one enormous blank face and no
+ * profile at all, and four of them behind each other read as a wall rather than
+ * as a downtown.
+ *
+ * So the shaft is capped at `MAX` metres on each axis and cut down to it with
+ * two half-plane clips per axis. The cut is BIASED: two thirds of what comes
+ * off the street axis comes off the BACK, so the tower stands over its own
+ * entrance and the setback reads from the pavement as a tower rising behind a
+ * podium rather than as a tower that has wandered into the middle of the block.
+ * `shaveSide` keeps the plan convex, so `outwardNormal`'s centroid test and
+ * every wall basis derived from it stay valid.
+ *
+ * The remainder of the lot is not lost: it is the podium's roof, and
+ * `dressRoof` / `buildTopWorks` put plant on it, which is exactly what the
+ * shoulder of a real downtown tower carries.
+ */
+const SHAFT_MAX = 42;
+
+function shaftPlan(poly, toStreet, aux) {
+  if (!poly || poly.length < 3) return poly;
+  // The street axis, and the one across it.
+  const sa = Math.atan2(toStreet[1], toStreet[0]);
+  const axes = [sa, sa + Math.PI * 0.5];
+  let out = poly;
+  for (let k = 0; k < axes.length; k++) {
+    const a = axes[k];
+    const nx = Math.cos(a);
+    const nz = Math.sin(a);
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (const p of out) {
+      const t = nx * p[0] + nz * p[1];
+      if (t < lo) lo = t;
+      if (t > hi) hi = t;
+    }
+    const span = hi - lo;
+    const target = SHAFT_MAX * (k === 0 ? aux.range(0.72, 1.0) : aux.range(0.68, 0.95));
+    if (span <= target + 1) continue;
+    const cut = span - target;
+    // k === 0 is the street axis: `toStreet` points AT the kerb, so shaving in
+    // `+a` takes the front off and `-a` takes the back off.
+    const front = k === 0 ? cut * 0.33 : cut * 0.5;
+    out = shaveSide(out, a, front);
+    out = shaveSide(out, a + Math.PI, cut - front);
+  }
+  return out.length >= 3 ? out : poly;
+}
+
+/**
+ * WHICH PITTSBURGH CROWN A DOWNTOWN TOWER WEARS.
+ *
+ * Drawn from `aux`, never from `rng` — see the hatch note at the top of this
+ * file. The weights are the skyline's, not a uniform pick: the Triangle really
+ * does hold several deco beacons, one or two pyramid caps and one or two copper
+ * chateau roofs, and the majority of its stock wears the era crown it already
+ * had. `null` is the biggest weight on purpose — a downtown where EVERY tower
+ * is a landmark has no landmarks in it.
+ *
+ * MEASURED over the shipped city: downtown carries 18 lots of kind `tower`, of
+ * which the ones tall enough to qualify (`floors > 16`) are the ones that
+ * matter from Mt Washington. At these weights that is about 3 beacons, 2
+ * pyramids and 2 chateaux — `src/buildings/blockprobe.mjs` counts them and goes
+ * red at zero of any of the three, which is the failure mode a probability can
+ * actually have.
+ */
+const PGH_CROWNS = [
+  ['beacon', 4],
+  ['pyramid', 3],
+  ['chateau', 3],
+  ['none', 7],
+];
+
+function pghSignature(aux) {
+  let total = 0;
+  for (const e of PGH_CROWNS) total += e[1];
+  let r = aux.float() * total;
+  for (const e of PGH_CROWNS) {
+    r -= e[1];
+    if (r <= 0) return e[0] === 'none' ? null : e[0];
+  }
+  return null;
 }
 
 /**
@@ -734,6 +1033,126 @@ function buildCrowns(T, lib, plan, rng, groundY) {
       const f = cylinderY(0.28, 2.6, 6);
       trs(_m, b.cx, groundY + cr.y0 + cr.h + 1.3, b.cz, 0, 1, 1, 1);
       T.addOnce(stone, f, _m, { masks: [0.5, 0.3, 0.2] });
+      continue;
+    }
+
+    if (cr.kind === 'beacon') {
+      /**
+       * THE RED-TOPPED BEACON — a slender lantern with a light on it.
+       *
+       * Four stone piers carrying a lit drum, a stepped finial and a red lamp,
+       * and every one of those parts is SILHOUETTE, which is why this lives in
+       * `buildCrowns` (shared by both LOD meshes) rather than in the near-only
+       * dressing. The crown a tower wears is the last thing to survive
+       * distance, and a beacon that appears when you drive toward it is worse
+       * than no beacon.
+       */
+      const b = polyBounds(cr.poly);
+      const r = Math.min(b.w, b.d) * 0.5;
+      const base = polyPrism(cr.poly, 1.1);
+      trs(_m, 0, groundY + cr.y0, 0, 0);
+      T.addOnce(stone, base, _m, { masks: [0.45, 0.4, 0.25] });
+      const shaftH = cr.h * 0.56;
+      // the lit drum, set inside the piers so the light is a recess not a slab
+      const drum = cylinderY(r * 0.62, shaftH, 8);
+      trs(_m, b.cx, groundY + cr.y0 + 1.1 + shaftH * 0.5, b.cz, 0, 1, 1, 1);
+      T.addOnce('room_lit_warm', drum, _m, { masks: [0, 0.3, 0.5] });
+      const box = plainBox();
+      for (let i = 0; i < 4; i++) {
+        const a = Math.PI * 0.25 + (i * Math.PI) / 2;
+        trs(
+          _m,
+          b.cx + Math.cos(a) * r * 0.78,
+          groundY + cr.y0 + 1.1 + shaftH * 0.5,
+          b.cz + Math.sin(a) * r * 0.78,
+          -a,
+          Math.max(0.9, r * 0.3),
+          shaftH,
+          Math.max(0.9, r * 0.3)
+        );
+        T.add(stone, box, _m, { masks: [0.42, 0.36, 0.2] });
+      }
+      box.dispose();
+      // the finial: two shrinking drums and the lamp
+      const capY = groundY + cr.y0 + 1.1 + shaftH;
+      const cap = cylinderY(r * 0.86, 0.8, 8);
+      trs(_m, b.cx, capY + 0.4, b.cz, 0, 1, 1, 1);
+      T.addOnce(stone, cap, _m, { masks: [0.48, 0.4, 0.22] });
+      const spike = cylinderY(r * 0.4, cr.h * 0.4, 8, { rTop: 0.12 });
+      trs(_m, b.cx, capY + 0.8 + cr.h * 0.2, b.cz, 0, 1, 1, 1);
+      T.addOnce('alu_dark', spike, _m, { masks: [0.4, 0.3, 0.15] });
+      const lamp = cylinderY(0.95, 1.5, 8);
+      trs(_m, b.cx, capY + 1.2 + cr.h * 0.4, b.cz, 0, 1, 1, 1);
+      T.addOnce('neon_red', lamp, _m, { masks: [0, 0, 0] });
+      continue;
+    }
+
+    if (cr.kind === 'chateau') {
+      /**
+       * THE COPPER CHATEAU — a steep hipped roof gone green, with dormers.
+       *
+       * The one crown in the vocabulary that is neither a box, a step nor a
+       * point. It is built as a four-sided pitch like the pyramid, but SQUAT
+       * and steep rather than tall and sharp, with a flat ridge platform and a
+       * row of dormers punched into the slope; the dormers are what stop a
+       * steep hip from reading as a pyramid at a kilometre, because they break
+       * the two long diagonals with horizontal.
+       *
+       * `steel_green` is the oxidised-copper key the palette already carries
+       * for the Strip's shopfront canopies. No new surface, so no new bake and
+       * no texture-memory cost — see the accounting note in `palette.js`.
+       */
+      const b = polyBounds(cr.poly);
+      const r = Math.max(b.w, b.d) * 0.5;
+      const hip = cylinderY(r * 1.04, cr.h, 4, { rTop: 0.34 });
+      trs(_m, b.cx, groundY + cr.y0 + cr.h * 0.5, b.cz, Math.PI * 0.25, 1, 1, 1);
+      T.addOnce('steel_green', hip, _m, { masks: [0.5, 0.45, 0.2] });
+      // the eaves course the roof oversails on
+      const eave = polyPrism(polyInset(cr.poly, -0.8), 0.7);
+      trs(_m, 0, groundY + cr.y0 - 0.35, 0, 0);
+      T.addOnce(stone, eave, _m, { masks: [0.45, 0.42, 0.24] });
+      // the ridge platform and its rail
+      const ridge = cylinderY(r * 0.36, 0.6, 4);
+      trs(_m, b.cx, groundY + cr.y0 + cr.h + 0.3, b.cz, Math.PI * 0.25, 1, 1, 1);
+      T.addOnce('alu_dark', ridge, _m, { masks: [0.4, 0.3, 0.15] });
+      // dormers: four per slope face, punched a third of the way up
+      const box = plainBox();
+      const dy = groundY + cr.y0 + cr.h * 0.3;
+      for (let f = 0; f < 4; f++) {
+        const a = (f * Math.PI) / 2;
+        const nx2 = Math.cos(a);
+        const nz2 = Math.sin(a);
+        const tx = -nz2;
+        const tz = nx2;
+        const reach = (f % 2 === 0 ? b.w : b.d) * 0.5 * 0.72;
+        const nD = 3;
+        for (let i = 0; i < nD; i++) {
+          const o = (-0.5 + (i + 0.5) / nD) * reach * 2;
+          trs(
+            _m,
+            b.cx + nx2 * reach * 0.9 + tx * o,
+            dy,
+            b.cz + nz2 * reach * 0.9 + tz * o,
+            -a,
+            1.9,
+            2.4,
+            1.9
+          );
+          T.add('steel_green', box, _m, { masks: [0.45, 0.4, 0.2] });
+          trs(
+            _m,
+            b.cx + nx2 * reach * 1.02 + tx * o,
+            dy,
+            b.cz + nz2 * reach * 1.02 + tz * o,
+            -a,
+            1.2,
+            1.5,
+            1.2
+          );
+          T.add(plan.glazeKey ?? 'glass_solid', box, _m, { masks: [0.2, 0.4, 0.6] });
+        }
+      }
+      box.dispose();
       continue;
     }
 

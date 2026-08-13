@@ -90,6 +90,8 @@ class Projectile {
     this.empSeconds = 0;
     this.tethered = false;
     this.pins = false;
+    /** Authored impulse into the target; 0 = the class default. See `spawn`. */
+    this.knock = 0;
     this.ignites = false;
     this.marks = false;
     this.visual = null;
@@ -430,6 +432,17 @@ export class ProjectileSim {
     p.empSeconds = d?.empSeconds ?? 0;
     p.tethered = d?.tethered === true;
     p.pins = d?.pins === true;
+    /**
+     * Per-projectile impulse into whatever it hits, 0 = "use the default".
+     *
+     * The defaults are 6 for a round and 26 for something that pins, which is
+     * one number for the whole arsenal and is why every hit shoved a body by
+     * the same amount whether it came from a tack or a 12-gauge. The pump gun's
+     * `knock: 9` x 8 pellets is 72 on a full pattern against the Paint Cannon's
+     * 7 x 6 = 42 — the "harder knockdown" in the report, expressed where the
+     * physics can read it rather than as an adjective in a design note.
+     */
+    p.knock = d?.knock ?? 0;
     p.ignites = d?.ignites === true;
     p.marks = d?.marks === true;
     /* A tumbling drum and a spinning bottle: the spin is deterministic per
@@ -681,7 +694,7 @@ export class ProjectileSim {
       damage: p.damage * falloff,
       penetration: p.penetration,
       dropoff: 1,
-      impulse: p.pins ? 26 : 6,
+      impulse: p.knock > 0 ? p.knock : (p.pins ? 26 : 6),
       mask: p.mask,
       /* The round names its shooter here rather than four subsystems away.
        * See `ProjectileSim.shooter` and `physics.fireBullet`. */

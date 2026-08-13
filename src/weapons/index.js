@@ -12,9 +12,39 @@ import { buildModel } from './models/index.js';
 import {
   ALL_WEAPONS, WEAPON_ORDER, WEAPON_CLASSES, CLASS_EXEMPLAR, BROTHER_LOADOUT,
   BROTHER_SIGNATURE, BROTHER_HANDLING, NEUTRAL_HANDLING, BROTHER_START,
-  buildRecoilPattern, SPREAD_MODS,
+  BROTHER_LEGACY, BROTHER_WEAPON_NAMES, buildRecoilPattern, SPREAD_MODS,
 } from './lib.js';
 import { clamp, clamp01, lerp, DEG } from './mathx.js';
+
+/**
+ * A/B HATCH — `?owNoRealGuns=1` builds the arsenal the way it shipped before
+ * the playtest report: sixteen weapons, no `pistol`, no `shotgun`, and Carson
+ * back on the Flare Gun and Harpoon.
+ *
+ * Two new procedural models are two new geometry builds, ~5 extra draw-call
+ * buckets in the rig and two more entries in every per-weapon loop, and an
+ * addition whose cost is only visible as an ABSENCE cannot be measured against
+ * a different build on a machine that is also doing something else
+ * (ARCHITECTURE.md, "A/B hatches"). This arm restores the absence on a LIVE
+ * build so `tools/perfcheck.mjs --ab='.|owNoRealGuns=1,.'` prices it off one
+ * compile, one GPU state and one governor decision.
+ */
+const _qs = typeof location !== 'undefined' ? new URLSearchParams(location.search) : null;
+const NO_REAL_GUNS = _qs?.get('owNoRealGuns') === '1';
+/** The ids the hatch removes, and what Carson carries instead when it is on. */
+const REAL_GUNS = ['pistol', 'shotgun'];
+const PRE_REPORT_CARSON = ['fists', 'pipe', 'flare', 'speargun', 'harpoon', 'depth'];
+const PRE_REPORT_CARSON_START = ['fists', 'pipe', 'flare', 'speargun'];
+
+/* The four tables this system reads, resolved ONCE against the hatch. Every
+ * reference below goes through these so the arm cannot be half-applied. */
+const ORDER = NO_REAL_GUNS ? WEAPON_ORDER.filter((w) => !REAL_GUNS.includes(w)) : WEAPON_ORDER;
+const LOADOUT = NO_REAL_GUNS ? { ...BROTHER_LOADOUT, carson: PRE_REPORT_CARSON } : BROTHER_LOADOUT;
+const START = NO_REAL_GUNS ? { ...BROTHER_START, carson: PRE_REPORT_CARSON_START } : BROTHER_START;
+const SIGNATURE_OF = NO_REAL_GUNS ? { ...BROTHER_SIGNATURE, carson: 'flare' } : BROTHER_SIGNATURE;
+const LEGACY = NO_REAL_GUNS ? {} : BROTHER_LEGACY;
+/** Canonical wheel order, as a comparator. Preallocated (rule 5). */
+const byWheelOrder = (a, b) => ORDER.indexOf(a) - ORDER.indexOf(b);
 
 /**
  * WEAPONS — the improvised arsenal, held in a character's hand.
@@ -208,6 +238,8 @@ export class WeaponSystem {
     this._swingSide = 1;
     this._swingContactAt = -1;
     this._autoCycleAt = 0;
+    /** True while a tube gun is loading itself one shell at a time. */
+    this._shellReload = false;
     this._switchTo = null;
     /** null = automatic (vehicle / dead); true|false = forced. */
     this.holsterOverride = null;
@@ -313,7 +345,7 @@ export class WeaponSystem {
 
     const t0 = performance.now();
     let tris = 0;
-    for (const id of WEAPON_ORDER) {
+    for (const id of ORDER) {
       const def = ALL_WEAPONS[id];
       /* One deterministic sub-stream per weapon: the dents in the Dock Pipe are
        * the same dents in every session and in every capture (rule 4). */
@@ -378,8 +410,9 @@ export class WeaponSystem {
 
     this.stats = { tris, drawCalls: 0, live: 0, fired: 0, weapons: this.states.size };
     console.info(
-      `[weapons] ${this.states.size} improvised weapons · ${(tris / 1000).toFixed(1)}k tris · ` +
-        `built in ${(performance.now() - t0).toFixed(0)}ms`
+      `[weapons] ${this.states.size} weapons · ${(tris / 1000).toFixed(1)}k tris · ` +
+        `built in ${(performance.now() - t0).toFixed(0)}ms` +
+        (NO_REAL_GUNS ? ' · owNoRealGuns=1 (pistol/shotgun withheld)' : '')
     );
   }
 
@@ -395,7 +428,7 @@ export class WeaponSystem {
    * state, a probe) and true on a real character switch.
    */
   setBrother(id, equip = false) {
-    const l = BROTHER_LOADOUT[id];
+    const l = LOADOUT[id];
     if (!l) return false;
     this.brotherId = id;
     Object.assign(this.hand,
@@ -408,12 +441,27 @@ export class WeaponSystem {
     }
     this._resolveUnlocks();
     if (equip) {
-      const want = BROTHER_SIGNATURE[id];
+      const want = SIGNATURE_OF[id];
       const ok = this.loadout.includes(want) ? want
         : (this.loadout.find((w) => !ALL_WEAPONS[w].melee) ?? this.loadout[1] ?? this.loadout[0]);
       this.setWeaponImmediate(ok ?? 'fists');
     }
     return true;
+  }
+
+  /**
+   * What this weapon is CALLED in the hands that are holding it.
+   *
+   * Two brothers can carry the same engine id — Carson's DOCK .38 and Aidan's
+   * SHOP NINE are one `pistol` — and the HUD, the pickup toast and the fire
+   * payload should all say the name the man who owns it uses. See
+   * `BROTHER_WEAPON_NAMES` in `lib.js` for why there are two ids rather than
+   * six. Everything not in that table falls through to the def's own label, so
+   * this is a lookup miss for fourteen of the eighteen weapons and costs
+   * nothing.
+   */
+  labelFor(id, brother = this.brotherId) {
+    return BROTHER_WEAPON_NAMES[brother]?.[id] ?? ALL_WEAPONS[id]?.label ?? id;
   }
 
   /**
@@ -433,7 +481,7 @@ export class WeaponSystem {
    */
   _resolveUnlocks() {
     const id = this.brotherId;
-    const all = BROTHER_LOADOUT[id];
+    const all = LOADOUT[id];
     if (!all) return this.loadout;
     if (this.unlockAll) return this.setLoadout(all);
 
@@ -445,14 +493,32 @@ export class WeaponSystem {
        * `BROTHER_START` is byte-identical to `src/game/data.js`'s. Passing
        * this system's own copy avoids reaching into another subsystem's data
        * table for a field already held here. */
-      owned = econ.loadout(id, { start: BROTHER_START[id] ?? ['fists'] });
+      owned = econ.loadout(id, { start: START[id] ?? ['fists'] });
     } else {
-      owned = (BROTHER_START[id] ?? ['fists']).slice();
+      owned = (START[id] ?? ['fists']).slice();
     }
     /* Anything granted this session that the save has not caught up with. */
     for (const w of this._granted ?? []) if (!owned.includes(w)) owned.push(w);
     /* Canonical wheel order, so the wheel never reshuffles as things unlock. */
     const out = all.filter((w) => owned.includes(w));
+    /**
+     * A SAVE FROM BEFORE THE REPORT KEEPS WHAT IT EARNED.
+     *
+     * `all` is the brother's CURRENT canonical six, and Carson's no longer has
+     * the Flare Gun or the Harpoon in it. Filtering the save's unlocks through
+     * it and stopping there would silently confiscate a weapon somebody spent a
+     * chapter on — the wheel would simply be one shorter, with no toast and no
+     * way to tell that from a bug. `BROTHER_LEGACY` is the list of ids that
+     * were in THIS brother's six before, and they come back if, and only if,
+     * the save says he owns them. A new save has none, so this is dead code on
+     * every fresh game and load-bearing on every old one. */
+    let legacy = false;
+    for (const w of LEGACY[id] ?? []) {
+      if (owned.includes(w) && this.states.has(w) && !out.includes(w)) { out.push(w); legacy = true; }
+    }
+    /* Only re-sort when something was appended — `all.filter` is already in
+     * canonical order, and this runs twice a second on the unlock poll. */
+    if (legacy) out.sort(byWheelOrder);
     if (!out.length) out.push('fists');
     return this.setLoadout(out);
   }
@@ -495,9 +561,9 @@ export class WeaponSystem {
     if (!this._granted.includes(id)) this._granted.push(id);
     if (this.loadout.includes(id)) return false;
     /* Insert in canonical wheel order so the wheel never reshuffles. */
-    const order = WEAPON_ORDER.indexOf(id);
+    const order = ORDER.indexOf(id);
     let i = 0;
-    while (i < this.loadout.length && WEAPON_ORDER.indexOf(this.loadout[i]) < order) i++;
+    while (i < this.loadout.length && ORDER.indexOf(this.loadout[i]) < order) i++;
     this.loadout.splice(i, 0, id);
     this._hudState.loadout = this.loadout;
     this._grantAmmo(id, 0);
@@ -635,7 +701,7 @@ export class WeaponSystem {
     if (!s) return h;
     const a = this.ammo;
     h.id = this.activeId;
-    h.name = s.def.label ?? s.def.id;
+    h.name = this.labelFor(this.activeId);
     h.mode = s.mode;
     h.melee = !!s.def.melee;
     h.ammo = s.def.melee ? 0 : Math.min(a.mag, Math.max(1, a.magSize));
@@ -656,7 +722,7 @@ export class WeaponSystem {
     h.dryFired = (this.ctx.time?.elapsed ?? 0) - this._dryAt < DRY_FIRE_LOCKOUT;
     h.driveBy = this.driveBy === true;
     h.brother = this.brotherId;
-    h.locked = WEAPON_ORDER.filter((w) => !this.loadout.includes(w));
+    h.locked = ORDER.filter((w) => !this.loadout.includes(w));
     h.ads = this.adsProgress > 0.5;
     /* `ui` maps this to reticle bloom as 4 + spread * 40 px. */
     h.spread = clamp01(this._spread / 6);
@@ -702,12 +768,13 @@ export class WeaponSystem {
     const s = this.states.get(id);
     if (!s || id === this.activeId) return false;
     if (!force && !this.loadout.includes(id)) {
-      this._notify(s.def.label ?? id, 'LOCKED', 'slag');
+      this._notify(this.labelFor(id), 'LOCKED', 'slag');
       return false;
     }
     const from = this.current;
     this._switchTo = null;
     this._autoCycleAt = 0;
+    this._shellReload = false;
     this._swingContactAt = -1;
     this.rig.stopClip();
     this.rig.swingT = -1;
@@ -720,7 +787,7 @@ export class WeaponSystem {
     const hf = 0.42 * this.hand.handling;
     this.rig.swapTo(id, (from?.holsterTime ?? 0.34) * hf, (s.def.drawTime ?? 0.5) * hf);
     this.rig.setLoaded(true);
-    this._notify(s.def.label ?? id, s.def.melee ? 'MELEE' : `${s.mag + (s.chambered ? 1 : 0)} / ${s.reserve}`);
+    this._notify(this.labelFor(id), s.def.melee ? 'MELEE' : `${s.mag + (s.chambered ? 1 : 0)} / ${s.reserve}`);
     return true;
   }
 
@@ -802,6 +869,10 @@ export class WeaponSystem {
     if (s.mag >= s.def.magSize || s.reserve <= 0) return false;
     this.rig.stopClip();
     const empty = s.mag === 0 && !s.chambered;
+    /* A tube-fed gun loads one shell per clip and comes back for the next in
+     * `update`; the flag is what says the player asked for a FULL tube rather
+     * than for the single shell this clip is about to seat. */
+    this._shellReload = s.def.shellReload === true;
     this.rig.play(empty ? 'reloadEmpty' : 'reloadTac');
     return true;
   }
@@ -874,7 +945,7 @@ export class WeaponSystem {
     if (!def) return;
     const w = this._fireWeapon;
     w.id = def.id;
-    w.name = def.label;
+    w.name = this.labelFor(def.id);
     w.class = def.fxClass;
     w.audio = def.audioProfile;
     w.suppressed = true;
@@ -894,6 +965,25 @@ export class WeaponSystem {
   tryFire() {
     const s = this.state;
     if (!s || s.def.melee) return false;
+    /**
+     * A SHELL-BY-SHELL RELOAD IS INTERRUPTIBLE, AND THAT IS THE WHOLE POINT.
+     *
+     * On a magazine weapon the reload is atomic: you committed to 2.4 s when
+     * you pressed R and the gun is out of the fight until it finishes. A tube
+     * gun is the opposite — every shell you seat is a shell you can shoot, so
+     * "how many can I afford before they come round the corner" becomes a
+     * decision the player makes rather than one the animation makes for him.
+     * That is how GTA's pump gun behaves and it is why the report named it.
+     *
+     * The cancel happens BEFORE the `reloading` guard below, because that guard
+     * is what makes an atomic reload atomic. It requires a chambered round, so
+     * cancelling never produces a shot the gun did not have. */
+    if (this.reloading && s.def.shellReload && s.chambered && this._fireTimer <= 0) {
+      this._shellReload = false;
+      this.rig.stopClip();
+      this.rig.boltHold = 0;
+      this._emitReload('end');
+    }
     if (this.reloading || this.switching || this._fireTimer > 0) return false;
     /**
      * DRY FIRE — a click, a lockout and a state the HUD can grey out.
@@ -916,7 +1006,7 @@ export class WeaponSystem {
       const dd = s.def;
       const w = this._fireWeapon;
       w.id = dd.id;
-      w.name = dd.label;
+      w.name = this.labelFor(dd.id);
       w.class = dd.fxClass;
       w.audio = dd.audioProfile;
       w.suppressed = true;
@@ -1093,7 +1183,8 @@ export class WeaponSystem {
   _completeReload(empty) {
     const s = this.state;
     if (!s) return;
-    const want = s.def.magSize - s.mag;
+    /* One shell per clip for a tube gun; `update` comes back for the next. */
+    const want = s.def.shellReload ? Math.min(1, s.def.magSize - s.mag) : s.def.magSize - s.mag;
     const take = Math.min(want, s.reserve);
     s.reserve -= take;
     s.mag += take;
@@ -1143,6 +1234,19 @@ export class WeaponSystem {
     if (this._swingContactAt >= 0 && this.rig.swingT >= this._swingContactAt) {
       this._swingContactAt = -1;
       this.melee.strike(def, player, this._swingSide, this.rng);
+    }
+
+    /* ---- shell-by-shell reload: come back for the next one -------------
+     * Driven from here rather than from the clip's own `end` event on purpose.
+     * `rig._advanceClip` fires that event from inside its own loop and then
+     * nulls `this.clip` on the line after it, so a `play()` from the handler is
+     * a clip started and immediately thrown away on the frames where the last
+     * event and the clip's end land together. One frame of daylight between
+     * shells is imperceptible at 0.62 s a shell and it is also honest: that
+     * frame is exactly when the gun is interruptible. */
+    if (this._shellReload && !this.reloading && !this.switching) {
+      if (def.shellReload && s.reserve > 0 && s.mag < def.magSize) this.rig.play('reloadTac');
+      else this._shellReload = false;
     }
 
     /* ---- single-shot auto-cycle ---------------------------------------- */
@@ -1434,7 +1538,7 @@ export class WeaponSystem {
       rig.boreDir(this._firePayload.dir);
       const w = this._fireWeapon;
       w.id = def.id;
-      w.name = def.label;
+      w.name = this.labelFor(def.id);
       w.class = def.fxClass;
       w.audio = def.audioProfile;
       w.suppressed = def.silent === true;
@@ -1520,6 +1624,7 @@ export class WeaponSystem {
     this._debugFrame = 0;
     this._swingContactAt = -1;
     this._autoCycleAt = 0;
+    this._shellReload = false;
     /* `holstered: true` photographs the sling pose (normally only seen from a
      * car), and it has to survive `update()` re-deriving the flag every frame,
      * so it goes through the same override `game` would use. */
@@ -1679,8 +1784,16 @@ export class WeaponSystem {
           tethered: !!d.tethered, pins: !!d.pins, autoCycle: !!d.autoCycle,
           reach: d.reach ?? 0, arcDeg: d.arcDeg ?? 0,
           swing: d.swing ? { ...d.swing } : null,
+          /* The two the real guns added. `knock` is the per-projectile impulse
+           * the ballistics sim hands `physics.fireBullet`; `pump` and
+           * `shellReload` are the shotgun's action, both read by the rig and
+           * the reload loop rather than declared for decoration. */
+          knock: d.knock ?? 0, pump: !!d.pump, shellReload: !!d.shellReload,
+          sling: d.sling ?? null,
         },
         vm,
+        /* Resolved for the ACTIVE brother — the same string the HUD shows. */
+        name: this.labelFor(id),
         ammo: { mag: s.mag, reserve: s.reserve, chambered: s.chambered, mode: s.mode },
       };
     }
@@ -1691,9 +1804,23 @@ export class WeaponSystem {
       loadout: this.loadout.slice(),
       active: this.activeId,
       hand: { ...this.hand },
-      signature: BROTHER_SIGNATURE[this.brotherId] ?? null,
-      start: (BROTHER_START[this.brotherId] ?? []).slice(),
-      full: (BROTHER_LOADOUT[this.brotherId] ?? []).slice(),
+      signature: SIGNATURE_OF[this.brotherId] ?? null,
+      start: (START[this.brotherId] ?? []).slice(),
+      full: (LOADOUT[this.brotherId] ?? []).slice(),
+      /**
+       * Ids that are in NOBODY's canonical six but that a save may still carry
+       * — Carson's Flare Gun and Harpoon after the report. Published because a
+       * harness has no other way to know which brother a retired weapon has to
+       * be staged on, and hardcoding that list in the probe is precisely the
+       * duplicated table `OWNER` exists to avoid.
+       */
+      legacy: Object.fromEntries(Object.entries(LEGACY).map(([b, l]) => [b, l.slice()])),
+      /* What EVERY id would be called in this brother's hands — the whole
+       * table, not just his six, because story completion puts all of it in
+       * all three pairs of hands and a gate has to be able to compare one id
+       * across three registers. */
+      names: Object.fromEntries([...this.states.keys()].map((w) => [w, this.labelFor(w)])),
+      realGuns: !NO_REAL_GUNS,
       unlockAll: this.unlockAll,
       driveBy: this.driveBy,
       readyCap: READY_CAP,
@@ -1715,6 +1842,7 @@ export class WeaponSystem {
     if (!force && !this.loadout.includes(id)) return false;
     this._switchTo = null;
     this._autoCycleAt = 0;
+    this._shellReload = false;
     this._swingContactAt = -1;
     this.activeId = id;
     this.rig.stopClip();

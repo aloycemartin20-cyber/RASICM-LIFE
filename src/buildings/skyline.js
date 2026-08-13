@@ -23,6 +23,15 @@ const CELL = 78;
 const RECOMPUTE_MOVE = 40;
 
 /**
+ * The same hatch `archetypes.js` reads — `?owNoPgh=1` — so one page load can
+ * measure the whole Pittsburgh wave off, near tier and far tier together. A
+ * hatch that only reached the streamed city would leave the impostor field
+ * changed in both arms and quietly bias every A/B taken from a long shot.
+ */
+const NO_PGH =
+  typeof location !== 'undefined' && /[?&]owNoPgh=1/.test(location.search);
+
+/**
  * Seating an impostor on a hill.
  *
  * THE DEFECT THIS EXISTS FOR, and it is worth stating precisely because the
@@ -236,6 +245,96 @@ function gableGeo() {
   return paint(a.build());
 }
 
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * THE THREE PITTSBURGH SILHOUETTES, AT IMPOSTOR SCALE
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * `archetypes.js` now gives the Golden Triangle's tall lots a red-lit deco
+ * beacon, a pyramid cap or a copper chateau roof, and `landmarks.js` stands a
+ * spired glass castle on one of its blocks. Every one of those is REAL geometry
+ * inside the stream radius and NONE of it exists beyond it, where this field
+ * takes over — so from Hazelwood at 1.2 km (the `farview` shot, the one that
+ * exists to test exactly this) downtown reverted to the flat-topped blocks and
+ * ziggurat towers it always was, and the change stopped at the LOD boundary.
+ *
+ * That is the same defect `lodHoarding` was written for and the argument is
+ * identical: what survives distance is SILHOUETTE, so the impostor tier has to
+ * carry the outline even though it can carry nothing else. These are not copies
+ * of the near meshes — they cannot be, they are unit boxes scaled by a matrix —
+ * they are the same RULE at the same three profiles: a point, a hipped roof and
+ * a ring of column heads. Each costs one prototype geometry and no draw calls
+ * at all: the field is bucketed by (kind, material), so a new kind is one more
+ * InstancedMesh in a field that already has thirteen and the instances come out
+ * of the ones the old kinds would have had.
+ */
+
+/** A tower that comes to a POINT: shaft, collar, four-sided cap. */
+function spireGeo() {
+  const a = new Accum('sky_spire');
+  const b = plainBox();
+  const cone = new THREE.ConeGeometry(0.5, 1, 4, 1);
+  a.add(b, trs(_m, 0, 0.38, 0, 0, 1, 0.76, 1));
+  ribs(a, b, 0.03, 0.72, 10);
+  a.add(b, trs(_m, 0, 0.765, 0, 0, 1.04, 0.03, 1.04));
+  a.add(b, trs(_m, 0, 0.83, 0, 0, 0.86, 0.1, 0.86));
+  // the cap, turned 45 degrees so its arrises face the corners of the plan
+  a.add(cone, trs(_m, 0, 1.09, 0, Math.PI * 0.25, 1.2, 0.44, 1.2));
+  a.add(b, trs(_m, 0, 1.33, 0, 0, 0.05, 0.14, 0.05));
+  cone.dispose();
+  b.dispose();
+  return paint(a.build());
+}
+
+/** A hipped copper roof with a ridge platform — the chateau. */
+function chateauGeo() {
+  const a = new Accum('sky_chateau');
+  const b = plainBox();
+  const cone = new THREE.ConeGeometry(0.5, 1, 4, 1);
+  a.add(b, trs(_m, 0, 0.42, 0, 0, 1, 0.84, 1));
+  ribs(a, b, 0.04, 0.8, 8);
+  // the eaves course the roof oversails on
+  a.add(b, trs(_m, 0, 0.85, 0, 0, 1.1, 0.035, 1.1));
+  a.add(cone, trs(_m, 0, 0.955, 0, Math.PI * 0.25, 1.44, 0.19, 1.44));
+  a.add(b, trs(_m, 0, 1.06, 0, 0, 0.3, 0.03, 0.3));
+  // one dormer per slope, which is what stops a steep hip reading as a pyramid
+  for (const s of [-1, 1]) {
+    a.add(b, trs(_m, s * 0.3, 0.9, 0, 0, 0.1, 0.06, 0.1));
+    a.add(b, trs(_m, 0, 0.9, s * 0.3, 0, 0.1, 0.06, 0.1));
+  }
+  cone.dispose();
+  b.dispose();
+  return paint(a.build());
+}
+
+/**
+ * A dead-flat dark slab with a ring of column heads on top — the Steel Tower's
+ * own profile, so the buildings around it belong to the same city.
+ */
+function crownGeo() {
+  const a = new Accum('sky_crown');
+  const b = plainBox();
+  a.add(b, trs(_m, 0, 0.47, 0, 0, 1, 0.94, 1));
+  ribs(a, b, 0.03, 0.9, 14, 0.5, 0.5, 0.012);
+  a.add(b, trs(_m, 0, 0.95, 0, 0, 1.04, 0.03, 1.04));
+  // the heads: four per face plus the corners, standing proud of a sunk deck
+  a.add(b, trs(_m, 0, 0.985, 0, 0, 0.66, 0.04, 0.66));
+  for (let i = 0; i < 4; i++) {
+    const o = -0.5 + (i + 0.5) / 4;
+    for (const s of [-1, 1]) {
+      a.add(b, trs(_m, o, 1.0, s * 0.5, 0, 0.1, 0.075, 0.1));
+      a.add(b, trs(_m, s * 0.5, 1.0, o, 0, 0.1, 0.075, 0.1));
+    }
+  }
+  for (const sx of [-1, 1]) {
+    for (const sz of [-1, 1]) {
+      a.add(b, trs(_m, sx * 0.47, 1.02, sz * 0.47, 0, 0.14, 0.12, 0.14));
+    }
+  }
+  b.dispose();
+  return paint(a.build());
+}
+
 /** A block with a timber water tower on it — the New York-ism, used sparingly. */
 function waterGeo() {
   const a = new Accum('sky_water');
@@ -302,6 +401,10 @@ export class Skyline {
       { geo: slabGeo(), name: 'slab' },
       { geo: gableGeo(), name: 'gable' },
       { geo: waterGeo(), name: 'water' },
+      // The Golden Triangle's three — see the note over `spireGeo`.
+      { geo: spireGeo(), name: 'spire' },
+      { geo: chateauGeo(), name: 'chateau' },
+      { geo: crownGeo(), name: 'crown' },
     ];
     // The impostor tier's own surfaces — same hues, a quarter of the texture
     // frequency and a fraction of the weathering. See `sky_concrete` in
@@ -372,7 +475,47 @@ export class Skyline {
           const r = rng.float();
           let kind;
           if (tall > 0.75 && h > 55) {
-            kind = r < 0.42 ? 1 : r < 0.72 ? 4 : 3; // tower / slab / notched block
+            /**
+             * DOWNTOWN'S TALL MIX, and it is the only branch that changed.
+             *
+             * Beyond the stream radius this field IS the Golden Triangle, and
+             * before this it offered three profiles there: a ziggurat tower, a
+             * post-war slab and a notched block — none of which is a shape the
+             * near city now builds. `farview` photographed a downtown with no
+             * point, no hipped roof and no column ring in it at 1.2 km, while
+             * `skyline` at 500 m had all three, so the city changed silhouette
+             * as you crossed the boundary.
+             *
+             * Seven ways, weighted so the new three take a little over half of
+             * the tall stock. That is deliberately MORE than `archetypes.js`
+             * gives its own tall lots (about 40% of the ones over 16 storeys):
+             * the impostor field is thinned by `rng.float() > 0.86` and by
+             * every instance a streamed tile suppresses, so a share that looks
+             * right per-instance photographs as one lonely spire per frame.
+             *
+             * `NO_PGH` is the same hatch `archetypes.js` reads, so
+             * `--ab='.|owNoPgh=1,.'` measures the whole wave at once and the
+             * far field cannot be A/B'd into a different city than the near
+             * one — the kind roll is taken either way, only the mapping moves,
+             * so the instance count and the seating are bit-identical.
+             */
+            kind = NO_PGH
+              ? r < 0.42
+                ? 1
+                : r < 0.72
+                  ? 4
+                  : 3
+              : r < 0.2
+                ? 1 // ziggurat tower
+                : r < 0.34
+                  ? 4 // post-war slab
+                  : r < 0.46
+                    ? 3 // notched block
+                    : r < 0.66
+                      ? 7 // spire — the pyramid cap and the glass castle
+                      : r < 0.82
+                        ? 9 // flat top with a ring of column heads
+                        : 8; // copper chateau
           } else if (style.archetypes.mill && r < 0.55) {
             kind = 2; // shed
           } else if (tall < 0.33 && h < 15 && r < 0.72) {
@@ -395,7 +538,35 @@ export class Skyline {
             dd *= 0.72;
             h = Math.min(h, 13) * 0.85;
           }
-          const mat = kind === 1 || kind === 4 ? (rng.float() < 0.6 ? 2 : 0) : tall > 0.7 ? 0 : rng.float() < 0.5 ? 1 : 0;
+          /**
+           * ONE DRAW FOR THE WHOLE TALL BRANCH, taken whether or not the
+           * instance ends up glazed.
+           *
+           * The old expression drew for kinds 1 and 4 and not for kind 3, which
+           * was harmless while those were the only three tall kinds and is not
+           * harmless now: `?owNoPgh=1` maps the same `r` to a different kind,
+           * so a conditional draw would make the two arms consume the stream at
+           * different rates and every instance after the first tall one would
+           * be seated somewhere else. The arms would be two cities, and an A/B
+           * between two cities measures the cities.
+           *
+           * So `tallBranch` draws unconditionally. That does shift the impostor
+           * field against the tree this was cut from — a notched downtown block
+           * now consumes a float it used to skip — which is why `skyprobe.mjs`
+           * is re-run rather than assumed: seating, daylight, burial and the
+           * built-tile overlap are all measured again on the new field.
+           */
+          const tallBranch = tall > 0.75 && h > 55;
+          const mat =
+            tallBranch || kind === 1 || kind === 4
+              ? rng.float() < 0.6
+                ? 2
+                : 0
+              : tall > 0.7
+                ? 0
+                : rng.float() < 0.5
+                  ? 1
+                  : 0;
 
           /**
            * Sit the plan on the ground BEFORE the rotation is thrown away —

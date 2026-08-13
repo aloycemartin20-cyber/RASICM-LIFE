@@ -69,6 +69,7 @@ export function clearGeometryCache() {
     for (const r of entry.rotors ?? []) r.geo?.dispose?.();
     entry.steer?.geo?.dispose?.();
     entry.turret?.geo?.dispose?.();
+    entry.turret?.trim?.dispose?.();
     entry.turret?.gun?.geo?.dispose?.();
   }
   GEO_CACHE.clear();
@@ -118,6 +119,13 @@ function geometryFor(spec, lod) {
   const merged = {
     paint: mergeAll(body.paint ?? []),
     trim: mergeAll([...(body.trim ?? []), ...(interior.trim ?? [])]),
+    /**
+     * A SECOND BODY COLOUR — see `accent` in paint.js. Painted steel in the
+     * class's own `style.accent`, for a machine that is genuinely two colours
+     * (the Clipper's red paddle wheel against its white hull) rather than one
+     * colour with black trim on it.
+     */
+    accent: mergeAll(body.accent ?? []),
     chrome: mergeAll([...(body.chrome ?? []), ...(interior.chrome ?? [])]),
     cavity: mergeAll([...(body.cavity ?? []), ...(interior.cavity ?? [])]),
     glass: mergeAll(body.glass ?? []),
@@ -171,9 +179,10 @@ function geometryFor(spec, lod) {
     const dark = mergeAll([
       merged.trim, merged.chrome, merged.cavity, merged.grilleMesh,
       merged.plate, merged.disc, merged.seat, merged.leather, merged.dash,
-      merged.liner,
+      merged.liner, merged.accent,
     ]);
     merged.trim = dark;
+    merged.accent = new THREE.BufferGeometry();
     merged.liner = new THREE.BufferGeometry();
     merged.chrome = new THREE.BufferGeometry();
     merged.cavity = new THREE.BufferGeometry();
@@ -213,9 +222,9 @@ function geometryFor(spec, lod) {
     merged.trim = mergeAll([
       merged.trim, merged.chrome, merged.cavity, merged.grilleMesh,
       merged.plate, merged.disc, merged.seat, merged.leather, merged.dash,
-      merged.liner,
+      merged.liner, merged.accent,
     ]);
-    for (const k of ['chrome', 'cavity', 'grilleMesh', 'plate', 'disc', 'seat', 'leather', 'dash', 'liner']) {
+    for (const k of ['chrome', 'cavity', 'grilleMesh', 'plate', 'disc', 'seat', 'leather', 'dash', 'liner', 'accent']) {
       merged[k] = new THREE.BufferGeometry();
     }
     // Lamps collapse to front (white) and rear (red) clusters.
@@ -282,6 +291,10 @@ function geometryFor(spec, lod) {
     bakeGrime(body.turret.geo, spec, 0.6);
     bakeWear(body.turret.geo, spec, 0.6);
     bakeBoxUV(body.turret.gun.geo);
+    // The turret's dark furniture — vision blocks, smoke dischargers, coax,
+    // bustle basket. Inside the pivot, so it cannot ride in the hull's own
+    // `trim` group; see the note in `tank.js`.
+    if (body.turret.trim?.attributes?.position) bakeBoxUV(body.turret.trim);
     turret = body.turret;
   }
 
@@ -604,6 +617,11 @@ export function buildVehicleModel(spec, mats, opts = {}) {
     const pm = add(body.paint, paintMat, 'paint');
     if (pm) panels.push({ mesh: pm, lod });
     add(body.trim, mats.trim('dark'), 'trim');
+    // Only classes that author one — no point materialising (and caching) an
+    // accent material for the forty classes that are one colour.
+    if (body.accent?.attributes?.position?.count) {
+      add(body.accent, mats.accent(spec.style?.accent), 'accent');
+    }
     add(body.chrome, mats.chrome(), 'chrome');
     add(body.cavity, mats.cavity(), 'cavity');
     add(body.grilleMesh, mats.grilleMesh(), 'grille');
@@ -702,7 +720,17 @@ export function buildVehicleModel(spec, mats, opts = {}) {
       const pivot = new THREE.Group();
       pivot.name = `rotor_${r.axis}`;
       pivot.position.set(r.pos[0], r.pos[1], r.pos[2]);
-      const m = new THREE.Mesh(r.geo, mats.trim('dark'));
+      /**
+       * Blades are dark by default — they are a helicopter's. A rotor that is
+       * PAINTED, like the Clipper's red sternwheel, names its own material:
+       * `mat: 'accent'` takes the class's `style.accent`, the same second body
+       * colour the static half of the boat uses, so the turning wheel and the
+       * boot-top stripe beside it cannot drift apart.
+       */
+      const m = new THREE.Mesh(
+        r.geo,
+        r.mat === 'accent' ? mats.accent(spec.style?.accent) : mats.trim('dark')
+      );
       m.name = `rotorBlades_${r.axis}`;
       pivot.add(m);
       g.add(pivot);
@@ -727,6 +755,15 @@ export function buildVehicleModel(spec, mats, opts = {}) {
       shell.matrixAutoUpdate = false;
       shell.updateMatrix();
       ring.add(shell);
+      // Dark furniture bolted to the same ring. LOD-gated by `tank.js` (it
+      // emits nothing at LOD >= 2), so this costs a draw call only up close.
+      if (t.trim?.attributes?.position?.count) {
+        const tf = new THREE.Mesh(t.trim, mats.trim('dark'));
+        tf.name = 'turretTrim';
+        tf.matrixAutoUpdate = false;
+        tf.updateMatrix();
+        ring.add(tf);
+      }
       const trunnion = new THREE.Group();
       trunnion.name = 'gunTrunnion';
       trunnion.position.set(t.gun.pos[0], t.gun.pos[1], t.gun.pos[2]);
@@ -915,7 +952,7 @@ export function modelStats(spec) {
   for (const d of e0.doors ?? []) { lod0 += safeTris(d.geo); tris += safeTris(d.geo); }
   for (const r of e0.rotors ?? []) { lod0 += safeTris(r.geo); tris += safeTris(r.geo); }
   if (e0.turret) {
-    const t = safeTris(e0.turret.geo) + safeTris(e0.turret.gun.geo);
+    const t = safeTris(e0.turret.geo) + safeTris(e0.turret.trim) + safeTris(e0.turret.gun.geo);
     lod0 += t; tris += t;
   }
   if (e0.wheel) lod0 += (safeTris(e0.wheel.rubber) + safeTris(e0.wheel.rim) + safeTris(e0.wheel.disc)) * 4;

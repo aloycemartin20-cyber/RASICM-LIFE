@@ -170,6 +170,85 @@ export const EXTRA_FRAMES = {
   },
 };
 
+/**
+ * ────────────────────────────────────────────────────────────────────────────
+ * THE RIDE CAMERA — what the lens does while you are a PASSENGER
+ * ────────────────────────────────────────────────────────────────────────────
+ * Riding the trolley or the incline is the one time in this game the player is
+ * not steering anything, and a chase camera welded 7 m behind a vehicle he is
+ * not driving is the worst possible answer: it frames the back of a box for two
+ * minutes. So a passenger gets an AUTOMATIC camera — a short reel of authored
+ * framings that CUT between each other every few seconds, the way a title
+ * sequence covers a train.
+ *
+ * WHY CUTS AND NOT ONE MOVING SHOT. A single continuous camera has to solve
+ * "where should I be" for every second of a 45 s ride, and the honest answer
+ * changes: on the flat straight the picture is the car against the street, on
+ * the climb it is the city opening up behind. One shot that tries to be both
+ * spends its time travelling between them. Cutting is free, it is what film
+ * does, and each shot then only has to be right for its own six seconds.
+ *
+ * THE REEL, and what each shot is for:
+ *
+ *   vista    THE POSTCARD, and the reason this exists. The camera stands on
+ *            the far side of the car from `transit.vista` and looks back
+ *            THROUGH the car at it — so on the incline the shot is the car
+ *            climbing with downtown unfolding behind it, which is the single
+ *            most photographed view in Pittsburgh and the whole point of
+ *            riding the thing. Skipped by services with no vista (the trolley
+ *            runs down a street; there is nothing behind it but the street).
+ *   track    exterior tracking: the lens paces the car from off the flank,
+ *            low, so the city streams past the window band.
+ *   window   over-shoulder, INSIDE: the lens sits at the passenger's shoulder
+ *            and looks forward and outboard through the glass. This is the one
+ *            that sells "I am on the tram" rather than "I am watching a tram".
+ *   reveal   a WORLD-FIXED wide: the camera is planted ahead of the car when
+ *            the shot starts and does not move; the car travels through frame
+ *            and out of it. The only shot with no camera motion at all, which
+ *            is what makes the moving ones read as moving.
+ *   orbit    a slow arc round the car at walking pace — 9 deg/s, so it reads
+ *            as a drift rather than a spin.
+ *
+ * Every shot is a POSITION and a LOOK POINT, both solved analytically from the
+ * subject's drawn pose and then eased with one time constant, and both SNAPPED
+ * on a cut. Nothing here is random (hard rule 4): the reel is a fixed cycle and
+ * the side flips on the shot index, so a capture of the same ride is the same
+ * film twice.
+ *
+ * `dur` seconds, `fov` multiplies the base FOV, `lens` is the ease time
+ * constant (a long lens on a static wide wants a slower hand than a tracking
+ * shot).
+ */
+export const CINE = {
+  /** Cross-fade in and out of the reel, seconds. A cut INSIDE it is instant. */
+  blendTau: 0.32,
+  /** How fast the shot solves ease toward their ideal, seconds. */
+  tau: 0.30,
+  /** Framing radius floor after a collision pull-in, metres. */
+  minRadius: 1.4,
+  /** Seconds a live shot may stay blocked before the reel cuts away from it. */
+  blockGrace: 0.5,
+  /**
+   * A framing is only offered if at least this much of the way from the
+   * subject to the lens is free when the cut happens. See `_cineClearance`.
+   */
+  minClear: 0.6,
+  shots: [
+    /**
+     * The postcard is the ONE shot that has to hold two subjects at once — the
+     * car, steeply below the lens, and a city on the horizon — so it is the one
+     * shot with a wide lens. At 1.45 the vertical half-angle is ~45 deg, which
+     * is what lets a 47 deg separation sit inside the frame at all; at the
+     * reel's normal 0.9-1.0 it cannot, and no amount of aiming fixes that.
+     */
+    { id: 'vista', dur: 7.0, fov: 1.45, vista: true },
+    { id: 'track', dur: 6.0, fov: 1.00 },
+    { id: 'window', dur: 5.0, fov: 1.02 },
+    { id: 'reveal', dur: 6.5, fov: 0.86 },
+    { id: 'orbit', dur: 6.0, fov: 1.00 },
+  ],
+};
+
 export class CameraRig {
   constructor(ctx) {
     this.ctx = ctx;
@@ -289,6 +368,42 @@ export class CameraRig {
     this.fovAim = 1;
     /** 0..1 filter of `movement.sprinting` — see the boom section of update(). */
     this.sprintCommit = 0;
+
+    /* ---- the ride camera (see CINE) ---- */
+    /**
+     * `active` is the request, `blend` is how much of the frame it owns. They
+     * are separate so ending the reel is a cross-fade back to the chase rather
+     * than a cut to it — a cut INTO gameplay reads as a glitch, where a cut
+     * between two authored shots reads as editing.
+     */
+    this.cine = {
+      active: false,
+      target: null,
+      blend: 0,
+      /** Index into `CINE.shots`, and seconds spent in it. */
+      shot: 0,
+      t: 0,
+      /** How many cuts this ride has made — published for the gates. */
+      cuts: 0,
+      /** Seeded per shot so the solve is stable across the shot. */
+      side: 1,
+      /** True on the frame a cut happened, for a harness that samples it. */
+      cut: false,
+    };
+    this._cinePos = new THREE.Vector3();
+    this._cineQuat = new THREE.Quaternion();
+    this._cineLook = new THREE.Vector3();
+    this._cineWant = new THREE.Vector3();
+    this._cineWantLook = new THREE.Vector3();
+    this._cineAnchor = new THREE.Vector3();
+    this._cineSubPos = new THREE.Vector3();
+    this._cineSubQuat = new THREE.Quaternion();
+    /** Where a world-fixed shot was planted at its cut. */
+    this._cineFixed = new THREE.Vector3();
+    this._cineFov = this._footFov;
+    this._cineFresh = false;
+    /** Seconds the live shot has been obstructed. See CINE.blockGrace. */
+    this._cineBlockT = 0;
 
     /* ---- outputs ---- */
     this.position = new THREE.Vector3();
@@ -527,6 +642,18 @@ export class CameraRig {
       return;
     }
     this.lookIdle = 0;
+    /**
+     * MOUSE LOOK DOES NOT END THE REEL, AND IT DOES NOT BANK EITHER.
+     *
+     * The ride camera is deliberately exited on a MOVE key or F (see
+     * `src/player/vehicle.js`) and not on a mouse delta — a twitch of the hand
+     * must not throw away an authored shot the player is watching. But the
+     * deltas cannot be integrated in the meantime either: `manualYaw` would
+     * accumulate through a 45 s ride and the chase camera would come back
+     * pointing at the sky. Swallow them; pointer lock is untouched either way,
+     * which is what keeps `src/ui/lockuxprobe.mjs` measuring the same thing.
+     */
+    if (this.cine.active) return;
     if (this.vehicle) {
       this.manualYaw = clamp(this.manualYaw + dYaw, -Math.PI, Math.PI);
       this.manualPitch = clamp(
@@ -636,6 +763,359 @@ export class CameraRig {
   }
 
   /* ==================================================================== */
+  /* the ride camera                                                      */
+  /* ==================================================================== */
+
+  /** True while the reel owns any of the frame — including the fade out. */
+  get cinematicActive() {
+    return this.cine.active;
+  }
+
+  /** The shot on screen right now, or null. Published for the gates and `ui`. */
+  get cinematicShot() {
+    return this.cine.active || this.cine.blend > 0 ? CINE.shots[this.cine.shot].id : null;
+  }
+
+  /**
+   * Start the reel on `target` — anything that publishes a drawn pose and a
+   * `transit` record (see `src/vehicles/tram.js`). Idempotent: calling it again
+   * with the same target does not restart the reel, so a per-frame caller is
+   * safe.
+   */
+  beginCinematic(target) {
+    if (!target) return false;
+    if (this.cine.active && this.cine.target === target) return true;
+    this.cine.active = true;
+    this.cine.target = target;
+    this.cine.t = 0;
+    this.cine.cuts = 0;
+    this.cine.cut = true;
+    this._cineFresh = true;
+    // Open on the postcard when the service has one, on the tracking shot
+    // when it does not — never on the interior, which means nothing until the
+    // player has seen the outside of the thing he just got into.
+    this.cine.shot = target.transit?.vista ? 0 : 1;
+    this.cine.side = 1;
+    return true;
+  }
+
+  /**
+   * Hand the frame back to the normal camera. The fade is in `update`, and the
+   * TARGET IS DELIBERATELY KEPT until the fade completes: the last shot goes on
+   * tracking the car while the frame dissolves back to the chase. Dropping it
+   * here instead makes `_solveCine` publish the chase pose it is fading FROM,
+   * so the cross-fade has nothing to cross and the hand-back is a cut — which
+   * is exactly the glitch the fade exists to avoid.
+   */
+  endCinematic() {
+    if (!this.cine.active) return false;
+    this.cine.active = false;
+    return true;
+  }
+
+  /** Advance to the next framing in the reel. A CUT: the solve is snapped. */
+  _cineCut() {
+    const shots = CINE.shots;
+    const hasVista = !!this.cine.target?.transit?.vista;
+    let n = this.cine.shot;
+    for (let i = 0; i < shots.length; i++) {
+      n = (n + 1) % shots.length;
+      if (!shots[n].vista || hasVista) break;
+    }
+    this.cine.shot = n;
+    this.cine.t = 0;
+    this.cine.cuts++;
+    this.cine.cut = true;
+    this.cine.side = this.cine.cuts % 2 === 0 ? 1 : -1;
+    this._cineFresh = true;
+  }
+
+  /**
+   * Place shot `S`: fill `want` with where the lens goes and `look` with what
+   * it points at, both in world space, from the subject basis this frame's
+   * `_solveCine` has already built.
+   *
+   * Split out of the solver so a framing can be TRIED before it is committed —
+   * see `_cineClearance` and the shot rejection in `_solveCine`.
+   */
+  _cineFrame(S, v, want, look, fresh) {
+    const seat = v.transit?.seat;
+    const half = v.spec?.half;
+    const len = half ? half.z * 2 : 6;
+    const hw = v.transit?.hw ?? (half ? half.x : 1.2);
+    const side = this.cine.side;
+    look.copy(this._cineAnchor);
+
+    switch (S.id) {
+      case 'vista': {
+        /**
+         * THE POSTCARD. Stand UPHILL of the car — on the far side of it from
+         * `transit.vista` — and look back down THROUGH the car at the vista, so
+         * the climb, the carriage and the city behind it are one picture.
+         * `_tmp` is the horizontal bearing from the vista to the car; the lens
+         * is that bearing continued past the car, swung out to one flank and
+         * lifted well clear of the trestle.
+         *
+         * IT HAS TO BE AN AERIAL, and that is geometry rather than taste.
+         * "Uphill of the car" on a funicular is THE HILL: MEASURED on the
+         * emitted incline, an offset of 25 m up the run gains about 25 m of
+         * terrain, so a lens set 12 m above the car 25 m behind it is inside
+         * Mt. Washington — the first capture of this shot photographed the
+         * inside of the lower station's headhouse for exactly that reason. The
+         * rise is therefore steeper than the hill's (26 m over ~18 m of
+         * offset, ~55 deg against the run's ~50), which is also the angle the
+         * real postcard is taken from.
+         *
+         * It is still legitimately unavailable at the bottom of the run, where
+         * the headhouse is; that is not handled here but by the shot being
+         * REJECTED at the cut (see `_cineClearance`), which is the right place
+         * for it because every exterior shot has the same failure mode
+         * somewhere in a city.
+         */
+        const vp = v.transit.vista;
+        this._tmp.set(this._cineAnchor.x - vp.x, 0, this._cineAnchor.z - vp.z);
+        if (this._tmp.lengthSq() < 1e-4) this._tmp.copy(this._vehFwd);
+        this._tmp.normalize();
+        want.copy(this._cineAnchor)
+          .addScaledVector(this._tmp, len * 0.6 + 10)
+          .addScaledVector(this._vehRight, side * (len * 0.5 + 7));
+        want.y = this._cineAnchor.y + 26.0;
+        /**
+         * AIM BETWEEN THE TWO, not at the car.
+         *
+         * The lens is 26 m above the car and 16 m behind it — 52 degrees down —
+         * while the city it is meant to show is 500 m out and 5 degrees down.
+         * Pointing at the car puts the city off the top of the frame and
+         * pointing at the city loses the car off the bottom; the shot is the
+         * bisector, weighted slightly toward the subject. `_tmp` and `_tmp2`
+         * are the two unit directions; the blend is the EXACT bisector and is
+         * renormalised because they are ~47 degrees apart and their sum is not
+         * a unit vector. MEASURED at 0.55/0.45 (car-weighted): the city sat
+         * 34 degrees off the axis against a 36.5 degree half-frame — inside
+         * the glass but on the edge of it. The bisector puts both at ~31.
+         */
+        this._tmp.subVectors(this._cineAnchor, want).normalize();
+        this._tmp2.set(vp.x - want.x, vp.y - want.y, vp.z - want.z).normalize();
+        this._tmp.multiplyScalar(0.5).addScaledVector(this._tmp2, 0.5).normalize();
+        look.copy(want).addScaledVector(this._tmp, 60);
+        break;
+      }
+      case 'track': {
+        // Off the flank, low and a little behind: the window band fills the
+        // frame and the street rips past behind it.
+        want.copy(this._cineAnchor)
+          .addScaledVector(this._vehRight, side * (len * 0.55 + 7.5))
+          .addScaledVector(this._vehFwd, -len * 0.15);
+        want.y = this._cineAnchor.y + 1.4;
+        break;
+      }
+      case 'window': {
+        /**
+         * LOOKING OUT OF THE WINDOW, from just inboard of the glass at window
+         * height, aimed forward and OUTBOARD along the band.
+         *
+         * The first cut of this was an over-the-shoulder from the seat aimed
+         * slightly down, and the frame it produced was two thirds red floor:
+         * `vehicles/build.js` builds `buildInterior` for `kind: 'car'` and for
+         * nothing else, so the inside of a trolley is the inside of its own
+         * painted shell — there is no saloon to frame. What IS authored in
+         * there is the full-length window band and the lit strip behind it, so
+         * the shot is composed on that and on the city moving past it, with the
+         * pillars cutting the frame. The eye is level: a downward tilt inside a
+         * 2.6 m box is a tilt into the floor.
+         *
+         * ...AND IT SITS ON THE CENTRELINE, WHICH IS THE SECOND CORRECTION.
+         * Pressed against the glass at `hw * 0.55` the lens was 0.4 m from the
+         * emissive saloon strip `tram.js` insets at `hw - 0.20` — the frame
+         * came back a white slab with a sliver of city at the top. On the
+         * centreline the strips are over a metre away on BOTH flanks and read
+         * as what they are: lit windows either side of a corridor. So the shot
+         * looks down the length of the car and slightly out, not across it.
+         */
+        want.copy(this._cineSubPos)
+          .addScaledVector(this._vehRight, -side * hw * 0.34)
+          .addScaledVector(this._up, (seat?.y ?? 0.6) + 0.44)
+          .addScaledVector(this._vehFwd, (seat?.z ?? 0) - 1.2);
+        // Aimed ACROSS the car and out, level, with a touch of lead. The roof
+        // crown is above the band and the floor is below it, so anything but
+        // a level lateral axis photographs paint.
+        look.copy(want)
+          .addScaledVector(this._vehRight, side * 22)
+          .addScaledVector(this._vehFwd, 7)
+          .addScaledVector(this._up, 0.8);
+        break;
+      }
+      case 'reveal': {
+        /**
+         * WORLD-FIXED. Planted once, on the cut, ahead of where the car is
+         * going, then never moved again — so the car crosses the frame under
+         * its own power. The cut is the only place a shot is allowed to latch
+         * world state, and it is why this one reads as a locked-off camera
+         * instead of a lazy follow.
+         */
+        if (fresh) {
+          this._cineFixed.copy(this._cineAnchor)
+            .addScaledVector(this._vehFwd, len * 3.0 + 34)
+            .addScaledVector(this._vehRight, side * 20);
+          this._cineFixed.y = this._cineAnchor.y + 13;
+        }
+        want.copy(this._cineFixed);
+        break;
+      }
+      default: {
+        // orbit — a slow arc, 9 deg/s, elevated.
+        const a = this.cine.t * 0.157 * side;
+        const r = len * 0.9 + 10;
+        want.set(
+          this._cineAnchor.x + Math.sin(a) * r,
+          this._cineAnchor.y + 5.0,
+          this._cineAnchor.z + Math.cos(a) * r
+        );
+        break;
+      }
+    }
+  }
+
+  /**
+   * How much of the way to `want` is actually free, 0..1, cast from the point
+   * the shot is framing. 1 is clear sky.
+   *
+   * This is the same sphere cast the chase boom uses, asked a different
+   * question: not "how far can the boom go" but "is this framing available at
+   * all". Without it the reel cheerfully cuts to a locked-off wide inside a
+   * warehouse, and the collision pull-in then plants the lens 1.4 m from the
+   * car with brick filling the frame — which is exactly what the first capture
+   * of the incline's postcard shot photographed, from inside the lower
+   * station's headhouse.
+   */
+  _cineClearance(want) {
+    const phys = this.ctx.peek('physics');
+    if (!phys) return 1;
+    this._dir.subVectors(want, this._cineAnchor);
+    const r = this._dir.length();
+    if (r < 1e-3) return 1;
+    this._dir.multiplyScalar(1 / r);
+    const hit = phys.sphereCast(
+      this._cineAnchor, this._dir, CHASE.collideRadius, r, phys.MASK.WORLD
+    );
+    if (!hit.hit) return 1;
+    return Math.max(0, hit.distance - CAMERA.collide.pad) / r;
+  }
+
+  /**
+   * Solve this frame's authored framing.
+   *
+   * The subject pose is read the same way `_solveChase` reads it — off
+   * `model.root`'s world matrix, which is what actually gets DRAWN, with the
+   * physics pose as the fallback every offline rig uses (rule 12: frame the
+   * picture, not the intermediate).
+   */
+  _solveCine(dt) {
+    const v = this.cine.target;
+    if (!v) {
+      // Nothing to frame and nothing to overwrite: hold the last authored pose
+      // so the fade in `update` has something to cross-fade FROM. See
+      // `endCinematic`.
+      return;
+    }
+    const obj = v.object3D ?? v.mesh ?? v.root ?? v.model?.root ?? null;
+    if (obj) {
+      obj.updateWorldMatrix(true, false);
+      this._cineSubPos.setFromMatrixPosition(obj.matrixWorld);
+      this._cineSubQuat.setFromRotationMatrix(obj.matrixWorld);
+    } else {
+      this._cineSubPos.copy(v.position ?? this.pivotTarget);
+      if (v.quaternion) this._cineSubQuat.copy(v.quaternion);
+      else this._cineSubQuat.identity();
+    }
+
+    this.cine.t += dt;
+    if (this.cine.active && this.cine.t >= CINE.shots[this.cine.shot].dur) this._cineCut();
+
+    /* ---- the subject's own basis, and the cabin point we frame ---- */
+    // +Z is the nose (see `_solveChase`); the trolley and the incline car are
+    // both built that way, and the transit seat is in the same frame.
+    this._vehFwd.set(0, 0, 1).applyQuaternion(this._cineSubQuat);
+    this._vehRight.set(1, 0, 0).applyQuaternion(this._cineSubQuat);
+    this._up.set(0, 1, 0).applyQuaternion(this._cineSubQuat);
+    const seat = v.transit?.seat;
+    // The look point is the SALOON, not the chassis origin: on a 14 m carriage
+    // those are a metre and a half apart vertically and it is the difference
+    // between framing the car and framing the underframe.
+    this._cineAnchor.copy(this._cineSubPos)
+      .addScaledVector(this._up, (seat?.y ?? 0.6))
+      .addScaledVector(this._vehFwd, (seat?.z ?? 0) * 0.35);
+
+    const want = this._cineWant;
+    const look = this._cineWantLook;
+
+    /**
+     * PICK A FRAMING THAT EXISTS. Only on a cut — a per-frame re-pick would
+     * thrash the reel every time the car passed a lamp post, and a shot the
+     * player is already watching should ride out its own six seconds. The
+     * interior shot is exempt: it is inside the body it would cast against.
+     */
+    if (this._cineFresh) {
+      for (let i = 0; i < CINE.shots.length; i++) {
+        const S = CINE.shots[this.cine.shot];
+        this._cineFrame(S, v, want, look, true);
+        if (S.id === 'window' || this._cineClearance(want) >= CINE.minClear) break;
+        this._cineCut();
+      }
+    }
+    const S = CINE.shots[this.cine.shot];
+    this._cineFrame(S, v, want, look, this._cineFresh);
+
+    /* ---- ease, then keep the lens out of the scenery ---- */
+    if (this._cineFresh) {
+      this._cinePos.copy(want);
+      this._cineLook.copy(look);
+      this._cineFresh = false;
+      this.cine.cut = true;
+    } else {
+      const k = 1 - Math.exp(-dt / CINE.tau);
+      this._cinePos.lerp(want, k);
+      this._cineLook.lerp(look, k);
+      this.cine.cut = false;
+    }
+
+    /**
+     * The chosen framing was clear when it was chosen; the world still moves
+     * THROUGH it — a trolley runs behind a warehouse, an incline car climbs
+     * past a hillside block — so the cast runs every frame, the boom still
+     * pulls in, and a shot that STAYS blocked is cut out of rather than ridden
+     * to the end of its six seconds staring at brick. Half a second of grace
+     * first: a lamp post or a passing van is a wipe, not a ruined shot.
+     */
+    if (S.id !== 'window') {
+      const free = this._cineClearance(this._cinePos);
+      this._cineBlockT = free < CINE.minClear ? this._cineBlockT + dt : 0;
+      if (this.cine.active && this._cineBlockT > CINE.blockGrace) {
+        this._cineBlockT = 0;
+        this._cineCut();
+      }
+      if (free < 1) {
+        this._dir.subVectors(this._cinePos, this._cineAnchor);
+        const r = this._dir.length();
+        if (r > 1e-3) {
+          this._dir.multiplyScalar(1 / r);
+          this._cinePos.copy(this._cineAnchor)
+            .addScaledVector(this._dir, Math.max(CINE.minRadius, r * free));
+        }
+      }
+    }
+
+    /* ---- aim ---- */
+    this._tmp2.subVectors(this._cineLook, this._cinePos);
+    const flat = Math.hypot(this._tmp2.x, this._tmp2.z);
+    const pitch = Math.atan2(this._tmp2.y, Math.max(1e-4, flat));
+    const yaw = Math.atan2(-this._tmp2.x, -this._tmp2.z);
+    this._e.set(clamp(pitch, -CAMERA.pitchLimit, CAMERA.pitchLimit), yaw, 0);
+    this._cineQuat.setFromEuler(this._e);
+    this._cineFov = this.ctx.config.fov * CAMERA.fovScale * S.fov;
+  }
+
+  /* ==================================================================== */
   /* impulses — public feel API (unchanged)                               */
   /* ==================================================================== */
 
@@ -714,6 +1194,31 @@ export class CameraRig {
       this.position.lerpVectors(this._footPos, this._chasePos, t);
       this.quaternion.copy(this._footQuat).slerp(this._chaseQuat, t);
       this.fov = lerp(this._footFov, this._chaseFov, t);
+    }
+
+    /**
+     * THE RIDE CAMERA SITS ON TOP OF THE WHOLE SOLVE, not inside it.
+     *
+     * Both solvers keep running underneath — the chase because it is what the
+     * reel fades back to and it must be settled when it gets the frame, the
+     * foot boom because it is the chase's own fallback. This costs nothing
+     * when nobody is riding anything: `blend` is 0, `active` is false, and the
+     * whole block is one comparison.
+     */
+    if (this.cine.active || this.cine.blend > 0) {
+      this.cine.blend = approach(this.cine.blend, this.cine.active ? 1 : 0, CINE.blendTau, dt);
+      if (!this.cine.active && this.cine.blend < 0.004) {
+        this.cine.blend = 0;
+        this.cine.target = null;   // only once the fade has actually landed
+      }
+      if (this.cine.blend > 0) {
+        this._solveCine(dt);
+        const cb = this.cine.blend;
+        const t = cb * cb * (3 - 2 * cb);
+        this.position.lerp(this._cinePos, t);
+        this.quaternion.slerp(this._cineQuat, t);
+        this.fov = lerp(this.fov, this._cineFov, t);
+      }
     }
 
     this.forward.set(0, 0, -1).applyQuaternion(this.quaternion);

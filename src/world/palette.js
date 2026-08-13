@@ -515,7 +515,57 @@ export const PALETTE = {
 
   /* ---------------------------------------------------------- bridges --- */
   bridge_concrete: { name: 'precast', surface: 'concrete', opts: { vertexMasks: true } },
-  /** Steel City's bridges are painted the city's own gold. */
+  /**
+   * THE THREE BRIDGE PAINTS.
+   *
+   * Steel City paints its crossings the way Pittsburgh does: the sisters and
+   * the gateway spans in the city's own gold, the long river crossings in cold
+   * structural blue, and the mill's bridge in nothing at all. Which span wears
+   * which is `plan.BRIDGES[].steel`; this table only says what the paint IS.
+   *
+   * ALL THREE RESOLVE ONTO ONE BAKE. `materials.get(name, opts)` keys its
+   * TEXTURE on `name` and applies `tint` as a linear multiply on the finished
+   * material, exactly as `plaster_cream` / `plaster_blue` / `plaster_pink` all
+   * share one `plaster` bake. So three bridge colours cost three MATERIALS and
+   * zero extra texture memory — the 1024x1024 `bridge_steel` bake is made
+   * resident once either way. Tinting away from a bake instead of adding one
+   * is the whole reason the palette is a table of variants.
+   *
+   * The tints are multiplies, so they are chosen against `bridge_steel`'s own
+   * `tintA` of 0xc8a13c — a warm gold. `bridge_gold` is that colour left
+   * alone; `bridge_blue` has to pull a long way off it, which is why its
+   * multiply is heavy on blue and light on red.
+   */
+  /**
+   * AZTEC GOLD. The bake's own `tintA` is 0xc8a13c, which comes out of the
+   * forge as a WEATHERED gold — right for a hundred-year-old truss up close,
+   * and, photographed at 300 m through this city's haze, indistinguishable
+   * from the rust on the mill. The multiply below saturates it: `alb.rgb *=
+   * tint` is a shader uniform (`materials/shader.js`, `owTintCol`) and is NOT
+   * part of `_bakeKey`, so it costs one material and not one byte of texture.
+   * Blue is what it takes out — 0x55/0xff = 0.33 — which is exactly what
+   * separates gold from brown at distance.
+   */
+  bridge_gold: {
+    name: 'bridge_steel',
+    surface: 'metal',
+    opts: { vertexMasks: true, tint: 0xffcf55 },
+  },
+  bridge_blue: {
+    name: 'bridge_steel',
+    surface: 'metal',
+    opts: { vertexMasks: true, tint: 0x5c86b4 },
+  },
+  bridge_black: {
+    name: 'bridge_steel',
+    surface: 'metal',
+    opts: { vertexMasks: true, tint: 0x4a4640 },
+  },
+  /**
+   * The pre-`steel`-key name, kept as the fallback `bridges.js` uses for a span
+   * with no authored colour. Identical to `bridge_gold`, because gold is what
+   * every bridge in the city used to be.
+   */
   bridge_steel: { name: 'bridge_steel', surface: 'metal', opts: { vertexMasks: true } },
   bridge_rail: { name: 'plate_steel', surface: 'metal', opts: { vertexMasks: true } },
 };

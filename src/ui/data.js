@@ -46,7 +46,7 @@ export const BOYZ = [
       + 'wharves, and the Harbormaster has been taxing every load off them for '
       + 'nine years. That stops this season.',
     stats: [['SPEED', 0.62], ['TOUGH', 0.92], ['DRIVE', 0.68], ['AIM', 0.74]],
-    weapons: ['fists', 'pipe', 'flare', 'speargun', 'harpoon', 'depth'],
+    weapons: ['fists', 'pipe', 'pistol', 'shotgun', 'speargun', 'depth'],
     radio: ['slack', 'gold', 'furnace', 'incline'],
     body: { skin: '#f0cdae', shirt: '#1f6f6a', pants: '#26303c', hair: '#3b2a1c' },
   },
@@ -101,9 +101,22 @@ export const BOY_BY_ID = Object.fromEntries(BOYZ.map((b) => [b.id, b]));
 /* ------------------------------------------------------------- weapons --- */
 
 /**
- * The improvised arsenal. `slot` groups the weapon wheel:
+ * The arsenal. `slot` groups the weapon wheel:
  * 0 melee · 1 light · 2 precise · 3 heavy · 4 explosive · 5 special.
  * `glyph` is drawn by `weaponGlyph()` in weapon.js — no image assets exist.
+ *
+ * NAMES HERE ARE THE FALLBACK, NOT THE AUTHORITY. `_pullState` prefers the
+ * live `weapons.getHudState().name`, which resolves the two real guns into the
+ * holding brother's own register (Carson's DOCK .38 is Aidan's SHOP NINE — see
+ * `BROTHER_WEAPON_NAMES` in `src/weapons/lib.js`). These strings are what the
+ * wheel and a HUD with no weapon system behind it show, so they carry Carson's
+ * names: he is the only brother who carries either before story completion.
+ *
+ * The pistol and the shotgun SHARE their glyphs with the Nail Gun and the
+ * Paint Cannon, and that is safe rather than lazy: the two pairs are never in
+ * one wheel, because no brother carries a weapon from both halves — Carson has
+ * the real guns, Aidan has the nailer and the sprayer, and story completion
+ * still gives each man his own six.
  */
 export const WEAPONS = {
   fists: { name: 'FISTS', slot: 0, glyph: 'fist', mag: 0, melee: true, dmg: 14 },
@@ -111,6 +124,8 @@ export const WEAPONS = {
   wrench: { name: 'BODY WRENCH', slot: 0, glyph: 'wrench', mag: 0, melee: true, dmg: 30 },
   crowbar: { name: 'CROWBAR', slot: 0, glyph: 'crow', mag: 0, melee: true, dmg: 26 },
 
+  pistol: { name: 'DOCK .38', slot: 1, glyph: 'pistol', mag: 12, ammo: 96, dmg: 26 },
+  shotgun: { name: 'RIVER 12', slot: 1, glyph: 'shotgun', mag: 6, ammo: 48, dmg: 17 },
   nailgun: { name: 'NAIL GUN', slot: 1, glyph: 'pistol', mag: 30, ammo: 90, dmg: 20 },
   tackgun: { name: 'TACK CANNON', slot: 1, glyph: 'pistol', mag: 40, ammo: 140, dmg: 18 },
   sprayer: { name: 'PAINT CANNON', slot: 1, glyph: 'shotgun', mag: 8, ammo: 60, dmg: 15 },
@@ -175,6 +190,14 @@ export const DISTRICTS = [
   { id: 'westend', name: 'WEST END', x: -1032, z: 368, r: 384, tint: '#3a3d35' },
   { id: 'northside', name: 'MANCHESTER', x: -984, z: -568, r: 368, tint: '#383a41' },
   { id: 'hazel', name: 'HAZELWOOD', x: 984, z: -56, r: 344, tint: '#463a2e' },
+  /**
+   * OAKLAND. Mirrors `src/world/plan.js` DISTRICTS exactly — centre, radius and
+   * the same tint the world biases its palette by, written as the hex the map
+   * draws with. It is the thirteenth district and the map's east-central fill:
+   * before it, `districtAt` answered THE STRIP or STEEL ROW for the whole
+   * plateau between them, so the HUD named a neighbourhood 350 m away.
+   */
+  { id: 'oakland', name: 'OAKLAND', x: 520, z: 40, r: 316, tint: '#42403a' },
 ];
 
 export const LANDMARKS = [
@@ -183,7 +206,11 @@ export const LANDMARKS = [
   { id: 'lm_stadium', name: 'STEEL BOWL', x: -416, z: -512, kind: 'stadium' },
   { id: 'lm_mill', name: 'OLD BLAST FURNACE', x: 872, z: 248, kind: 'mill' },
   { id: 'lm_tower', name: 'STEEL TOWER', x: -208, z: -16, kind: 'tower' },
+  { id: 'lm_glass', name: 'GLASSHOUSE COURT', x: -216, z: 104, kind: 'glasscourt' },
   { id: 'lm_market', name: 'STRIP MARKET', x: 352, z: -224, kind: 'market' },
+  { id: 'lm_cathedral', name: 'THE CATHEDRAL OF STEEL', x: 508, z: 24, kind: 'cathedral' },
+  { id: 'lm_ironwood', name: 'IRONWOOD PARK', x: 676, z: 164, kind: 'greenpark' },
+  { id: 'lm_colorpark', name: 'COLOR PARK', x: 306, z: 654, kind: 'colorpark' },
 ];
 
 export const SAFEHOUSES = [
@@ -215,6 +242,7 @@ export const DOCKS = [
   { id: 'dk_south', name: 'SOUTH SIDE DOCKS', x: -88, z: 280 },
   { id: 'dk_north', name: 'NORTH SHORE SLIP', x: -24, z: -264 },
   { id: 'dk_point', name: 'POINT MARINA', x: -744, z: -88 },
+  { id: 'dk_color', name: 'COLOR PARK LANDING', x: 322, z: 606 },
 ];
 
 export const AIRFIELDS = [
@@ -227,19 +255,35 @@ export const MILITARY = [
   { id: 'ab_ridge', name: 'RIDGELINE AFB', x: -321, z: -1166 },
 ];
 
-/** The map's chokepoints — police close these first. */
+/**
+ * The map's chokepoints — police close these first.
+ *
+ * `paint` MIRRORS `plan.BRIDGES[].steel`: which of the three civic colours the
+ * span's superstructure wears. Gold is the Sisters and the two gateway
+ * crossings, blue the long river spans, black the mill's own bridge. It is
+ * carried here so the pause map can say "the gold one" the way a player would;
+ * `citymap.js` still draws every bridge blip in `POI_STYLE.bridge`, and
+ * adopting this field is its call to make, not this table's.
+ */
+export const BRIDGE_PAINT = {
+  bridge_gold: '#d2a63a',
+  bridge_blue: '#5d86ae',
+  bridge_black: '#4c4a46',
+};
+
 export const BRIDGES = [
-  { id: 'br_fortduq', name: 'FORT DUQUESNE BRIDGE', a: [-405, -35], b: [-520, -370], kind: 'highway' },
-  { id: 'br_sixth', name: 'SIXTH STREET BRIDGE', a: [-150, -20], b: [-235, -330], kind: 'arterial' },
-  { id: 'br_ninth', name: 'NINTH STREET BRIDGE', a: [70, -140], b: [-15, -450], kind: 'arterial' },
-  { id: 'br_16th', name: 'SIXTEENTH STREET BRIDGE', a: [352, -352], b: [268, -652], kind: 'arterial' },
-  { id: 'br_31st', name: 'THIRTY-FIRST ST BRIDGE', a: [648, -596], b: [560, -900], kind: 'arterial' },
-  { id: 'br_fortpitt', name: 'FORT PITT BRIDGE', a: [-372, 116], b: [-500, 392], kind: 'highway' },
-  { id: 'br_smithfield', name: 'SMITHFIELD ST BRIDGE', a: [-96, 268], b: [-176, 552], kind: 'arterial' },
-  { id: 'br_birmingham', name: 'BIRMINGHAM BRIDGE', a: [268, 436], b: [188, 724], kind: 'arterial' },
-  { id: 'br_hotmetal', name: 'HOT METAL BRIDGE', a: [596, 620], b: [512, 900], kind: 'street' },
-  { id: 'br_westend', name: 'WEST END BRIDGE', a: [-856, -296], b: [-944, 16], kind: 'arterial' },
-  { id: 'br_mckees', name: 'MCKEES ROCKS BRIDGE', a: [-1204, -520], b: [-1296, -172], kind: 'arterial' },
+  { id: 'br_fortduq', name: 'FORT DUQUESNE BRIDGE', a: [-405, -35], b: [-520, -370], kind: 'highway', paint: 'bridge_gold' },
+  { id: 'br_sixth', name: 'SIXTH STREET BRIDGE', a: [-150, -20], b: [-235, -330], kind: 'arterial', paint: 'bridge_gold' },
+  { id: 'br_seventh', name: 'SEVENTH STREET BRIDGE', a: [-40, -80], b: [-125, -390], kind: 'arterial', paint: 'bridge_gold' },
+  { id: 'br_ninth', name: 'NINTH STREET BRIDGE', a: [70, -140], b: [-15, -450], kind: 'arterial', paint: 'bridge_gold' },
+  { id: 'br_16th', name: 'SIXTEENTH STREET BRIDGE', a: [352, -352], b: [268, -652], kind: 'arterial', paint: 'bridge_gold' },
+  { id: 'br_31st', name: 'THIRTY-FIRST ST BRIDGE', a: [648, -596], b: [560, -900], kind: 'arterial', paint: 'bridge_blue' },
+  { id: 'br_fortpitt', name: 'FORT PITT BRIDGE', a: [-372, 116], b: [-500, 392], kind: 'highway', paint: 'bridge_gold' },
+  { id: 'br_smithfield', name: 'SMITHFIELD ST BRIDGE', a: [-96, 268], b: [-176, 552], kind: 'arterial', paint: 'bridge_blue' },
+  { id: 'br_birmingham', name: 'BIRMINGHAM BRIDGE', a: [268, 436], b: [188, 724], kind: 'arterial', paint: 'bridge_blue' },
+  { id: 'br_hotmetal', name: 'HOT METAL BRIDGE', a: [596, 620], b: [512, 900], kind: 'street', paint: 'bridge_black' },
+  { id: 'br_westend', name: 'WEST END BRIDGE', a: [-856, -296], b: [-944, 16], kind: 'arterial', paint: 'bridge_blue' },
+  { id: 'br_mckees', name: 'MCKEES ROCKS BRIDGE', a: [-1204, -520], b: [-1296, -172], kind: 'arterial', paint: 'bridge_blue' },
 ];
 
 /** Twelve hidden packages, at world scale (map units x4). */
@@ -287,6 +331,7 @@ export const POI_STYLE = {
   ammo: { c: '#ff6a12', g: 'ammo', p: 4, label: 'AMMU-NATION' },
   food: { c: '#ff8ab0', g: 'food', p: 3, label: 'FOOD — RESTORES HEALTH' },
   landmark: { c: '#9aa7b8', g: 'star', p: 3, label: 'LANDMARK' },
+  glasscourt: { c: '#bfe8ff', g: 'star', p: 3, label: 'GLASSHOUSE COURT' },
   airport: { c: '#5fd0ff', g: 'plane', p: 3, label: 'AIRFIELD' },
   military: { c: '#8aa062', g: 'plane', p: 4, label: 'MILITARY BASE — RESTRICTED' },
   dock: { c: '#2ea6a0', g: 'boat', p: 3, label: 'BOAT DOCK' },

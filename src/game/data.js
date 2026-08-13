@@ -318,6 +318,12 @@ export const WEAPON_LIB = {
   wrench: { name: 'Body Wrench', dmg: 30, rate: 0.46, range: 3.8, ammo: Infinity, melee: true, price: 0 },
   pipe: { name: 'Dock Pipe', dmg: 28, rate: 0.42, range: 4.0, ammo: Infinity, melee: true, price: 0 },
   crowbar: { name: 'Crowbar', dmg: 26, rate: 0.38, range: 3.6, ammo: Infinity, melee: true, price: 0 },
+  // The two real guns. Names here are CARSON's — he is the only brother who
+  // carries either before story completion — and the HUD swaps in Aidan's and
+  // Dylan's register at runtime off `BROTHER_WEAPON_NAMES` (weapons/lib.js).
+  // Priced like what they are: pistol rounds are cheap and 12-gauge is not.
+  pistol: { name: 'Dock .38', dmg: 26, rate: 0.3, range: 60, ammo: 96, price: 8 },
+  shotgun: { name: 'River 12', dmg: 17, rate: 0.78, range: 30, ammo: 48, pellets: 8, price: 16 },
   nailgun: { name: 'Nail Gun', dmg: 20, rate: 0.22, range: 46, ammo: 90, price: 6 },
   tackgun: { name: 'Tack Cannon', dmg: 18, rate: 0.16, range: 42, ammo: 140, price: 5 },
   flare: { name: 'Flare Gun', dmg: 46, rate: 0.7, range: 52, ammo: 40, price: 14 },
@@ -379,8 +385,13 @@ export const BOYZ = {
     body: { skin: '#f0cdae', shirt: '#1f6f6a', pants: '#26303c', hair: '#3b2a1c' },
     hp: 130, armorMax: 60, runSpeed: 6.4, vehGrip: 1.06, boatSpeed: 1.25,
     rival: 'THE HARBORMASTER',
-    weapons: ['fists', 'pipe', 'flare', 'speargun', 'harpoon', 'depth'],
-    start: ['fists', 'pipe', 'flare', 'speargun'],
+    // The playtest report — "the guns need to be more like GTA, replace harpoon
+    // and flare guns with real guns like pistol and shotgun" — is why the
+    // DOCK .38 and the RIVER 12 are in these two lines instead of the Flare Gun
+    // and the Harpoon. Both old ids are still in WEAPON_LIB and still work; a
+    // save that earned the Harpoon keeps it (`BROTHER_LEGACY`, weapons/lib.js).
+    weapons: ['fists', 'pipe', 'pistol', 'shotgun', 'speargun', 'depth'],
+    start: ['fists', 'pipe', 'pistol', 'speargun'],
     radio: ['slack', 'gold', 'furnace', 'incline'],
     // Carson's own car: a white body-on-frame SUV (the 'suv' class, an Overlook).
     // Tall, boxy, high stance and slow to roll — the eldest brother's tow rig,
@@ -426,10 +437,11 @@ export const BOYZ = {
                 ['carson', "Then I'd better be quick."]],
         done: [['carson', 'Salvage law. Finders keepers.']] },
       { no: 'CH 5', name: 'Bridge Toll', zone: 'SMITHFIELD CROSSING', teaser: "Wreck the toll convoy — clock's running.",
-        track: 'rampage', goal: 6, spread: 420, at: 'dock_south', baseTimer: 105, cash: 3400, respect: 80, unlock: 'harpoon', difficulty: 3,
+        track: 'rampage', goal: 6, spread: 420, at: 'dock_south', baseTimer: 105, cash: 3400, respect: 80, unlock: 'shotgun', difficulty: 3,
         intro: [['boss', 'Six trucks. My money. Try it.'],
                 ['carson', 'I intend to.']],
-        done: [['carson', "Convoy's scrap. He'll come himself now."]] },
+        done: [['carson', "Convoy's scrap. He'll come himself now."],
+               ['aidan', 'Took a pump gun off the last driver. RIVER 12. It is yours.']] },
       { no: 'CH 6', name: 'Nobody Touches Family', zone: 'SOUTH SIDE DOCKS', teaser: 'They came for Dylan. Bad idea.',
         track: 'protect', ward: 'dylan', goal: 8, at: 'dock_south', cash: 2800, respect: 95, unlock: 'depth', difficulty: 4,
         intro: [['boss', 'You cost me a convoy, Carson. So I priced up your little brother.'],
@@ -758,7 +770,11 @@ export const RESPECT_UNLOCKS = [
 
 /** Cash tiers a shop will sell at once you have the respect for them. */
 export const SHOP_STOCK = {
-  ammo: ['nailgun', 'tackgun', 'sprayer', 'smg', 'rivetgun', 'flare', 'speargun', 'emp', 'harpoon'],
+  /* `flare` and `harpoon` stay on the shelf: nobody's canonical six carries
+   * them any more, but a save from before the report still can, and a weapon
+   * you own with no shop that sells its ammunition is a weapon you lose. */
+  ammo: ['pistol', 'nailgun', 'tackgun', 'sprayer', 'shotgun', 'smg', 'rivetgun',
+    'flare', 'speargun', 'emp', 'harpoon'],
 };
 
 /** Starting float. */

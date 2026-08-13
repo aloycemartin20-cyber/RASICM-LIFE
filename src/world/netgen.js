@@ -1502,6 +1502,13 @@ function buildBridge(b, terrain) {
     id: b.id,
     name: b.name,
     style: b.style,
+    /**
+     * WHAT COLOUR THE STEEL IS PAINTED — a `world/palette.js` key, straight off
+     * the plan. `bridges.js` accumulates into whichever key it is handed, so a
+     * span's identity is one authored field rather than a branch in the
+     * builder. `plan.BRIDGES` documents the convention.
+     */
+    steel: b.steel ?? 'bridge_steel',
     kind: b.kind,
     lanes: b.lanes,
     deckY: deck,
@@ -1704,6 +1711,30 @@ function connectors(terrain) {
     { id: 'sawmill', name: 'Saw Mill Run', kind: 'arterial', lanes: 4, pts: [[-1140, 220], [-940, 340], [-720, 470], [-500, 600], [-260, 700], [0, 770]] },
     { id: 'streets_run', name: 'Steel Row Approach', kind: 'arterial', lanes: 4, pts: [[500, 300], [660, 340], [820, 400], [960, 500], [1060, 640]] },
     { id: 'troyroad', name: 'Troy Hill Road', kind: 'arterial', lanes: 2, pts: [[260, -880], [380, -960], [520, -1010], [680, -1030], [820, -990]] },
+    /**
+     * THE TWO ROADS INTO OAKLAND, and they exist because a district reached
+     * only by its own grid is a district the closing pass has to rescue.
+     *
+     * `gridDistrict` lays rails inside the circle and stops; what ties a
+     * neighbourhood to the city is a connector that runs THROUGH it and out
+     * the far side, which is why every other district in this table has one.
+     * Oakland had none: `fifth` clips its northern edge at z = -190 and
+     * `streets_run` its southern at z = 300, and neither enters it.
+     *
+     * `baum` comes down off the Strip and crosses the plateau to Steel Row —
+     * the way you get from the produce terminal to the mill without going
+     * through downtown. `bates` runs the other axis, from the Boulevard end of
+     * downtown along the Monongahela shoulder and on into Hazelwood, so the
+     * campus has a river approach as well as a hill one. Both are laid to the
+     * same rules as every other connector: `clipToLand` at 14 m of margin and
+     * a 0.5 slope cap drops anything that finds the bank or the bluff.
+     *
+     * Neither name is taken. `Forbes Avenue` and `Fifth Avenue`, which is what
+     * the real pair of Oakland arterials are called, are already downtown's
+     * grid and a connector respectively.
+     */
+    { id: 'baum', name: 'Baum Boulevard', kind: 'arterial', lanes: 4, pts: [[236, -244], [340, -140], [440, -40], [548, 44], [664, 128], [784, 220]] },
+    { id: 'bates', name: 'Bates Street', kind: 'arterial', lanes: 4, pts: [[-104, 176], [104, 152], [312, 130], [516, 132], [716, 96], [908, 20]] },
   ];
   const out = [];
   for (const p of paths) {
@@ -1743,6 +1774,15 @@ const GRID_STYLE = {
   hill: { a: 104, b: 138, alleys: 0.2, wander: 14, kind: 'street', lanes: 2 },
   mill: { a: 156, b: 208, alleys: 0.15, wander: 9, kind: 'street', lanes: 2 },
   park: { a: 176, b: 232, alleys: 0, wander: 17, kind: 'street', lanes: 2 },
+  /**
+   * OAKLAND. A campus block is an institution, not a terrace: one library, one
+   * hall or one lawn fills the whole quad, so the rails are further apart than
+   * anywhere but the mill and the wander is small — a university plan is
+   * surveyed, not grown. `alleys` stays low for the same reason (a service
+   * road behind a hall, not a row of back yards), and the lanes stay at two
+   * because the through traffic is on the connectors, not the quad.
+   */
+  campus: { a: 118, b: 148, alleys: 0.18, wander: 5, kind: 'street', lanes: 2 },
 };
 
 /** Per-district grid rotations, so no two neighbourhoods share an angle. */
@@ -1759,6 +1799,14 @@ const DISTRICT_YAW = {
   westend: -0.14,
   northside: -0.26,
   hazel: -0.86,
+  /**
+   * Oakland's plan is square to its own plateau and shares an angle with
+   * nothing: the nearest neighbours in this table are `steelrow` at 0.42 and
+   * `southside` at 0.34, both across a river or a hill from it. It is also the
+   * bearing the Cathedral's quad is authored at (`plan.LANDMARKS`
+   * `lm_cathedral.site.yaw`), which is why the two numbers must agree.
+   */
+  oakland: 0.52,
 };
 
 function gridDistrict(d, terrain, rng, corridors, blocks) {

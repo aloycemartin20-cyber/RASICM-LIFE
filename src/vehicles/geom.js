@@ -24,6 +24,28 @@
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 
+/**
+ * ────────────────────────────────────────────────────────────────────────────
+ * `?owNoVehDetail=1` — THE A/B HATCH FOR VEHICLE DETAIL
+ * ────────────────────────────────────────────────────────────────────────────
+ * The wave that rounded the Steelbed and the Overlook, re-armoured the Bulwark
+ * and added the Three Rivers Clipper spends triangles in three places: the
+ * extra section samples a class asks for with `style.perSeg0`, the Bulwark's
+ * fenders / stowage / light clusters, and the Clipper's rails, mullions and
+ * paddle buckets. This flag switches all three back off IN ONE BUILD, which is
+ * the only way `tools/perfcheck.mjs --ab='.|owNoVehDetail=1,.'` can attribute a
+ * frame-time difference to them rather than to the machine.
+ *
+ * Same convention and the same reason as `?owNoPoseClear=1` in
+ * `vehicles/index.js` and `?owNoLightLock=1` in `src/render/`: an A/B arm that
+ * needs a source edit is an A/B arm nobody re-runs.
+ *
+ * Read ONCE, at module load — `geometryFor` caches per (class, lod), so a flag
+ * sampled per call would only ever be seen by the first build of each class.
+ */
+export const VEH_DETAIL =
+  typeof location === 'undefined' || !/[?&]owNoVehDetail=1/.test(location.search);
+
 /* ------------------------------------------------------------------ */
 /* Curves                                                              */
 /* ------------------------------------------------------------------ */

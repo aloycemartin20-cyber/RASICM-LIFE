@@ -503,7 +503,248 @@ export class Layout {
     }
     for (const lot of lots ?? []) this._lot(B, lot, bx, lod, rng, parked);
     if (lod === 0) this._wasteGround(B, bx, lots, rng);
+    this._placeGreens(B, bx, lod);
     if (lod === 0) this._placeSigns(B, bx);
+  }
+
+  /* ================================================================== */
+  /* THE PLANTED LANDMARKS — Oakland's quad and park, Color Park's bank */
+  /* ================================================================== */
+
+  /**
+   * `buildings` authors the hard landscape of a park — the walks, the
+   * bandstand, the pond coping, the painted slabs — and stops there, because
+   * VEGETATION IS THIS SUBSYSTEM'S. `kit_green.js` owns the five species,
+   * their four canopy variants, the far tier and the seven leaf materials, and
+   * a second tree grown in `buildings` would be the Point Fountain defect with
+   * a trunk on it: two subsystems deciding one fact (ARCHITECTURE.md rule 12).
+   * So the trees for `lm_ironwood`, `lm_cathedral` and `lm_colorpark` are
+   * planted here, off the published `world.landmarks` entry.
+   *
+   * TILE-INDEPENDENCE, in the form the file header calls the second one. The
+   * candidate list is a pure function of the landmark's own id and geometry —
+   * the same 230 points every boot, in the same order, whatever tile is being
+   * built — and each candidate is emitted ONLY by the tile whose bounds
+   * contain it. So a park that straddles four tiles plants each of its trees
+   * exactly once, no tree falls down a seam, and nothing doubles up when a
+   * tile is rebuilt at a different LOD. The `_in` test is applied BEFORE the
+   * terrain and lane queries, so a tile nowhere near a park pays two hashes
+   * per candidate and no more.
+   */
+  _placeGreens(B, bx, lod) {
+    for (const lm of this.world.landmarks ?? []) {
+      if (lm.kind !== 'greenpark' && lm.kind !== 'cathedral' && lm.kind !== 'colorpark') continue;
+      const s = lm.site;
+      const reach = (s ? Math.hypot(s.hx ?? 0, s.hz ?? 0) + (s.r ?? 0) : 40) + 8;
+      if (lm.x + reach < bx.x0 || lm.x - reach > bx.x1) continue;
+      if (lm.z + reach < bx.z0 || lm.z - reach > bx.z1) continue;
+      const seed = this._siteSeed(lm.id);
+      if (lm.kind === 'greenpark') this._parkPlanting(B, bx, lod, lm, seed);
+      else if (lm.kind === 'cathedral') this._quadPlanting(B, bx, lod, lm, seed);
+      else this._bankPlanting(B, bx, lod, lm, seed);
+    }
+  }
+
+  /** A stable 32-bit seed from a landmark id. Same city every boot. */
+  _siteSeed(id) {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < id.length; i++) h = Math.imul(h ^ id.charCodeAt(i), 0x01000193);
+    return h >>> 0;
+  }
+
+  /**
+   * Plant ONE candidate. `mix` is the cumulative roll: below `mix[0]` a canopy
+   * tree, below `mix[1]` a pine, below `mix[2]` a shrub, otherwise a drift of
+   * grass. Returns nothing — a candidate that fails any guard simply does not
+   * get planted, which is what a park with a path through it looks like.
+   */
+  _plantOne(B, bx, lod, seed, i, x, z, mix, clear = 2.2) {
+    if (!this._in(bx, x, z)) return;
+    if (this.world.isWater?.(x, z)) return;
+    const y = this.world.heightAt(x, z);
+    if (!Number.isFinite(y)) return;
+    if (!this._clearsLanes(x, y, z, clear)) return;
+    const h0 = hash3i(seed, i, 1);
+    const h1 = hash3i(seed, i, 2);
+    const roll = hash3i(seed, i, 3);
+    const yaw = hash3i(seed, i, 4) * TAU;
+    const sc = 0.85 + hash3i(seed, i, 5) * 0.7;
+    const mask = [0.45 + h0 * 0.8, 0.35 + h1 * 0.7, 0.7];
+    if (roll < mix[0] && this._headroom(x, y, z, 9.5 * sc)) {
+      const sp = STREET_SPECIES[Math.floor(hash3i(seed, i, 6) * STREET_SPECIES.length) % STREET_SPECIES.length];
+      const v = lod !== 0 ? 'far' : Math.floor(hash3i(seed, i, 7) * 4) % 4;
+      const li = lod !== 0 ? 0 : this._leafIndex(hash3i(seed, i, 8), 0.22);
+      const M = trs(new THREE.Matrix4(), x, y - 0.02, z, yaw, sc, sc * (0.92 + h1 * 0.34), sc,
+        (h0 - 0.5) * 0.08, (h1 - 0.5) * 0.08);
+      B.put(`tree_${sp}_${v}_wood`, M, mask);
+      B.put(`tree_${sp}_${v}_leaf${li}`, M, mask);
+      if (lod === 0) B.box('wood', x, y, z, 0.36, 2.6, 0.36);
+      return;
+    }
+    if (roll < mix[1] && this._headroom(x, y, z, 9 * sc)) {
+      const M = trs(new THREE.Matrix4(), x, y, z, yaw, sc, sc, sc);
+      B.put('tree_pine_wood', M, mask);
+      B.put('tree_pine_leaf', M, mask);
+      return;
+    }
+    if (lod !== 0) return;
+    if (roll < mix[2]) {
+      B.put(['shrub_a', 'shrub_b', 'shrub_c'][i % 3],
+        trs(new THREE.Matrix4(), x, y, z, yaw, sc, sc, sc), mask);
+      return;
+    }
+    // A lawn is a drift of grass, not one tuft every ten metres — same
+    // reasoning, and the same `q.grassDensity` scaling, as `_park`.
+    const gn = Math.max(1, Math.round(5 * this.grassDensity));
+    for (let k = 0; k < gn; k++) {
+      const g0 = hash3i(seed, i * 11 + k, 41);
+      const g1 = hash3i(seed, i * 11 + k, 42);
+      const gx = x + (g0 - 0.5) * 2.4;
+      const gz = z + (g1 - 0.5) * 2.4;
+      if (!this._in(bx, gx, gz)) continue;
+      const gy = this.world.heightAt(gx, gz);
+      if (!this._clearsLanes(gx, gy, gz, 0.5)) continue;
+      const gs = sc * (0.7 + 0.8 * g0);
+      B.put('grass_clump', trs(new THREE.Matrix4(), gx, gy, gz, g1 * TAU, gs * 1.5, gs, gs * 1.5), mask);
+    }
+  }
+
+  /** A bench, and a bin thrown clear of it on the bench's own yaw. */
+  _parkSeat(B, bx, seed, i, x, z, yaw) {
+    if (!this._in(bx, x, z)) return;
+    const y = this.world.heightAt(x, z);
+    if (!Number.isFinite(y) || !this._clearsLanes(x, y, z, 1.6)) return;
+    const M = trs(new THREE.Matrix4(), x, y, z, yaw, 1, 1, 1, 0, (hash3i(seed, i, 14) - 0.5) * 0.03);
+    B.put('bench_slat', M, [0.8, 0.7, 0.5]);
+    B.put('bench_ends', M, [0.8, 0.9, 0.5]);
+    if (hash3i(seed, i, 15) < 0.55) {
+      const px = x + Math.cos(yaw) * 2.4;
+      const pz = z + Math.sin(yaw) * 2.4;
+      if (this._in(bx, px, pz) && this._clearsLanes(px, y, pz, 0.4)) {
+        B.put('bin_mesh', trs(new THREE.Matrix4(), px, y, pz, hash3i(seed, i, 16) * TAU), [0.9, 0.9, 0.6]);
+      }
+    }
+  }
+
+  /**
+   * IRONWOOD PARK. Trees over the whole disc except the three places
+   * `buildings` already occupies — the bandstand at the centre, the pond on
+   * the north-west quarter, and the 3.4 m ring of hoggin at r = R - 24, which
+   * is a path and gets benches instead of maples.
+   */
+  _parkPlanting(B, bx, lod, lm, seed) {
+    const R = lm.site?.r ?? 84;
+    const n = Math.max(24, Math.round((Math.PI * R * R) / 96));
+    const pondX = lm.x - R * 0.42;
+    const pondZ = lm.z + R * 0.34;
+    for (let i = 0; i < n; i++) {
+      // Sunflower-ish placement: a golden-angle spiral jittered by two hashes,
+      // which fills a disc evenly without the clumping a uniform square draw
+      // gives you after rejection.
+      const t = (i + 0.5) / n;
+      const rr = Math.sqrt(t) * (R - 5) * (0.94 + hash3i(seed, i, 51) * 0.12);
+      const a = i * 2.39996 + hash3i(seed, i, 52) * 0.5;
+      const x = lm.x + Math.cos(a) * rr;
+      const z = lm.z + Math.sin(a) * rr;
+      if (rr < 13) continue;                                   // the bandstand
+      if (Math.abs(rr - (R - 24.3)) < 3.2) continue;           // the path loop
+      if (Math.hypot(x - pondX, z - pondZ) < 19) continue;     // the pond
+      this._plantOne(B, bx, lod, seed, i, x, z, [0.40, 0.50, 0.62]);
+    }
+    if (lod !== 0) return;
+    for (let i = 0; i < 10; i++) {
+      const a = (i / 10) * TAU + 0.31;
+      const rr = R - 20.4;
+      this._parkSeat(B, bx, seed, i, lm.x + Math.cos(a) * rr, lm.z + Math.sin(a) * rr, a + Math.PI);
+    }
+  }
+
+  /**
+   * THE CATHEDRAL'S QUAD. A campus lawn is mown, not wooded: the planting is a
+   * FRAME rather than a fill — a rank of trees down each long edge inside the
+   * boundary wall, nothing at all across the middle, because the whole point
+   * of the site is the tower standing alone on grass and a canopy in front of
+   * it is the one thing that would cost the silhouette.
+   */
+  _quadPlanting(B, bx, lod, lm, seed) {
+    const HU = lm.site?.hx ?? 54;
+    const HV = lm.site?.hz ?? 42;
+    const yaw = lm.site?.yaw ?? 0;
+    const c = Math.cos(yaw);
+    const s = Math.sin(yaw);
+    const W = (u, v) => [lm.x + u * c - v * s, lm.z + u * s + v * c];
+    let i = 0;
+    for (const sv of [-1, 1]) {
+      for (let k = 0; k < 13; k++, i++) {
+        const u = -HU + 6 + (k / 12) * (HU * 2 - 12);
+        // The ranges stand at |v| = HV - 12 with a 15 m depth, so the trees go
+        // between the wall and the range: |v| = HV - 3.
+        const [x, z] = W(u + (hash3i(seed, i, 61) - 0.5) * 3.0, sv * (HV - 3.0));
+        if (hash3i(seed, i, 62) > 0.82) continue;   // a pit nobody replanted
+        this._plantOne(B, bx, lod, seed, i, x, z, [0.86, 0.86, 0.94], 2.0);
+      }
+    }
+    if (lod !== 0) return;
+    /**
+     * THE LAWN. "Alone on its lawn" is the whole composition, and a landmark
+     * cannot paint one: `buildings` has no ground surface in its palette and
+     * the terrain layer under a dense district resolves to worn earth
+     * (`terrainmesh` picks `terrain_dirt` off `urbanAt`, which is 0.72 here).
+     * So the grass is instanced — `grass_clump` is 56 triangles, no shadow,
+     * culled at 145 m — over the two halves of the quad the walks and the
+     * plinth leave free.
+     */
+    for (let k = 0; k < 150; k++, i++) {
+      const u = -HU + 4 + hash3i(seed, i, 65) * (HU * 2 - 8);
+      const v = -HV + 4 + hash3i(seed, i, 66) * (HV * 2 - 8);
+      if (Math.abs(u) < 20 && Math.abs(v) < 18) continue;   // the plinth
+      if (Math.abs(v) > HV - 20 && Math.abs(v) < HV - 4) continue;   // the ranges
+      if (Math.abs(u) < 3.4 || Math.abs(v) < 3.4) continue; // the cross walk
+      const [x, z] = W(u, v);
+      if (!this._in(bx, x, z)) continue;
+      const y = this.world.heightAt(x, z);
+      if (!Number.isFinite(y) || !this._clearsLanes(x, y, z, 0.6)) continue;
+      const gs = 0.8 + hash3i(seed, i, 67) * 0.7;
+      B.put('grass_clump', trs(new THREE.Matrix4(), x, y, z,
+        hash3i(seed, i, 68) * TAU, gs * 1.6, gs, gs * 1.6), [0.4, 0.35, 0.7]);
+    }
+    // Benches face the cross walk, four a side, looking at the tower.
+    for (const sv of [-1, 1]) {
+      for (let k = 0; k < 4; k++, i++) {
+        const u = -HU * 0.62 + (k / 3) * HU * 1.24;
+        const [x, z] = W(u, sv * 9.5);
+        this._parkSeat(B, bx, seed, i, x, z, yaw + (sv > 0 ? Math.PI : 0));
+      }
+    }
+  }
+
+  /**
+   * COLOR PARK. Nothing is planted on the painted apron — the apron is the
+   * point — so this is a screen of trees along the inland edge behind the
+   * legal wall, plus benches and bins on the trail between the slabs and the
+   * river. The wall is at v = HV - 3.4 and the trail at v = -0.86 HV; both
+   * numbers come off the same `site` the geometry is built from.
+   */
+  _bankPlanting(B, bx, lod, lm, seed) {
+    const HU = lm.site?.hx ?? 76;
+    const HV = lm.site?.hz ?? 16;
+    const yaw = lm.site?.yaw ?? 0;
+    const c = Math.cos(yaw);
+    const s = Math.sin(yaw);
+    const W = (u, v) => [lm.x + u * c - v * s, lm.z + u * s + v * c];
+    let i = 0;
+    for (let k = 0; k < 16; k++, i++) {
+      const u = -HU + 4 + (k / 15) * (HU * 2 - 8);
+      const [x, z] = W(u + (hash3i(seed, i, 71) - 0.5) * 3.5, HV + 1.6 + hash3i(seed, i, 72) * 2.0);
+      if (hash3i(seed, i, 73) > 0.80) continue;
+      this._plantOne(B, bx, lod, seed, i, x, z, [0.72, 0.80, 0.94], 2.0);
+    }
+    if (lod !== 0) return;
+    for (let k = 0; k < 7; k++, i++) {
+      const u = -HU + 12 + (k / 6) * (HU * 2 - 24);
+      const [x, z] = W(u, -HV * 0.86 + 2.6);
+      this._parkSeat(B, bx, seed, i, x, z, yaw + Math.PI);
+    }
   }
 
   /* ================================================================== */
@@ -661,7 +902,26 @@ export class Layout {
     // ---- the landmarks that a working city labels ------------------------
     for (const lm of this.world.landmarks ?? []) {
       if (!this._in(bx, lm.x, lm.z)) continue;
-      const r = (lm.site?.r ?? 30) + 6;
+      /**
+       * THE RING TO SEARCH FOR A SIGN SPOT ON, AND WHY IT IS NOT `site.r`.
+       *
+       * `site` is a rounded box: `r` is the CORNER RADIUS, not the size. For
+       * the six original landmarks that was harmless — five of them are discs
+       * or near-discs, where `r` is the whole shape — but the Cathedral's quad
+       * is `hx 54 x hz 42, r 12`, so `r + 6` would start the search 18 m from
+       * the centre, which is inside the tower's own plinth. The box-shaped
+       * sites take the half diagonal instead.
+       *
+       * SCOPED TO THE NEW KINDS ON PURPOSE. The six original landmarks keep
+       * the ring they were tuned against — the Strip Market's plaque has been
+       * placed off `r + 6` = 9 m since it was authored, and moving it to 70 m
+       * would be a silent regression in somebody else's content for the sake
+       * of a tidier expression here.
+       */
+      const boxy = lm.kind === 'cathedral' || lm.kind === 'greenpark' || lm.kind === 'colorpark';
+      const r = boxy
+        ? Math.hypot(lm.site?.hx ?? 0, lm.site?.hz ?? 0) + (lm.site?.r ?? 30) + 6
+        : (lm.site?.r ?? 30) + 6;
       if (lm.kind === 'mill') {
         /**
          * THE WORKS GATE. A riveted arch over the entrance is how every plant
@@ -699,7 +959,15 @@ export class Layout {
         const yaw = Math.atan2(Math.cos(spot.a), Math.sin(spot.a));
         this._plaque(B, [String(lm.name).toUpperCase(), 'LOWER STATION'],
           spot.x, spot.y, spot.z, yaw, mask);
-      } else if (lm.kind === 'market' || lm.kind === 'stadium') {
+      } else if (lm.kind === 'market' || lm.kind === 'stadium'
+        || lm.kind === 'cathedral' || lm.kind === 'greenpark' || lm.kind === 'colorpark') {
+        /**
+         * The Oakland / South Side wave: a board on two posts, on the ring
+         * road the reserve laid round each site. Same search and same fallback
+         * as the market and the stadium — these are places with names on the
+         * map, and a place named on the map and nowhere on the ground is a
+         * wayfinding defect, not a missing decoration.
+         */
         const spot = this._signSpotRings(lm.x, lm.z,
           [Math.max(12, r), Math.max(12, r) + 14, Math.max(12, r) + 28], 3.0, 4);
         if (!spot) continue;

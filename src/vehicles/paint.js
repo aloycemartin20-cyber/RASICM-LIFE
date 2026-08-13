@@ -631,6 +631,41 @@ export class VehicleMaterials {
     });
   }
 
+  /**
+   * ────────────────────────────────────────────────────────────────────────
+   * `accent` — A SECOND BODY COLOUR, FOR CLASSES THAT ARE TWO COLOURS
+   * ────────────────────────────────────────────────────────────────────────
+   * Every group in this file answers a question about MATERIAL — is it paint,
+   * is it grained plastic, is it a hole. None of them answers "the same
+   * material, a different colour", and until now nothing needed to: a car is
+   * one colour with black trim on it.
+   *
+   * A paddle steamer is not. Its hull is white and its WHEEL is red, and that
+   * red is not a livery decal, not a lamp and not trim — it is painted steel
+   * exactly like the hull beside it. Drawing it in `paint` makes it white;
+   * drawing it in `trim` makes it a grey plastic wheel; drawing it in `lamp`
+   * makes it glow. So there is one more group, keyed BY COLOUR so two classes
+   * with two different accents do not fight over one cached material.
+   *
+   * Deliberately NOT the `paint` material: that one carries flake, clearcoat,
+   * the wear shader and a `color` vertex attribute that `build.js` bakes grime
+   * into, none of which a working boat's enamel wants. This is house paint on
+   * steel — matte-ish, low env, no flake — and it is folded into the single
+   * dark group at LOD >= 1 like every other secondary group, so it costs one
+   * draw call and only up close.
+   */
+  accent(color = 0xb0392c) {
+    return this._cached(`accent_${color}`, () =>
+      new THREE.MeshStandardMaterial({
+        color,
+        metalness: 0.06,
+        roughness: 0.62,
+        envMapIntensity: 0.55,
+        dithering: true,
+      })
+    );
+  }
+
   /** The black void behind grilles, inside arches and behind glass edges. */
   cavity() {
     return this._cached('cavity', () =>

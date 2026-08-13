@@ -148,17 +148,24 @@ function make(id, seed) {
 
 let target = null;
 if (VIEW === 'contact') {
-  /* Sixteen weapons on a 4x4 grid, each scaled into a 0.42 m cell so the whole
-   * arsenal can be compared for silhouette variety in one frame. This is the
-   * shot to look at when asking "can a critic tell these apart". */
+  /* The whole arsenal on a grid, each weapon scaled into its own cell so the
+   * set can be compared for silhouette variety in one frame. This is the shot
+   * to look at when asking "can a critic tell these apart".
+   *
+   * The grid is DERIVED from `WEAPON_ORDER.length`, not the 4x4 it was written
+   * as: the moment the pistol and the shotgun landed, a hardcoded four columns
+   * put a fifth row at y = -0.75 with two weapons on it, outside the framing
+   * and outside the shadow camera. Five columns fits eighteen in four rows. */
   /**
    * Cells are sized in SCREEN space, so the fit has to be measured after the
    * -90 deg yaw that turns the bore (model -Z) into screen X. Measuring the
    * un-rotated box and spacing rows by a guess is what put a 0.30 m nail gun
    * through the flare gun below it in the first pass.
    */
-  const cellW = 0.52;
-  const cellH = 0.30;
+  const cols = WEAPON_ORDER.length > 16 ? 5 : 4;
+  const rows = Math.ceil(WEAPON_ORDER.length / cols);
+  const cellW = 0.52 * (4 / cols);
+  const cellH = 0.30 * (4 / rows);
   WEAPON_ORDER.forEach((id, i) => {
     const inst = make(id, 0x1000 + i * 977);
     if (!inst) return;
@@ -178,7 +185,11 @@ if (VIEW === 'contact') {
     const s = Math.min((cellW * 0.9) / wide, (cellH * 0.84) / tall);
     inst.group.position.set(-c.x, -c.y, -c.z);
     holder.scale.setScalar(s);
-    holder.position.set((i % 4 - 1.5) * cellW, (1.5 - Math.floor(i / 4)) * cellH, 0);
+    holder.position.set(
+      (i % cols - (cols - 1) / 2) * cellW,
+      ((rows - 1) / 2 - Math.floor(i / cols)) * cellH,
+      0
+    );
     scene.add(holder);
   });
   camera.position.set(0, 0.0, 2.05);
@@ -208,6 +219,7 @@ if (VIEW === 'contact') {
     const sz = bb.getSize(new THREE.Vector3());
     const span = Math.max(sz.x, sz.y, sz.z);
 
+    /* A close-up on a POINT — the muzzle, the grip. Radius is authored. */
     const frame = (dir, radius, fov = 34, at = c) => {
       camera.fov = fov;
       const halfV = (fov * 0.5 * Math.PI) / 180;
@@ -217,17 +229,53 @@ if (VIEW === 'contact') {
       camera.lookAt(at);
       camera.updateProjectionMatrix();
     };
+
+    /**
+     * THE WHOLE WEAPON, FRAMED ON WHICHEVER AXIS ACTUALLY BINDS.
+     *
+     * The single-weapon views used to solve their distance from `span` — the
+     * LONGEST dimension — against the horizontal half-angle. That is right for
+     * a metre of speargun seen from the side, where the length binds and the
+     * height is a tenth of it, and it is wrong for anything compact: measured
+     * on the pistol (span 184 mm, height 172 mm) the old formula put 116 mm of
+     * frame in front of a 172 mm object and cut the muzzle, the magazine and
+     * the sights off three different edges at once. It was never noticed
+     * because until now the shortest thing in the set was a 230 mm flare gun.
+     *
+     * Projecting the box's half-extents onto the camera's own screen axes and
+     * taking the binding one costs three dot products and cannot be wrong for
+     * either shape.
+     */
+    const fwd = new THREE.Vector3();
+    const right = new THREE.Vector3();
+    const camUp = new THREE.Vector3();
+    const half = new THREE.Vector3().subVectors(bb.max, bb.min).multiplyScalar(0.5);
+    const frameFit = (dir, fov = 34, margin = 1.14) => {
+      camera.fov = fov;
+      const halfV = (fov * 0.5 * Math.PI) / 180;
+      const halfH = Math.atan(Math.tan(halfV) * camera.aspect);
+      fwd.fromArray(dir).normalize();
+      right.crossVectors(new THREE.Vector3(0, 1, 0), fwd).normalize();
+      camUp.crossVectors(fwd, right).normalize();
+      const ext = (a) =>
+        Math.abs(a.x) * half.x + Math.abs(a.y) * half.y + Math.abs(a.z) * half.z;
+      const d = Math.max(ext(right) / Math.tan(halfH), ext(camUp) / Math.tan(halfV)) * margin;
+      camera.position.copy(c).addScaledVector(fwd, d);
+      camera.lookAt(c);
+      camera.updateProjectionMatrix();
+    };
+
     switch (VIEW) {
-      case 'side': frame([1, 0.05, 0.02], span * 0.56); break;
-      case 'top': frame([0.02, 1, 0.06], span * 0.56); break;
-      case 'front': frame([0.05, 0.12, -1], span * 0.42, 30); break;
+      case 'side': frameFit([1, 0.05, 0.02]); break;
+      case 'top': frameFit([0.02, 1, 0.06]); break;
+      case 'front': frameFit([0.05, 0.12, -1], 30); break;
       case 'detail': {
         const m = new THREE.Vector3().fromArray(target.model.nodes.muzzle ?? [0, 0, 0]);
         frame([0.85, 0.42, 0.75], span * 0.16, 32, m);
         break;
       }
       case 'grip': frame([0.9, 0.25, 0.6], 0.11, 34, new THREE.Vector3(0, -0.01, 0.0)); break;
-      default: frame([0.72, 0.34, 0.86], span * 0.56, 34);
+      default: frameFit([0.72, 0.34, 0.86]);
     }
     // Move the floor under the weapon.
     scene.children.find((o) => o.isMesh && o.geometry?.type === 'PlaneGeometry')

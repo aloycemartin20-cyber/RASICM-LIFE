@@ -845,6 +845,214 @@ try {
   await pump(24);
   const unlockedPrompt = await prompt();
   /* =================================================================== */
+  area = 'ride the trolley';
+  /* =================================================================== */
+  /**
+   * REPORTED, from play: "I don't see any trollys — add riding the trolly or
+   * the incline with automatic cinematic camera".
+   *
+   * `src/vehicles/tramprobe.mjs` gates the same sequence in node against a
+   * stub physics world; this is the half that stub cannot answer — the real
+   * streamed city, the real key path, the real DOM prompt, the real collision
+   * world deciding where a man may be put down. If these two disagree, the
+   * difference is the world, which is the point of running both.
+   *
+   * Ordering note: this section leaves the player standing on the ballast in
+   * the Strip, which is why it sits after everything that cares where he is.
+   */
+
+  const tramSeen = await run(`
+    game.missions.abort();
+    if (player.inVehicle) player.vehicles.abort(player.movement);
+    const svc = veh._tram;
+    const cars = svc && svc.cars ? svc.cars : [];
+    return {
+      cars: cars.length,
+      stops: svc && svc.stops ? svc.stops.map((s) => s.name) : [],
+      transit: cars.every((c) => !!c.vehicle.transit),
+      takeable: cars.every((c) => c.vehicle.enterable === false),
+    };`);
+  rec('a fleet of trolleys is running the line, not one car',
+    tramSeen.cars >= 2 && tramSeen.transit && tramSeen.takeable,
+    `${tramSeen.cars} cars, stops ${tramSeen.stops.join(' / ')}`);
+
+  /**
+   * Park the player at the kerb beside the car under test.
+   *
+   * The offset is rotated by the carriage's own YAW rather than by
+   * three's `applyQuaternion`: this string is evaluated in the page, where
+   * `THREE` is not a global. A vehicle's nose is +Z, so (2.4, -4.35) local is
+   * "two and a half metres off the flank, level with the rear door".
+   */
+  const STAND_BESIDE = `
+    const svc = veh._tram;
+    const c = svc.cars[game.__tramIdx];
+    const v = c.vehicle;
+    const q = v.quaternion;
+    const yaw = Math.atan2(2 * (q.w * q.y + q.x * q.z), 1 - 2 * (q.y * q.y + q.x * q.x));
+    const s = Math.sin(yaw), co = Math.cos(yaw);
+    const lx = 2.4, lz = -4.35;
+    game.wq.placePlayer(v.position.x + lx * co + lz * s, v.position.z - lx * s + lz * co, 0);
+    return { dwelling: c.transit.dwelling, speed: +c.transit.speed.toFixed(2) };`;
+
+  // Stand next to the nearest car and let the city stream in around us before
+  // anything is measured — a prompt read through a half-built tile is noise.
+  await run(`
+    const svc = veh._tram;
+    const p = player.position;
+    let best = 0;
+    let bd = Infinity;
+    svc.cars.forEach((c, i) => {
+      const d = Math.hypot(c.vehicle.position.x - p.x, c.vehicle.position.z - p.z);
+      if (d < bd) { bd = d; best = i; }
+    });
+    game.__tramIdx = best;
+    return best;`);
+  await run(STAND_BESIDE);
+  await pump(150);
+
+  /* ---- NEGATIVE CONTROL: press F at a rolling carriage ---------------- */
+  /**
+   * The waits in this section are WOUND, not sat out.
+   *
+   * A trolley stands 8 s and runs 45 s, so watching the timetable go round
+   * costs this probe a minute and a half of wall clock to prove three
+   * transitions. The timetable is `tramprobe.mjs`'s subject and is gated
+   * there against the emitted trajectory; what is under test HERE is the
+   * player path through the real streamed world, so the service's own
+   * `RailMover` state is moved to the interesting moment the same way
+   * `game.__probeAt` holds a car still for the carjack section above.
+   */
+  await run(`
+    const m = veh._tram.cars[game.__tramIdx].mover;
+    m.wait = 0;
+    return m.wait;`);
+  await pump(45);
+  await run(STAND_BESIDE);
+  await pump(6);
+  const movingPrompt = await prompt();
+  await tapF();
+  await pump(20);
+  const movingBoard = await run(`
+    const c = veh._tram.cars[game.__tramIdx];
+    return { inVehicle: !!player.inVehicle, phase: player.vehicles.phase,
+             speed: +c.transit.speed.toFixed(2) };`);
+  rec('CONTROL: F at a moving trolley does nothing',
+    movingBoard.inVehicle === false && movingBoard.phase === 'none',
+    `at ${movingBoard.speed} m/s: phase ${movingBoard.phase}, ` +
+    `prompt ${movingPrompt ? movingPrompt.text : 'none'}`);
+
+  /* ---- board at the stop --------------------------------------------- */
+  await run(`
+    const m = veh._tram.cars[game.__tramIdx].mover;
+    m.s = m.dir > 0 ? m.sMax - 6 : m.sMin + 6;
+    return m.s;`);
+  let atStop = false;
+  for (let i = 0; i < 25; i++) {
+    const st = await run('return veh._tram.cars[game.__tramIdx].transit.dwelling;');
+    if (st) { atStop = true; break; }
+    await pump(8);
+  }
+  await run(STAND_BESIDE);
+  await pump(8);
+  const ridePrompt = await prompt();
+  rec('a trolley standing at its stop offers the ride',
+    atStop && /RIDE/.test(ridePrompt?.text ?? ''),
+    ridePrompt ? `${ridePrompt.key} ${ridePrompt.text} · ${ridePrompt.sub}` : 'no prompt');
+
+  await tapF();
+  await pump(120);
+  const aboard = await run(`
+    const c = veh._tram.cars[game.__tramIdx];
+    return {
+      phase: player.vehicles.phase,
+      passenger: player.vehicles.passenger === true,
+      same: player.vehicles.vehicle === c.vehicle,
+      cine: player.rig.cinematicActive === true,
+      shot: player.rig.cinematicShot,
+      driver: c.vehicle.driver ?? null,
+    };`);
+  rec('F seats you as a PASSENGER, with no hand on the controls',
+    aboard.phase === 'drive' && aboard.passenger && aboard.same && aboard.driver === null,
+    `phase ${aboard.phase}, passenger ${aboard.passenger}, driver ${aboard.driver}`);
+  rec('...and the automatic camera takes over',
+    aboard.cine === true && !!aboard.shot,
+    `cinematic ${aboard.cine}, opening shot ${aboard.shot}`);
+
+  /* ---- ride a segment ------------------------------------------------ */
+  const shotSet = new Set();
+  for (let i = 0; i < 26; i++) {
+    const s = await run('return player.rig.cinematicShot;');
+    if (s) shotSet.add(s);
+    await pump(8);
+  }
+  const riding = await run(`
+    const c = veh._tram.cars[game.__tramIdx];
+    const v = c.vehicle;
+    const inv = v.quaternion.clone().invert();
+    const local = player.position.clone().sub(v.position).applyQuaternion(inv);
+    return {
+      moving: c.transit.speed > 1,
+      seated: player.vehicles.phase === 'drive',
+      lx: +local.x.toFixed(2), ly: +local.y.toFixed(2), lz: +local.z.toFixed(2),
+      half: { x: v.spec.half.x, y: v.spec.half.y, z: v.spec.half.z },
+    };`);
+  rec('the reel CUTS between framings while you ride',
+    shotSet.size >= 2,
+    `${shotSet.size} distinct shots: ${[...shotSet].join(', ')}`);
+  rec('the passenger rides INSIDE the carriage',
+    riding.seated && Math.abs(riding.lx) < riding.half.x &&
+    Math.abs(riding.lz) < riding.half.z && Math.abs(riding.ly) < riding.half.y + 0.6,
+    `body at (${riding.lx}, ${riding.ly}, ${riding.lz}) in a ` +
+    `${riding.half.x * 2} x ${riding.half.z * 2} m carriage, moving ${riding.moving}`);
+
+  /* ---- ring the bell, get off at the next stop ------------------------ */
+  await tapF();
+  await pump(10);
+  const rang = await run(`
+    return { requested: player.vehicles.alightRequested === true,
+             phase: player.vehicles.phase };`);
+  rec('F between stops rings for the next one instead of dumping you out',
+    rang.requested === true && rang.phase === 'drive',
+    `requested ${rang.requested}, phase ${rang.phase}`);
+
+  // Wind on to the far mark (see the note above the control).
+  await run(`
+    const m = veh._tram.cars[game.__tramIdx].mover;
+    m.s = m.dir > 0 ? m.sMax - 8 : m.sMin + 8;
+    return m.s;`);
+  let gotOff = false;
+  for (let i = 0; i < 40; i++) {
+    const st = await run('return player.vehicles.phase;');
+    if (st === 'none') { gotOff = true; break; }
+    await pump(8);
+  }
+  const alighted = await run(`
+    const c = veh._tram.cars[game.__tramIdx];
+    const v = c.vehicle;
+    const p = player.position;
+    return {
+      phase: player.vehicles.phase,
+      inVehicle: !!player.inVehicle,
+      passenger: player.vehicles.passenger === true,
+      cine: player.rig.cinematicActive === true,
+      dwelling: c.transit.dwelling,
+      off: +Math.hypot(p.x - v.position.x, p.z - v.position.z).toFixed(2),
+      drop: +(p.y - (v.position.y - v.spec.comY)).toFixed(2),
+      halfX: v.spec.half.x, halfZ: v.spec.half.z,
+    };`);
+  rec('...and the next dwell puts you down beside the car',
+    gotOff && alighted.inVehicle === false && alighted.passenger === false &&
+    alighted.dwelling === true &&
+    alighted.off > alighted.halfX && alighted.off < alighted.halfZ + 6 &&
+    Math.abs(alighted.drop) < 2.5,
+    `phase ${alighted.phase}, ${alighted.off} m from the car centre, ` +
+    `${alighted.drop} m above the railhead, dwelling ${alighted.dwelling}`);
+  rec('...with the camera handed back to the player',
+    alighted.cine === false,
+    `cinematic ${alighted.cine}`);
+
+  /* =================================================================== */
   area = 'job board';
   /* =================================================================== */
 

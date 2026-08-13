@@ -1,5 +1,5 @@
 import {
-  RIVERS, DISTRICTS, HILLS, BLUFF, HALF_CITY,
+  RIVERS, DISTRICTS, HILLS, BLUFF, HALF_CITY, LANDMARKS, siteDist,
   WATER_Y, RIVER_BED, RIVER_SHORE, RIVER_BANK,
   clamp01, smoothstep, smootherstep, lerp, segDist2,
 } from './plan.js';
@@ -256,6 +256,14 @@ const _bl = { s: 0, arc: 0 };
 /* ----------------------------------------------------------------- height -- */
 
 const PAD = DISTRICTS.filter((d) => d.pad !== null);
+/**
+ * The landmark sites that are GREEN GROUND rather than built ground — see
+ * `urbanAt`. Filtered by `kind`, so a landmark added to `plan.js` with one of
+ * these kinds gets the treatment without a second list to keep in step.
+ */
+const GREEN_SITES = LANDMARKS.filter((l) => l.kind === 'greenpark' || l.kind === 'cathedral');
+/** Metres past a green site over which `urbanAt` comes back up to normal. */
+const GREEN_FEATHER = 46;
 
 /**
  * The analytic heightfield, before roads. Everything else in the file is a
@@ -581,6 +589,38 @@ export class Terrain {
       if (t <= 0) continue;
       const v = smootherstep(t) * d.density;
       if (v > best) best = v;
+    }
+    /**
+     * A PARK IS NOT URBAN GROUND, however dense the district round it is.
+     *
+     * `urbanAt` is a district field and nothing else, so the two consumers
+     * both got the wrong answer inside a green landmark: `terrainmesh` picks
+     * `terrain_dirt` over `terrain_grass` when `nB > 0.86 - urban * 0.85`, and
+     * `roadmesh` narrows the verge by the same number. MEASURED at Ironwood
+     * Park's centre with Oakland's `density: 0.72`, `urban` was 0.355 and the
+     * dirt threshold 0.42 — and `nB` runs on a ~90 m wavelength, so a 168 m
+     * park sits inside one or two lobes of it and comes out ENTIRELY bare
+     * earth, which is what the first capture of the park showed: a bandstand
+     * in a car park.
+     *
+     * The fix is not to lower the district's density — Oakland is a real
+     * neighbourhood with real traffic and `density` also drives peds, traffic
+     * and lots. It is to say the thing that is actually true: inside a park
+     * site, and feathered out over `GREEN_FEATHER` metres beyond it, the
+     * ground is not urban. `THE POINT` has spelled the same idea as a whole
+     * district at `density: 0.15` since the table was written.
+     *
+     * The multiply is 0.08 at the centre rather than 0, because a city park is
+     * still walked across: keeping a little urban leaves the desire paths and
+     * worn patches the noise gives you instead of a flat green disc.
+     */
+    if (best > 0) {
+      for (let i = 0; i < GREEN_SITES.length; i++) {
+        const d = siteDist(GREEN_SITES[i], x, z);
+        if (d >= GREEN_FEATHER) continue;
+        const w = 1 - smootherstep(Math.max(0, d) / GREEN_FEATHER);
+        best *= 1 - 0.92 * w;
+      }
     }
     return best;
   }

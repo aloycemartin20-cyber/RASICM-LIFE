@@ -557,8 +557,16 @@ if (C.poisOff.length) fails.push(`POI(s) islanded or unresolved: ${C.poisOff.map
 
 console.log('');
 if (fails.length === 0) {
+  /**
+   * COUNT THE SITES, DO NOT SPELL THEM. This line said "the six published
+   * landmark sites" for as long as there were six; the table is now ten and
+   * the sentence was quietly reporting a smaller guarantee than the run had
+   * actually made. A summary that hard-codes the size of the thing it swept is
+   * a summary that goes stale without going red.
+   */
   console.log('LANDMARK GATE PASSED — no drivable carriageway and no lane a truck could use ' +
-    'reaches into any of the six published landmark sites, and the city is still one network.');
+    `reaches into any of the ${report.sites.length} published landmark sites, ` +
+    'and the city is still one network.');
 } else {
   console.log(`LANDMARK GATE FAILED — ${fails.join('; ')}`);
 }

@@ -37,6 +37,35 @@ import * as THREE from 'three';
  * step stagger — STEP_RISE per bay, capped well inside the underframe — that
  * gives the classic level-cabin silhouette without ever leaving the rails.
  *
+ * ────────────────────────────────────────────────────────────────────────────
+ * RIDING IT — AND WHY THE CARS ARE NOT `Vehicle`s
+ * ────────────────────────────────────────────────────────────────────────────
+ * REPORTED, from play: "add riding the trolly or the incline with automatic
+ * cinematic camera". The incline ride is the postcard in this whole game — a
+ * 50-degree climb with the Golden Triangle opening up behind you — and until
+ * now it was scenery you watched from the pavement.
+ *
+ * The obvious way to make it boardable is to make each cabin a `Vehicle`, and
+ * it is the wrong way: these two are ONE CABLE. Their positions are not
+ * independent (`alongA + alongB` is a constant, and that invariant is the
+ * gate), they have no wheels the tyre model could load, and the trestle is not
+ * ground. Handing them to the dynamics would mean fighting the counterweight
+ * every step to arrive back at the position this file already knows.
+ *
+ * So each car publishes a RIDER HANDLE instead — a small object that quacks
+ * like a Vehicle at exactly the four faces the player and the HUD read (a
+ * drawn pose, `spec.half`, a velocity, a `transit` record) and at nothing
+ * else. `src/player/vehicle.js` boards a passenger through the same
+ * `transit` contract `src/vehicles/tram.js` publishes, and it contains not one
+ * line that knows an incline from a trolley. The handles are NOT registered
+ * with `vehicles`: nothing in the fleet sweeps, LODs, collides or despawns
+ * them, which is the whole point of them being handles rather than vehicles.
+ *
+ * `vista` on the handle is the world point the ride camera is asked to keep
+ * BEHIND the car — for this service, the bottom of the run, out over the river.
+ * That one field is what turns the generic reel in `camera.js` into the
+ * Duquesne shot without the camera knowing what an incline is.
+ *
  * Registered in `src/main.js`. deps: ['world'] — the descriptor is published
  * during `WorldSystem.init`, so the cars exist before prewarm compiles the
  * scene. If no track was published (a stripped test world), the subsystem is
@@ -124,6 +153,8 @@ export class FunicularSystem {
   async init(ctx) {
     this.ctx = ctx;
     this.cars = [];
+    /** One rider handle per car — the boarding contract. See the header. */
+    this.riders = [];
     this._mats = null;
     this._geos = [];
     this.root = null;
@@ -170,7 +201,136 @@ export class FunicularSystem {
     // same reason). Deterministic: no randomness, phase advances on scaled dt.
     this._phase = DWELL + TRAVEL * 0.45;
     this._pt = { x: 0, z: 0 };
+    /** Previous pose, so the handles publish a real velocity. */
+    this._prev = [new THREE.Vector3(), new THREE.Vector3()];
+    /**
+     * THE VISTA — the point the ride camera keeps behind the car.
+     *
+     * 500 m back down the bearing from the lower station and 30 m up: on Mt.
+     * Washington's north face that is out over the Monongahela with downtown
+     * behind it, which is the view the real incline exists to sell. Derived
+     * from the PUBLISHED track (one owner for a spatial fact, rule 12) rather
+     * than from a downtown coordinate copied out of DESIGN.md — if the
+     * landmark's solved bearing ever moves, this moves with it.
+     */
+    const vp = t.at(0, -500, { x: 0, z: 0 });
+    this.vista = { x: vp.x, y: t.trackY(0) + 30, z: vp.z };
+    for (let i = 0; i < 2; i++) this.riders.push(this._makeRider(i));
     this._pose(this._phase);
+    this._prev[0].copy(this.cars[0].position);
+    this._prev[1].copy(this.cars[1].position);
+  }
+
+  /**
+   * A rider handle for car `i`. Live REFERENCES to the car's own position and
+   * quaternion, so it can never disagree with what is drawn, and `prevPosition`
+   * / `prevQuaternion` alias them too — `_drawnPose` in `src/player/vehicle.js`
+   * lerps between them, and lerping a value with itself is that value, which is
+   * exactly right for a body that is posed rather than integrated.
+   *
+   * Everything past `transit` is HUD SHAPE, not decoration:
+   * `VehicleSystem.getHudState()` reads `player.vehicle` whatever it is and
+   * dereferences `v.drivetrain.rpm` unguarded, so a handle that omitted it
+   * would throw sixty times a second for the length of the ride.
+   */
+  _makeRider(i) {
+    const car = this.cars[i];
+    const self = this;
+    const floorY = 0.5 - ((STEPS - 1) / 2) * STEP_RISE + STEP_RISE; // bay 1's floor
+    const transit = {
+      kind: 'funicular',
+      line: 'THE DUQUESNE INCLINE',
+      hw: CAR_W / 2,
+      /** The rail plane in car-local y — the car rides `carLift` above it. */
+      railY: -(self.track?.carLift ?? 1.2),
+      doorZ: [-STEP_D / 2],
+      /**
+       * Seat anchor: the passenger's HEAD, in the second bay down — `_buildCar`
+       * puts that bay's centre at `(k - 1.5) * STEP_D` for k = 1, i.e. −D/2, and
+       * its floor at `floorY`. The cabins are a staircase, so "which bay" is a
+       * height as well as a place.
+       */
+      seat: { x: 0, y: floorY + 0.768, z: -STEP_D / 2 },
+      vista: this.vista,
+      get dwelling() { return self.dwelling(); },
+      get speed() { return self.riders[i].velocity.length(); },
+      get stopName() { return self.stationOf(i); },
+    };
+    return {
+      transit,
+      type: 'incline',
+      name: 'INCLINE CAR',
+      position: car.position,
+      quaternion: car.quaternion,
+      prevPosition: car.position,
+      prevQuaternion: car.quaternion,
+      velocity: new THREE.Vector3(),
+      angularVelocity: new THREE.Vector3(),
+      get speed() { return this.velocity.length(); },
+      get forwardSpeed() { return this.velocity.length(); },
+      model: { root: car },
+      destroyed: false,
+      /**
+       * THE SHAPE EVERY PER-FRAME CONSUMER OF `player.vehicle` DEREFERENCES.
+       *
+       * Not decoration, and not defensive programming for its own sake — each
+       * of these is a crash that was FOUND, in this order:
+       *
+       *   drivetrain  `VehicleSystem.getHudState()` reads `player.vehicle`
+       *               whatever it is and takes `v.drivetrain.rpm` unguarded.
+       *   input       `VehicleSystem._pollHorn()` runs EVERY FRAME on
+       *               `player.vehicle` and `setHorn` writes `v.input.horn`.
+       *               Without this the whole subsystem update threw sixty
+       *               times a second for the length of the ride — and because
+       *               `funicular` is registered after `vehicles`, the throw
+       *               took the incline's own `update` down with it: the car
+       *               froze on the rails, the ride camera stopped cutting,
+       *               and the only trace was one page error. The node gates
+       *               could not see it, because their stubs are not
+       *               `VehicleSystem`. That is rule 12's stub corollary
+       *               arriving from the other side, and it is why
+       *               `funicularprobe` now runs the REAL `_pollHorn` and the
+       *               REAL `getHudState` against this object.
+       *   control     the same shape `Vehicle` exposes, so a consumer that
+       *               reaches for a brake lamp finds a number rather than a
+       *               throw.
+       */
+      fuel: 100, maxFuel: 100, fuelDry: false,
+      health: 100, maxHealth: 100,
+      drivetrain: { rpm: 0, gearLabel: '—' },
+      input: { throttle: 0, brake: 0, steer: 0, handbrake: false, horn: false, boost: 0 },
+      control: { throttle: 0, brake: 0, steer: 0 },
+      horn: false, altitude: 0, rotorSpin: 0, submerged: 0, drowned: false,
+      spec: {
+        id: 'incline', name: 'INCLINE CAR', kind: 'funicular', nogas: true,
+        comY: -transit.railY,
+        half: { x: CAR_W / 2, y: 1.9, z: (STEPS * STEP_D) / 2 },
+        engine: { redline: 1 },
+        turret: null,
+      },
+    };
+  }
+
+  /**
+   * True while the cars are standing at their platforms with the doors open.
+   *
+   * ONE CABLE, so it is one answer for BOTH cars: when one is at the lower
+   * station the other is at the upper, and they leave together. That is not a
+   * simplification, it is the counterweight invariant this file's gate exists
+   * to measure.
+   */
+  dwelling() {
+    if (!this.cars.length) return false;
+    const half = DWELL + TRAVEL;
+    const u = this._phase % (2 * half);
+    return (u < half ? u : u - half) < DWELL;
+  }
+
+  /** Which platform car `i` is standing at (or heading for). */
+  stationOf(i) {
+    const a0 = this._along(this._phase);
+    const a = i === 0 ? a0 : this.aMin + this.aMax - a0;
+    return a < (this.aMin + this.aMax) * 0.5 ? 'LOWER STATION' : 'UPPER STATION';
   }
 
   /** One car: a staircase of red/yellow/glass boxes, +Z pointing uphill. */
@@ -266,10 +426,26 @@ export class FunicularSystem {
     if (!this.cars.length) return;
     this._phase += dt;
     this._pose(this._phase);
+    // Publish a REAL velocity on the handles, differenced off the emitted
+    // poses rather than differentiated out of `_along` — the pose is what a
+    // rider actually travels on, and dt <= 0 (a stopped clock) must publish
+    // zero rather than divide by it.
+    for (let i = 0; i < this.riders.length; i++) {
+      const p = this.cars[i].position;
+      const v = this.riders[i].velocity;
+      if (dt > 1e-6) v.subVectors(p, this._prev[i]).multiplyScalar(1 / dt);
+      else v.set(0, 0, 0);
+      this._prev[i].copy(p);
+    }
   }
 
   dispose() {
     if (this.root) this.root.removeFromParent();
+    // A rider aboard when the subsystem goes away must be put back on his feet,
+    // not left seated on a cabin that is no longer in the scene.
+    // `VehicleHandler._stepRide` reads exactly this flag.
+    for (const r of this.riders) r.destroyed = true;
+    this.riders.length = 0;
     for (const g of this._geos) g.dispose();
     if (this._mats) for (const k of Object.keys(this._mats)) this._mats[k].dispose();
     this._geos.length = 0;

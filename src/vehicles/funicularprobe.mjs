@@ -68,6 +68,10 @@ import { publishInclineTracks } from '../world/incline.js';
 import { adoptLandmarkSites, buildLandmark, LANDMARKS as BLD_LANDMARKS } from '../buildings/landmarks.js';
 import { TileBuilder } from '../buildings/tile.js';
 import { FunicularSystem, FUNICULAR_LIVERY } from './funicular.js';
+import { VehicleSystem } from './index.js';
+import { Movement } from '../player/movement.js';
+import { VehicleHandler } from '../player/vehicle.js';
+import { CameraRig } from '../player/camera.js';
 import { Rng } from '../core/rng.js';
 
 const args = Object.fromEntries(
@@ -557,6 +561,366 @@ const check = (name, ok, msg) => {
       `accent #${L.accent.toString(16)} ${seen.get(L.accent) ?? 0} tris (yellow=${isYellow}), ` +
       `glass #${L.glass.toString(16)} ${seen.get(L.glass) ?? 0} tris`
   );
+}
+
+/* --------------------------------------------------------------- the ride --- */
+/**
+ * RIDING THE INCLINE — the postcard, gated.
+ *
+ * REPORTED: "add riding the trolly or the incline with automatic cinematic
+ * camera ... the incline ride is the postcard — the climb with downtown
+ * unfolding behind". Everything above proves the cars run; this proves a
+ * player can be ON one and that the camera does the job it was added for.
+ *
+ * It drives the REAL `VehicleHandler` and the REAL `CameraRig` against the
+ * REAL `FunicularSystem` that has just been measured, and asserts on the
+ * EMITTED camera transform — where the lens actually is and which way it
+ * actually points — never on the shot table the camera read.
+ *
+ * The one STUB is physics: `checkCapsule` always clear, `sphereCast` never
+ * hits. So this measures where the ride camera WANTS to be, not whether the
+ * hillside lets it; `src/game/interactprobe.mjs` runs the boarding half
+ * against the real collision world.
+ *
+ * This section drives the system on its OWN clock and therefore ignores
+ * `--freeze` — you cannot ride a service that is not running, and `--freeze`
+ * is the control for `travels`/`dwell`, which are measured above and still go
+ * red under it.
+ */
+{
+  const RDT = 1 / 60;
+  const held = new Set();
+  const rideCtx = {
+    scene,
+    time: { elapsed: 0, dt: RDT, scale: 1, alpha: 1, frame: 0 },
+    rng: new Rng(2),
+    config: { q: {}, fov: 65 },
+    input: {
+      moveVector(out = { x: 0, y: 0 }) {
+        out.x = (held.has('right') ? 1 : 0) - (held.has('left') ? 1 : 0);
+        out.y = (held.has('forward') ? 1 : 0) - (held.has('back') ? 1 : 0);
+        return out;
+      },
+      action: (k) => held.has(k),
+      actionPressed: () => false,
+    },
+    events: { on: () => () => {}, off() {}, emit() {} },
+    get: (id) => (id === 'world' ? worldStub : null),
+    peek: (id) => (
+      id === 'world' ? worldStub
+        : id === 'funicular' ? sys
+          : id === 'physics' ? ridePhys
+            : null
+    ),
+    has: (id) => id === 'world' || id === 'funicular',
+  };
+  let groundY = 0;
+  /**
+   * `blockVista` models the ONE thing the open-sky stub cannot: the lower
+   * station's headhouse standing exactly where the postcard shot wants to
+   * put the lens. It reports a hit only for a cast heading UPHILL AWAY from
+   * the vista, which is the vista framing's own bearing and nothing else's.
+   * See the `postcard-blocked` control at the end of this section.
+   */
+  let blockVista = false;
+  const BLOCK = { hit: true, distance: 0 };
+  const ridePhys = {
+    MASK: { WORLD: 3, CHARACTER: 3 },
+    groundHeight: () => groundY,
+    checkCapsule: () => true,
+    sphereCast: (origin, dir, radius, far) => {
+      if (blockVista && sys.vista && rider) {
+        const ax = rider.position.x - sys.vista.x;
+        const az = rider.position.z - sys.vista.z;
+        const al = Math.hypot(ax, az) || 1;
+        const dl = Math.hypot(dir.x, dir.z) || 1;
+        if ((dir.x * ax + dir.z * az) / (al * dl) > 0.6) {
+          BLOCK.distance = far * 0.15;
+          return BLOCK;
+        }
+      }
+      return { hit: false, distance: Infinity };
+    },
+  };
+  const player = { controlEnabled: true, health: { dead: false } };
+  const m = new Movement(rideCtx, player);
+  m.grounded = true;
+  m.character = {
+    enabled: true, height: 1.78, stepHeight: 0.4, radius: 0.32,
+    position: new THREE.Vector3(),
+    teleport(x, y, z) { this.position.set(x, y, z); },
+    setPosition(x, y, z) { this.position.set(x, y, z); },
+  };
+  player.movement = m;
+  const rig = new CameraRig(rideCtx);
+  player.rig = rig;
+  const handler = new VehicleHandler(rideCtx, player);
+  player.vehicles = handler;
+
+  const riders = sys.riders ?? [];
+  const rider = riders[0];
+  const frame = () => {
+    rideCtx.time.frame++;
+    rideCtx.time.elapsed += RDT;
+    sys.update(RDT, rideCtx);
+    scene.updateMatrixWorld(true);
+    if (rider) groundY = rider.position.y + rider.transit.railY;
+    handler.update(RDT, m);
+    rig.setVehicle(handler.seated ? handler.vehicle : null);
+    rig.update(RDT, m, health0);
+  };
+  const health0 = { fraction: 1, suppression: 0 };
+
+  check('riders', riders.length === 2 && riders.every((r) => !!r.transit),
+    `${riders.length} rider handle(s), ` +
+    `line "${rider?.transit?.line}", stops "${riders.map((r) => r.transit.stopName).join('/')}"`);
+
+  // The handle IS the drawn car, not a copy of it. Move the system, re-read.
+  const before = rider ? rider.position.clone() : new THREE.Vector3();
+  for (let i = 0; i < 4000 && rider.position.distanceTo(before) < 0.5; i++) frame();
+  check('handle-is-car',
+    !!rider && rider.position === cars[0].position &&
+    rider.quaternion === cars[0].quaternion && rider.position.distanceTo(before) > 0.5,
+    rider ? `same objects, moved ${rider.position.distanceTo(before).toFixed(2)} m` : 'no rider');
+
+  /**
+   * `dwelling` decides whether a player may step into a moving cabin, so it is
+   * measured against the EMITTED motion and not against the phase clock that
+   * produced it: over two full cycles, every frame it claims a dwell the car
+   * must not have moved since the previous frame.
+   */
+  {
+    let dwellPairs = 0;
+    let dwellMoved = 0;
+    let ranMoving = 0;
+    let prevDwell = rider.transit.dwelling;
+    let prev = rider.position.clone();
+    for (let s = 0; s < Math.ceil((2 * CYCLE_GUESS) / RDT); s++) {
+      frame();
+      const moved = rider.position.distanceTo(prev);
+      const now = rider.transit.dwelling;
+      if (prevDwell && now) { dwellPairs++; if (moved > 1e-6) dwellMoved++; }
+      if (!prevDwell && !now && moved > 1e-4) ranMoving++;
+      prevDwell = now;
+      prev.copy(rider.position);
+    }
+    check('dwelling', dwellPairs > 0 && dwellMoved === 0 && ranMoving > 0,
+      `${dwellPairs} standing frame pairs, ${dwellMoved} of them moving; ` +
+      `${ranMoving} frames actually travelling`);
+  }
+
+  /**
+   * THE VISTA. It has to be a real place, DOWNHILL of the lower station and
+   * below the top of the run, or the postcard shot points at the mountain.
+   * Derived here from the measured rail ends, not from the descriptor the
+   * system read (rule 12).
+   */
+  {
+    const vp = sys.vista;
+    const aLo = leftLine[0].a;
+    const aHi = leftLine[leftLine.length - 1].a;
+    const lowEnd = railAt(leftLine, aLo);
+    const highEnd = railAt(leftLine, aHi);
+    // The measured rail ends in world XZ, from this file's own principal axis.
+    const dLow = Math.hypot(vp.x - (mx + axX * aLo), vp.z - (mz + axZ * aLo));
+    const dHigh = Math.hypot(vp.x - (mx + axX * aHi), vp.z - (mz + axZ * aHi));
+    check('vista',
+      Number.isFinite(vp.x) && Number.isFinite(vp.y) && Number.isFinite(vp.z) &&
+      dLow > 300 && dHigh > dLow && vp.y < highEnd.y,
+      `${dLow.toFixed(0)} m beyond the lower end (and ${dHigh.toFixed(0)} m from the upper), ` +
+      `y ${vp.y.toFixed(1)} vs rail ends ${lowEnd.y.toFixed(1)}..${highEnd.y.toFixed(1)}`);
+  }
+
+  /**
+   * The HUD reads `player.vehicle` whatever it is and dereferences
+   * `v.drivetrain.rpm` unguarded, so this calls the REAL
+   * `VehicleSystem.getHudState` on the handle. A handle that is not
+   * HUD-shaped throws sixty times a second for the length of a ride, and that
+   * is a crash a camera gate would never see.
+   */
+  {
+    let hud = null;
+    let threw = null;
+    try {
+      hud = VehicleSystem.prototype.getHudState.call({
+        ctx: { peek: (k) => (k === 'player' ? { vehicle: rider } : null) },
+        _playerVehicle: VehicleSystem.prototype._playerVehicle,
+      });
+    } catch (e) { threw = e.message; }
+    check('hud-safe',
+      !threw && hud && hud.inVehicle === true && hud.noFuel === true &&
+      Number.isFinite(hud.speedKmh),
+      threw ? `threw: ${threw}` : `${hud?.name} · ${hud?.speedKmh} km/h · noFuel ${hud?.noFuel}`);
+  }
+
+  /**
+   * THE ONE THAT ACTUALLY BROKE THE RIDE, and the reason this section runs
+   * production `VehicleSystem` methods rather than describing them.
+   *
+   * `_pollHorn` runs EVERY FRAME on `player.vehicle`, whatever it is, and
+   * `setHorn` writes `v.input.horn`. A handle with no `input` therefore threw
+   * sixty times a second — and since `funicular` is registered after
+   * `vehicles`, the throw took the incline's own `update` with it: MEASURED in
+   * a live capture, the car sat frozen at the lower station for the whole
+   * "ride" and the reel never cut, with one page error as the only symptom.
+   * Every stub in this file would have gone on passing.
+   */
+  {
+    let threw = null;
+    let fired = 0;
+    const sysStub = {
+      ctx: {
+        peek: (k) => (k === 'player' ? { vehicle: rider } : null),
+        input: { frozen: false, enabled: true, action: (a) => a === 'horn' },
+        events: { emit: () => { fired++; } },
+      },
+      _hornVehicle: null,
+      setHorn: VehicleSystem.prototype.setHorn,
+      _playerVehicle: VehicleSystem.prototype._playerVehicle,
+    };
+    try {
+      VehicleSystem.prototype._pollHorn.call(sysStub, sysStub.ctx);
+      VehicleSystem.prototype._pollHorn.call(sysStub, sysStub.ctx);
+    } catch (e) { threw = e.message; }
+    check('horn-safe',
+      !threw && rider.input.horn === true && rider.horn === true && fired === 1,
+      threw ? `threw: ${threw}` : `input.horn ${rider.input.horn}, ${fired} edge(s) emitted`);
+    rider.input.horn = false;
+    rider.horn = false;
+  }
+
+  /* ---- board at the platform and watch the reel --------------------- */
+  let guard = 0;
+  while (!rider.transit.dwelling && guard++ < 20000) frame();
+  {
+    const off = new THREE.Vector3(2.1, rider.transit.railY, -2.4)
+      .applyQuaternion(rider.quaternion);
+    m.position.copy(rider.position).add(off);
+    m.prevPosition.copy(m.position);
+    m.grounded = true;
+  }
+  frame();
+  const boarded = handler.tryEnter(m);
+  guard = 0;
+  while (handler.phase !== 'drive' && guard++ < 600) frame();
+  check('board',
+    boarded && handler.phase === 'drive' && handler.passenger === true &&
+    rig.cinematicActive === true,
+    `boarded ${boarded}, phase ${handler.phase}, passenger ${handler.passenger}, ` +
+    `opening shot "${rig.cinematicShot}"`);
+
+  const shots = new Set();
+  let vistaN = 0;
+  let vistaBad = 0;
+  let vistaBehind = 0;
+  let fovLo = Infinity;
+  let worstCar = 0;
+  let worstVis = 0;
+  let fovHi = 0;
+  const fwd = new THREE.Vector3();
+  const toCar = new THREE.Vector3();
+  const toVista = new THREE.Vector3();
+  const vp = sys.vista;
+  guard = 0;
+  // Ride the whole climb: out of this dwell, up the hill, into the next one.
+  while (rider.transit.dwelling && guard++ < 4000) { frame(); shots.add(rig.cinematicShot); }
+  guard = 0;
+  while (!rider.transit.dwelling && guard++ < 20000) {
+    frame();
+    shots.add(rig.cinematicShot);
+    if (rig.cinematicShot !== 'vista') continue;
+    vistaN++;
+    toCar.subVectors(rider.position, rig.position).normalize();
+    toVista.set(vp.x - rig.position.x, vp.y - rig.position.y, vp.z - rig.position.z).normalize();
+    fwd.set(0, 0, -1).applyQuaternion(rig.quaternion);
+    /**
+     * BOTH SUBJECTS INSIDE THE EMITTED FRUSTUM — the car AND the city, which
+     * is the whole claim the shot makes.
+     *
+     * The tolerance is not a taste number and is deliberately not a RATCHET:
+     * it is the lens's OWN vertical half-angle, read off `rig.fov` (which is
+     * what `applyTo` writes onto the camera), less a 10% margin for the frame
+     * edge. A shot that widened its lens to cheat this check would be widening
+     * the actual picture, and a shot that narrowed it would go red.
+     */
+    const halfFov = (rig.fov * 0.5 * 0.9) * (Math.PI / 180);
+    fovLo = Math.min(fovLo, rig.fov);
+    fovHi = Math.max(fovHi, rig.fov);
+    const aCar = Math.acos(Math.min(1, Math.max(-1, fwd.dot(toCar)))) * 180 / Math.PI;
+    const aVis = Math.acos(Math.min(1, Math.max(-1, fwd.dot(toVista)))) * 180 / Math.PI;
+    worstCar = Math.max(worstCar, aCar);
+    worstVis = Math.max(worstVis, aVis);
+    if (fwd.dot(toCar) < Math.cos(halfFov) || fwd.dot(toVista) < Math.cos(halfFov)) vistaBad++;
+    // ...and the lens is on the FAR side of the car from the vista, which is
+    // what puts downtown BEHIND the climb rather than in front of it.
+    const dCam = Math.hypot(vp.x - rig.position.x, vp.z - rig.position.z);
+    const dCar = Math.hypot(vp.x - rider.position.x, vp.z - rider.position.z);
+    if (dCam > dCar) vistaBehind++;
+  }
+  check('reel', shots.size >= 3 && shots.has('vista'),
+    `${shots.size} shots over the climb: ${[...shots].join(', ')}`);
+  check('postcard',
+    vistaN > 60 && vistaBad === 0 && vistaBehind === vistaN,
+    `${vistaN} vista frames at ${fovLo.toFixed(0)}-${fovHi.toFixed(0)} deg vertical fov, ` +
+    `${vistaBad} out of frame (worst car ${worstCar.toFixed(0)} deg, city ${worstVis.toFixed(0)} deg), ` +
+    `${vistaBehind} with the lens uphill of the car`);
+
+  /**
+   * NEGATIVE CONTROL for the shot rejection, run on the LIVE camera with no
+   * source edit: stand the headhouse where the postcard wants the lens.
+   *
+   * MEASURED before the rejection existed: the reel cut to `vista` anyway, the
+   * boom's own pull-in dragged the lens to its 1.4 m floor, and the frame was
+   * brickwork — that capture is what this control was written from. The reel
+   * must now refuse the framing and spend its seconds on one that exists.
+   */
+  {
+    blockVista = true;
+    const blocked = new Set();
+    for (let i = 0; i < 3600; i++) { frame(); blocked.add(rig.cinematicShot); }
+    blockVista = false;
+    const open = new Set();
+    for (let i = 0; i < 3600; i++) { frame(); open.add(rig.cinematicShot); }
+    // The blocker's cone is wide (+/-53 deg off the anti-vista bearing) and
+    // legitimately catches whichever of `reveal` / `orbit` happens to be
+    // pointing into it as well, so the bar is "the reel refuses the postcard
+    // and goes on working", not a shot count.
+    check('postcard-blocked',
+      !blocked.has('vista') && blocked.size >= 2 && open.has('vista'),
+      `blocked: ${[...blocked].join(', ')} · clear again: ${[...open].join(', ')}`);
+  }
+
+  /* ---- get off at the top ------------------------------------------- */
+  const rang = handler.tryExit(m);
+  guard = 0;
+  while (handler.phase !== 'none' && guard++ < 20000) frame();
+  const lateralOff = Math.hypot(m.position.x - rider.position.x, m.position.z - rider.position.z);
+  check('alight',
+    rang === true && handler.phase === 'none' && handler.passenger === false &&
+    rig.cinematicActive === false && rider.transit.dwelling === true &&
+    lateralOff > rider.spec.half.x && lateralOff < 8,
+    `rang ${rang}, phase ${handler.phase}, put down ${lateralOff.toFixed(2)} m off the car ` +
+    `at the ${rider.transit.stopName}`);
+
+  /* ---- NEGATIVE CONTROL: boarding a moving cabin --------------------- */
+  guard = 0;
+  while (rider.transit.dwelling && guard++ < 4000) frame();
+  for (let i = 0; i < 120; i++) frame();
+  {
+    const off = new THREE.Vector3(2.1, rider.transit.railY, -2.4)
+      .applyQuaternion(rider.quaternion);
+    m.position.copy(rider.position).add(off);
+    m.prevPosition.copy(m.position);
+    m.grounded = true;
+  }
+  frame();
+  const promptMoving = handler.prompt ? handler.prompt.text : null;
+  handler.candidate = rider;
+  const boardedMoving = handler.tryEnter(m);
+  check('no-board-moving',
+    boardedMoving === false && handler.phase === 'none' && promptMoving === null,
+    `tryEnter -> ${boardedMoving}, phase ${handler.phase}, prompt ${promptMoving ?? 'none'} ` +
+    `at ${rider.transit.speed.toFixed(2)} m/s`);
 }
 
 /* ----------------------------------------------------------------- report --- */

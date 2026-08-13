@@ -261,6 +261,18 @@ try {
   if (args.nocapfix) extra += '&nocapfix=1';
   if (args.nonotchfix) extra += '&nonotchfix=1';
   if (args.noringweld) extra += '&noringweld=1';
+  /**
+   * `--nooakland` — the OAKLAND wave off, so a ratchet miss can be ATTRIBUTED.
+   *
+   * The hatch itself is `src/world/plan.js`'s `owNoOakland`, and it has to be
+   * a QUERY PARAMETER here rather than the `OW_NO_OAKLAND` env var the node-
+   * side probes use: this file's world is built inside the browser, where
+   * `process` does not exist and only `location.search` is readable. Setting
+   * the env var for a browser probe and reading a different number is measuring
+   * the harness, not the change — every arm below is one page load with one
+   * URL, and this is how the second arm gets a different one.
+   */
+  if (args.nooakland) extra += '&owNoOakland=1';
   await page.goto(`http://127.0.0.1:${PORT}/?capture=1&lockstep=1&prewarm=0&q=high${extra}`, {
     waitUntil: 'domcontentloaded',
     timeout: 120000,

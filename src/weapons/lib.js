@@ -1,7 +1,7 @@
 import { DEG } from './mathx.js';
 
 /**
- * THE IMPROVISED ARSENAL — sixteen weapons.
+ * THE ARSENAL — eighteen weapons: sixteen improvised tools and two real guns.
  *
  * ---------------------------------------------------------------------------
  * THE CONTRACT WITH `game` AND `ui`
@@ -47,9 +47,13 @@ import { DEG } from './mathx.js';
  * ---------------------------------------------------------------------------
  * WHO CARRIES WHAT (DESIGN.md)
  * ---------------------------------------------------------------------------
- *   Carson  fists · pipe   -> flare, speargun, harpoon, depth
+ *   Carson  fists · pipe   -> pistol, shotgun, speargun, depth
  *   Aidan   fists · wrench -> nailgun, sprayer, rivetgun, launcher
  *   Dylan   fists · crowbar-> tackgun, emp, smg, rocket
+ *
+ * Carson's flare and harpoon are what the playtest report asked to be replaced
+ * with real guns. They are STILL BUILT and still fire — see `BROTHER_LEGACY`
+ * for how a save that earned one keeps it.
  */
 
 /* Shared handling defaults, overridden per weapon. */
@@ -224,6 +228,104 @@ export const WEAPONS = {
   }),
 
   /* ==================================================================== */
+  /*  REAL GUNS — the two things in here that were manufactured as guns    */
+  /* ==================================================================== */
+
+  /**
+   * THE PLAYTEST REPORT: *"the guns need to be more like GTA — replace harpoon
+   * and flare guns with real guns like pistol and shotgun"*.
+   *
+   * These two are `cls: 'light'` because the class is a BALANCE bucket (rate,
+   * damage, range) and that is honestly where both of them sit; the shotgun
+   * carries `sling: 'precise'` so a metre of gun rides across the back rather
+   * than off the hips (see `rig.js` SLING).
+   *
+   * BALANCE, stated so the next person does not have to reverse it out of the
+   * numbers:
+   *
+   *   pistol vs NAIL GUN — the pistol must NOT obsolete Aidan's tool, which is
+   *     the fastest-cycling one-hander in the game. Sustained DPS is
+   *     deliberately the nail gun's: 20/0.22 = 90.9 against 26/0.30 = 86.7, and
+   *     the nail gun is AUTO off a 30-round magazine while the pistol is semi
+   *     off 12. What the pistol buys is the two things a sidearm is for —
+   *     ACCURACY (1.5 deg of hip cone against 2.4, and 0.22 ADS against 0.55)
+   *     and DRAW SPEED (0.30 s, the fastest in the arsenal bar fists). Its
+   *     niche is "the thing you already have out", not "the better nail gun".
+   *
+   *   shotgun vs PAINT CANNON — the sprayer is the game's improvised shotgun
+   *     and it stays the cheap, fast, blinding one: 7 pellets x 15 = 105 at
+   *     0.55 s a pull, and it MARKS what it hits. The pump is the serious one:
+   *     8 x 17 = 136 inside 6 m, a harder falloff (0.22 of it left at 30 m
+   *     against the sprayer's 0.20 at 22), a 0.78 s pump cycle you watch
+   *     complete, and `knock` 9 per pellet against the default 6 — 72 of
+   *     impulse on a full pattern against the sprayer's 42, which is the
+   *     "harder knockdown" the report asked for expressed as physics rather
+   *     than as an adjective.
+   */
+
+  pistol: def({
+    id: 'pistol', label: 'Pistol', cls: 'light', hold: 'oneHand',
+    lib: { dmg: 26, rate: 0.30, range: 60, ammo: 96 },
+    magSize: 12, reserve: 96, damage: 26, rate: 0.30,
+    /* 9x19 out of a 95 mm barrel: 340 m/s, which crosses 60 m in 0.19 s and
+     * drops 18 cm doing it. Slower than the Shop SMG's 370 (shorter barrel)
+     * and three times anything else one-handed in the set. */
+    muzzleVelocity: 340, dragK: 0.44, dropoff: 0.55, penetration: 0.5,
+    range: 60, projectile: 'bullet', eject: 'brass',
+    shell: { caseLen: 0.0192, rimR: 0.00478 },
+    tracerEvery: 3,
+    /* THE NICHE. The tightest hip cone of any firearm here and the tightest
+     * aimed cone of anything that is not a harpoon. */
+    spreadHip: 1.5, spreadAds: 0.22, spreadPerShot: 0.34, spreadMax: 3.2, spreadDecay: 6.2,
+    /* A short recoil auto snaps up hard and comes straight back down: the
+     * highest per-shot pitch of the light class and almost no drift. */
+    recoil: { pitch: 0.0105, yaw: 0.0028, kickBack: 0.014, kickUp: 0.009, punch: 0.28, body: 0.8, drift: 0.9 },
+    modes: ['semi'],
+    /* Drop the mag, seat a fresh one, thumb the slide stop. The fastest
+     * reload in the game and the fastest draw of any firearm. */
+    reloadTac: 1.5, reloadEmpty: 2.0, adsTime: 0.18,
+    drawTime: 0.30, holsterTime: 0.24,
+  }),
+
+  shotgun: def({
+    id: 'shotgun', label: 'Shotgun', cls: 'light', hold: 'twoHand', sling: 'precise',
+    lib: { dmg: 17, rate: 0.78, range: 30, ammo: 48, pellets: 8 },
+    magSize: 6, reserve: 48, damage: 17, rate: 0.78,
+    /* EIGHT pellets of 00 buck at 380 m/s. 136 damage if the whole pattern
+     * lands, which it only does inside about 6 m; by 30 m each pellet is worth
+     * 3.7 and the weapon is a noise-maker. That cliff IS the weapon. */
+    pellets: 8, muzzleVelocity: 380, dragK: 1.35, dropoff: 0.22, penetration: 0.35,
+    range: 30, projectile: 'bullet', eject: 'brass',
+    shell: { caseLen: 0.0699, rimR: 0.01033 },
+    tracerEvery: 0,
+    /* 4.6 deg at the hip is a 1.6 m pattern at 10 m — tighter than the
+     * sprayer's 5.2 because this one has a choke stub left on it. */
+    spreadHip: 4.6, spreadAds: 2.6, spreadPerShot: 0.4, spreadMax: 6.2, spreadDecay: 4.4,
+    recoil: { pitch: 0.0225, yaw: 0.0045, kickBack: 0.046, kickUp: 0.018, punch: 0.72, body: 1.5, trauma: 0.12 },
+    modes: ['semi'],
+    /* THE PUMP. `rig.js` strokes the forend once per shot off this flag, and at
+     * 0.78 s a cycle the stroke is fully visible between rounds — which is the
+     * whole tactile point of a pump gun and the reason the rate is not faster. */
+    pump: true,
+    /**
+     * SHELL BY SHELL, AND INTERRUPTIBLE.
+     *
+     * `reloadTac` is the time for ONE shell, not for the magazine: the system
+     * replays the clip until the tube is full (`WeaponSystem._shellReload`) and
+     * a trigger pull with a round chambered cancels the rest. That is what a
+     * tube-fed gun does and it is the single biggest reason a shotgun feels
+     * different from every magazine weapon in the game — you choose how much of
+     * the reload you can afford. `reloadEmpty` is longer because the first
+     * stroke on an empty gun also has to close the action.
+     */
+    shellReload: true,
+    reloadTac: 0.62, reloadEmpty: 0.86, adsTime: 0.30,
+    drawTime: 0.66, holsterTime: 0.46,
+    /* Per-PELLET impulse into whatever it hits — see the balance note above. */
+    knock: 9,
+  }),
+
+  /* ==================================================================== */
   /*  PRECISE — one heavy projectile, long range, slow                    */
   /* ==================================================================== */
 
@@ -366,10 +468,19 @@ export const WEAPONS = {
   }),
 };
 
-/** Ordered exactly as the weapon wheel groups them (see `ui/data.js` slots). */
+/**
+ * Ordered exactly as the weapon wheel groups them (see `ui/data.js` slots).
+ *
+ * THIS ORDER IS LOAD-BEARING. `giveWeapon` inserts a granted weapon at its
+ * index here so the wheel never reshuffles mid-game, and every `BROTHER_*`
+ * table below is written in this order for the same reason. The pistol leads
+ * the light block because it is the sidearm every one of these is measured
+ * against; the shotgun sits between the sprayer and the SMG, which is where it
+ * belongs by rate.
+ */
 export const WEAPON_ORDER = [
   'fists', 'pipe', 'wrench', 'crowbar',
-  'nailgun', 'tackgun', 'sprayer', 'smg',
+  'pistol', 'nailgun', 'tackgun', 'sprayer', 'shotgun', 'smg',
   'flare', 'speargun', 'rivetgun', 'harpoon',
   'launcher', 'depth', 'rocket', 'emp',
 ];
@@ -393,9 +504,31 @@ export const CLASS_EXEMPLAR = {
  * remaining two across his eight chapters.
  */
 export const BROTHER_LOADOUT = {
-  carson: ['fists', 'pipe', 'flare', 'speargun', 'harpoon', 'depth'],
+  carson: ['fists', 'pipe', 'pistol', 'shotgun', 'speargun', 'depth'],
   aidan: ['fists', 'wrench', 'nailgun', 'sprayer', 'rivetgun', 'launcher'],
   dylan: ['fists', 'crowbar', 'tackgun', 'emp', 'smg', 'rocket'],
+};
+
+/**
+ * WHAT A BROTHER USED TO CARRY, AND STILL DOES IF THE SAVE SAYS SO.
+ *
+ * The report replaced Carson's Flare Gun and Harpoon with the DOCK .38 and the
+ * RIVER 12. Both old ids are still built, still finalised, still modelled and
+ * still fire — nothing about them was deleted — but they are no longer in
+ * anybody's canonical six, and `_resolveUnlocks` filters the save's unlocks
+ * THROUGH that six. Without this table a player who had earned the Harpoon
+ * would load their save and find it gone from the wheel with no explanation,
+ * which is the exact failure mode the arsenal probe was written for.
+ *
+ * So: a legacy id appears in the wheel if, and only if, the save actually
+ * carries it. A new game never sees one. Keyed per brother rather than
+ * globally, because "any owned weapon" would let a malformed save put Dylan's
+ * Scrap Rocket in Carson's hands and quietly break the disjoint-loadout rule.
+ */
+export const BROTHER_LEGACY = {
+  carson: ['flare', 'harpoon'],
+  aidan: [],
+  dylan: [],
 };
 
 /**
@@ -411,11 +544,13 @@ export const BROTHER_LOADOUT = {
  *
  * Each brother now comes up holding the firearm that states what he is:
  *
- *   carson  Flare Gun    one-handed, break-open, a burning 25 mm tracer he can
- *                        watch arc onto a boat deck. He is the heavy, slow,
- *                        single-shot brother — his whole set (flare, spear,
- *                        harpoon, depth) is one big hit at a time, and that is
- *                        the tank's identity, not an omission.
+ *   carson  DOCK .38     the sidearm. Was the Flare Gun, which is the weapon
+ *                        the playtest report was looking at when it said the
+ *                        guns needed to be real guns: a break-open 25 mm
+ *                        signal pistol is a beautiful object and it is not
+ *                        what a player reaches for on the first screen. The
+ *                        .38 draws in 0.30 s and hits what the reticle is on,
+ *                        which is what "default sidearm" has to mean.
  *   aidan   Nail Gun     the body-shop tool, semi OR 273 rpm auto, one-handed
  *                        so he keeps his mobility. The all-rounder's gun.
  *   dylan   Shop SMG     667 rpm out of an open bolt. The true automatic, on
@@ -424,9 +559,36 @@ export const BROTHER_LOADOUT = {
  *                        return fire.
  */
 export const BROTHER_SIGNATURE = {
-  carson: 'flare',
+  carson: 'pistol',
   aidan: 'nailgun',
   dylan: 'smg',
+};
+
+/**
+ * THE SAME GUN, NAMED IN THE HANDS THAT HOLD IT.
+ *
+ * There are exactly TWO new engine ids — `pistol` and `shotgun` — because
+ * three copies of one weapon differing only in a string is three weapons the
+ * table has to keep distinct, three models to build and three of everything to
+ * keep in sync, for no mechanical difference at all. But a DeCarlo does not
+ * call a gun by its catalogue name: Carson's came off a South Side pawn counter
+ * and Aidan's came out of a customer's glovebox, and the HUD should say so.
+ *
+ * So the id is shared and the LABEL is resolved per brother.
+ * `WeaponSystem.labelFor` reads this and publishes it on `getHudState().name`,
+ * which `ui/index.js:_pullState` prefers over its own static table. Anything
+ * not listed here falls through to the def's own `label`.
+ *
+ * It matters because story completion (`unlockEverything`) puts every weapon in
+ * every brother's hands, so all three of these are reachable in a finished
+ * save — and because the register is half of what makes these three men
+ * different people. Carson names things after the water, Aidan after the
+ * street his shop is on, Dylan after the hill he lives at the top of.
+ */
+export const BROTHER_WEAPON_NAMES = {
+  carson: { pistol: 'DOCK .38', shotgun: 'RIVER 12' },
+  aidan: { pistol: 'SHOP NINE', shotgun: 'BUTLER PUMP' },
+  dylan: { pistol: 'RIDGE SNUB', shotgun: 'INCLINE 12' },
 };
 
 /**
@@ -482,7 +644,7 @@ export const NEUTRAL_HANDLING = { spread: 1, recoil: 1, settle: 1, handling: 1, 
  * `start` arrays in `src/game/data.js`.
  */
 export const BROTHER_START = {
-  carson: ['fists', 'pipe', 'flare', 'speargun'],
+  carson: ['fists', 'pipe', 'pistol', 'speargun'],
   aidan: ['fists', 'wrench', 'nailgun', 'rivetgun'],
   dylan: ['fists', 'crowbar', 'tackgun', 'smg'],
 };
@@ -507,6 +669,10 @@ const SIGNATURE = {
   pipe: { fx: 'suppressed', audio: 'suppressed', flash: 0 },
   wrench: { fx: 'suppressed', audio: 'suppressed', flash: 0 },
   crowbar: { fx: 'suppressed', audio: 'suppressed', flash: 0 },
+  /* The only two entries in this table that get the profile they are NAMED
+   * after, because they are the only two weapons that are what it says. */
+  pistol: { fx: 'pistol', audio: 'pistol', flash: 1.0 },
+  shotgun: { fx: 'shotgun', audio: 'shotgun', flash: 1.35 },
   /* 120 psi of air, not powder: a hard mechanical bark and a puff, no fireball. */
   nailgun: { fx: 'pistol', audio: 'pistol', flash: 0.35 },
   tackgun: { fx: 'smg', audio: 'smg', flash: 0.3 },
@@ -559,6 +725,10 @@ export function finalizeWeapon(id) {
   d.spreadMax = d.spreadMax ?? 4;
   d.spreadDecay = d.spreadDecay ?? 4;
   d.viewFov = d.adsFov;
+  /* Per-projectile impulse into what it hits. 0 means "use the ballistics
+   * default", which is 6 for a bullet and 26 for something that pins. */
+  d.knock = d.knock ?? 0;
+  d.shellReload = d.shellReload === true;
   return d;
 }
 

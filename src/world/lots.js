@@ -29,11 +29,28 @@ const KIND_HEIGHT = {
 
 /** Lot depth and frontage width per district family. */
 const SUBDIV = {
-  downtown: { depth: 46, width: [26, 54], park: 0.05, park2: 0.07 },
+  /**
+   * Downtown is the one grid that must never roll a whole-block void, and its
+   * lots must be narrow enough that a block holds 4-6 buildings: measured by
+   * blockprobe, park 0.05/park2 0.07 produced NINE of 38 Golden Triangle
+   * blocks holding nothing but a park or a car park (24% of the district —
+   * the critics' "vast unfilled fields"), and [26,54] widths gave a block two
+   * slabs with no graceful failure. Street-wall ratchet lives in blockprobe.
+   */
+  downtown: { depth: 46, width: [14, 26], park: 0.0, park2: 0.03 },
   grid: { depth: 30, width: [11, 24], park: 0.06, park2: 0.10 },
   hill: { depth: 24, width: [9, 16], park: 0.09, park2: 0.08 },
   mill: { depth: 62, width: [34, 78], park: 0.05, park2: 0.16 },
   park: { depth: 40, width: [22, 44], park: 0.62, park2: 0.12 },
+  /**
+   * OAKLAND. A campus plot is an institution: one hall on a 40 m frontage with
+   * a lawn beside it, not a terrace of eleven-metre rowhouses. The frontages
+   * are the widest in the city after the mill's, the lots are deep enough for
+   * a courtyard building, and `park` is high — a university is mostly grass,
+   * which is what makes the Cathedral's own lawn read as part of something
+   * rather than as a hole in the street wall.
+   */
+  campus: { depth: 44, width: [24, 48], park: 0.24, park2: 0.10 },
 };
 
 /**
@@ -289,6 +306,13 @@ function pickKind(b, d, area, rng) {
       return r < 0.86 ? 'house' : 'shop';
     case 'park':
       return r < 0.5 ? 'park' : 'house';
+    /**
+     * A campus has no shops and no houses on it. Everything is an institutional
+     * block — hall, library, laboratory, dormitory — with the odd lawn between
+     * them, so this is the one family that never draws `shop` or `house`.
+     */
+    case 'campus':
+      return r < 0.18 ? 'park' : 'block';
     default:
       if (r < 0.30) return 'shop';
       if (r < 0.86) return 'block';

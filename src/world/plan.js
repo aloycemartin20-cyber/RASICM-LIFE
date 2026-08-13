@@ -56,6 +56,42 @@ export const RIVER_BANK = 5.2;
  */
 export const RIVER_OVERHANG = 24;
 
+/**
+ * `?owNoOakland=1` / `OW_NO_OAKLAND=1` — the A/B hatch for the OAKLAND wave.
+ *
+ * ONE BUILD, THE CHANGE OFF AND ON. `tools/perfcheck.mjs --ab='.|owNoOakland=1,.'`
+ * is the only machine-immune way to price a new district: two worktrees measured
+ * minutes apart on this machine have come back 70% different with no code change
+ * at all (see that file's header), so the two arms have to be the same binary in
+ * the same minute.
+ *
+ * What it removes is the whole wave and nothing else — the district (and with it
+ * its terrain pad, its street grid, its blocks, its lots and its traffic) and the
+ * three landmark sites (and with them the road reserve, the ring roads, the
+ * emitted geometry, the planting and the `urbanAt` suppression). It does NOT
+ * touch the bridge colours: those are a tint on an existing bake plus one
+ * accumulator key, and there is no arm of them worth measuring.
+ *
+ * Read at MODULE SCOPE deliberately, because `terrain.js` derives `PAD` and
+ * `GREEN_SITES` from these arrays once at load. A hatch consulted later would
+ * leave the heightfield with an Oakland-shaped plateau in it and no Oakland on
+ * top, which is a measurement of nothing.
+ */
+function planHatch(qs, env) {
+  try {
+    if (typeof location !== 'undefined' && new URLSearchParams(location.search).get(qs) === '1') return true;
+  } catch { /* no location */ }
+  try {
+    if (typeof process !== 'undefined' && process?.env?.[env] === '1') return true;
+  } catch { /* no process */ }
+  return false;
+}
+const NO_OAKLAND = planHatch('owNoOakland', 'OW_NO_OAKLAND');
+if (NO_OAKLAND) console.warn('[world] OAKLAND wave OFF — no district, no Cathedral, no parks');
+/** The wave's own entries, dropped as one when the hatch is set. */
+const OAKLAND_IDS = new Set(['oakland', 'lm_cathedral', 'lm_ironwood', 'lm_colorpark', 'dk_color']);
+const wave = (list) => (NO_OAKLAND ? list.filter((e) => !OAKLAND_IDS.has(e.id)) : list);
+
 const p4 = (pts) => pts.map(([x, z]) => [x * K, z * K]);
 
 /**
@@ -139,7 +175,7 @@ export const RIVERS = [
  * and Mt. Washington into hills with flat tops full of houses, which is what
  * Pittsburgh actually looks like from the air.
  */
-export const DISTRICTS = [
+export const DISTRICTS = wave([
   { id: 'point', name: 'THE POINT', x: -672, z: 16, r: 248, tall: 0.10, tint: [0.30, 0.36, 0.30], pad: 4, edge: 120, density: 0.15, wealth: 0.5, grid: 'park' },
   { id: 'downtown', name: 'GOLDEN TRIANGLE', x: -232, z: 64, r: 400, tall: 1.00, tint: [0.36, 0.38, 0.44], pad: 9, edge: 180, density: 1.0, wealth: 0.85, grid: 'downtown' },
   { id: 'strip', name: 'THE STRIP', x: 248, z: -184, r: 344, tall: 0.55, tint: [0.42, 0.34, 0.28], pad: 12, edge: 200, density: 0.8, wealth: 0.45, grid: 'grid' },
@@ -152,7 +188,37 @@ export const DISTRICTS = [
   { id: 'westend', name: 'WEST END', x: -1032, z: 368, r: 384, tall: 0.30, tint: [0.35, 0.36, 0.33], pad: 58, edge: 300, density: 0.45, wealth: 0.4, grid: 'hill' },
   { id: 'northside', name: 'MANCHESTER', x: -984, z: -568, r: 368, tall: 0.32, tint: [0.34, 0.35, 0.38], pad: 16, edge: 240, density: 0.55, wealth: 0.4, grid: 'grid' },
   { id: 'hazel', name: 'HAZELWOOD', x: 984, z: -56, r: 344, tall: 0.36, tint: [0.40, 0.34, 0.28], pad: 34, edge: 260, density: 0.5, wealth: 0.3, grid: 'grid' },
-];
+  /**
+   * OAKLAND — the campus plateau, and the one hole this table still had in it.
+   *
+   * SITED BY SURVEY, NOT BY EYE. Pittsburgh's Oakland is up the hill east of
+   * downtown, south of the Strip, north of the Monongahela, west of Hazelwood
+   * — and on this map that description picks out exactly one piece of ground,
+   * the basin between `strip`, `steelrow` and `hazel`. It was measured before
+   * it was authored:
+   *
+   *   - CENTRE-TO-CENTRE. No district centre in this table has ever fallen
+   *     inside another's circle and this one does not either: 352 m to `strip`
+   *     (r 344), 434 m to `steelrow` (r 400), 474 m to `hazel` (r 344), 753 m
+   *     to `downtown`. `r = 316` keeps every other centre outside OAKLAND's
+   *     circle in turn, which is the same invariant read the other way.
+   *   - DRY. Sampled every 15 degrees on the r = 320 ring: nearest waterline
+   *     147 m, zero wet samples. The Monongahela is 400 m south of the centre.
+   *   - THE BASIN IS REAL, and filling it is a fix rather than a cost.
+   *     MEASURED on the shipped analytic field with no OAKLAND in it,
+   *     `heightAt(520, 40) = -22.48 m` — 22 m of DRY ground below the pool,
+   *     because `isWater` needs a waterline within 6 m and there is none for
+   *     400 m. Every district around it pads up (strip 12, steelrow 7, hazel
+   *     34) and the un-padded gap between them sagged. `pad: 26` is a plateau
+   *     between the Strip and Hazelwood, which is what Oakland is.
+   *
+   * `edge: 300` rather than the 240-260 its neighbours use, because the lift
+   * here is ~48 m and `smootherstep`'s peak grade is 1.875x the mean: 48 x
+   * 1.875 / 300 = 30%, at `netgen`'s MAX_GRADE rather than over it, and the
+   * grid's own `clipToLand` drops any rail that finds worse.
+   */
+  { id: 'oakland', name: 'OAKLAND', x: 520, z: 40, r: 316, tall: 0.52, tint: [0.38, 0.36, 0.31], pad: 26, edge: 300, density: 0.72, wealth: 0.62, grid: 'campus' },
+]);
 
 export const DISTRICT_BY_ID = Object.fromEntries(DISTRICTS.map((d) => [d.id, d]));
 
@@ -260,7 +326,7 @@ export const HILLS = [
  * instead of probing. Two subsystems deciding independently which way a
  * landmark faces is the same defect as two deciding where it is.
  */
-export const LANDMARKS = [
+export const LANDMARKS = wave([
   { id: 'lm_point', name: 'The Point Fountain', x: -452, z: 46, kind: 'fountain',
     site: { ox: 0, oz: 0, hx: 0, hz: 0, yaw: 0, r: 46 } },
   { id: 'lm_incline', name: 'Duquesne Incline', x: -488, z: 296, kind: 'incline',
@@ -278,7 +344,87 @@ export const LANDMARKS = [
     site: { ox: 0, oz: 0, hx: 0, hz: 0, yaw: 0, r: 36 } },
   { id: 'lm_market', name: 'Strip Market', x: 352, z: -224, kind: 'market',
     site: { ox: 0, oz: -7, hx: 18, hz: 58, yaw: 0, r: 3 } },
-];
+  /**
+   * THE CATHEDRAL OF STEEL — Oakland's gothic tower and the quad it stands on.
+   *
+   * A limestone skyscraper alone on a lawn, which is a silhouette this city
+   * does not otherwise own: everything tall in Steel City is either a glass
+   * curtain wall (the Steel Tower) or a mill stack. It reads from Mt.
+   * Washington, from the Strip and from both airfields, and it is the reason
+   * OAKLAND is legible from outside its own streets.
+   *
+   * The site is a BOX, not a disc, and it is the QUAD rather than the tower:
+   * the tower's own base is 34 x 30 m, the flanking halls stand on the long
+   * edges, and the reserve keeps the carriageway off the lawn between them.
+   * `yaw` is `DISTRICT_YAW.oakland`, so the quad is square to Oakland's grid
+   * and the ring road `landmarkRings` lays around it reads as the campus
+   * perimeter rather than as a roundabout in a field.
+   */
+  { id: 'lm_cathedral', name: 'The Cathedral of Steel', x: 508, z: 24, kind: 'cathedral',
+    site: { ox: 0, oz: 0, hx: 54, hz: 42, yaw: 0.52, r: 12 } },
+  /**
+   * IRONWOOD PARK — Oakland's big park, on the south-east shoulder of the
+   * plateau where the ground falls away toward the Monongahela.
+   *
+   * A disc, because a park has no facade to square up to, and 84 m of it so
+   * the ring road is a park drive with room for lawns, a path loop and a
+   * bandstand inside it. Placed 199 m from the district centre, so the whole
+   * site (199 + 84 = 283 m) sits inside OAKLAND's r = 316 rather than hanging
+   * off its edge, and 87 m clear of the Cathedral's quad so the two reserves
+   * do not merge into one block nobody can drive between.
+   */
+  { id: 'lm_ironwood', name: 'Ironwood Park', x: 676, z: 164, kind: 'greenpark',
+    site: { ox: 0, oz: 0, hx: 0, hz: 0, yaw: 0, r: 84 } },
+  /**
+   * COLOR PARK — the legal wall, on the Monongahela's south bank.
+   *
+   * The riverside slab where the city stopped painting over the paint: bays of
+   * poured concrete in loud primaries, a tagged retaining wall, and the trail
+   * running through it. It is a CAPSULE-ISH BOX along the bank rather than a
+   * disc, because the bank here is 40 m of dry shelf between the waterline and
+   * Carson Street and a disc big enough to matter would land in one or the
+   * other. `yaw` is the bearing of the waterline itself, measured off the
+   * emitted `waterDist` field between x = 280 and x = 400.
+   */
+  { id: 'lm_colorpark', name: 'Color Park', x: 306, z: 654, kind: 'colorpark',
+    site: { ox: 0, oz: 0, hx: 76, hz: 16, yaw: 0.489, r: 5 } },
+  /**
+   * GLASSHOUSE COURT — the glass castle on the Triangle, and the one downtown
+   * silhouette no generator will ever produce.
+   *
+   * The owner's report was "downtown does not have enough buildings — make it
+   * like pittsburgh (steel building, ppg, highmark tower, etc.)". Of that list
+   * the Steel Tower already exists as `lm_tower`; the deco crowns and the
+   * pyramid caps are massing rules and now come out of
+   * `src/buildings/archetypes.js` on ordinary downtown lots. The glass gothic
+   * castle does not: spired corner turrets on a mirrored curtain wall are an
+   * authored shape or they are absent, and it is the profile that makes a
+   * skyline photograph read as this city rather than as any city.
+   *
+   * THE SITE IS A CITY BLOCK, NOT A TOWER PAD, and that is the whole point.
+   * The real thing is one tower and five low buildings round a plaza, and a
+   * landmark that reserved only its shaft would have put another empty field
+   * in the middle of the district the report says is already too empty. So
+   * `hx, hz` = 30 x 40 is a downtown block (`netgen.GRID_STYLE.downtown` cuts
+   * them at about 65 x 95 m), `yaw` is `DISTRICT_YAW.downtown` so it is square
+   * to the Triangle's grid, and `buildings` fills the block edges with the
+   * court's own wings — street wall on all four sides, plaza in the middle.
+   *
+   * WHERE IT STANDS WAS MEASURED, NOT PICKED. A reserve is only as good as the
+   * corridors `netgen.reserveLandmarks` is allowed to cut, and it exempts
+   * bridges, elevated decks and rails — the first draft of an enlarged
+   * `lm_tower` site went red on `lmsweep` at 41.3 m of intrusion because it
+   * reached the Fort Duquesne approach. So downtown was swept on an 8 m
+   * lattice for the point that maximises the smaller of (a) distance to any
+   * un-cuttable corridor and (b) distance to an existing landmark site.
+   * (-216, 104) came back at 93 m and 84 m against the 79 m this site needs
+   * (55 m of reach plus `LANDMARK_RESERVE`), and it is 121 m off the Steel
+   * Tower — one block, which is what the two of them are apart in the city
+   * this is a portrait of.
+   */
+  { id: 'lm_glass', name: 'Glasshouse Court', x: -216, z: 104, kind: 'glasscourt',
+    site: { ox: 0, oz: 0, hx: 30, hz: 40, yaw: -0.52, r: 5 } },
+]);
 
 /**
  * Metres of clear ground between a landmark site and the CENTRELINE of any
@@ -370,11 +516,24 @@ export const AIRBASE = {
   runway: [1200, 46],
 };
 
-export const DOCKS = [
+export const DOCKS = wave([
   { id: 'dk_south', name: 'South Side Docks', x: -88, z: 280 },
   { id: 'dk_north', name: 'North Shore Slip', x: -24, z: -264 },
   { id: 'dk_point', name: 'Point Marina', x: -744, z: -88 },
-];
+  /**
+   * COLOR PARK LANDING — the South Side flats' own slip, off the legal wall.
+   *
+   * The excursion boats work this bank, and until this entry the whole of the
+   * Monongahela east of the Smithfield Street Bridge had nowhere to tie up:
+   * `dk_south` is 400 m downstream of The Point and the other two are on the
+   * Allegheny and the Ohio. Sited IN the channel, like the other three, so a
+   * hull moored on it floats — `heightAt` here is river bed, not bank.
+   *
+   * `src/game/data.js` owns what a dock DOES (staging apron, mission anchor)
+   * and does not carry this one yet; see the handoff note.
+   */
+  { id: 'dk_color', name: 'Color Park Landing', x: 322, z: 606 },
+]);
 
 export const SAFEHOUSES = [
   { id: 'sh_boathouse', name: "Carson's Boathouse", x: 88, z: 560 },
@@ -429,19 +588,56 @@ export const POI_PAD = { r: 17, blend: 26 };
  * place police will try to close and several missions stage on. `a` and `b` are
  * anchors on dry land; the generator finds the water crossing between them,
  * pins the deck at `deckY` and ramps the approaches.
+ *
+ * ───────────────────────────────────────────────────────────────────────────
+ * `steel` — WHAT COLOUR THE SUPERSTRUCTURE IS PAINTED.
+ * ───────────────────────────────────────────────────────────────────────────
+ * A palette key in `world/palette.js`, handed to `bridges.js` on the emitted
+ * spec. Until this field existed every truss, arch and cable in the city was
+ * one material, so eleven crossings over three rivers had one identity between
+ * them — which is the opposite of what a bridge is for on a map whose
+ * chokepoints are all bridges. You cannot say "meet me at the blue one".
+ *
+ * The convention is Pittsburgh's, not an invention:
+ *
+ *   `bridge_gold`   THE SISTERS and the two gateway crossings. Three identical
+ *                   self-anchored suspension spans in a row over the Allegheny
+ *                   — Sixth, Seventh, Ninth — plus Fort Pitt and Fort Duquesne,
+ *                   the pair you arrive downtown through, and the Sixteenth
+ *                   Street truss. Aztec gold over red lead.
+ *   `bridge_blue`   the long river crossings: Smithfield, Birmingham,
+ *                   Thirty-First, West End, McKees Rocks. Cold blue-green
+ *                   structural paint, which is what the big spans upstream and
+ *                   downstream of the golden triangle actually wear.
+ *   `bridge_black`  the Hot Metal Bridge, alone. It is the MILL's bridge — it
+ *                   carried ladles, not commuters — and it was never painted a
+ *                   civic colour. Bare plate, mill scale and rust.
+ *
+ * Nothing else in the file may decide this. `bridges.js` reads `spec.steel`
+ * and nothing else; a bridge with no `steel` key falls back to the gold, which
+ * is the colour every span used to be.
  */
 export const BRIDGES = [
-  { id: 'br_fortduq', name: 'Fort Duquesne Bridge', river: 'allegheny', kind: 'highway', a: [-405, -35], b: [-520, -370], lanes: 4, deckY: 19, style: 'arch' },
-  { id: 'br_sixth', name: 'Sixth Street Bridge', river: 'allegheny', kind: 'arterial', a: [-150, -20], b: [-235, -330], lanes: 4, deckY: 17, style: 'suspension' },
-  { id: 'br_ninth', name: 'Ninth Street Bridge', river: 'allegheny', kind: 'arterial', a: [70, -140], b: [-15, -450], lanes: 4, deckY: 17, style: 'suspension' },
-  { id: 'br_16th', name: 'Sixteenth Street Bridge', river: 'allegheny', kind: 'arterial', a: [352, -352], b: [268, -652], lanes: 4, deckY: 18, style: 'truss' },
-  { id: 'br_31st', name: 'Thirty-First Street Bridge', river: 'allegheny', kind: 'arterial', a: [648, -596], b: [560, -900], lanes: 4, deckY: 18, style: 'truss' },
-  { id: 'br_fortpitt', name: 'Fort Pitt Bridge', river: 'monongahela', kind: 'highway', a: [-372, 116], b: [-500, 392], lanes: 4, deckY: 21, style: 'arch' },
-  { id: 'br_smithfield', name: 'Smithfield Street Bridge', river: 'monongahela', kind: 'arterial', a: [-96, 268], b: [-176, 552], lanes: 4, deckY: 17, style: 'truss' },
-  { id: 'br_birmingham', name: 'Birmingham Bridge', river: 'monongahela', kind: 'arterial', a: [268, 436], b: [188, 724], lanes: 4, deckY: 19, style: 'truss' },
-  { id: 'br_hotmetal', name: 'Hot Metal Bridge', river: 'monongahela', kind: 'street', a: [596, 620], b: [512, 900], lanes: 2, deckY: 15, style: 'truss' },
-  { id: 'br_westend', name: 'West End Bridge', river: 'ohio', kind: 'arterial', a: [-856, -296], b: [-944, 16], lanes: 4, deckY: 20, style: 'arch' },
-  { id: 'br_mckees', name: 'McKees Rocks Bridge', river: 'ohio', kind: 'arterial', a: [-1204, -520], b: [-1296, -172], lanes: 4, deckY: 20, style: 'truss' },
+  { id: 'br_fortduq', name: 'Fort Duquesne Bridge', river: 'allegheny', kind: 'highway', a: [-405, -35], b: [-520, -370], lanes: 4, deckY: 19, style: 'arch', steel: 'bridge_gold' },
+  { id: 'br_sixth', name: 'Sixth Street Bridge', river: 'allegheny', kind: 'arterial', a: [-150, -20], b: [-235, -330], lanes: 4, deckY: 17, style: 'suspension', steel: 'bridge_gold' },
+  /**
+   * THE MIDDLE SISTER. Pittsburgh's trio is three identical self-anchored
+   * suspension spans on one straight reach of the Allegheny, and this map had
+   * two of them with a 220 m hole where the third goes. Its anchors are the
+   * midpoint of Sixth's and Ninth's on both banks — the same bearing, the same
+   * deck height, the same style — so it lands in the downtown grid and the
+   * North Shore grid exactly where its sisters do.
+   */
+  { id: 'br_seventh', name: 'Seventh Street Bridge', river: 'allegheny', kind: 'arterial', a: [-40, -80], b: [-125, -390], lanes: 4, deckY: 17, style: 'suspension', steel: 'bridge_gold' },
+  { id: 'br_ninth', name: 'Ninth Street Bridge', river: 'allegheny', kind: 'arterial', a: [70, -140], b: [-15, -450], lanes: 4, deckY: 17, style: 'suspension', steel: 'bridge_gold' },
+  { id: 'br_16th', name: 'Sixteenth Street Bridge', river: 'allegheny', kind: 'arterial', a: [352, -352], b: [268, -652], lanes: 4, deckY: 18, style: 'truss', steel: 'bridge_gold' },
+  { id: 'br_31st', name: 'Thirty-First Street Bridge', river: 'allegheny', kind: 'arterial', a: [648, -596], b: [560, -900], lanes: 4, deckY: 18, style: 'truss', steel: 'bridge_blue' },
+  { id: 'br_fortpitt', name: 'Fort Pitt Bridge', river: 'monongahela', kind: 'highway', a: [-372, 116], b: [-500, 392], lanes: 4, deckY: 21, style: 'arch', steel: 'bridge_gold' },
+  { id: 'br_smithfield', name: 'Smithfield Street Bridge', river: 'monongahela', kind: 'arterial', a: [-96, 268], b: [-176, 552], lanes: 4, deckY: 17, style: 'truss', steel: 'bridge_blue' },
+  { id: 'br_birmingham', name: 'Birmingham Bridge', river: 'monongahela', kind: 'arterial', a: [268, 436], b: [188, 724], lanes: 4, deckY: 19, style: 'truss', steel: 'bridge_blue' },
+  { id: 'br_hotmetal', name: 'Hot Metal Bridge', river: 'monongahela', kind: 'street', a: [596, 620], b: [512, 900], lanes: 2, deckY: 15, style: 'truss', steel: 'bridge_black' },
+  { id: 'br_westend', name: 'West End Bridge', river: 'ohio', kind: 'arterial', a: [-856, -296], b: [-944, 16], lanes: 4, deckY: 20, style: 'arch', steel: 'bridge_blue' },
+  { id: 'br_mckees', name: 'McKees Rocks Bridge', river: 'ohio', kind: 'arterial', a: [-1204, -520], b: [-1296, -172], lanes: 4, deckY: 20, style: 'truss', steel: 'bridge_blue' },
 ];
 
 /* ------------------------------------------------------- street names ---- */
@@ -563,6 +759,28 @@ export const DISTRICT_STREETS = {
       'North Franklin Street', 'Fontella Street', 'Decatur Street'],
     alley: ['Faulsey Way', 'Rush Way', 'Dounton Way', 'Massachusetts Way', 'Fayette Way',
       'Stedman Way', 'Boquet Way'],
+  },
+  /**
+   * OAKLAND. `GRID_STYLE.campus` is the widest grid in the city outside the
+   * mill — institutional blocks are big — so the arrays are short: `R = r *
+   * 1.12 = 353.9`, `ceil(2R / a) + 1 = 7` rails of the `u` family at a = 118,
+   * `ceil(2R / b) + 1 = 6` of the `v` family at b = 148, and one alley slot per
+   * `v` row, which is 5. Those are the counts below, exactly, and
+   * `routeprobe.mjs` goes red if the grid ever outgrows them.
+   *
+   * Named the way the rest of this table is named — the real neighbourhood's
+   * streets — and checked against every other entry for collisions, because
+   * `routeprobe` asserts all 285 authored names are distinct and that none of
+   * them shadows a name `netgen` emits by hand. Oakland's two obvious
+   * candidates, Forbes Avenue and Fifth Avenue, are already spoken for
+   * (downtown's grid and a cross-town connector), which is why neither is here.
+   */
+  oakland: {
+    along: ['Bellefield Avenue', 'Dithridge Street', 'Craig Street', 'Neville Street',
+      'Bayard Street', 'Ruskin Avenue', 'Schenley Drive'],
+    cross: ['Atwood Street', 'Meyran Avenue', 'Oakland Avenue', 'Semple Street',
+      'McKee Place', 'Coltart Avenue'],
+    alley: ['Louisa Way', 'Frew Way', 'Tennyson Way', 'Halket Way', 'Darragh Way'],
   },
   hazel: {
     along: ['Second Avenue', 'Hazelwood Avenue', 'Flowers Avenue', 'Elizabeth Street', 'Gladstone Street',

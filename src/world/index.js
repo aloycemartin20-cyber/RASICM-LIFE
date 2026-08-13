@@ -1850,7 +1850,7 @@ export class WorldSystem {
       'line_white', 'line_dash', 'line_yellow', 'mark_cross', 'mark_stop',
       'drain', 'cover', 'ballast', 'rail_steel', 'sleeper',
       'terrain_grass', 'terrain_dirt', 'terrain_silt', 'terrain_rock',
-      'bridge_concrete', 'bridge_steel', 'bridge_rail',
+      'bridge_concrete', 'bridge_steel', 'bridge_gold', 'bridge_blue', 'bridge_black', 'bridge_rail',
       'runway', 'apron_slab', 'runway_paint', 'runway_lamp',
     ];
     // All THREE mesh forms per surface. `instancing` and `instancingColor` are

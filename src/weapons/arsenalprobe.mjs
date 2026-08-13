@@ -109,14 +109,33 @@ const args = Object.fromEntries(
   })
 );
 
-/** DESIGN.md "Weapons": the arsenal this game is contractually required to have. */
+/**
+ * DESIGN.md "Weapons": the arsenal this game is contractually required to have.
+ *
+ * RE-BASELINED WITH THE REAL GUNS, and the shape of the re-baseline is the
+ * point. The playtest report asked for the Flare Gun and the Harpoon to be
+ * REPLACED by a pistol and a shotgun, and "replaced" was taken to mean *out of
+ * Carson's loadout*, not *deleted from the game*: both old ids are still built,
+ * still modelled, still fire, and still appear below, because a save that
+ * earned the Harpoon must still be able to draw it. The `report` group at the
+ * bottom of this file is what gates the difference between those two readings.
+ */
 const REQUIRED = {
   melee: ['fists', 'pipe', 'wrench', 'crowbar'],
-  light: ['nailgun', 'tackgun', 'sprayer', 'smg'],
+  light: ['pistol', 'nailgun', 'tackgun', 'sprayer', 'shotgun', 'smg'],
   precise: ['flare', 'speargun', 'rivetgun', 'harpoon'],
   explosive: ['launcher', 'depth', 'rocket', 'emp'],
 };
 const REQUIRED_IDS = Object.values(REQUIRED).flat();
+const REQUIRED_COUNT = REQUIRED_IDS.length;
+
+/** Whose canonical six each weapon belongs to after the report. */
+const REPORT = {
+  /* Out of every brother's six; still built, still drawable from a save. */
+  retired: ['flare', 'harpoon'],
+  /* In, and whose. */
+  added: { pistol: 'carson', shotgun: 'carson' },
+};
 
 /**
  * The GTA-style class spread the arsenal has to cover, expressed as a predicate
@@ -378,24 +397,101 @@ try {
       `canDraw=${lock.canDraw} setWeapon=${lock.drew} after=${lock.activeAfter}, ` +
       `after ui:weapon=${lock.activeAfterEvent}`);
 
+    /**
+     * THE GRANT MUST BE OF SOMETHING HE DOES NOT ALREADY OWN.
+     *
+     * This staged the RIVET GUN, which is in Aidan's DESIGN.md starting kit —
+     * so `giveWeapon` took the `loadout.includes(id)` early return and reported
+     * `false` for "already carried", and the check was red on every build that
+     * has ever run it while printing "mag 24/24, drawable=true" and looking
+     * like a tolerance problem. The weapon has to be one of the two his
+     * CHAPTERS grant; the Paint Cannon is the first of them.
+     *
+     * Read out of the game rather than named here, so a loadout edit cannot
+     * silently re-create the same bug: his six minus his start, first entry.
+     */
     const grant = await page.evaluate(() => {
       const wp = window.__ENGINE__.ctx.peek('weapons');
       wp.setBrother('aidan', true);
+      const A = wp.debugArsenal();
+      const target = A.full.find((w) => !A.start.includes(w));
+      if (!target) return { err: 'aidan starts with his whole six' };
       const before = { ...wp.ammo };
-      const gave = wp.giveWeapon('rivetgun');
-      wp.setWeapon('rivetgun');
-      const st = wp.states.get('rivetgun');
+      const gave = wp.giveWeapon(target);
+      wp.setWeapon(target);
+      const st = wp.states.get(target);
       return {
-        gave, drew: wp.activeId === 'rivetgun',
+        target, gave, drew: wp.activeId === target,
         mag: st.mag, magSize: st.def.magSize, before: before.mag,
-        inLoadout: wp.loadout.includes('rivetgun'),
+        inLoadout: wp.loadout.includes(target),
       };
     });
     rec('progression', 'a granted weapon arrives with a half magazine and is drawable',
-      grant.gave && grant.inLoadout && grant.drew &&
+      !grant.err && grant.gave && grant.inLoadout && grant.drew &&
       grant.mag >= Math.ceil(grant.magSize / 2),
-      `mag ${grant.mag}/${grant.magSize} (want >= ${Math.ceil(grant.magSize / 2)}), ` +
-      `drawable=${grant.drew}`);
+      grant.err ?? `${grant.target}: mag ${grant.mag}/${grant.magSize} ` +
+      `(want >= ${Math.ceil(grant.magSize / 2)}), granted=${grant.gave} ` +
+      `inLoadout=${grant.inLoadout} drawable=${grant.drew}`);
+
+    /**
+     * A SAVE FROM BEFORE THE REPORT STILL CARRIES WHAT IT EARNED.
+     *
+     * This is the one check that tells "replaced in Carson's loadout" apart
+     * from "deleted from the game", and the two are indistinguishable from
+     * every other line in this file: the coverage group would stay green if the
+     * Harpoon existed only as an orphan nothing could ever draw.
+     *
+     * It goes through `game.economy.unlockWeapon`, which is the authority a
+     * loaded save writes through — NOT `weapons.giveWeapon`, which would prove
+     * only that the probe can push an id into an array. Then it asks the live
+     * system the two questions a returning player asks: is it on my wheel, and
+     * can I draw it?
+     *
+     * It runs HERE, before `unlockEverything`, on purpose: `unlockAll` short-
+     * circuits `_resolveUnlocks` to the canonical six and the legacy path never
+     * executes, so a version of this check placed after the unlock would pass
+     * against a build that had dropped the feature entirely.
+     */
+    const legacySave = await page.evaluate(() => {
+      const e = window.__ENGINE__;
+      const wp = e.ctx.peek('weapons');
+      const econ = e.ctx.peek('game')?.economy;
+      if (!econ?.unlockWeapon) return { err: 'no game.economy' };
+      wp.setBrother('carson', true);
+      const retired = (wp.debugArsenal().legacy ?? {}).carson ?? [];
+      const target = retired[retired.length - 1] ?? null;
+      if (!target) return { err: 'no retired ids declared for carson' };
+      const before = wp.loadout.slice();
+      const wrote = econ.unlockWeapon(target, 'carson');
+      wp._resolveUnlocks();
+      const after = wp.loadout.slice();
+      const drew = wp.setWeapon(target);
+      const st = wp.states.get(target);
+      return {
+        target, wrote, before, after, drew,
+        active: wp.activeId,
+        canDraw: wp.canDraw(target),
+        built: !!st,
+        /* Canonical wheel order is preserved — a legacy weapon appended to the
+         * end would reshuffle the wheel every time the poll ran. */
+        ordered: after.filter((w) => before.includes(w)).join(',') === before.join(','),
+        sixPlusOne: after.length === before.length + 1,
+      };
+    });
+    if (legacySave.err) {
+      rec('report', 'a pre-report save can be staged', false, legacySave.err);
+    } else {
+      rec('report', `a save that earned the ${legacySave.target} keeps it on the wheel`,
+        legacySave.wrote === true && legacySave.built &&
+        legacySave.after.includes(legacySave.target) && legacySave.sixPlusOne,
+        `[${legacySave.before.join(' ')}] -> [${legacySave.after.join(' ')}]`);
+      rec('report', `and can still draw and hold the ${legacySave.target}`,
+        legacySave.canDraw === true && legacySave.drew === true &&
+        legacySave.active === legacySave.target,
+        `canDraw=${legacySave.canDraw} setWeapon=${legacySave.drew} active=${legacySave.active}`);
+      rec('report', 'the legacy weapon lands in canonical wheel order',
+        legacySave.ordered === true, legacySave.after.join(' '));
+    }
 
     const stock = await page.evaluate(() => {
       const wp = window.__ENGINE__.ctx.peek('weapons');
@@ -446,13 +542,53 @@ try {
     const wp = window.__ENGINE__.ctx.peek('weapons');
     const before = wp.brotherId;
     const out = {};
+    const retired = {};
+    const six = {};
+    const names = {};
+    const sig = {};
+    let legacy = {};
     for (const b of ['carson', 'aidan', 'dylan']) {
       wp.setBrother(b, false);
-      for (const id of wp.loadout) if (!(id in out)) out[id] = b;
+      /**
+       * `full`, NOT `loadout`. `loadout` is what the SAVE has unlocked, which
+       * is four weapons on a fresh one and six only after `unlockEverything` —
+       * so a group run in isolation (`--only=`, a negative-control arm) would
+       * read a different table from a full sweep and score a different game.
+       * `full` is the brother's canonical six however far the save has got.
+       */
+      const A = wp.debugArsenal();
+      six[b] = A.full.slice();
+      /* The name the HUD would print for every id in this brother's hands, read
+       * off the live system rather than off `ui/data.js`'s static table — the
+       * two disagree on purpose for the ids two brothers can both carry. */
+      names[b] = A.names ?? {};
+      sig[b] = A.signature;
+      legacy = A.legacy ?? legacy;
+      for (const id of six[b]) if (!(id in out)) out[id] = b;
+    }
+    /**
+     * THE RETIRED IDS HAVE NO OWNER, AND THAT IS THE WHOLE PROBLEM.
+     *
+     * After the playtest report the Flare Gun and the Harpoon are in nobody's
+     * canonical six, so the loop above never names a brother for them — and an
+     * unowned weapon is exactly the case staging rule 1 was written for: the
+     * ownership poll puts fists back in the character's hands half a second
+     * into a 1.1 s Harpoon cycle and everything downstream measures a punch.
+     * They are still BUILT and a save can still carry them, so they still have
+     * to be fired here. `debugArsenal().legacy` names the brother whose save
+     * can hold each one; `retired` marks them so the sweep knows to suspend the
+     * poll for the length of that one measurement, the same suspension (and the
+     * same justification) as the `brothers` group's.
+     */
+    for (const b of Object.keys(legacy)) {
+      for (const id of legacy[b]) if (!(id in out)) { out[id] = b; retired[id] = true; }
     }
     wp.setBrother(before ?? 'carson', true);
-    return out;
+    return { owner: out, retired, six, names, signature: sig };
   });
+  const OWNER_OF = OWNER.owner;
+  const RETIRED = OWNER.retired;
+  const SIX = OWNER.six;
 
   /* ================================================================== */
   /*  1. COVERAGE — is the arsenal DESIGN.md says exists actually here?  */
@@ -461,7 +597,8 @@ try {
   const W = arsenal.weapons;
   const ids = arsenal.order;
 
-  rec('coverage', 'sixteen weapons are built and reachable', ids.length === 16, `${ids.length} built`);
+  rec('coverage', `all ${REQUIRED_COUNT} weapons are built and reachable`,
+    ids.length === REQUIRED_COUNT, `${ids.length} built, want ${REQUIRED_COUNT}`);
   const missing = REQUIRED_IDS.filter((id) => !W[id]);
   rec('coverage', 'every DESIGN.md weapon id is present', missing.length === 0,
     missing.length ? `MISSING: ${missing.join(', ')}` : REQUIRED_IDS.join(' '));
@@ -524,6 +661,115 @@ try {
     rec('table', `every pair differs on >= ${MIN_DISTINCT_AXES} of ${AXES.length} axes`,
       worst.n >= MIN_DISTINCT_AXES,
       `closest pair ${worst.a}/${worst.b} differ on ${worst.n}`);
+  }
+
+  /* ================================================================== */
+  /*  2b. REPORT — did the playtest note actually get answered?          */
+  /* ================================================================== */
+  /**
+   * *"The guns need to be more like GTA — replace harpoon and flare guns with
+   * real guns like pistol and shotgun."*
+   *
+   * Every check above would stay green against a build that added two ids and
+   * left Carson holding a flare pistol, and against a build that added two ids
+   * that are strictly better than everything they sit next to. Both are ways of
+   * not doing the work. This group is the one that reads the report back:
+   *
+   *   1. the two named weapons are OUT of every brother's canonical six,
+   *   2. the two new ones are IN, on the brother who lost the old ones,
+   *   3. they behave like the guns they are named after, through the same
+   *      ballistics path as the Shop SMG rather than as a re-skinned tool, and
+   *   4. neither of them flattens the weapon it sits closest to — the pistol
+   *      must not obsolete the Nail Gun and the shotgun must not obsolete the
+   *      Paint Cannon, which is the actual risk in adding "real guns" to an
+   *      arsenal whose whole identity is improvised ones.
+   *
+   * The numbers below are read off `debugArsenal()`, i.e. the FINALISED defs
+   * the fire code uses, never off `lib.js`.
+   */
+  {
+    const inSix = (id) => Object.entries(SIX).filter(([, l]) => l.includes(id)).map(([b]) => b);
+    for (const id of REPORT.retired) {
+      const holders = inSix(id);
+      rec('report', `${id} is out of every brother's canonical six`,
+        holders.length === 0 && !!W[id],
+        holders.length ? `still carried by ${holders.join(', ')}` : 'retired, still built');
+    }
+    for (const [id, boy] of Object.entries(REPORT.added)) {
+      const holders = inSix(id);
+      rec('report', `${id} is in ${boy}'s six and nobody else's`,
+        holders.length === 1 && holders[0] === boy,
+        holders.length ? `carried by ${holders.join(', ')}` : 'carried by NOBODY');
+    }
+    rec('report', 'the weapon carson comes up holding is one of the real guns',
+      OWNER.signature.carson in REPORT.added,
+      `carson -> ${OWNER.signature.carson}, aidan -> ${OWNER.signature.aidan}, ` +
+      `dylan -> ${OWNER.signature.dylan}`);
+
+    /* THE REGISTER. One engine id, three brothers, three Steel City names. */
+    for (const id of Object.keys(REPORT.added)) {
+      const said = ['carson', 'aidan', 'dylan'].map((b) => OWNER.names[b]?.[id] ?? '?');
+      rec('report', `${id} is named in each brother's own register`,
+        new Set(said).size === 3 && said.every((s) => s && s !== '?' && s !== W[id].def.label),
+        said.join(' / '));
+    }
+
+    /* Both are real firearms in the sim, not tools wearing a gun's name. */
+    for (const id of Object.keys(REPORT.added)) {
+      const d = W[id].def;
+      rec('report', `${id} fires bullets and ejects brass, like the Shop SMG`,
+        d.projectile === 'bullet' && d.eject === 'brass' &&
+        d.muzzleVelocity >= 300 && d.magSize > 1,
+        `projectile=${d.projectile} eject=${d.eject} ${d.muzzleVelocity} m/s, ` +
+        `mag ${d.magSize}, ${d.pellets} projectile(s)/pull`);
+    }
+
+    /* --- the pistol's niche: accuracy and draw, NOT sustained damage --- */
+    {
+      const p = W.pistol.def, n = W.nailgun.def;
+      const dps = (d) => d.damage * d.pellets / d.cycleTime;
+      rec('report', 'the pistol does not out-damage the nail gun over time',
+        dps(p) < dps(n),
+        `pistol ${dps(p).toFixed(1)} dps vs nail gun ${dps(n).toFixed(1)} ` +
+        `(${p.damage}/${p.cycleTime}s vs ${n.damage}/${n.cycleTime}s)`);
+      rec('report', 'the pistol wins on ACCURACY, which is its niche',
+        p.spreadHip < n.spreadHip && p.spreadAds < n.spreadAds && p.range > n.range,
+        `hip ${p.spreadHip} vs ${n.spreadHip} deg, aimed ${p.spreadAds} vs ${n.spreadAds}, ` +
+        `range ${p.range} vs ${n.range} m`);
+      rec('report', 'the pistol wins on DRAW SPEED, which is the other half',
+        p.drawTime < n.drawTime && p.drawTime <= 0.35 &&
+        ids.filter((i) => !W[i].def.melee).every((i) => W[i].def.drawTime >= p.drawTime),
+        `${p.drawTime}s vs the nail gun's ${n.drawTime}s, and the fastest firearm draw ` +
+        `of ${ids.filter((i) => !W[i].def.melee).length}`);
+      rec('report', 'the pistol is semi-only off a real magazine',
+        p.modes.length === 1 && p.modes[0] === 'semi' && p.magSize >= 10 && p.magSize <= 15,
+        `modes [${p.modes.join(' ')}], ${p.magSize}-round magazine`);
+    }
+
+    /* --- the shotgun competes with the sprayer close in, and knocks --- */
+    {
+      const s = W.shotgun.def, c = W.sprayer.def;
+      const burst = (d) => d.damage * d.pellets;
+      const knockOf = (d) => (d.knock > 0 ? d.knock : 6) * d.pellets;
+      rec('report', 'the shotgun hits harder than the paint cannon in one pull',
+        burst(s) > burst(c) && s.pellets >= 8,
+        `${s.pellets}x${s.damage} = ${burst(s)} vs ${c.pellets}x${c.damage} = ${burst(c)}`);
+      rec('report', 'and pays for it in rate of fire',
+        s.cycleTime > c.cycleTime,
+        `${s.cycleTime}s a pull vs the sprayer's ${c.cycleTime}s`);
+      rec('report', 'the shotgun knocks targets down harder than anything else',
+        knockOf(s) > knockOf(c) * 1.5 &&
+        ids.every((i) => W[i].def.melee || i === 'shotgun' || knockOf(W[i].def) < knockOf(s)),
+        `${s.pellets} pellets x ${s.knock} impulse = ${knockOf(s)} vs the sprayer's ${knockOf(c)}`);
+      rec('report', 'its damage falls off a cliff past its own range',
+        s.dropoff <= 0.25 && s.range <= 34,
+        `${(s.dropoff * 100).toFixed(0)}% of ${s.damage} left per pellet at ${s.range} m`);
+      rec('report', 'it is a PUMP: a visible stroke and a shell-by-shell reload',
+        s.pump === true && s.shellReload === true && s.reloadTac < 1 &&
+        s.reloadEmpty > s.reloadTac,
+        `pump=${s.pump} shellReload=${s.shellReload}, ${s.reloadTac}s a shell ` +
+        `(${s.reloadEmpty}s for the first on an empty gun), ${s.magSize} in the tube`);
+    }
   }
 
   /* ================================================================== */
@@ -663,7 +909,7 @@ try {
         climbEarly: early / Math.max(1, n / 2),
         climbLate: late / Math.max(1, n / 2),
       };
-    }, { wid: id, owner: OWNER[id] });
+    }, { wid: id, owner: OWNER_OF[id] });
     autoHeld.push(a);
 
     /**
@@ -762,7 +1008,7 @@ try {
         dry, started, wet, mag: st.mag, held: wp.activeId === wid,
         phases: window.__WREC__.reload.slice(),
       };
-    }, { wid: id, owner: OWNER[id] });
+    }, { wid: id, owner: OWNER_OF[id] });
     rec('auto', `${id}: an empty gun refuses to fire, reloads, then fires again`,
       r.dry === false && r.started === true && r.wet === true && r.mag > 0 && r.held,
       `dry=${r.dry} reload=${r.started} refire=${r.wet} mag=${r.mag} held=${r.held} ` +
@@ -774,7 +1020,7 @@ try {
   /* ================================================================== */
   const fireOne = async (id) => {
     await toRange(0);
-    return page.evaluate(async ({ wid, owner }) => {
+    return page.evaluate(async ({ wid, owner, suspend }) => {
       const e = window.__ENGINE__;
       const wp = e.ctx.peek('weapons');
       const pl = e.ctx.peek('player');
@@ -782,6 +1028,11 @@ try {
        * bypasses the unlock gate but not the ownership POLL, which puts fists
        * back in his hands within half a second — see the header. */
       if (owner) wp.setBrother(owner, true);
+      /* A RETIRED weapon is in nobody's six, so the poll would take it back
+       * however it was staged. Suspended for this one measurement and restored
+       * below — see the note at `OWNER`. */
+      const pollWas = wp._unlockPoll;
+      if (suspend) wp._unlockPoll = 1e9;
       /* setWeaponImmediate, NOT giveWeapon: the probe must not mutate the
        * brother's loadout, or the per-brother checks later on are testing a
        * loadout this file assembled rather than the one the game ships. */
@@ -811,9 +1062,11 @@ try {
       const r = window.__WREC__;
       const p = pl.position;
       const mz = wp.muzzleWorld();
+      const held = wp.activeId === wid;
+      if (suspend) wp._unlockPoll = typeof pollWas === 'number' ? pollWas : 0;
       return {
-        id: wid, melee: !!d.melee, shots, brother: wp.brotherId,
-        stillHeld: wp.activeId === wid,
+        id: wid, melee: !!d.melee, shots, brother: wp.brotherId, suspend: !!suspend,
+        stillHeld: held,
         fireEvents: r.fire.length,
         foreign: r.foreign.length,
         withOrigin: r.fire.filter((f) => f.origin).length,
@@ -842,7 +1095,7 @@ try {
         reserveBefore: before.reserve, reserveAfter: st.reserve,
         pellets: d.pellets, eject: d.eject, silent: !!d.silent, explodes: !!d.explodes,
       };
-    }, { wid: id, owner: OWNER[id] });
+    }, { wid: id, owner: OWNER_OF[id], suspend: !!RETIRED[id] });
   };
 
   const fired = [];
@@ -911,6 +1164,87 @@ try {
       lost.length === 0,
       lost.length ? lost.map((f) => `${f.id} lost by ${f.brother}`).join(', ')
         : `${fired.length} weapons, staged on their owners`);
+
+    /**
+     * THE PUMP GUN'S RELOAD, WHICH IS THE ONE MECHANIC IN THE REPORT THAT
+     * NOTHING ELSE IN THIS FILE TOUCHES.
+     *
+     * The `auto` group's reload check only runs for weapons with an automatic
+     * mode, and the shotgun is semi. Everything about "shell by shell and
+     * interruptible" is therefore invisible to every other line here: a build
+     * that filled the tube in one clip would pass the whole gate.
+     *
+     * Two beats, and the SECOND is the one that matters. A tube gun that loads
+     * one shell per clip and cannot be interrupted is just a slow magazine
+     * reload; being able to stop after two shells and shoot is the decision the
+     * mechanic exists to give the player, and it is measured as a real trigger
+     * pull landing a real round while the reload is running.
+     */
+    const tube = await page.evaluate(async ({ owner }) => {
+      const e = window.__ENGINE__;
+      const wp = e.ctx.peek('weapons');
+      const frames = (k) => new Promise((d) => { let i = 0; const t = () => (++i >= k ? d() : requestAnimationFrame(t)); requestAnimationFrame(t); });
+      if (owner) wp.setBrother(owner, true);
+      wp.setWeaponImmediate('shotgun');
+      wp.refillAll();
+      const st = wp.states.get('shotgun');
+      const def = st.def;
+      if (!def.shellReload) return { err: 'shotgun is not a shell-by-shell reload' };
+
+      /* ---- beat one: an empty tube fills one shell at a time -------------- */
+      st.mag = 0; st.chambered = false;
+      wp._fireTimer = 0;
+      window.__WRESET__();
+      const started = wp.reload();
+      /* Sample the magazine every frame: the SHAPE of the curve is the claim.
+       * A magazine reload is a single step from 0 to full; a tube reload is a
+       * staircase, and only the staircase can be interrupted usefully. */
+      const steps = [];
+      for (let i = 0; i < Math.ceil((def.reloadEmpty + def.reloadTac * 6) * 64); i++) {
+        await frames(1);
+        const n = st.mag + (st.chambered ? 1 : 0);
+        if (!steps.length || steps[steps.length - 1] !== n) steps.push(n);
+        if (st.mag >= def.magSize) break;
+      }
+      const full = st.mag;
+      const beats = window.__WREC__.reload.filter((p) => p === 'magin').length;
+
+      /* ---- beat two: a trigger pull cancels the rest of it ---------------- */
+      st.mag = 0; st.chambered = false;
+      wp._fireTimer = 0;
+      wp.reload();
+      /* Two shells in, then pull. */
+      for (let i = 0; i < 400 && st.mag + (st.chambered ? 1 : 0) < 2; i++) await frames(1);
+      const atPull = st.mag + (st.chambered ? 1 : 0);
+      window.__WRESET__();
+      const wasReloading = wp.reloading;
+      wp._fireTimer = 0;
+      const fired = wp.tryFire();
+      await frames(8);
+      const shotsOut = window.__WREC__.fire.filter((f) => f.origin).length;
+      const stillReloading = wp.reloading || wp._shellReload;
+      return {
+        started, steps, full, magSize: def.magSize, beats,
+        atPull, wasReloading, fired, shotsOut, stillReloading,
+        held: wp.activeId === 'shotgun',
+      };
+    }, { owner: OWNER_OF.shotgun });
+
+    if (tube.err) {
+      rec('report', 'the shotgun reloads shell by shell', false, tube.err);
+    } else {
+      rec('report', 'the shotgun fills its tube one shell at a time',
+        tube.started === true && tube.full === tube.magSize &&
+        tube.steps.length >= tube.magSize && tube.beats >= tube.magSize && tube.held,
+        `mag went ${tube.steps.join(' -> ')} (${tube.steps.length} steps to ` +
+        `${tube.full}/${tube.magSize}), ${tube.beats} load beats announced`);
+      rec('report', 'and a trigger pull cancels the rest of the reload',
+        tube.wasReloading === true && tube.atPull >= 1 && tube.fired === true &&
+        tube.shotsOut >= 1 && tube.stillReloading === false,
+        `interrupted with ${tube.atPull} in the gun: reloading=${tube.wasReloading} ` +
+        `-> fired=${tube.fired} (${tube.shotsOut} round(s) left the muzzle), ` +
+        `reload still running=${tube.stillReloading}`);
+    }
   }
 
   /* ================================================================== */
@@ -948,12 +1282,40 @@ try {
    * weapon that keeps your sprint. This is THE gate for the bug that cost ten
    * of sixteen weapons their Shift key, and it was measuring empty hands.
    */
+  /**
+   * THE SLOW LEG HOLDS ALT, BECAUSE SHIFT STOPPED BEING THE RUN.
+   *
+   * `src/player/movement.js` now AUTO-RUNS: "full deflection IS the run", so
+   * `_updateSprint` latches `sprinting` off the movement magnitude with no key
+   * held at all (`MOVE.autoRunMag` 0.94), and W on a keyboard is magnitude 1.
+   * The old slow leg — W with no Shift — is therefore a sprint, and MEASURED
+   * across all eighteen weapons it reported "peak 6.40 m/s sprinting vs 6.40
+   * jogging (x1.00)" on a build where sprint worked perfectly and `sprintFrames`
+   * was 71 of 86 in the leg that was supposed to be a jog. Every line in the
+   * group was red and not one of them was about a weapon.
+   *
+   * The WALK modifier (Alt) is the one input auto-run explicitly yields to
+   * (`!cmd.walkHeld` in `_updateSprint`), so it is now the slow leg: 1.72 m/s
+   * against a 6.4-6.9 m/s run, a differential of ~3.7x rather than the old
+   * ~1.9x. The check gains an ABSOLUTE half as well, which the old form could
+   * not have — peak speed has to reach the brother's own `movement.sprintSpeed`,
+   * read off the player rather than assumed.
+   *
+   * The defect the group exists for still fails it, and fails it harder: a
+   * weapon that pushes a carry pose past the aim threshold sets
+   * `movement.aiming`, which kills auto-run AND Shift AND caps the character at
+   * `MOVE.aimSpeed` (1.9), so the ratio collapses to ~1.1 and the absolute
+   * misses by a factor of three.
+   */
   const runLeg = async (id, sprint) => {
-    await page.evaluate(({ wid, owner }) => {
+    await page.evaluate(({ wid, owner, suspend }) => {
       const wp = window.__ENGINE__.ctx.peek('weapons');
       if (owner) wp.setBrother(owner, true);
+      /* Same suspension as the fire sweep, for the same reason: a retired
+       * weapon has no owner for the poll to accept. Restored below. */
+      if (suspend) { window.__POLLWAS__ = wp._unlockPoll; wp._unlockPoll = 1e9; }
       wp.setWeaponImmediate(wid);
-    }, { wid: id, owner: OWNER[id] });
+    }, { wid: id, owner: OWNER_OF[id], suspend: !!RETIRED[id] });
     await toRange(0);
     await pump(30);
     await page.evaluate(() => {
@@ -971,18 +1333,26 @@ try {
       };
       requestAnimationFrame(t);
     });
-    if (sprint) await page.keyboard.down('ShiftLeft');
+    /* Shift on the fast leg (still the explicit run), Alt on the slow one —
+     * the only modifier auto-run yields to. See the note above. */
+    const mod = sprint ? 'ShiftLeft' : 'AltLeft';
+    await page.keyboard.down(mod);
     await page.keyboard.down('KeyW');
     await pump(80);
     await page.keyboard.up('KeyW');
-    if (sprint) await page.keyboard.up('ShiftLeft');
-    const s = await page.evaluate((wid) => {
+    await page.keyboard.up(mod);
+    const s = await page.evaluate(({ wid, suspend }) => {
       window.__SAMPSTOP__ = true;
       const wp = window.__ENGINE__.ctx.peek('weapons');
+      const pl = window.__ENGINE__.ctx.peek('player');
       window.__SAMP__.held = wp.activeId === wid;
       window.__SAMP__.hold = wp.current?.hold ?? null;
+      /* The brother's OWN top speed, off the player. DESIGN.md gives the three
+       * of them different legs, so a constant here would be wrong for two. */
+      window.__SAMP__.top = pl.movement?.sprintSpeed ?? 0;
+      if (suspend) wp._unlockPoll = typeof window.__POLLWAS__ === 'number' ? window.__POLLWAS__ : 0;
       return window.__SAMP__;
-    }, id);
+    }, { wid: id, suspend: !!RETIRED[id] });
     await pump(10);
     return s;
   };
@@ -990,12 +1360,16 @@ try {
   for (const id of want('sprint') ? ids : []) {
     const walk = await runLeg(id, false);
     const run = await runLeg(id, true);
-    const gain = walk.maxV > 0.5 ? run.maxV / walk.maxV : 0;
+    const gain = walk.maxV > 0.2 ? run.maxV / walk.maxV : 0;
+    /* 0.94, not 1.0: the run is sampled from a standstill over 80 frames and
+     * the last few percent of the ramp land inside the sampler's own jitter. */
+    const reached = run.top > 0 ? run.maxV / run.top : 0;
     rec('sprint', `${id}: holding it still lets you run`,
-      run.sprintFrames > 0 && run.aimFrames === 0 && gain >= 1.25 &&
+      run.sprintFrames > 0 && run.aimFrames === 0 && gain >= 1.6 && reached >= 0.94 &&
       run.held === true && walk.held === true,
-      `peak ${run.maxV.toFixed(2)} m/s sprinting vs ${walk.maxV.toFixed(2)} jogging ` +
-      `(x${gain.toFixed(2)}) · sprint frames ${run.sprintFrames}/${run.n}, ` +
+      `peak ${run.maxV.toFixed(2)} m/s running vs ${walk.maxV.toFixed(2)} walking ` +
+      `(x${gain.toFixed(2)}, want >= 1.6) · reached ${(reached * 100).toFixed(0)}% of ` +
+      `this brother's ${run.top.toFixed(2)} m/s · sprint frames ${run.sprintFrames}/${run.n}, ` +
       `aim frames ${run.aimFrames}, carry pose max ${run.maxAds.toFixed(2)}, ` +
       `held=${run.held && walk.held} (${run.hold})`);
   }
@@ -1058,7 +1432,6 @@ try {
       wp._shotIndex = 0;
       const simFired0 = wp.sim.stats.fired;
       const pl = e.ctx.peek('player');
-      const p0 = pl.viewKick?.pitch ?? 0;
       /**
        * THE BURST GOES OUT IN ONE TICK, AND THE KICK IS SCORED ON ITS PEAK.
        *
@@ -1092,16 +1465,51 @@ try {
        * fragile brother gets thrown by it, so dylan > aidan > carson by a margin
        * noise cannot manufacture.
        */
-      for (let i = 0; i < 12; i++) {
-        wp._fireTimer = 0;
-        wp.tryFire();
+      /**
+       * THREE BURSTS, MEDIAN TAKEN — and the alternative was loosening the
+       * margin, which is the wrong repair.
+       *
+       * The impulse integral is first-order independent of sampling phase and
+       * frame rate (that is why it replaced a peak sample), but it is not
+       * NOISE-free: `RecoilAxis` is stepped by the engine's own `dt` and the
+       * 42-frame recovery straddles whatever else the machine is doing.
+       * MEASURED over four runs of this group, the aidan/carson ratio came out
+       * 1.003, 1.147, 1.057 and 1.351 against a table that says 0.94/0.80 =
+       * 1.175 — a true separation of 17.5% with a spread of roughly +/-10%
+       * around it, so a 6% margin sits inside the noise and the check flipped
+       * red on about one run in three.
+       *
+       * Repeating the burst and taking the MEDIAN attacks the variance rather
+       * than the bar: three samples cost 2 s per brother and the outlier that
+       * produced 1.003 cannot be the middle one. The margin stays at 1.06, and
+       * a build that genuinely flattened `BROTHER_HANDLING` still goes red —
+       * `--nc=brothers` is the control that proves it.
+       */
+      const REPS = 3;
+      const climbs = [];
+      let spread = 0;
+      for (let r = 0; r < REPS; r++) {
+        wp._spread = 0;
+        wp._shotIndex = 0;
+        const base = pl.viewKick?.pitch ?? 0;
+        for (let i = 0; i < 12; i++) {
+          wp._fireTimer = 0;
+          wp.tryFire();
+        }
+        if (r === 0) spread = wp.spreadDegrees;
+        let c = 0;
+        for (let i = 0; i < 42; i++) {
+          await frames(1);
+          c += Math.abs((pl.viewKick?.pitch ?? 0) - base) * (e.ctx.time?.dt ?? 1 / 60);
+        }
+        climbs.push(c);
+        /* Let the spring come all the way home before the next burst, or the
+         * second sample inherits the first one's tail. */
+        await frames(24);
+        wp.refillAll();
       }
-      const spread = wp.spreadDegrees;
-      let climb = 0;
-      for (let i = 0; i < 42; i++) {
-        await frames(1);
-        climb += Math.abs((pl.viewKick?.pitch ?? 0) - p0) * (e.ctx.time?.dt ?? 1 / 60);
-      }
+      climbs.sort((a, b) => a - b);
+      const climb = climbs[Math.floor(REPS / 2)];
 
       /* Reload duration, measured off the clip the rig is running. */
       st.mag = 0; st.chambered = false;
@@ -1237,25 +1645,49 @@ try {
       cam.updateMatrixWorld();
 
       const shots = 8;
+      /**
+       * ONE ROUND AT A TIME, AND THE BOOKS CLOSED AFTER EACH.
+       *
+       * The conversion check downstream needs to know how many rounds actually
+       * CONNECTED, and no aggregate can tell it: `hits` counts panels (a
+       * penetrating round makes two or three) and `shots` counts rounds fired
+       * (a probe-driven burst does not always all land — measured, 4 of 8 on
+       * one run). Sampling the damage counter after every individual round
+       * answers it exactly, and it costs nothing: the loop was already one
+       * round per iteration.
+       */
+      const perShot = [];
       for (let i = 0; i < shots; i++) {
         /* Re-aim before EVERY round: `tryFire` casts from the live camera and
          * the player's rig re-solves it each frame, so a single `lookAt` only
          * survives one shot and the rest went past the car. */
         cam.lookAt(car.position.x, car.position.y + 0.2, car.position.z);
         cam.updateMatrixWorld();
+        /* Fired from a settled cone: this measures the CONVERSION, and a round
+         * thrown wide by the previous one's bloom measures the harness. */
+        wp._spread = 0;
+        const before = wp.sim.cars.stats.damage;
         wp._fireTimer = 0;
         wp.tryFire();
-        await frames(5);
+        await frames(6);
+        perShot.push(+(wp.sim.cars.stats.damage - before).toFixed(4));
       }
       await frames(40);
       const c1 = { ...wp.sim.cars.stats };
       const out = {
         shots,
+        perShot,
+        connected: perShot.filter((d) => d > 0.1).length,
         health0: h0, health1: car.health,
         lost: h0 - car.health,
         perRound: wp.current.damage,
         carHits: c1.hits - c0.hits,
         carDamage: c1.damage - c0.damage,
+        /* The two coefficients that turn an actor-scale round into vehicle
+         * points, read off the systems that OWN them — see the note at the
+         * check below for why this file may not carry its own copy. */
+        transfer: wp.sim.cars.bulletTransfer,
+        scale: veh.actorDamageScale ?? 1,
         simCarHits: wp.sim.stats.carHits,
         impacts: window.__WREC__.impact.length,
         destroyed: car.destroyed,
@@ -1276,23 +1708,74 @@ try {
     if (v.err) {
       rec('vehicle', 'a vehicle can be staged for the bullet test', false, v.err);
     } else {
+      /* `carHits` counts PANEL hits, and a penetrating round makes more than
+       * one of them — see the note at the conversion check below. */
       rec('vehicle', 'bullets hit vehicles at all', v.carHits > 0,
-        `${v.carHits} of ${v.shots} rounds struck the body`);
+        `${v.shots} rounds produced ${v.carHits} body-panel hits`);
       rec('vehicle', 'the vehicle takes damage', v.lost > 0,
         `health ${v.health0.toFixed(0)} -> ${v.health1.toFixed(0)} (-${v.lost.toFixed(1)})`);
       /**
-       * THE SCALE IS CHECKED AGAINST THE CAR'S OWN HEALTH, NOT AGAINST THE
-       * NUMBER THIS CODE PASSED TO `vehicles.damage`. Reading back the argument
-       * would be rule 12's "compare a number to itself"; reading the health the
-       * vehicle system actually ended up with tests the whole path, including
-       * anything `vehicles` does to the figure on the way in.
+       * THE SCALE, IN TWO HALVES, AND NEITHER OF THEM IS A CONSTANT KEPT HERE.
+       *
+       * This used to be one line asserting `lost ≈ hits x damage x 0.6`. That
+       * 0.6 was the single coefficient `weapons/vehiclehit.js` REPLACED — it is
+       * now `BULLET_TRANSFER x vehicles.actorDamageScale`, two facts owned by
+       * two different subsystems, and the header of that file says in as many
+       * words that neither may be copied anywhere else "because the day the
+       * body scale moves this file must not be the place that silently
+       * disagrees". A probe carrying the old product is that same mistake with
+       * a longer fuse: `ACTOR_TO_VEHICLE` moved and this went red against a
+       * build where every round was landing exactly as designed.
+       *
+       * So the coefficients are read live and the check splits along the
+       * subsystem boundary, which makes it strictly stronger than the ratio it
+       * replaces — a factor lost on either side now names its own side:
+       *
+       *   HANDED OVER  what `weapons` gave `vehicles.damage()` must be the
+       *                round's own damage through both coefficients. Exact to
+       *                a few percent: the only slack is range falloff over the
+       *                9 m to the target (~0.5% for the Shop SMG).
+       *   ABSORBED     the health the car ACTUALLY lost. `vehicles` may eat
+       *                some of a hit on the way in — panels, glass, armour —
+       *                but it may never AMPLIFY one, and it may not swallow it
+       *                whole either. Asserted on `car.health`, which is the
+       *                emitted artefact, exactly as before.
        */
-      const want60 = v.carHits * v.perRound * 0.6;
-      const ratio = want60 > 0 ? v.lost / want60 : 0;
-      rec('vehicle', 'damage lands at the 60% vehicle scale',
-        ratio > 0.6 && ratio < 1.45,
-        `${v.carHits} hits x ${v.perRound} dmg x 0.6 = ${want60.toFixed(1)} expected, ` +
-        `${v.lost.toFixed(1)} observed (x${ratio.toFixed(2)})`);
+      /**
+       * SCORED PER ROUND THAT CONNECTED, WHICH IS THE ONLY EXACT DENOMINATOR.
+       *
+       * The two aggregates both lie, in opposite directions:
+       *
+       *   `carHits` counts PANEL hits, and a 9x19 at 0.55 penetration goes
+       *     through a door skin and registers again on the far panel — MEASURED,
+       *     eight rounds produced twelve. `fireBullet` splits ONE round's
+       *     damage across those layers, so the conversion is applied once per
+       *     ROUND and multiplying by hits overstates it by half.
+       *   `shots` counts rounds FIRED, which assumes every one landed. Measured
+       *     on the very next run: 8 fired, 4 connected, and the check reported a
+       *     50% scale error against a build whose scale was exactly right.
+       *     Whether a probe-driven burst all lands is a fact about the harness.
+       *
+       * The stage now samples `cars.stats.damage` after each individual round,
+       * so `connected` is exact and the expectation is not a guess about either.
+       * With that denominator the only slack left is range falloff over the 9 m
+       * to the target — 0.5% for the Shop SMG — so the band is 2%, tight enough
+       * that a lost, doubled or halved factor cannot hide behind a miss.
+       */
+      const perRoundPoints = v.perRound * v.transfer * v.scale;
+      const expect = v.connected * perRoundPoints;
+      const ratio = expect > 0 ? v.carDamage / expect : 0;
+      rec('vehicle', 'a round is converted to vehicle points by transfer x scale',
+        v.connected >= 4 && ratio > 0.96 && ratio < 1.02,
+        `${v.perRound} dmg x ${v.transfer} transfer x ${v.scale} scale = ` +
+        `${perRoundPoints.toFixed(1)} points a round; ${v.connected} of ${v.shots} ` +
+        `rounds connected for an expected ${expect.toFixed(1)}, weapons handed over ` +
+        `${v.carDamage.toFixed(1)} (x${ratio.toFixed(3)}) over ${v.carHits} panel hits`);
+      const absorbed = v.carDamage > 0 ? v.lost / v.carDamage : 0;
+      rec('vehicle', 'the car absorbs some of it and amplifies none of it',
+        absorbed > 0.35 && absorbed <= 1.02,
+        `handed ${v.carDamage.toFixed(1)}, health lost ${v.lost.toFixed(1)} ` +
+        `(x${absorbed.toFixed(2)})`);
       rec('vehicle', 'the impact is announced so fx and audio can answer it',
         v.impacts > 0, `${v.impacts} bullet:impact events`);
       rec('vehicle', 'a wrecked vehicle is skipped', v.wrecked && v.wreckHits === 0,
@@ -1480,7 +1963,9 @@ try {
       const out = [];
       /* Three weapons from three different brothers, so at least two of them
        * are always in the wrong hands whoever is active. */
-      for (const id of ['smg', 'harpoon', 'launcher']) {
+      /* One from each brother's six, and the shotgun deliberately: it is the
+       * newest model in the game and the one a stale rig would drop first. */
+      for (const id of ['smg', 'shotgun', 'launcher']) {
         wp.debugPose('idle');
         wp.debugPose(id, { mode: 'ads' });
         const staged = wp.rig?.active?.id ?? null;

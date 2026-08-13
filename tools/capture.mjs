@@ -144,7 +144,23 @@ try {
   const LOCKSTEP = String(args.lockstep ?? '1') !== '0';
   const url =
     `http://127.0.0.1:${PORT_ACTUAL}/?capture=1&shot=${encodeURIComponent(SHOT)}` +
-    (LOCKSTEP ? '&lockstep=1' : '') + (process.env.OW_WALLCLOCK ? '&owWallClockBuild=1' : '');
+    (LOCKSTEP ? '&lockstep=1' : '') + (process.env.OW_WALLCLOCK ? '&owWallClockBuild=1' : '') +
+    /**
+     * `--hatch=<name>` — set one `ow*` query hatch on the captured page.
+     *
+     * Capture mode's streaming budget is denominated in WORK, not milliseconds
+     * (ARCHITECTURE.md rule 8's deliberate exception), so two captures of one
+     * shot are byte-identical whatever else the machine is doing. That makes
+     * `info.calls` and `info.tris` from a pair of captures the ONLY
+     * machine-immune way to price a change on a loaded box — `perfcheck --ab`
+     * measures milliseconds, and milliseconds on a machine running thirty-odd
+     * other browsers measure the machine. Without this flag there was no way
+     * to put a hatch on the page at all, so the cheap deterministic instrument
+     * could not be pointed at anything.
+     *
+     * One name, no value: every hatch in this tree is `=1` or absent.
+     */
+    (args.hatch ? `&${encodeURIComponent(String(args.hatch))}=1` : '');
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: TIMEOUT });
 
   // Engine sets window.__READY__ = true once assets are loaded and first frame drawn.

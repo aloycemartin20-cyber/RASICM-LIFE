@@ -10,6 +10,53 @@
  * red cars, and the fleet palette already owns the colour.
  *
  * ────────────────────────────────────────────────────────────────────────────
+ * "I DON'T SEE ANY TROLLYS" — WHY, AND WHAT CHANGED
+ * ────────────────────────────────────────────────────────────────────────────
+ * The trolley existed and `tramprobe` was green the whole time. It was simply
+ * never THERE. MEASURED off the emitted service, one car shuttling the whole
+ * 1085 m line at the 9 m/s cap:
+ *
+ *   one-way trip     ~125 s      round trip incl. dwells  ~260 s
+ *   headway at any point on the line   ~130 s, and the car is IN SHOT for
+ *                                      about two of those 130 seconds
+ *
+ * Two minutes of empty track between sightings, on a line whose near terminus
+ * is 167 m from the Golden Triangle. A player who walks the Strip for five
+ * minutes has a coin-flip chance of ever seeing the thing.
+ *
+ * So the service is now a FLEET on a SECTIONED line, which is also how you run
+ * more than one car on single track without a passing loop — there is exactly
+ * one drawn track (`roadmesh._rail` lays one ballast bed, one pair of railheads
+ * at +/-0.7175 m per rail edge), so two cars meeting head-on is not a timetable
+ * problem, it is two carriages in the same cubic metre. Each car owns one
+ * SECTION between two stops and short-turns on it, the way a real short-worked
+ * street railway does:
+ *
+ *   stops       4, at the two termini and at two intermediate marks snapped to
+ *               ROAD CROSSINGS where one is within SNAP_M — so a stop is where
+ *               a street meets the line, which is where a player is;
+ *   cars        3, one per section, each dwelling DWELL s at both its marks;
+ *   clearance   each car's marks are held CLEAR m inside its section, so two
+ *               cars sharing an interchange stop stand 2*CLEAR apart at
+ *               opposite ends of the same platform and can never overlap;
+ *   headway     MEASURED on the emitted positions, worst case over every point
+ *               on the line: see `tramprobe`'s `headway` check.
+ *
+ * The union of the sections is the whole line, so every crossing the old single
+ * car served is still served — three times as often, by a car that is never
+ * more than a section away.
+ *
+ * `?owOneTram=1` (or `OW_ONE_TRAM=1` headless) restores the single car running
+ * the full line. That is the A/B arm for `perfcheck` and the negative control
+ * for the fleet assertions in `tramprobe`.
+ *
+ * ────────────────────────────────────────────────────────────────────────────
+ * RIDING IT. Each car publishes a `transit` record on its `Vehicle`, which is
+ * the whole contract `src/player/vehicle.js` boards a PASSENGER through: is it
+ * standing at a stop right now, where is the seat, where is the platform, what
+ * is this line called. Nothing in this file knows the player exists.
+ *
+ * ────────────────────────────────────────────────────────────────────────────
  * WHY THE TRAM IS KINEMATIC AND NOT A CAR WITH INVISIBLE WHEELS
  * ────────────────────────────────────────────────────────────────────────────
  * A rail vehicle's whole character is that it CANNOT deviate: no slip angle,
@@ -276,23 +323,210 @@ const BOGIE_HALF = 3.8;
 /** The corridor the service runs — the line `railsweep` certifies. */
 const LINE_ID = 'rail_strip';
 
+/** What the line is called on the side of the car and in the ride prompt. */
+export const LINE_NAME = 'THE MONONGAHELA';
+
 /**
- * Owns the one tram: finds the emitted rail line, spawns the carriage on it,
- * and poses it kinematically every frame. Created and driven by
- * `VehicleSystem.update` (see the wiring note there); everything it touches
- * outside `vehicles` goes through `ctx.peek` (hard rule 2).
+ * Cars on the line, and therefore SECTIONS. Three is what turns a ~130 s
+ * headway into a ~53 s one on this line's length; see the header.
+ */
+const CARS = 3;
+
+/** Seconds a car stands at each of its two marks, doors open. */
+const DWELL = 8.0;
+
+/**
+ * How far inside its section each car's mark sits (m). A car is 14 m long, so
+ * two cars sharing an interchange stop stand 2*CLEAR = 20 m apart nose to nose
+ * — clear of each other by a full car length whatever the timetable does.
+ */
+const CLEAR = 10.0;
+
+/** An intermediate stop snaps to a road crossing within this distance (m). */
+const SNAP_M = 60;
+
+/** Shortest section the sectioning is allowed to produce (m). */
+const MIN_SECTION = 180;
+
+/**
+ * Stop names, termini first and last. DESIGN.md vocabulary: Butler St is
+ * Lawrenceville's spine and the Strip Market is the landmark at (352, -224),
+ * both of which the emitted marks land beside (MEASURED: the s=364 mark is
+ * 94 m from THE STRIP's centre, the s=727 mark is on a street crossing in
+ * Lawrenceville). If the sectioning ever produces a different count the names
+ * fall back to fleet-speak rather than lying about where you are.
+ */
+const STOP_NAMES = ['TRIANGLE YARD', 'STRIP MARKET', 'BUTLER STREET', 'FOUNDRY TERMINUS'];
+
+/**
+ * A/B hatch, same shape as `legacyPave` in `src/world/roadmesh.js`:
+ * `?owOneTram=1` / `OW_ONE_TRAM=1` puts the single car back on the full line.
+ * It is the reference arm for `perfcheck --ab` and the negative control for
+ * `tramprobe`'s fleet, headway and separation checks. Never reachable in play.
+ */
+let _oneTram = null;
+function oneTram() {
+  if (_oneTram !== null) return _oneTram;
+  _oneTram = false;
+  try {
+    if (typeof location !== 'undefined' && new URLSearchParams(location.search).get('owOneTram') === '1') {
+      _oneTram = true;
+    }
+  } catch { /* no location */ }
+  try {
+    if (typeof process !== 'undefined' && process?.env?.OW_ONE_TRAM === '1') _oneTram = true;
+  } catch { /* no process */ }
+  if (_oneTram) console.warn('[vehicles] LEGACY tram: one car on the whole line, pre-fleet');
+  return _oneTram;
+}
+
+/* ---------------------------------------------------------------- line -- */
+
+/** The point at arc `s` on an extracted line, written into `out`. */
+function pointAt(line, s, out) {
+  const { pts, cum } = line;
+  const n = pts.length;
+  const sc = s < 0 ? 0 : s > cum[n - 1] ? cum[n - 1] : s;
+  let i = 0;
+  while (i < n - 2 && cum[i + 1] < sc) i++;
+  const span = cum[i + 1] - cum[i];
+  const t = span > 1e-9 ? (sc - cum[i]) / span : 0;
+  const a = pts[i];
+  const b = pts[i + 1];
+  out.x = a.x + (b.x - a.x) * t;
+  out.y = a.y + (b.y - a.y) * t;
+  out.z = a.z + (b.z - a.z) * t;
+  return out;
+}
+
+/**
+ * The stretch of `line` between arcs `s0` and `s1`, as a line in its own right
+ * whose arc origin is `s0`.
+ *
+ * This is what lets a car run a SECTION without `RailMover` knowing sections
+ * exist: `src/world/railmover.js` is a `world` module and a pure function
+ * library, and it is not this change's file to edit. A slice is the same shape
+ * of object it already consumes, so the mover's own end-to-end logic — brake
+ * into the mark, dwell, reverse — becomes short-turn behaviour untouched.
+ */
+function sliceLine(line, s0, s1) {
+  const a = { x: 0, y: 0, z: 0 };
+  const b = { x: 0, y: 0, z: 0 };
+  pointAt(line, s0, a);
+  pointAt(line, s1, b);
+  const pts = [{ x: a.x, y: a.y, z: a.z }];
+  for (let i = 0; i < line.pts.length; i++) {
+    if (line.cum[i] > s0 + 1e-3 && line.cum[i] < s1 - 1e-3) {
+      pts.push({ x: line.pts[i].x, y: line.pts[i].y, z: line.pts[i].z });
+    }
+  }
+  pts.push({ x: b.x, y: b.y, z: b.z });
+  const cum = new Float64Array(pts.length);
+  for (let i = 1; i < pts.length; i++) {
+    const p = pts[i - 1];
+    const q = pts[i];
+    cum[i] = cum[i - 1] + Math.hypot(q.x - p.x, q.y - p.y, q.z - p.z);
+  }
+  return { pts, cum, length: cum[cum.length - 1] };
+}
+
+/**
+ * Arc positions where a DRIVABLE street crosses the line.
+ *
+ * Read off the same emitted graph the line itself came from, and only the
+ * non-rail edges — a rail-on-rail crossing is a junction, not a street. These
+ * are where a stop belongs: the whole complaint was that the trolley was never
+ * anywhere the player was, and the player is on the streets.
+ */
+function roadCrossings(roads, line) {
+  const out = [];
+  const segs = line.pts;
+  for (const e of roads.edges) {
+    if (!e || e.rail) continue;
+    const na = roads.nodes[e.a];
+    const nb = roads.nodes[e.b];
+    if (!na || !nb) continue;
+    for (let i = 0; i < segs.length - 1; i++) {
+      const p = segs[i];
+      const q = segs[i + 1];
+      const d = (q.x - p.x) * (nb.z - na.z) - (q.z - p.z) * (nb.x - na.x);
+      if (Math.abs(d) < 1e-9) continue;
+      const t = ((na.x - p.x) * (nb.z - na.z) - (na.z - p.z) * (nb.x - na.x)) / d;
+      const u = ((na.x - p.x) * (q.z - p.z) - (na.z - p.z) * (q.x - p.x)) / d;
+      if (t <= 0 || t >= 1 || u <= 0 || u >= 1) continue;
+      out.push(line.cum[i] + t * (line.cum[i + 1] - line.cum[i]));
+      break;
+    }
+  }
+  out.sort((x, y) => x - y);
+  return out;
+}
+
+/**
+ * Where the cars stand. Even splits of the usable run, with every INTERIOR
+ * mark pulled onto a road crossing when one is within `SNAP_M` and the pull
+ * does not starve a neighbouring section.
+ */
+function planStops(line, roads, cars) {
+  const s0 = CLEAR;
+  const s1 = Math.max(s0 + MIN_SECTION, line.length - CLEAR);
+  const marks = [];
+  for (let i = 0; i <= cars; i++) marks.push(s0 + ((s1 - s0) * i) / cars);
+  const crossings = roads ? roadCrossings(roads, line) : [];
+  for (let i = 1; i < cars; i++) {
+    let best = -1;
+    let bestD = SNAP_M;
+    for (const c of crossings) {
+      const d = Math.abs(c - marks[i]);
+      if (d < bestD) { bestD = d; best = c; }
+    }
+    if (best < 0) continue;
+    if (best - marks[i - 1] < MIN_SECTION || marks[i + 1] - best < MIN_SECTION) continue;
+    marks[i] = best;
+  }
+  const p = { x: 0, y: 0, z: 0 };
+  return marks.map((s, i) => {
+    pointAt(line, s, p);
+    return {
+      index: i,
+      s,
+      x: p.x,
+      y: p.y,
+      z: p.z,
+      name: marks.length === STOP_NAMES.length
+        ? STOP_NAMES[i]
+        : `${LINE_NAME} STOP ${i + 1}`,
+    };
+  });
+}
+
+/* ------------------------------------------------------------- service -- */
+
+/**
+ * Owns the trolley fleet: finds the emitted rail line, plans the stops, slices
+ * it into one section per car, spawns the carriages and poses them
+ * kinematically every frame. Created and driven by `VehicleSystem.update` (see
+ * the wiring note there); everything it touches outside `vehicles` goes through
+ * `ctx.peek` (hard rule 2).
  */
 export class TramService {
   /**
    * @param {object} sys   the vehicle system (needs `.spawn`).
-   * @param {object} [opts] `paralysed: true` freezes the timetable — the
-   *        tram spawns on the rail and never advances. PROBE-ONLY, the
-   *        negative control `tramprobe.mjs` runs against the live code with no
-   *        edit (same pattern as `debugIgnorePause` in freeroam/weapons).
+   * @param {object} [opts] `paralysed: true` freezes the timetable — the cars
+   *        spawn on the rail and never advance. `cars` overrides the fleet
+   *        size. Both PROBE-ONLY: the negative controls in `tramprobe.mjs` run
+   *        against the live code with no edit (same pattern as
+   *        `debugIgnorePause` in freeroam/weapons).
    */
   constructor(sys, opts = {}) {
     this.sys = sys;
     this.opts = opts;
+    /** One record per car: { vehicle, mover, section, transit, stops }. */
+    this.cars = [];
+    /** The stop marks, in order along the line. */
+    this.stops = [];
+    this.line = null;
+    /** Car 0's handles, kept so every existing reader still works unchanged. */
     this.vehicle = null;
     this.mover = null;
     /** true once we know the map has no usable line — stop asking. */
@@ -307,15 +541,20 @@ export class TramService {
   /** Once per frame, with the SCALED dt. Safe to call before world is ready. */
   update(dt, ctx) {
     if (this.dead) return;
-    if (!this.mover && !this._init(ctx)) return;
-    const v = this.vehicle;
+    if (!this.cars.length && !this._init(ctx)) return;
+    for (let i = 0; i < this.cars.length; i++) this._step(this.cars[i], dt);
+  }
+
+  /** Pose one car from its own mover. Was the whole of `update` before. */
+  _step(c, dt) {
+    const v = c.vehicle;
     if (!v) return;
 
-    // A wrecked tram stops where it was wrecked; the line is blocked. That is
-    // a consequence, not a bug — and it must not keep gliding while on fire.
-    if (!v.destroyed && !this.opts.paralysed) this.mover.step(dt);
+    // A wrecked tram stops where it was wrecked; its section is blocked. That
+    // is a consequence, not a bug — and it must not keep gliding while on fire.
+    if (!v.destroyed && !this.opts.paralysed) c.mover.step(dt);
 
-    const m = this.mover;
+    const m = c.mover;
     m.sampleAt(m.s + BOGIE_HALF, this._f);
     m.sampleAt(m.s - BOGIE_HALF, this._r);
     const dx = this._f.x - this._r.x;
@@ -342,7 +581,7 @@ export class TramService {
     // Never let the sleep latch or the pair resolver bank a stale pose.
     v.sleeping = false;
     v._sleepTimer = 0;
-    // Brake lamps while it slows for (or stands at) a terminus.
+    // Brake lamps while it slows for (or stands at) a stop.
     v.control.brake = m.braking ? 1 : 0;
     v.speed = Math.abs(m.v);
     v.forwardSpeed = m.v * m.dir;
@@ -362,37 +601,132 @@ export class TramService {
       this.dead = true;
       return false;
     }
-    this.mover = new RailMover(line, this.opts.mover);
-    const m = this.mover;
-    m.sampleAt(m.s + BOGIE_HALF, this._f);
-    m.sampleAt(m.s - BOGIE_HALF, this._r);
-    const yaw = Math.atan2(this._f.x - this._r.x, this._f.z - this._r.z);
-    this._p.set(
-      (this._f.x + this._r.x) * 0.5,
-      (this._f.y + this._r.y) * 0.5,
-      (this._f.z + this._r.z) * 0.5
-    );
+    this.line = line;
+    const want = Math.max(1, Math.round(
+      this.opts.cars ?? (oneTram() ? 1 : CARS)
+    ));
+    // A short line cannot hold three sections; the fleet shrinks rather than
+    // parking cars on top of each other.
+    const fits = Math.max(1, Math.floor((line.length - 2 * CLEAR) / MIN_SECTION));
+    const cars = Math.min(want, fits);
+    this.stops = planStops(line, roads, cars);
+
     const spec = this.sys.specOf ? this.sys.specOf('tram') : null;
-    this._p.y += spec?.comY ?? 1.15;
-    // Ore red, tone 1, gloss, worked-in wear: an exact member of the
-    // pre-warmed VARIANTS set, so this spawn compiles nothing mid-play.
-    const v = this.sys.spawn('tram', this._p, yaw, {
-      paint: 0x6d1f1c, finish: 'gloss', flake: 0.5, wear: 0.5,
-      plate: 'PRT 1713',
-    });
-    if (!v) { this.dead = true; return false; }
-    v.kinematic = true;   // VehicleSystem.fixedUpdate: never integrated
-    v.burnsFuel = false;
-    v.engineOn = true;
-    this.vehicle = v;
+    const comY = spec?.comY ?? 1.15;
+    for (let i = 0; i < cars; i++) {
+      const a = this.stops[i];
+      const b = this.stops[i + 1];
+      const section = sliceLine(line, a.s, b.s);
+      /**
+       * Stagger the start phases so the whole line does not pulse in unison —
+       * deterministic (a fixed fraction of the section per car), never `rng`,
+       * because a capture has to photograph the same city twice.
+       */
+      const mover = new RailMover(section, {
+        dwell: DWELL,
+        margin: CLEAR,
+        s0: CLEAR + (section.length - 2 * CLEAR) * ((i * 0.37) % 1),
+        ...this.opts.mover,
+      });
+      mover.sampleAt(mover.s + BOGIE_HALF, this._f);
+      mover.sampleAt(mover.s - BOGIE_HALF, this._r);
+      const yaw = Math.atan2(this._f.x - this._r.x, this._f.z - this._r.z);
+      this._p.set(
+        (this._f.x + this._r.x) * 0.5,
+        (this._f.y + this._r.y) * 0.5 + comY,
+        (this._f.z + this._r.z) * 0.5
+      );
+      // Ore red, tone 1, gloss, worked-in wear, and ONE plate string for the
+      // whole fleet: an exact member of the pre-warmed VARIANTS set, and
+      // `PaintShop.plate` caches per string, so three cars compile nothing and
+      // cost no extra texture memory over the one that shipped before.
+      const v = this.sys.spawn('tram', this._p, yaw, {
+        paint: 0x6d1f1c, finish: 'gloss', flake: 0.5, wear: 0.5,
+        plate: 'PRT 1713',
+      });
+      if (!v) continue;
+      v.kinematic = true;   // VehicleSystem.fixedUpdate: never integrated
+      v.burnsFuel = false;
+      v.engineOn = true;
+      /**
+       * NOT TAKEABLE — RIDEABLE. `game.freeroam`'s walk-up verb is
+       * `TAKEABLE(v) = !v.destroyed && v.enterable !== false`, and with the
+       * flag unset it happily offered TAKE THE MONONGAHELA at a carriage doing
+       * 9 m/s, then silently did nothing when the press reached
+       * `player.vehicles.tryEnter` and was refused. `specs.js` has said "not
+       * enterable" in prose since the tram landed; this makes it true. The
+       * RIDE prompt comes from `src/player/vehicle.js`, which knows about the
+       * dwell and can therefore only offer a verb that works.
+       */
+      v.enterable = false;
+      const car = { index: i, vehicle: v, mover, section, from: a, to: b };
+      car.transit = makeTransit(car, comY);
+      v.transit = car.transit;
+      this.cars.push(car);
+    }
+    if (!this.cars.length) { this.dead = true; return false; }
+    this.vehicle = this.cars[0].vehicle;
+    this.mover = this.cars[0].mover;
     return true;
   }
 
   dispose() {
-    // The vehicle itself is despawned by VehicleSystem.dispose's fleet sweep.
+    // The vehicles themselves are despawned by VehicleSystem.dispose's sweep.
+    for (const c of this.cars) { if (c.vehicle) c.vehicle.transit = null; }
+    this.cars.length = 0;
+    this.stops.length = 0;
     this.vehicle = null;
     this.mover = null;
+    this.line = null;
   }
 }
 
-export { RAIL_TOP, BOGIE_HALF };
+/* ------------------------------------------------------------- transit -- */
+
+/**
+ * THE RIDE CONTRACT, published on the `Vehicle` as `v.transit`.
+ *
+ * `src/player/vehicle.js` boards a passenger through exactly this and nothing
+ * else — it never imports this module and never reaches into `TramService`.
+ * Every field is either a constant or a getter over the mover's own state, so
+ * reading it allocates nothing.
+ *
+ * Local frame note: the tram's model hangs at `-spec.comY`, so vehicle-local
+ * y = 0 is the CoM and the wheel-contact plane is at `-comY`. `floorY` (0.90
+ * above the rail head, from the spec's style) therefore lands at `0.90 - comY`,
+ * and the seat anchor is the SEATED HEAD over it — the same convention
+ * `vehicles.seatAnchor()` publishes, which is what `_resolveAnchors` subtracts
+ * `GAIT.seat.headHeight` from.
+ */
+function makeTransit(car, comY) {
+  const floorLocalY = 0.90 - comY;
+  return {
+    kind: 'tram',
+    line: LINE_NAME,
+    /** Half width of the body, for the platform stand-off. */
+    hw: 1.30,
+    /** The wheel-contact plane in vehicle-local y. */
+    railY: -comY,
+    /** Doors are at +/-4.35 in the carriage; board by whichever is nearer. */
+    doorZ: [4.35, -4.35],
+    /** Seat anchor: the passenger's HEAD, at a window place aft of centre. */
+    seat: { x: 0.62, y: floorLocalY + 0.768, z: -1.5 },
+    /** The postcard direction, if this service has one. The trolley's is the
+     *  street it is running down, so it has none and the camera uses travel. */
+    vista: null,
+    /** Standing at a stop with the doors open — the only time you may board. */
+    get dwelling() {
+      return car.mover.wait > 0 && Math.abs(car.mover.v) < 1e-6 && !car.vehicle.destroyed;
+    },
+    get speed() { return Math.abs(car.mover.v); },
+    /** Which mark it is at (or heading for), by name. */
+    get stopName() {
+      const m = car.mover;
+      const nearFrom = m.s - m.sMin < m.sMax - m.s;
+      if (m.wait > 0) return (nearFrom ? car.from : car.to).name;
+      return (m.dir > 0 ? car.to : car.from).name;
+    },
+  };
+}
+
+export { RAIL_TOP, BOGIE_HALF, CARS, DWELL, CLEAR };

@@ -63,7 +63,19 @@ export function buildBridges(specs, materials, palette, root) {
 
 function buildOne(b, a, col) {
   const conc = a('bridge_concrete');
-  const steel = a('bridge_steel');
+  /**
+   * ONE SPAN, ONE COLOUR — and the colour is the plan's, not this file's.
+   *
+   * Every truss, arch and cable in the city used to accumulate into a single
+   * `bridge_steel`, so eleven crossings had one identity between them. The
+   * palette key now arrives on the spec (`plan.BRIDGES[].steel`, carried
+   * through `netgen.buildBridge`); `a()` opens an accumulator per key, so the
+   * gold spans, the blue spans and the black one merge into three meshes
+   * instead of one and cost three draw calls instead of one. They share the
+   * SAME baked texture — the variants are a tint on one `bridge_steel` bake —
+   * so the texture memory is unchanged. See `world/palette.js`.
+   */
+  const steel = a(b.steel ?? 'bridge_steel');
   const rail = a('bridge_rail');
   const pts = b.pts;
   const ys = b.y;

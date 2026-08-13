@@ -365,6 +365,45 @@ export class PropSystem {
         }, pri);
       }
       /**
+       * THE WORLD SINGLETONS — planting on the landmark parks, and the plaques
+       * on the places the plan tables give names to.
+       *
+       * NEITHER OF THESE WAS REACHABLE BEFORE THIS LINE. `layout.buildTile` is
+       * the entry point both were written against, and NOTHING IN THE SHIPPED
+       * GAME CALLS IT: this method drives `_edgeFurniture`, `_edgeWires`,
+       * `_edgeDecals`, `_lot` and `_wasteGround` one job at a time so each
+       * stays inside rule 8's frame budget, and the two whole-tile passes were
+       * never added to the list. `grep -rn buildTile src/` returns exactly two
+       * hits, and both are harnesses — `world/airsweep.mjs` and, for the sign
+       * half, `props/signprobe.mjs`. So `_placeSigns` has been green under its
+       * own probe and dead in the game the whole time, which is a sharper
+       * version of the "a probe with no package.json entry is a file" rule in
+       * ARCHITECTURE.md: a PASS that is wired only to its gate proves the code
+       * works, not that anybody runs it.
+       *
+       * Both go in as their own scheduled jobs, at the same priority as the
+       * rest, so a tile that contains a park or a bridge abutment does not
+       * build it in the same frame as its edges.
+       */
+      this.schedule(() => {
+        if (!rec.alive) return;
+        try {
+          layout._placeGreens(batch, rec.bx, rec.lod);
+        } catch (err) {
+          console.error('[props] landmark planting failed', err);
+        }
+      }, pri);
+      if (rec.lod === 0) {
+        this.schedule(() => {
+          if (!rec.alive) return;
+          try {
+            layout._placeSigns(batch, rec.bx);
+          } catch (err) {
+            console.error('[props] named-place signs failed', err);
+          }
+        }, pri);
+      }
+      /**
        * A tile whose lots carry wall-mounted dressing cannot be assembled yet:
        * that dressing raycasts at the wall to find out where the wall IS, and
        * this tile's own buildings are still sitting in the static-collision

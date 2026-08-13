@@ -92,6 +92,43 @@
  *    the first clear one wins; if every one is blocked you stay in the car,
  *    which is also what GTA does.
  *
+ * ────────────────────────────────────────────────────────────────────────────
+ * AND ONE THING YOU CAN NOW DO THAT YOU COULD NOT: RIDE.
+ *
+ * REPORTED, from play: "I don't see any trollys — add riding the trolly or the
+ * incline". The trolley and the funicular both existed; neither could be
+ * boarded, because the only way into a vehicle in this file was the DRIVER'S
+ * seat, and a passenger is a different verb with different rules:
+ *
+ *   - you may only get on while the car is STANDING AT A STOP. Stepping into
+ *     a 19.5 t carriage doing 9 m/s is not a carjack, it is an accident, and
+ *     `tryEnter` refuses it outright — which is also the negative control the
+ *     gates assert on;
+ *   - you have NO CONTROLS. `_stepRide` forwards nothing: the service keeps
+ *     its own timetable and the player is freight. The only input that does
+ *     anything is F (get off) and a move key (take the camera back);
+ *   - there is no fare, no jack, no door handle and no driver to haul out;
+ *   - the ride camera runs (see `CINE` in `camera.js`) because a passenger who
+ *     is not steering wants a picture, not a chase boom.
+ *
+ * THE CONTRACT IS `v.transit`, and nothing else. `src/vehicles/tram.js`
+ * publishes it on each trolley's `Vehicle`; `src/vehicles/funicular.js`
+ * publishes one per incline car on a lightweight handle that quacks like a
+ * Vehicle (the incline cars are scene geometry, not `Vehicle`s, and making
+ * them into `Vehicle`s to be rideable would put two counterweighted cabins
+ * into the tyre model). This file imports neither and knows the difference
+ * between them nowhere: it reads a seat anchor, a door z, a half width, a
+ * railhead plane and one boolean, `dwelling`.
+ *
+ * THE PHASE IS STILL `drive`, DELIBERATELY. `src/player/index.js` routes the F
+ * edge with `if (v.phase === 'drive') v.tryExit(m); else if (!v.busy)
+ * v.tryEnter(m)`, and `src/game/freeroam.js` reads the same string for its exit
+ * verb. A fifth phase string would have been the honest name and would have
+ * left F doing nothing at all aboard a tram until two files in other
+ * subsystems agreed to learn about it. `passenger` is the flag that separates
+ * them, `driving` and `seated` keep their old meanings, and every existing
+ * reader of `phase` keeps working with no edit anywhere else.
+ *
  * 5. IT RODE THE WRONG CAR. Fixing (3) put the body on `v.position` — the
  *    PHYSICS pose — while the renderer draws the car interpolated between the
  *    last two fixed steps. MEASURED (`camlagtest` check 3, kinematic drive, the
@@ -131,6 +168,26 @@ const T = {
 
 /** Above this the actor is thrown clear rather than stepping out. */
 const BAIL_SPEED = 7.0;
+
+/**
+ * How close to a transit car the RIDE prompt appears, measured to its box.
+ * Wider than `ENTER_REACH` because a 14 m carriage's box distance is measured
+ * to the flank and a platform is a couple of paces back from the running edge.
+ */
+const RIDE_REACH = 3.4;
+
+/**
+ * A transit door anchor may only be dropped onto ground within this much of
+ * the car's own railhead plane.
+ *
+ * The incline car dwells on a TRESTLE: `phys.groundHeight` under it answers
+ * with the hillside, which on the steep middle of the run is up to fifteen
+ * metres below the platform. Without the band the actor walks to the door and
+ * steps off the side of the mountain. Inside the band the ground query still
+ * wins, because a real platform, a kerb or the ballast shoulder is exactly what
+ * it is there to find.
+ */
+const TRANSIT_STEP_BAND = 1.6;
 
 /** World up, for the yaw the animator has already written onto the root. */
 const UP = new THREE.Vector3(0, 1, 0);
@@ -265,8 +322,27 @@ export class VehicleHandler {
     /** What `ui` should offer, or null. */
     this.prompt = null;
     this._promptRec = { key: 'F', text: 'ENTER', sub: '' };
+
+    /* ---- riding as a passenger (see the header) ---- */
+    /** True for the whole of a RIDE — set on `tryEnter`, cleared on the way out. */
+    this.passenger = false;
+    /** The `transit` record of whatever is being ridden, or null. */
+    this.transit = null;
+    /**
+     * "I want the next stop." Pressing F aboard a moving car arms this instead
+     * of refusing, and `_stepRide` spends it the moment the car stands — which
+     * is what a bell cord does and what the report asked for ("disembark at the
+     * next stop"). Cleared by every exit out of the ride.
+     */
+    this.alightRequested = false;
+    /** Reused scan list for transit handles that are not `Vehicle`s. */
+    this._rides = [];
+    /** Running best of `_consider`, so `_scan` allocates no closure. */
+    this._scanBest = null;
+    this._scanD = Infinity;
+
     /** Diagnostics the playtest harness reads. */
-    this.stats = { enters: 0, jacks: 0, exits: 0, exitBlocked: 0, bails: 0 };
+    this.stats = { enters: 0, jacks: 0, exits: 0, exitBlocked: 0, bails: 0, rides: 0 };
   }
 
   get active() {
@@ -385,36 +461,101 @@ export class VehicleHandler {
     return Math.hypot(dx, dy * 0.5, dz);
   }
 
+  /**
+   * Transit cars that are not `Vehicle`s and are therefore not in
+   * `vehicles.vehicles` — today that is the two incline cabins, published by
+   * `src/vehicles/funicular.js` as `riders`. Reached with `ctx.peek` (hard
+   * rule 2) and returned through one reused array (hard rule 5). A build with
+   * no funicular subsystem gets an empty list and never notices.
+   */
+  _transitRides() {
+    const out = this._rides;
+    out.length = 0;
+    const f = this.ctx.peek('funicular');
+    const list = f?.riders;
+    if (Array.isArray(list)) for (let i = 0; i < list.length; i++) out.push(list[i]);
+    return out;
+  }
+
+  /**
+   * One ranking step, over cars and transit alike. The reach and the gate
+   * differ by kind and by nothing else:
+   *
+   *   a car      ENTER_REACH to its box, whether it is moving or not — a
+   *              carjack of a rolling car is a feature (see note 1).
+   *   a transit  RIDE_REACH, and ONLY while it is standing at a stop. This is
+   *   car        the whole "boarding a moving trolley does nothing" rule, and
+   *              it lives HERE as well as in `tryEnter` so the prompt never
+   *              offers a verb the press would refuse.
+   *
+   * A METHOD, NOT A CLOSURE. The obvious shape for this is an arrow inside
+   * `_scan` capturing `p` and the running best — and `_scan` runs every frame
+   * the player is on foot, so that is a fresh function object sixty times a
+   * second for as long as the game is open (hard rule 5). The running best
+   * lives on the handler instead.
+   */
+  _consider(v, p) {
+    if (!v || v.destroyed || v._staged) return;
+    const dx = v.position.x - p.x, dz = v.position.z - p.z;
+    if (dx * dx + dz * dz > SCAN_RADIUS * SCAN_RADIUS) return;
+    if (Math.abs(v.position.y - p.y) > 4) return;
+    const t = v.transit;
+    if (t && !t.dwelling) return;
+    const d = this._boxDistance(v, p);
+    if (d < (t ? RIDE_REACH : ENTER_REACH) && d < this._scanD) {
+      this._scanD = d;
+      this._scanBest = v;
+    }
+  }
+
   _scan(vehicles, m) {
     this.prompt = null;
     this.candidate = null;
-    if (!vehicles || typeof vehicles.nearest !== 'function') return;
     if (!m.grounded || m.swimming) return;
     const p = m.position;
-    let best = null;
-    let bestD = ENTER_REACH;
+    this._scanBest = null;
+    this._scanD = Infinity;
     try {
       // `nearest` sorts by origin distance, which is the wrong metric for a
       // truck, so widen the query and re-rank by box distance.
-      const list = vehicles.vehicles;
+      const list = vehicles?.vehicles;
       if (Array.isArray(list)) {
-        for (let i = 0; i < list.length; i++) {
-          const v = list[i];
-          if (!v || v.destroyed || v._staged) continue;
-          const dx = v.position.x - p.x, dz = v.position.z - p.z;
-          if (dx * dx + dz * dz > SCAN_RADIUS * SCAN_RADIUS) continue;
-          if (Math.abs(v.position.y - p.y) > 4) continue;
-          const d = this._boxDistance(v, p);
-          if (d < bestD) { bestD = d; best = v; }
-        }
-      } else {
-        best = vehicles.nearest(p.x, p.y, p.z, ENTER_REACH + 2.4);
+        for (let i = 0; i < list.length; i++) this._consider(list[i], p);
+      } else if (typeof vehicles?.nearest === 'function') {
+        const n = vehicles.nearest(p.x, p.y, p.z, ENTER_REACH + 2.4);
+        if (n && !(n.transit && !n.transit.dwelling)) this._scanBest = n;
       }
+      const rides = this._transitRides();
+      for (let i = 0; i < rides.length; i++) this._consider(rides[i], p);
     } catch {
       return;
     }
+    const best = this._scanBest;
     if (!best) return;
     this.candidate = best;
+    const t = best.transit;
+    if (t) {
+      this._promptRec.text = 'RIDE';
+      this._promptRec.sub = t.stopName ? `${t.line} · ${t.stopName}` : t.line;
+      this.prompt = this._promptRec;
+      /**
+       * PUBLISH IT OURSELVES, and only for a transit car.
+       *
+       * `src/player/index.js` writes this record to `ui` only on the frame its
+       * text CHANGES, and `game.freeroam` re-asserts the same single slot every
+       * frame and clears it on its own falling edge (that file's `_publish`
+       * documents the "two caches over one slot" problem from the other side).
+       * A car is fine either way because `freeroam` offers its own, better
+       * worded TAKE line for one. Nothing in `game` knows the incline cabins
+       * exist — they are not `Vehicle`s and its scan cannot see them — so
+       * without this the one prompt telling the player he can ride the postcard
+       * is whichever cache wrote last. Re-asserting is free: `ui.setPrompt`
+       * change-guards every string it touches.
+       */
+      const ui = this.ctx.peek('ui');
+      try { ui?.setPrompt?.(this._promptRec); } catch { /* stub */ }
+      return;
+    }
     this._promptRec.text = this._occupied(best, 0) ? 'PULL OUT' : 'ENTER';
     this._promptRec.sub = best.spec?.name ?? best.name ?? best.type ?? '';
     this.prompt = this._promptRec;
@@ -489,6 +630,21 @@ export class VehicleHandler {
     if (this.phase !== PHASE.none) return false;
     const v = this.candidate;
     if (!v || v.destroyed) return false;
+    /**
+     * THE ONE RULE OF BOARDING A SERVICE: it has to be standing at a stop.
+     *
+     * Asserted here and not only in `_scan`, because `game.freeroam._board`
+     * sets `candidate` and calls straight through — so this is the gate a
+     * scripted board, a touch button and the F key all pass. It is also the
+     * negative control the gates read: `tramprobe`'s ride section and
+     * `interactprobe`'s trolley section both press F at a moving car and
+     * assert the player is still on the pavement.
+     */
+    const transit = v.transit ?? null;
+    if (transit && !transit.dwelling) return false;
+    this.transit = transit;
+    this.passenger = !!transit;
+    this.alightRequested = false;
     this.vehicle = v;
     // The player always goes for the wheel. If somebody is in it, that is a
     // carjack, not a reason to ride shotgun.
@@ -536,6 +692,20 @@ export class VehicleHandler {
   tryExit(m) {
     if (this.phase !== PHASE.drive) return false;
     const v = this.vehicle;
+    /**
+     * PULL THE CORD. A passenger who presses F between stops is not refused —
+     * that is the report's wording, "disembark at the next stop", and it is
+     * what the bell does on a real car. `_stepRide` spends the request on the
+     * first frame the service stands still.
+     *
+     * It returns TRUE so `game.freeroam`'s exit branch (which calls this a
+     * second time off the same key press) reports the action as performed
+     * rather than toasting "NO ROOM TO GET OUT" at a man on a moving tram.
+     */
+    if (this.passenger && this.transit && !this.transit.dwelling) {
+      this.alightRequested = true;
+      return true;
+    }
     if (!this._pickExit(v, m)) {
       this.stats.exitBlocked++;
       return false;
@@ -581,6 +751,33 @@ export class VehicleHandler {
    * to the truck without this file knowing anything about either.
    */
   _resolveAnchors(v, seat, m) {
+    const half0 = v?.spec?.half;
+    /**
+     * A PASSENGER'S ANCHORS COME FROM `transit`, NOT FROM `vehicles`.
+     *
+     * `seatAnchor` solves a DRIVER's place from a car's style block, and a
+     * trolley has no wheel to put him behind — the tram spec even declares
+     * `seats: 0`. The service knows where its saloon is; this reads it and
+     * nothing else, in the same head-anchor convention `seatAnchor` publishes,
+     * so the head-height subtraction below is shared by both paths.
+     */
+    if (this.transit) {
+      const t = this.transit;
+      this.seatLocal.set(t.seat.x, t.seat.y, t.seat.z);
+      // Board by the door on the side the player is already standing on.
+      this._v.copy(m.position).sub(v.position);
+      if (v.quaternion) this._v.applyQuaternion(this._q.copy(v.quaternion).invert());
+      this.side = this._v.x >= 0 ? 1 : -1;
+      let dz = t.doorZ[0];
+      for (const z of t.doorZ) if (Math.abs(z - this._v.z) < Math.abs(dz - this._v.z)) dz = z;
+      this.doorLocal.set(this.side * (t.hw + 0.65), t.railY, dz);
+      this.seatLocal.y -= GAIT.seat.headHeight * (m?.bodyScale ?? 1);
+      this._halfW = half0?.x ?? t.hw;
+      this._halfL = half0?.z ?? 5;
+      this._halfH = half0?.y ?? 1.6;
+      return;
+    }
+
     const vehicles = this.ctx.peek('vehicles');
     let anchor = null;
     if (vehicles && typeof vehicles.seatAnchor === 'function') {
@@ -693,8 +890,12 @@ export class VehicleHandler {
     const phys = this.ctx.peek('physics');
     if (phys) {
       const g = phys.groundHeight(this.doorPos.x, this.doorPos.z, this.doorPos.y + 2.4);
-      if (Number.isFinite(g)) this.doorPos.y = g + 0.02;
-      else if (feetY !== undefined) this.doorPos.y = feetY;
+      // A transit door only accepts ground within a step of its own railhead
+      // plane — see TRANSIT_STEP_BAND, and the incline's trestle.
+      const ok = Number.isFinite(g) &&
+        (!this.transit || Math.abs(g - this._v.y) <= TRANSIT_STEP_BAND);
+      if (ok) this.doorPos.y = g + 0.02;
+      else if (!this.transit && feetY !== undefined) this.doorPos.y = feetY;
     }
 
     /**
@@ -874,9 +1075,31 @@ export class VehicleHandler {
       this.phase = PHASE.drive;
       this.t = 0;
       this.stats.enters++;
+      /**
+       * A PASSENGER TAKES NO SEAT OFF THE SERVICE.
+       *
+       * `vehicles.setDriver` starts the engine, marks the tank as the player's
+       * and claims the seat — every one of which is wrong for a fare-free
+       * passenger on a kinematic car that is driving itself, and two of which
+       * would make `traffic`, `police` and the despawn guard think the player
+       * is at the controls of a trolley. The event still goes out, flagged, so
+       * anything listening for "the player got into something" still hears it.
+       */
+      if (this.passenger) {
+        this.stats.rides++;
+        this._enterPayload.vehicle = this.vehicle;
+        this._enterPayload.seat = this.seat;
+        this._enterPayload.passenger = true;
+        this.ctx.events.emit('vehicle:enter', this._enterPayload);
+        // The reel starts the instant the doors shut, not on the way in — a
+        // cut away from the body mid-animation loses the boarding beat.
+        this.player?.rig?.beginCinematic?.(this.vehicle);
+        return;
+      }
       const vehicles = this.ctx.peek('vehicles');
       this._enterPayload.vehicle = this.vehicle;
       this._enterPayload.seat = this.seat;
+      this._enterPayload.passenger = false;
       // `setDriver` starts the engine, marks the tank as the player's (so fuel
       // burns) and raises `vehicle:enter` itself — do not double-emit.
       // Belt and braces: a car entered without a jack (parked, or one the AI
@@ -899,6 +1122,8 @@ export class VehicleHandler {
     // suspension instead of staying where the door shut.
     this._composeAnchors(v, m.position.y);
     m.setSeatTransform(this.seatPos, this.seatYaw);
+
+    if (this.passenger) { this._stepRide(dt, m); return; }
 
     const input = this.ctx.input;
     if (this.player.controlEnabled && input && !this.player.health.dead) {
@@ -968,6 +1193,49 @@ export class VehicleHandler {
     }
   }
 
+  /**
+   * RIDING. The seat is already pinned by the caller; this is everything else.
+   *
+   * The list of things it does NOT do is the point: no `setInput`, no nitro, no
+   * lateral load, no handbrake, no horn. A passenger cannot make a 19.5 t
+   * carriage do anything, and forwarding a throttle to a `kinematic` vehicle
+   * that ignores it would be a lie the next reader has to disprove.
+   *
+   * Two inputs are live, and they are the two the report named:
+   *
+   *   any move key   takes the camera back. The ride continues — you are still
+   *                  on the tram, you just want to look at it yourself. This is
+   *                  deliberately NOT the mouse: see `addLook` in camera.js.
+   *   F              handled by `tryExit` (get off, or ring for the next stop).
+   *
+   * ...and the third thing, which is not an input at all: a `alightRequested`
+   * armed between stops is spent the moment the service stands.
+   */
+  _stepRide(dt, m) {
+    void dt;
+    const rig = this.player?.rig;
+    const t = this.transit;
+
+    // The service can be wrecked, streamed out or disposed under a rider.
+    if (!t || this.vehicle?.destroyed) { this._forceOut(m); return; }
+
+    if (rig?.cinematicActive) {
+      const s = m.scriptedInput;
+      const mv = this._mv;
+      if (s) { mv.x = s.x ?? 0; mv.y = s.y ?? 0; }
+      else if (this.ctx.input) this.ctx.input.moveVector(mv);
+      else { mv.x = 0; mv.y = 0; }
+      if (Math.abs(mv.x) > 0.2 || Math.abs(mv.y) > 0.2) rig.endCinematic();
+    }
+
+    if (this.alightRequested && t.dwelling) {
+      this.alightRequested = false;
+      // `tryExit` re-enters here with `dwelling` true, so it takes the real
+      // exit branch rather than arming the request again.
+      this.tryExit(m);
+    }
+  }
+
   _stepOut(u, m) {
     // The exit target was chosen and validated at tryExit against the car's
     // pose THEN; a car that is still rolling drags it along, so re-compose.
@@ -997,7 +1265,18 @@ export class VehicleHandler {
     const phys = this.ctx.peek('physics');
     if (phys) {
       const g = phys.groundHeight(out.x, out.z, out.y + 3.0);
-      if (Number.isFinite(g)) out.y = g + 0.03;
+      /**
+       * SAME BAND AS THE DOOR ANCHOR, and for a worse reason. `groundHeight`
+       * under an incline cabin answers with the HILLSIDE, which mid-run is up
+       * to fifteen metres below the trestle it is standing on — and unlike the
+       * door anchor, this point is where `_forceOut` TELEPORTS the actor. A
+       * step off a tram onto ground a storey down is a fall down Mt.
+       * Washington the player did not ask for. Inside the band the ground
+       * query still wins, which is what puts him on the platform.
+       */
+      const ok = Number.isFinite(g) &&
+        (!this.transit || Math.abs(g - out.y) <= TRANSIT_STEP_BAND);
+      if (ok) out.y = g + 0.03;
     }
     return out;
   }
@@ -1066,9 +1345,14 @@ export class VehicleHandler {
     this._bail = false;
     this.stats.exits++;
 
+    const wasPassenger = this.passenger;
+    this._endRide();
     const vehicles = this.ctx.peek('vehicles');
     let released = false;
-    if (v && vehicles?.clearDriver) {
+    // A passenger never took the seat (see `_stepIn`), so there is nothing to
+    // give back and `clearDriver` would be handed a handle that is not in the
+    // fleet at all. Raise the exit ourselves.
+    if (!wasPassenger && v && vehicles?.clearDriver) {
       // `clearDriver` raises `vehicle:exit` itself.
       try { vehicles.clearDriver(v, this.player); released = true; } catch { released = false; }
     }
@@ -1093,8 +1377,21 @@ export class VehicleHandler {
   }
 
   _pushDoor(open) {
+    // A transit car's doors are the service's business, and the incline cabins
+    // are not `Vehicle`s at all — `setDoor` would be handed an object with no
+    // `model.doors` to swing.
+    if (this.transit) return;
     const vehicles = this.ctx.peek('vehicles');
     vehicles?.setDoor?.(this.vehicle, this.seat, clamp01(open));
+  }
+
+  /** Everything a ride has to give back, wherever it ends. Idempotent. */
+  _endRide() {
+    if (!this.passenger) return;
+    this.passenger = false;
+    this.transit = null;
+    this.alightRequested = false;
+    this.player?.rig?.endCinematic?.();
   }
 
   /**
@@ -1134,9 +1431,11 @@ export class VehicleHandler {
     if (this.phase === PHASE.none) return;
     this._dropHold();
     const v = this.vehicle;
+    const wasPassenger = this.passenger;
+    this._endRide();
     const vehicles = this.ctx.peek('vehicles');
     let released = false;
-    if (v && vehicles?.clearDriver) {
+    if (!wasPassenger && v && vehicles?.clearDriver) {
       try { vehicles.clearDriver(v, this.player); released = true; } catch { released = false; }
     }
     if (v && !released) {
