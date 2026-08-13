@@ -186,6 +186,120 @@ function modPeak(env, lo = 2, hi = 12) {
   return bestHz;
 }
 
+/** Crest factor, dB: peak over RMS. A squashed read loses its transients. */
+function crest(sig, a, b) {
+  const p = peak(sig, a, b);
+  const r = db(sig, a, b);
+  return p > 0 ? 20 * Math.log10(p) - r : 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* ARTICULATION — the measurement the "cannot understand speech" report */
+/* needed, and the one nothing here had                                 */
+/* ------------------------------------------------------------------ */
+
+const BAND_N = 512;      // 10.7 ms at 48 kHz — short enough to resolve a burst
+const BAND_HOP = 256;
+
+/**
+ * Per-frame power in two bands of the EMITTED read:
+ *
+ *   lo  150-4300 Hz  the vowel bed — everything the vocal tract filter passes
+ *   hi  4500-9000 Hz CONSONANT BURSTS. `voiceLine` mixes its plosive and
+ *                    fricative bursts straight to the line output; they never
+ *                    pass the tract lowpass, so this is the one band where
+ *                    articulation is not summed with the vowels.
+ *
+ * Bed energy leaks up here through the tract lowpass's skirt. THE FIRST VERSION
+ * OF THIS METRIC ASSUMED THE LEAK DIVIDED OUT and it does not: it compared the
+ * consonant band at a syllable EDGE against the same band mid-vowel, on the
+ * theory that a common leak cancels. It cannot, because the leak is a floor —
+ * negligible in the numerator, dominant in the denominator — so the ratio
+ * measures the LOWPASS CORNER as much as the consonants. MEASURED: the shipped
+ * read scored 14.0 dB on it and the fixed read 14.8, while the same fixed chain
+ * with the old consonant level scored 8.2. A metric that ranks the build it was
+ * written to condemn ABOVE the build's own control is measuring the wrong
+ * quantity, and the shape of the mistake is rule 12's: the quantity that was
+ * easy to reach was not the one the ear uses.
+ *
+ * What the ear uses is MASKING — a burst is heard or not heard against the
+ * vowel it opens — so `onsetEnergy` below divides the burst by the VOWEL BED,
+ * which is a different signal in a different band, and no filter move can make
+ * both sides go the same way.
+ */
+function bands(sig, a, b) {
+  const i0 = Math.max(0, Math.floor(a * SR));
+  const i1 = Math.min(sig.length, Math.floor(b * SR));
+  const re = new Float64Array(BAND_N), im = new Float64Array(BAND_N);
+  const win = new Float64Array(BAND_N);
+  for (let i = 0; i < BAND_N; i++) win[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / BAND_N);
+  const binHz = SR / BAND_N;
+  const k = (f) => Math.round(f / binHz);
+  const LO0 = k(150), LO1 = k(4300), HI0 = k(4500), HI1 = k(9000);
+  const lo = [], hi = [];
+  for (let s = i0; s + BAND_N <= i1; s += BAND_HOP) {
+    for (let i = 0; i < BAND_N; i++) { re[i] = sig[s + i] * win[i]; im[i] = 0; }
+    fft(re, im);
+    let l = 0, h = 0;
+    for (let j = LO0; j <= LO1; j++) l += re[j] * re[j] + im[j] * im[j];
+    for (let j = HI0; j <= HI1; j++) h += re[j] * re[j] + im[j] * im[j];
+    lo.push(l); hi.push(h);
+  }
+  return { lo, hi };
+}
+
+/**
+ * ONSET ENERGY RATIO, dB — the consonant burst at a syllable onset, against the
+ * VOWEL BED it has to be heard through.
+ *
+ * This is the number the owner's report was about: "cannot understand speech"
+ * is what a vowel bed with no syllable edges sounds like. Both terms are read
+ * off the emitted buffer, and they are deliberately different signals:
+ *
+ *   numerator   the PEAK consonant-band frame in a window around each onset,
+ *               averaged over the onsets. A peak, not a mean, because a plosive
+ *               is 14 ms inside a 64 ms window and averaging buries the very
+ *               transient being measured under the vowel it opens.
+ *   denominator the mean vowel-band energy over the voiced frames — the masker.
+ *
+ * So it answers "how far does a burst stand out of what is masking it", which
+ * is the intelligibility question, and it moves for the two reasons that
+ * actually matter: louder consonants, and less mud in front of them. Both terms
+ * scale with the line's level, so the trim cancels out of it — this measures
+ * clarity, never loudness.
+ *
+ * The onsets are found on the emitted vowel-bed envelope, never on the syllable
+ * table the synth was driven from (rule 12), and the burst window LEADS the
+ * vowel because `voiceLine` schedules a consonant 14-45 ms early, the way a
+ * real closure precedes its release.
+ */
+function onsetEnergy(sig, a, b) {
+  const { lo, hi } = bands(sig, a, b);
+  const n = lo.length;
+  if (n < 24) return { db: 0, onsets: 0 };
+  const env = new Float64Array(n);
+  for (let i = 0; i < n; i++) env[i] = Math.sqrt(lo[i]);
+  const sm = Float64Array.from(env);
+  for (let i = 1; i < n - 1; i++) sm[i] = (env[i - 1] + env[i] + env[i + 1]) / 3;
+  let mean = 0, pk = 0;
+  for (let i = 0; i < n; i++) { mean += sm[i]; pk = Math.max(pk, sm[i]); }
+  mean /= n;
+  const thr = mean * 0.45;
+  const onsets = [];
+  for (let i = 1; i < n; i++) if (sm[i - 1] <= thr && sm[i] > thr) onsets.push(i);
+  if (onsets.length < 2) return { db: 0, onsets: onsets.length };
+  let bE = 0, bN = 0;
+  for (const o of onsets) {
+    let m = 0;
+    for (let i = Math.max(0, o - 9); i <= Math.min(n - 1, o + 3); i++) m = Math.max(m, hi[i]);
+    if (m > 0) { bE += m; bN++; }
+  }
+  let vE = 0, vN = 0;
+  for (let i = 0; i < n; i++) if (sm[i] > pk * 0.3) { vE += lo[i]; vN++; }
+  if (!bN || !vN || vE <= 0) return { db: 0, onsets: onsets.length };
+  return { db: 10 * Math.log10((bE / bN) / (vE / vN)), onsets: onsets.length };
+}
+
 /** Spectral centroid over the loud frames — brightness, i.e. buzz. */
 function centroid(sig, a, b) {
   const N = 2048;
@@ -358,7 +472,10 @@ const PAGE = `window.__RENDER__ = async (opts) => {
       a.done = true;
       if (a.cut) subs.cut.play(a.cut, { ctx: fakeCtx, ui: fakeUi, context: 'probe', onDone() {} });
       if (a.say) subs.push(a.say[0], a.say[1]);
-      if (a.speak) vox.speak(a.speak[0], a.speak[1], a.speak[2] ?? 0, { source: 'probe' });
+      // 'articulation' is the LIVE negative-control switch for section 2c: it
+      // overrides the shipped consonant level with no edit to src/audio/vox.js,
+      // the same pattern as 'duck: false' above.
+      if (a.speak) vox.speak(a.speak[0], a.speak[1], a.speak[2] ?? 0, { source: 'probe', articulation: opts.articulation });
       if (a.pause !== undefined) paused = a.pause;
       if (a.skipAll) subs.cut.skipAll();
       if (a.bark) {
@@ -434,6 +551,19 @@ const CENTROID_MAX = 900;    // brighter than this is a tannoy, not talk
 const MOD_DEPTH_MIN = 13;
 const VOICED_MAX = 0.88;
 const MOD_HZ = [2.0, 8.0];
+/* Articulation (section 2c) — what "muffled" is as a number. Three MEASURED
+   values on the same 10 s render, all RATCHETs (rule 13):
+
+     read as SHIPPED (articulation 0.34, wet 0.035, old tract EQ)  -21.1 dB
+     read as FIXED   (0.9, dry, 180 Hz HP + 2.9 kHz presence)      -15.3 dB
+     the fixed chain with 0.34 put back — the live control          -21.9 dB
+
+   The floor is set under the fixed value with headroom, and BOTH the shipped
+   build and the live control fail it, which is what makes it mean something.
+   Lower it when the read gets clearer; never raise it to go green. */
+const ONSET_RATIO_MIN = -17.0;
+const CREST_MIN = 9.0;
+const ONSET_NC_MARGIN = 5.0;
 
 /*
  * A PLAIN STATIC SERVER over the repo, not the dev server, and a blank page
@@ -566,6 +696,32 @@ try {
     `and a human syllable rhythm (${vHz.toFixed(1)} Hz in ${MOD_HZ[0]}-${MOD_HZ[1]})`);
   say(mDepth < MOD_DEPTH_MIN || mVoiced > VOICED_MAX,
     `NEGATIVE CONTROL the music bed fails the same test (${mDepth.toFixed(1)} dB, ${(mVoiced * 100).toFixed(0)}% voiced) — the metric discriminates`);
+
+  /* ================================================================= */
+  console.log('\n=== 2c. CAN YOU HEAR THE CONSONANTS? (articulation) ===\n');
+  /*
+   * THE OWNER'S REPORT: "the voices are muffled and echo — cannot understand
+   * speech and it's distracting (louder and more prominent than before)".
+   *
+   * Three of those four words already had a number in this file (echo ->
+   * modulation depth in 2b, loud -> the over-bed margin in 2), and MUFFLED had
+   * none. `onsetEnergy` is that number, and the negative control is the shipped
+   * consonant level before the fix, driven through the LIVE code path.
+   */
+  const artNc = await render({ radio: false, script: speakScript, articulation: 0.34 });
+  const oe = onsetEnergy(voice.sig, T_SPEAK, vEnd);
+  const oeNc = onsetEnergy(artNc.sig, T_SPEAK, vEnd);
+  const vCrest = crest(voice.sig, T_SPEAK, vEnd);
+  console.log(`  the read        onset ratio ${oe.db.toFixed(1)} dB over ${oe.onsets} onsets   crest ${vCrest.toFixed(1)} dB`);
+  console.log(`  NC articulation 0.34 (the shipped muffle)  ${oeNc.db.toFixed(1)} dB over ${oeNc.onsets} onsets`);
+  console.log('');
+  say(oe.db >= ONSET_RATIO_MIN,
+    `syllable onsets are distinct (${oe.db.toFixed(1)} dB >= ${ONSET_RATIO_MIN})`);
+  say(vCrest >= CREST_MIN,
+    `and the read still has transients, not a squashed bed (crest ${vCrest.toFixed(1)} dB >= ${CREST_MIN})`);
+  say(oe.db - oeNc.db >= ONSET_NC_MARGIN,
+    `NEGATIVE CONTROL the old consonant level scores ${oeNc.db.toFixed(1)} dB, ` +
+    `${(oe.db - oeNc.db).toFixed(1)} dB worse (>= ${ONSET_NC_MARGIN}) — the metric moves with articulation`);
 
   /* ================================================================= */
   console.log('\n=== 3. PAUSE: the line stops, the bed comes back, nothing doubles ===\n');

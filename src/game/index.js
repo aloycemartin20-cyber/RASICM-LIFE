@@ -112,6 +112,20 @@ export class GameSystem {
     /** Death mid-chapter: the chapter restarts itself after the WASTED card. */
     this._restartIdx = -1;
     this._restartT = 0;
+    /**
+     * The world-space diamond over the chapter ring, and the array `ui`
+     * retains. Preallocated: `_publishRingMarker` runs every free-roam frame.
+     */
+    this._ringMarker = { position: new THREE.Vector3(), label: 'CH', name: '' };
+    this._ringMarkers = [];
+    this._ringsOn = false;
+    /** The progress payload the phone and the pause menu read. See `getProgress`. */
+    this._progress = {
+      chapters: 0, total: 0, percent: 0, cash: 0, earned: 0, jobs: 0,
+      packages: 0, packagesTotal: 0, boy: '', storyDone: false,
+      next: null, boys: [], chapterList: [],
+    };
+    this._progressKey = -1;
     /** Unscaled stamp of the K press that armed "abandon the job?". */
     this._abortArmedRaw = 0;
     /** The `M.seq` it was armed on; `-1` is idle, and `M.seq` counts from 1. */
@@ -420,6 +434,7 @@ export class GameSystem {
       ui?.setMoney?.(h.money, 0);
       if (ui?.money) ui.money.hold = 3.4;
     }
+    this._pushProgress();
   }
 
   /* ==================================================================== */
@@ -484,7 +499,19 @@ export class GameSystem {
       }
       o.eyebrow = 'NEXT CHAPTER';
       o.text = this._nextTitle;
-      o.count = 'PRESS J';
+      /**
+       * THE PANEL NAMES THE PLACE, NOT THE KEY.
+       *
+       * The player is in free roam and stays there until he chooses otherwise
+       * (`_onEnterWorld`), so the persistent readout has to point at the thing
+       * in the WORLD that starts the chapter — the ring `StagingRings` is
+       * standing at the staging point, which is also the chapter pin on both
+       * map projections and the destination the GPS routes to (`_navTarget`).
+       * `J` is still the shortcut and the toast still names it; a HUD line
+       * whose only instruction is a keycap is what made the last build read as
+       * a menu with a city attached.
+       */
+      o.count = RING_CUE;
       return o;
     }
     // The arc is over; the city is not.
@@ -493,7 +520,7 @@ export class GameSystem {
     this._nextKey = null;
     o.eyebrow = 'SIDE JOB';
     o.text = j.name;
-    o.count = 'PRESS J';
+    o.count = RING_CUE;
     return o;
   }
 
@@ -559,12 +586,16 @@ export class GameSystem {
     const ui = this.wq.ui;
     const n = this.nextChapter();
     if (n) {
-      ui?.notify?.(`${n.def.no} · ${n.def.name.toUpperCase()}`, 'PRESS J', 'slag');
+      // Both halves on purpose: the RING is where the chapter is, `J` is the
+      // shortcut for a player who already knows. `ui._touchify` rewrites the
+      // keycap half for a build with no keyboard, which is why the phrase
+      // "PRESS J" survives verbatim inside the line.
+      ui?.notify?.(`${n.def.no} · ${n.def.name.toUpperCase()}`, RING_TOAST, 'slag');
       return;
     }
     ui?.notify?.(`${this.characters.boy.name.toUpperCase()}'S STORY`, 'COMPLETE', 'gold');
     const j = this.jobs.best();
-    if (j) ui?.notify?.(j.name.toUpperCase(), `SIDE JOB · PRESS J · ${money(j.pay)}`, 'slag');
+    if (j) ui?.notify?.(j.name.toUpperCase(), `SIDE JOB · ${RING_TOAST}`, 'slag');
   }
 
   /**
@@ -631,29 +662,66 @@ export class GameSystem {
    * flag with, so the line always ends at the flag.
    */
   _navTarget() {
-    return this.missions.waypoint ?? this.missions.userWaypoint ?? null;
+    /**
+     * THE RING IS ON THE GPS, and it is the LAST of the three because it is
+     * the only one the player did not ask for. A live mission's marker wins;
+     * a pin he dropped himself wins over the standing suggestion. Only when he
+     * has expressed no preference at all does the line lead to the next
+     * chapter's ring — which is exactly the case the report was about ("no way
+     * to tell what your progress is ... need better alignment with the actual
+     * gameplay"): free roam with nothing drawn anywhere.
+     */
+    return this.missions.waypoint ?? this.missions.userWaypoint ?? this._ringNav();
   }
 
   /**
-   * BEGIN STORY MODE — the fix for "I started as Aidan and nothing happened."
+   * `{x, z}` of the live chapter ring, or null — the ring's OWN resolved
+   * point, not the pin it was built from, so the line ends where the marker
+   * actually stands after the dry/reachable fix-up in `StagingRings._place`.
    *
-   * `src/ui/boot.js`'s START enables control, shows the HUD and hands the clock
-   * back, then emits `ui:boot { phase:'play' }`. Before this listener, that was
-   * the whole handover: the chapter the brother is up to was only ARMED
-   * (`_pendingChapter`, and a "PRESS J" feed toast from `_announceNext`), never
-   * STARTED. A first-time player therefore landed in free roam with a blank
-   * objective panel and no waypoint, the toast already faded, with no way to
-   * know that `J` was the thing to press — and a respawn just put him back in
-   * the same silent free roam. The reference build (`legacy/babylon-reference.html`
-   * `runLoader` -> `startChapter(start)`) begins the chapter on entry instead,
-   * and so should we.
+   * It honours `rings.enabled`, so the `?owNoRings=1` arm takes the ring off
+   * the GPS as well as out of the world. An A/B hatch that left half the
+   * feature running would measure the wrong thing, and the negative control in
+   * `src/ui/gpsprobe.mjs` needs a state with genuinely nothing to navigate to.
+   */
+  _ringNav() {
+    const r = this.freeroam?.rings;
+    const s = r?.enabled ? r.slots[0] : null;
+    return s?.on ? s : null;
+  }
+
+  /**
+   * ENTER THE WORLD IN FREE ROAM — and be TOLD what there is to do in it.
    *
-   * So do exactly what pressing `J` would do, on the player's behalf, the moment
-   * he enters: start the chapter he is up to. The intro cutscene plays and hands
-   * off to the travel/run phase, at which point the mission runner and the track
-   * publish the objective line (`getHudState().objective`) and the world
-   * waypoint marker — the "get to the docks / get in the marked vehicle" call to
-   * action — from the first controllable frame.
+   * ── What this used to do, and why it changed ──────────────────────────────
+   * It called `startMission` outright. That was the fix for "I started as Aidan
+   * and nothing happened": before it, `src/ui/boot.js`'s START handed over
+   * control with a blank objective panel, no waypoint and a four-second toast
+   * that had already faded, and the one key that would have started anything
+   * (`J`) was named nowhere.
+   *
+   * It fixed that and bought a worse problem, which is the report this replaces
+   * it for: "we lost the ability to do freeplay, or it is not clear — they
+   * should always be in freeplay mode and start missions by going to a certain
+   * location or walking onto a glowing ring." Auto-starting the chapter on
+   * entry means the ONLY way into free roam was to abandon the story with K,
+   * which is a key the game asks you twice to confirm. The open world was
+   * unreachable from the front door.
+   *
+   * ── What it does now ─────────────────────────────────────────────────────
+   * Control lands in FREE ROAM, every time, and the chapter is put in the world
+   * as a place instead:
+   *
+   *   - `StagingRings` stands a glowing ring at the chapter's staging point
+   *     (`_syncRings`), which is the same coordinate as the map pin and the
+   *     GPS destination — drive into it and the chapter starts, intro cutscene
+   *     and all, exactly as `J` would;
+   *   - a SHORT briefing beat plays first (two lines, skippable, the world
+   *     stopped) so the handover is not silent. This is the onboarding the
+   *     paragraph above bought and it is kept: what changes is that it hands
+   *     back to the city rather than to a mission. `src/ui/pauseprobe.mjs`'s
+   *     boot journey asserts exactly this — START opens a scene, the scene is
+   *     skippable, and the clock comes back at 1.
    *
    * Guarded so it only ever fires on the real entry gesture, never over a
    * mission that is already live (a staged debug entry, a resumed job) and never
@@ -663,14 +731,124 @@ export class GameSystem {
    * Only the live BootFlow emits `ui:boot`; every headless bench boots with the
    * flow disabled (`bootEnabled()` is false under `navigator.webdriver`), so
    * this changes nothing the playtest harness or any capture tool sees — it is
-   * purely the human's first-run path.
+   * purely the human's entry path.
    */
   _onEnterWorld(e) {
     if (e?.phase !== 'play') return;
     if (this.missions.active) return;
     const n = this.nextChapter();
     if (!n) return;
-    this.startMission(n.index);
+    // Re-arm first: the briefing may be skipped on its opening frame, and
+    // `_pendingChapter` is what `J` honours from the frame after this one.
+    this._announceNext();
+    const boy = this.characters.boy;
+    this.missions.playBriefing(
+      [
+        { who: boy.id, text: `Steel City is ours to drive. Nothing is on rails — go where you want.` },
+        { who: boy.id, text: `${n.def.no}, ${n.def.name}, is marked. Roll up on the ring when you're ready.` },
+      ],
+      `${boy.name} · FREE ROAM`,
+      () => this._syncHud(1),
+    );
+  }
+
+  /* ==================================================================== */
+  /* the staging rings — the world's own "there is something here"        */
+  /* ==================================================================== */
+
+  /**
+   * Stand a ring on everything the player could start right now, and start it
+   * if he just drove into one.
+   *
+   * WHO OWNS WHAT: `StagingRings` (`freeroam.js`) owns the geometry and the
+   * swept entry test and knows nothing about chapters; this method owns what a
+   * ring MEANS. That split is what lets `src/game/flowprobe.mjs` drive the
+   * rings with no `GameSystem` in the harness at all.
+   *
+   * Rings are FREE-ROAM FURNITURE and stand down the moment anything is
+   * running: a live chapter publishes its own markers and its own glow
+   * (`mission.js:_publishMarkers` / `_updateGlows`), and two rings claiming to
+   * be "the thing to do" is the ambiguity this feature exists to remove.
+   *
+   * @param {boolean} held true while the world is stopped, the player is dead
+   *   or a restart is pending — the rings still DRAW, they just cannot fire.
+   *   Same shape as every other input gate in this file: a stopped world takes
+   *   no orders, and a WASTED card must not be able to start the next chapter
+   *   because the body fell inside a ring.
+   */
+  _syncRings(dt, rx, rz, held) {
+    const rings = this.freeroam?.rings;
+    if (!rings) return;
+    if (this.missions.active || this.jobs.lite.active) {
+      if (this._ringsOn) {
+        this._ringsOn = false;
+        rings.clear();
+        this._publishRingMarker(true);
+      }
+      return;
+    }
+    this._ringsOn = true;
+    const n = this.nextChapter();
+    rings.setChapter(this._hud.next, n ? n.index : -1);
+    rings.setJobs(this.jobs.list());
+    this._publishRingMarker(false);
+    if (held) return;
+    const hit = rings.update(dt, rx, rz);
+    if (hit) this._enterRing(hit);
+  }
+
+  /**
+   * Walking / driving into a ring is the SAME DOOR `J` opens — `startMission`
+   * and `takeJob`, unchanged, so the intro cutscene, the travel leg, the
+   * payout and `mission:start` are all the ones the keyboard path produces.
+   * There is no second way to begin a chapter, which is the only reason the
+   * two can never disagree.
+   */
+  _enterRing(hit) {
+    if (hit.kind === 'chapter') {
+      return this.startMission(hit.index >= 0 ? hit.index : this._pendingChapter);
+    }
+    if (hit.kind === 'job') return this.takeJob(hit.id);
+    return null;
+  }
+
+  /**
+   * The chapter ring gets the world-space diamond as well — `ui.setObjectives`
+   * is the list `ui/markers.js` projects, so the ring is legible from across
+   * the river and through a building, not only once you can see the ground it
+   * is drawn on.
+   *
+   * ONLY THE CHAPTER, deliberately. GAMEPLAY.md §3 is "one thing lit up", and
+   * four diamonds in the sky is a minimap with extra steps. The three side
+   * jobs keep their map pins (`jobs.mapPoints`) and now have rings; they do
+   * not get sky markers as well.
+   *
+   * The array is REUSED and `ui` retains it by reference (`setObjectives`
+   * assigns), which is the same contract `mission.js` publishes under — so a
+   * chapter starting replaces it and this takes it back when the chapter ends.
+   */
+  _publishRingMarker(off) {
+    const ui = this.wq.ui;
+    if (!ui?.setObjectives) return;
+    const arr = this._ringMarkers;
+    const s = off ? null : this.freeroam?.rings?.slots?.[0];
+    if (!s?.on) {
+      if (!arr.length) return;
+      arr.length = 0;
+      ui.setObjectives(arr);
+      return;
+    }
+    const m = this._ringMarker;
+    m.position.set(s.x, s.y + 1.4, s.z);
+    m.name = s.name;
+    // One or two glyphs — `ui/markers.js` draws this INSIDE a small diamond and
+    // a whole chapter title in there renders as an unreadable smear.
+    m.label = 'CH';
+    if (arr.length !== 1) {
+      arr.length = 0;
+      arr.push(m);
+      ui.setObjectives(arr);
+    }
   }
 
   /**
@@ -755,6 +933,7 @@ export class GameSystem {
         best: cs.best[`${id}:${i}`] ?? null,
       };
     });
+    const p = this.getProgress();
     return {
       boy: id,
       name: boy.name,
@@ -765,7 +944,138 @@ export class GameSystem {
         : `${frontier} of ${total} chapters complete`,
       chapters,
       pending: this._pendingChapter,
+      // The FAMILY's progress alongside this brother's, so a chapter list can
+      // say "9 / 24 · 38%" without a second call. Copied out of the reused
+      // record on purpose — this method is called from menus, not per frame,
+      // and its result is expected to survive the next call.
+      progress: {
+        chapters: p.chapters, total: p.total, percent: p.percent,
+        jobs: p.jobs, earned: p.earned,
+      },
     };
+  }
+
+  /**
+   * THE WHOLE FAMILY'S PROGRESS, IN ONE RECORD — the answer to "there is no
+   * way to tell what your progress is in the missions or in the game".
+   *
+   * Nothing in the game published this. `getStoryOverview()` covered ONE
+   * brother's chapter list and was read only by the story modal and the cheat
+   * panel; the phone's PROGRESS tab was a hard-coded `4 / 24`
+   * (`src/ui/phone.js` shipped `this.chapter = 4` and nothing ever set it);
+   * and the pause menu said nothing at all. Three surfaces, none of them
+   * connected to the save.
+   *
+   * THE RECORD AND EVERY SUB-RECORD ARE PREALLOCATED AND REUSED — read them,
+   * do not retain them, the same contract `getAction()` and `nextChapter()`
+   * publish. `_pushProgress` calls this whenever the numbers move, which is
+   * rarely, but the phone paints off it every frame it is open.
+   *
+   *   chapters/total/percent  the 24-chapter arc across all three brothers
+   *   jobs                    free-roam work completed — see the note below
+   *   earned                  every dollar ever taken (`save.totals.cash`),
+   *                           which is not the wallet: `cash` is what is left
+   *   boys[]                  per-brother frontier, for the phone's STORY page
+   *   chapterList[]           the ACTIVE brother's chapters, done/current/locked
+   */
+  getProgress() {
+    const p = this._progress;
+    const s = this.save;
+    let done = 0;
+    let total = 0;
+    for (let i = 0; i < BOY_ORDER.length; i++) {
+      const id = BOY_ORDER[i];
+      const boy = BOYZ[id];
+      const n = Math.min(this.economy.char(id).chapter, boy.story.length);
+      done += n;
+      total += boy.story.length;
+      const b = p.boys[i] ??= { id: '', name: '', colour: '', done: 0, total: 0, active: false, storyDone: false };
+      b.id = id;
+      b.name = boy.name;
+      b.colour = boy.color;
+      b.done = n;
+      b.total = boy.story.length;
+      b.active = id === this.characters.activeId;
+      b.storyDone = n >= boy.story.length;
+    }
+    p.chapters = done;
+    p.total = total;
+    p.percent = total ? Math.round((done / total) * 100) : 0;
+    p.cash = this.economy.cash;
+    p.earned = s.totals.cash | 0;
+    /**
+     * FREE-ROAM WORK, DERIVED RATHER THAN COUNTED, and the reason is that the
+     * save has nowhere to count it. `save.totals.missions` is incremented by
+     * BOTH `mission.js` (every chapter and every side job) and `jobs.js`
+     * (`_endLite`), and `save.js:normalise` only carries the keys `blankSave`
+     * declares — so a new `totals.jobs` written here would be dropped on the
+     * next load, exactly as `totals.jacked` already is. Subtracting the story
+     * frontier from the total is the honest reading of the numbers that DO
+     * persist. It under-reports by one per replayed chapter, which is the
+     * conservative direction. A real counter wants a `save.js` field.
+     */
+    p.jobs = Math.max(0, (s.totals.missions | 0) - done);
+    p.packages = s.packages.length;
+    p.packagesTotal = HIDDEN_PACKAGES.length;
+    p.boy = this.characters.activeId;
+    p.storyDone = done >= total;
+    const n = this.nextChapter();
+    if (n) {
+      const nx = this._progNext ??= { index: -1, no: '', name: '' };
+      nx.index = n.index;
+      nx.no = n.def.no;
+      nx.name = n.def.name;
+      p.next = nx;
+    } else {
+      p.next = null;
+    }
+    const boy = this.characters.boy;
+    const cs = this.economy.char();
+    const frontier = Math.min(cs.chapter, boy.story.length);
+    const list = p.chapterList;
+    list.length = boy.story.length;
+    for (let i = 0; i < boy.story.length; i++) {
+      const c = boy.story[i];
+      const r = list[i] ??= { index: 0, no: '', name: '', status: '', best: null };
+      r.index = i;
+      r.no = c.no;
+      r.name = c.name;
+      r.status = i < frontier ? 'done' : i === frontier ? 'current' : 'locked';
+      r.best = cs.best[`${boy.id}:${i}`] ?? null;
+    }
+    return p;
+  }
+
+  /**
+   * PUSH THE PROGRESS AT THE PHONE, ON CHANGE ONLY.
+   *
+   * `ui/index.js` feeds `phone.setState` five fields every frame and story
+   * progress is not among them, so the phone's own PROGRESS page has been
+   * showing a constructor default since it was written. `ui` may not import
+   * `game` and `game` may not import `ui` (rule 2), so this reaches the widget
+   * through the published system object — the same door `_syncHud` already
+   * uses for `ui.money.hold`. The `story` field is this system's REUSED
+   * record: the phone reads it live and paints from it, so one push is enough
+   * and the numbers can never go stale between pushes.
+   *
+   * The stamp is an INTEGER built from the values that can move it, not a
+   * string: this runs inside `_syncHud`, which is the one method in this file
+   * whose header says it must not allocate.
+   */
+  _pushProgress() {
+    const s = this.save;
+    let k = BOY_ORDER.indexOf(this.characters.activeId) + 1;
+    for (let i = 0; i < BOY_ORDER.length; i++) k = (k * 31 + (this.economy.char(BOY_ORDER[i]).chapter | 0)) | 0;
+    k = (k * 131 + (s.totals.missions | 0)) | 0;
+    k = (k * 17 + s.packages.length) | 0;
+    k = (k * 7 + (s.totals.cash | 0)) | 0;
+    if (k === this._progressKey) return;
+    this._progressKey = k;
+    const push = this._phonePush ??= { story: null, chapter: 0, found: 0 };
+    push.story = this.getProgress();
+    push.chapter = push.story.chapters;
+    push.found = push.story.packages;
+    this.wq.ui?.phone?.setState?.(push);
   }
 
   /**
@@ -1078,6 +1388,11 @@ export class GameSystem {
     this.airbase.update(dt);
     if (!paused) this._input(ctx);
     this._syncHud();
+    // THE RINGS. Measured from the CAR when he is driving one — a ring you can
+    // only trigger by getting out is not a ring you can drive into. `_syncHud`
+    // has just refreshed `_hud.next`, which is the point they stand on.
+    this._syncRings(dt, v?.position?.x ?? pos.x, v?.position?.z ?? pos.z,
+      paused || !alive || this._restartT > 0);
     // Both are driven off `time.raw` and both must run while the world is
     // stopped: the GPS so a route asked for on the pause map is drawn on the
     // pause map, the toast so it can measure how long the card has been up.
@@ -1559,6 +1874,27 @@ const EMPTY_ARRAY = Object.freeze([]);
 const IDLE_ACTION = Object.freeze({
   id: 'none', short: '', label: '', sub: '', key: 'F', available: false, target: null,
 });
+
+/**
+ * WHAT THE PERSISTENT PANEL SAYS INSTEAD OF NAMING A KEY.
+ *
+ * One string, used by the NEXT panel, the SIDE JOB panel and both announce
+ * toasts, so the cue the player is given in free roam cannot drift between the
+ * three surfaces that carry it. `src/ui/gpsprobe.mjs` asserts the panel says
+ * this while the ring is up.
+ */
+const RING_CUE = 'FOLLOW THE RING';
+
+/**
+ * The same cue for the FEED, which is a much narrower column.
+ *
+ * MEASURED on a 1920x1080 capture: "FOLLOW THE RING · PRESS J" wraps the feed's
+ * value column onto two lines and the toast reads as a paragraph. The keycap
+ * has to survive verbatim — `ui._touchify` rewrites the literal "PRESS J" to
+ * "TAP JOB" for a build with no keyboard, and `src/ui/gpsprobe.mjs` identifies
+ * the announce toast by it.
+ */
+const RING_TOAST = 'RING OR PRESS J';
 
 /** Collect radius multiplier while driving — 2.2 m -> 3.5 m. */
 const PICKUP_DRIVE_BOOST = 1.6;

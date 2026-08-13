@@ -162,19 +162,61 @@ const BONE_SPEC = [
   ['headEnd', 'head', 0, 1.79, 0.004],
 ];
 
+/**
+ * AN ELBOW IS THE ANTI-KNEE, AND THIS TABLE USED TO FORGET IT.
+ *
+ * Every limb here bows in the sagittal plane: the middle joint sits off the
+ * root->end chord, and WHICH SIDE it sits on is the whole readability of the
+ * joint, because it is the only thing that says which way the limb hinges when
+ * it is nearly straight. A knee points FORWARD. An elbow points BACKWARD. They
+ * are opposite, and the arm chain below was authored with the LEG's signs:
+ *
+ *   MEASURED on the shipped table, deviation of the middle joint from the
+ *   root->end chord, +ve = the anatomically correct side:
+ *     player arm   -15.0 mm   <- elbow pointing FORWARD, i.e. hyperextended
+ *     player leg   +27.0 mm
+ *     ped arm      +10.6 mm   (`src/peds/rig.js`, the control: it is right)
+ *     ped leg      +32.2 mm
+ *
+ * The elbow was 15 mm the wrong side of its own chord and the forearm therefore
+ * carried BACKWARD out of it — a reversed hinge, held at every speed, and the
+ * owner's report ("arms are bent the wrong way, seems contorted") is exactly
+ * that. It reads loudest on carson because his `limb` girth and rolled-below-
+ * the-elbow sleeve put the crease on the silhouette, not because his skeleton
+ * differs: MEASURED, the three brothers' elbows agree to 0.1 degrees.
+ *
+ * The fix mirrors the arm's bow and nothing else. The magnitude is unchanged
+ * (-15.0 -> +15.0 mm), the wrist moves 4 mm and every bone LENGTH moves under
+ * 0.2 mm, so reach, the weapon hand and the IK targets are all where they were.
+ *
+ * NEGATIVE CONTROL: `build.legacyElbow === true` puts the leg-shaped bow back
+ * (and the pre-fix lateral splay below, which is the other half of the same
+ * defect). `identityprobe.mjs` runs it and requires the elbow sign to go red.
+ */
 const LIMB_SPEC = [
-  // clavicle -> hand
+  // clavicle -> hand. The elbow sits BEHIND the shoulder->wrist chord and the
+  // forearm carries forward out of it: a relaxed stand, ~6.6 degrees of flexion.
   ['clav', 'chest', 0.043, 1.418, 0.004],
   ['arm', 'clav', 0.176, 1.428, 0.002],
-  ['forearm', 'arm', 0.199, 1.163, -0.012],
-  ['hand', 'forearm', 0.214, 0.907, 0.004],
-  ['handEnd', 'hand', 0.219, 0.772, 0.012],
-  // leg
+  ['forearm', 'arm', 0.199, 1.163, 0.016],
+  ['hand', 'forearm', 0.214, 0.907, 0.000],
+  ['handEnd', 'hand', 0.219, 0.772, -0.008],
+  // leg. The knee sits IN FRONT of the hip->ankle chord — the opposite sign,
+  // and the one this table already had right.
   ['thigh', 'hips', 0.094, 0.912, 0.004],
   ['shin', 'thigh', 0.099, 0.498, -0.014],
   ['foot', 'shin', 0.101, 0.086, 0.022],
   ['toe', 'foot', 0.101, 0.031, -0.108],
 ];
+
+/** The pre-fix arm z, restored by `build.legacyElbow`. See LIMB_SPEC. */
+const LEGACY_ARM_Z = { clav: 0.004, arm: 0.002, forearm: -0.012, hand: 0.004, handEnd: 0.012 };
+
+/** The arm chain, girdle first. Everything else in LIMB_SPEC is a leg. */
+const ARM_CHAIN = new Set(['clav', 'arm', 'forearm', 'hand', 'handEnd']);
+
+/** Lateral bind x of the shoulder JOINT — the pivot the deltoid span moves. */
+const SHOULDER_X = 0.176;
 
 /** Names, in creation order. Index in this array is the skin index. */
 export const BONE_NAMES = (() => {
@@ -189,12 +231,37 @@ export const BONE_INDEX = (() => {
   return m;
 })();
 
-/** Bind-pose world positions, after the per-brother build has been applied. */
+/**
+ * Bind-pose world positions, after the per-brother build has been applied.
+ *
+ * `shoulder` MOVES THE SHOULDER JOINT; IT DOES NOT STRETCH THE ARM BELOW IT.
+ *
+ * The deltoid span is a property of the girdle — the clavicle and the shoulder
+ * joint it carries — and the arm hangs off that joint the same way on every
+ * man. Scaling the whole chain's absolute x by `shoulder`, which is what this
+ * did, also scaled the LATERAL DRIFT between shoulder, elbow and wrist, so a
+ * broad man's forearm splayed further out than a narrow man's and the elbow
+ * hinge tilted with the build: MEASURED, the upper arm's angle out of vertical
+ * ran carson 5.50 / aidan 5.16 / dylan 4.66 degrees off one authored 4.96.
+ * Small, but it is a per-build shear of the very axis the elbow turns about,
+ * and the bulk deltas can only ever make it worse.
+ *
+ * So the girdle scales and everything distal to the shoulder joint is carried
+ * RIGIDLY by the joint's own displacement. Carson's deltoid span — what
+ * `identityprobe`'s silhouette gate reads — does not move; his wrist comes in
+ * 4 mm; his elbow axis becomes the same axis as his brothers'.
+ *
+ * NEGATIVE CONTROL: `build.legacyElbow === true` restores the old x scaling as
+ * well as the old sagittal bow. One defect, one switch — see LIMB_SPEC.
+ */
 function bindPositions(build) {
   const p = Object.create(null);
   const S = build.scale ?? 1;
   const shoulder = build.shoulder ?? 1;
   const limb = build.limb ?? 1;
+  const legacy = build.legacyElbow === true;
+  // How far the widened girdle carries the shoulder joint, and with it the arm.
+  const armShift = SHOULDER_X * (shoulder - 1);
   const push = (name, x, y, z) => {
     p[name] = [x * S, y * S, z * S];
   };
@@ -202,11 +269,17 @@ function bindPositions(build) {
   for (const side of ['R', 'L']) {
     const s = side === 'R' ? 1 : -1;
     for (const [name, , x, y, z] of LIMB_SPEC) {
-      // Wider shoulders push the arm chain out; heavier legs sit slightly wider.
-      const isArm = name === 'clav' || name === 'arm' || name === 'forearm' ||
-        name === 'hand' || name === 'handEnd';
-      const w = isArm ? shoulder : 1 + (limb - 1) * 0.45;
-      push(name + side, s * x * w, y, z);
+      if (!ARM_CHAIN.has(name)) {
+        // Heavier legs sit slightly wider, at a damped rate.
+        push(name + side, s * x * (1 + (limb - 1) * 0.45), y, z);
+        continue;
+      }
+      // The girdle — clavicle and the shoulder joint it carries — scales with
+      // the deltoid span; everything distal to that joint rides the SAME
+      // displacement, so the elbow axis is the same on every build.
+      const girdle = name === 'clav' || name === 'arm';
+      const lx = legacy ? x * shoulder : girdle ? x * shoulder : x + armShift;
+      push(name + side, s * lx, y, legacy ? LEGACY_ARM_Z[name] : z);
     }
   }
   return p;

@@ -39,6 +39,23 @@
  * active brother's DESIGN.md run speed, not against whatever the code asked
  * for.
  *
+ * ONE SCENARIO HOLDS NO KEY AT ALL. Since `MOVE.autoRunMag`, full deflection
+ * IS the run — the report behind it was "I always need to hold in the run
+ * button to move fast enough" — so `W alone, no Shift (auto-run)` is scored by
+ * the same two criteria as the eleven rows that still hold Shift. The pair is
+ * the point: W is enough, and Shift has not stopped working.
+ *
+ * THE SPRINT SUITE NOW CHOOSES ITS OWN GROUND, and that is not housekeeping.
+ * `sites()` classifies TERRAIN, and a flat tile can have a bench on it; an
+ * attempt covers 8-9.5 m and a contact at that speed is a stumble, which ends
+ * a sprint correctly. Measured on one build, the same twelve scenarios scored
+ * 12/12 in isolation, 3/12 after an 8-site jump phase and 1/12 after the full
+ * 40-site phase — the difference being that `props` only dresses a tile once
+ * its BVH settles, so the site is bare early in a session and furnished later.
+ * The phase now stands on six candidate sites and RAY-CASTS eight headings off
+ * each (`__MP__.clearHeading`), then runs down the one with room. With that,
+ * the same build scores 12/12 after the jump phase too.
+ *
  *   node src/player/moveprobe.mjs
  *   node src/player/moveprobe.mjs --only=jump --sites=48
  *   node src/player/moveprobe.mjs --only=sprint --reps=4
@@ -47,7 +64,12 @@
  * ──────────────────────────────────────────────────────────────────────────
  * IT TAKES ABOUT 14 AND A HALF MINUTES. IT IS NOT HUNG.
  *
- * Measured end to end on a full default run: 14 min 25 s, exit 0, 9/11 gates.
+ * Measured end to end on a full default run: 14 min 25 s, exit 0. It scored
+ * 9/11 gates when that timing was taken; it is 11/11 on the build that added
+ * auto-run, and the two reds it used to carry went green for two different
+ * reasons — the sprint latch by the auto-run work, the nitro A/B by whoever
+ * was in `src/vehicles/` at the same time. Neither number is a claim about
+ * your tree: run it.
  * Unlike the other harnesses this one cannot be stepped: it drives REAL key
  * events through a REAL browser and has to pump REAL rendered frames between
  * them, four gaits at each of ~40 sites, plus the sprint scenarios and a
@@ -229,6 +251,88 @@ try {
         p.rig.reset(m.anchorHeight, m.position, yaw);
         p.animator?.reset();
         return { gy };
+      },
+
+      /**
+       * OWN THE SITE BEFORE MEASURING ON IT.
+       *
+       * The sprint phase runs after the jump phase has teleported the character
+       * to forty sites across the whole city, and by then the world around the
+       * open site is not the world the site was chosen for: traffic has spawned
+       * on it, a wanted level may be live, and the character may be carrying
+       * damage from a fall. All three end a sprint legitimately —
+       * `MOVE.stumble` on a contact, police fire, a hard landing — so a run
+       * scored on that ground is not a measurement of the sprint latch.
+       *
+       * MEASURED, one build, three ways of reaching the same twelve scenarios:
+       * isolated (`--only=sprint`) 12/12 at 6.40 m/s; after an 8-site jump
+       * phase, 3/12 with the SAME 6.40 m/s top speed but the state dropping out
+       * mid-run; after the full 40-site phase, 1/12 and a top speed of 2.94 m/s
+       * — which is `MOVE.airSpeedCap` (3.0), i.e. a character who was never on
+       * the ground at all. The gate was reading the city, not the sprint.
+       */
+      clearSite(x, z, r = 70) {
+        const p = P();
+        const veh = e.ctx.peek('vehicles');
+        e.ctx.peek('police')?.clearWanted?.('probe');
+        for (const o of (veh?.active ?? veh?.vehicles ?? []).slice()) {
+          if (!o?.position) continue;
+          const dx = o.position.x - x, dz = o.position.z - z;
+          if (dx * dx + dz * dz < r * r) veh?.despawn?.(o);
+        }
+        // A fall from the jump phase must not be the reason a sprint stumbles.
+        p.health?.reset?.(true);
+        return true;
+      },
+
+      /**
+       * WHICH WAY IS THERE ROOM TO RUN?
+       *
+       * `sites()` classifies TERRAIN — gradient and planarity — and a tile can
+       * be perfectly flat and have a lamp post, a bench or a wall standing on
+       * it. That is not a hypothetical: the sprint scenarios below hold the key
+       * for 1.2 s, which is 8 m at 6.4 m/s and 9.5 m at Dylan's 7.9, and a
+       * contact at that speed IS a stumble (`MOVE.stumble.wallSpeed` 5.2), which
+       * correctly ends the sprint. Scored on that ground the gate reports the
+       * street furniture rather than the latch.
+       *
+       * It is also why the same twelve scenarios pass in isolation and fail
+       * after the jump phase: the props pass only dresses a tile once its BVH
+       * is settled (see ARCHITECTURE.md rule 8), so early in a session the site
+       * is bare and forty sites later it is furnished.
+       *
+       * So the heading is MEASURED, not assumed: eight of them, each scored by
+       * how far a ray gets down the run line AND down the line the direction-
+       * change test swaps onto, at two heights. Call it after the character is
+       * standing on the site so the tile is really built.
+       */
+      clearHeading(x, z, dist = 16) {
+        const phys = e.ctx.peek('physics');
+        const w = e.ctx.peek('world');
+        const V = Object.getPrototypeOf(P().position).constructor;
+        let gy = phys?.groundHeight?.(x, z, (w?.walkableHeightAt?.(x, z) ?? 0) + 40);
+        if (!Number.isFinite(gy)) gy = w?.walkableHeightAt?.(x, z) ?? 0;
+        const o = new V();
+        const d = new V();
+        const reach = (dx, dz) => {
+          let worst = dist;
+          for (const h of [0.35, 1.2]) {
+            o.set(x, gy + h, z);
+            d.set(dx, 0, dz);
+            const hit = phys?.raycast?.(o, d, dist, phys.MASK.CHARACTER);
+            if (hit?.hit) worst = Math.min(worst, hit.distance);
+          }
+          return worst;
+        };
+        let best = { yaw: 0, room: -1 };
+        for (let i = 0; i < 8; i++) {
+          const yaw = (i / 8) * Math.PI * 2;
+          const s = Math.sin(yaw), c = Math.cos(yaw);
+          // Forward is (-sin, -cos) in this basis; the swap test runs LEFT.
+          const room = Math.min(reach(-s, -c), reach(-c, s));
+          if (room > best.room) best = { yaw, room: +room.toFixed(2) };
+        }
+        return best;
       },
 
       /** Wait until the capsule is genuinely at rest on something. */
@@ -437,11 +541,16 @@ try {
      * gait and calling it "the jump" is the same mistake as sampling the arc at
      * a fixed frame offset.
      */
+    /* The middle row used to be `jog` on a bare W. Auto-run made W and Shift+W
+     * the SAME gait, so that row would have been the sprint row measured twice
+     * — a quarter of a fifteen-minute probe spent proving a thing to itself.
+     * It is the WALK modifier instead, which restores a genuinely slow gait to
+     * the set: the four now span 0, 1.72 and 6.4 m/s. */
     const GAITS = [
       { id: 'stand', keys: [], settle: 0 },
-      { id: 'jog', keys: ['KeyW'], settle: 34 },
-      { id: 'sprint', keys: ['ShiftLeft', 'KeyW'], settle: 46 },
-      { id: 'sprint-release', keys: ['ShiftLeft', 'KeyW'], settle: 46, release: true },
+      { id: 'walk', keys: ['KeyW', 'AltLeft'], settle: 34 },
+      { id: 'run', keys: ['ShiftLeft', 'KeyW'], settle: 46 },
+      { id: 'run-release', keys: ['ShiftLeft', 'KeyW'], settle: 46, release: true },
     ];
 
     /**
@@ -585,7 +694,7 @@ try {
       if (a.length) byClass[c] = dist(a);
     }
     const byGait = {};
-    for (const g of ['stand', 'jog', 'sprint', 'sprint-release']) {
+    for (const g of ['stand', 'walk', 'run', 'run-release']) {
       const a = clean.filter((r) => r.gait === g).map((r) => r.apex);
       if (a.length) byGait[g] = dist(a);
     }
@@ -611,11 +720,33 @@ try {
   /* ==================================================================== */
 
   if (ONLY === 'all' || ONLY === 'sprint') {
-    // Somewhere open and level, so a failure is the sprint code and not a wall.
-    const open = await page.evaluate(() => {
-      const s = window.__MP__.sites(1);
-      return s.flat[0] ?? null;
-    });
+    /**
+     * Somewhere open and level, so a failure is the sprint code and not a wall
+     * — and "open" is now MEASURED on the site the character is standing on
+     * rather than inferred from the terrain field. Six candidates, each stood
+     * on long enough for its tile to finish dressing, and the first one with
+     * room to run in some direction wins. See `__MP__.clearHeading`.
+     */
+    let open = null;
+    let openYaw = 0;
+    let openRoom = 0;
+    {
+      const cands = await page.evaluate(() => window.__MP__.sites(6).flat ?? []);
+      for (const c of cands) {
+        await page.evaluate(([x, z]) => window.__MP__.clearSite(x, z), [c.x, c.z]);
+        await page.evaluate(([x, z]) => window.__MP__.place(x, z, 0), [c.x, c.z]);
+        await page.evaluate(() => window.__MP__.settle(120));
+        await pump(45); // let the tile finish streaming its props before asking
+        const best = await page.evaluate(([x, z]) => window.__MP__.clearHeading(x, z), [c.x, c.z]);
+        if (best.room > openRoom) { open = c; openYaw = best.yaw; openRoom = best.room; }
+        if (openRoom >= 14) break;
+      }
+      if (!open) { open = cands[0] ?? null; }
+      process.stderr.write(
+        `\rmoveprobe: sprint site ${open ? `${open.x.toFixed(0)}, ${open.z.toFixed(0)}` : 'NONE'} ` +
+        `· ${openRoom.toFixed(1)} m of room on heading ${(openYaw * 180 / Math.PI).toFixed(0)} deg          `
+      );
+    }
 
     /**
      * One attempt: from a standing start, hold Shift+W and see whether the
@@ -623,16 +754,17 @@ try {
      * motion — `sprinting` is the state machine's own claim, `speed` is the
      * distance it actually covered.
      */
-    const attempt = async (setup) => {
-      await page.evaluate(([x, z]) => window.__MP__.place(x, z, 0), [open.x, open.z]);
+    const attempt = async (setup, { shift = true } = {}) => {
+      await page.evaluate(([x, z]) => window.__MP__.clearSite(x, z), [open.x, open.z]);
+      await page.evaluate(([x, z, y]) => window.__MP__.place(x, z, y), [open.x, open.z, openYaw]);
       await page.evaluate(() => window.__MP__.settle(120));
       if (setup) await setup();
       const trace = page.evaluate((f) => window.__MP__.rec(f), 75);
-      await page.keyboard.down('ShiftLeft');
+      if (shift) await page.keyboard.down('ShiftLeft');
       await page.keyboard.down('KeyW');
       await pump(70);
       await page.keyboard.up('KeyW');
-      await page.keyboard.up('ShiftLeft');
+      if (shift) await page.keyboard.up('ShiftLeft');
       const t = await trace;
       const tail = t.slice(Math.floor(t.length * 0.5));
       const st = await page.evaluate(() => window.__MP__.state());
@@ -652,6 +784,16 @@ try {
 
     // 1. Bare: whatever the brother spawns with.
     scenarios.push({ name: 'baseline (spawn weapon)', setup: null });
+
+    /**
+     * 1b. NO KEY AT ALL. "I always need to hold in the run button to move fast
+     * enough" — this is the scenario that report names, scored by the same two
+     * criteria as every other row (the state held for the second half of the
+     * trial, AND 85 % of the brother's DESIGN.md run speed off the emitted
+     * motion). Every other row here still holds Shift, so the pair says both
+     * things at once: W alone is enough, and Shift has not stopped working.
+     */
+    scenarios.push({ name: 'W alone, no Shift (auto-run)', setup: null, shift: false });
 
     // 2. One per weapon class — the player's own hypothesis.
     const byCls = { melee: 'pipe', light: 'smg', precise: 'harpoon', explosive: 'rocket' };
@@ -715,7 +857,7 @@ try {
     for (const sc of scenarios) {
       process.stderr.write(`\rmoveprobe: sprint ${++scDone}/${scenarios.length} scenarios  (${sc.name})            `);
       const runs = [];
-      for (let i = 0; i < REPS; i++) runs.push(await attempt(sc.setup));
+      for (let i = 0; i < REPS; i++) runs.push(await attempt(sc.setup, { shift: sc.shift !== false }));
       const pass = runs.filter((r) => r.heldSprint > 0.6 && r.topSpeed > r.runSpeed * 0.85).length;
       rows.push({
         name: sc.name, reps: runs.length, pass,
@@ -744,7 +886,8 @@ try {
      */
     const changes = [];
     for (let rep = 0; rep < REPS; rep++) {
-      await page.evaluate(([x, z]) => window.__MP__.place(x, z, 0), [open.x, open.z]);
+      await page.evaluate(([x, z]) => window.__MP__.clearSite(x, z), [open.x, open.z]);
+      await page.evaluate(([x, z, y]) => window.__MP__.place(x, z, y), [open.x, open.z, openYaw]);
       await page.evaluate(() => window.__MP__.settle(120));
       const trace = page.evaluate((f) => window.__MP__.rec(f), 130);
       await page.keyboard.down('ShiftLeft');
@@ -757,10 +900,28 @@ try {
       await pump(10);
       const first = t.findIndex((r) => r.run === 1);
       if (first < 0) { changes.push({ ok: false, why: 'never sprinted at all' }); continue; }
-      const hit = t.slice(first).some((r) => r.st === 1);
+      /**
+       * THE WINDOW HAS TO END WHEN THE INPUT DOES, and it did not.
+       *
+       * `rec(130)` records 130 RENDERED frames, which is ~260 fixed steps, and
+       * the keys are released after ~90 of those frames. The tail of every
+       * trace is therefore a character standing still with no keys down —
+       * correctly not sprinting — and the old window ran to the end of the
+       * recording and counted it. MEASURED: "worst gap 205 steps" against a
+       * 20-step budget, on every run, on every build. This row has reported 0 %
+       * for as long as it has existed and the number was never about the
+       * direction change at all. It is the same disease as the rest of rule
+       * 12's list: the measurement included something the code was never asked
+       * to do. The window now closes on the last step where the player was
+       * still asking to move.
+       */
+      let lastHeld = -1;
+      for (let i = 0; i < t.length; i++) if (t[i].mag > 0.45) lastHeld = i;
+      if (lastHeld <= first) { changes.push({ ok: false, why: 'no input window' }); continue; }
+      const hit = t.slice(first, lastHeld + 1).some((r) => r.st === 1);
       // The swap shows up in the trace as the step where the wish direction
       // turns; find the longest run of non-sprinting steps after that.
-      const after = t.slice(first);
+      const after = t.slice(first, lastHeld + 1);
       let worst = 0, cur = 0;
       for (const r of after) {
         if (r.run === 0) { cur++; worst = Math.max(worst, cur); } else cur = 0;

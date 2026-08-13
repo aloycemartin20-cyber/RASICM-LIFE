@@ -4,9 +4,9 @@
  * Calibrated against Grand Theft Auto V's on-foot and in-car cameras. Where a
  * value is a direct measurement off GTA V footage it says so.
  *
- *   walk            ~1.7 m/s   (stick barely deflected)
- *   jog             ~3.3 m/s   (default run, no sprint key)
- *   sprint          6.4-7.9    (per brother, DESIGN.md "run speed")
+ *   walk            ~1.7 m/s   (WALK modifier held, or stick barely deflected)
+ *   jog             ~3.3 m/s   (mid stick only — the keyboard has no jog)
+ *   run             6.4-7.9    (per brother, DESIGN.md "run speed") — THE DEFAULT
  *   crouch walk     ~1.5 m/s
  *   jump apex       ~0.62 m
  *   camera distance 3.4 m at rest -> 4.6 m at sprint, 1.6 m aiming
@@ -147,6 +147,35 @@ export const MOVE = {
   walkSpeed: 1.72,
   jogSpeed: 3.35,
   sprintSpeed: 6.9,
+
+  /**
+   * AUTO-RUN. Push the stick (or W) all the way and you RUN — no key held.
+   *
+   * Reported by the owner as "I always need to hold in the run button to move
+   * fast enough", and he was describing a real asymmetry rather than a taste:
+   * `latchInput` has ALWAYS auto-sprinted a gamepad at full deflection
+   * (`Math.abs(input.stick.moveY) > 0.94`), and the keyboard — where
+   * `input.stick` is all zeroes — was simply left out of that line. A player on
+   * WASD therefore topped out at `jogSpeed` (3.35 m/s) unless Shift was held,
+   * while a player on a pad got 6.4-7.9 for free. This is the SAME threshold,
+   * applied to the movement magnitude instead of to one raw pad axis, so both
+   * devices now cross it at the same place and a full diagonal counts too
+   * (`|moveY|` alone reads 0.71 on a diagonal and used to refuse).
+   *
+   * 0.94 and not 1.0: a stick never quite reaches its stop, and not lower,
+   * because everything under it must stay reachable as an analogue gait —
+   * below this the ramp in `targetSpeed` still runs walk -> jog.
+   *
+   * Shift is UNCHANGED and still forces the run at any magnitude over 0.45.
+   * It was deliberately not repurposed as the walk modifier: the same action
+   * carries the vehicle nitro (`NITRO`, on the sprint control), the gamepad
+   * full-stick sprint, and three probes outside this subsystem that press it
+   * (`src/weapons/arsenalprobe.mjs --sprint` among them). Holding it now buys
+   * nothing on foot, which is the point — it is never WRONG to hold, so the
+   * muscle memory the report describes keeps working while it stops being
+   * required. The walk lives on the WALK modifier (Alt, `ACTIONS.walk`).
+   */
+  autoRunMag: 0.94,
   crouchSpeed: 1.48,
   swimSpeed: 2.1,
   swimSprint: 3.4,
@@ -318,6 +347,15 @@ export const CAMERA = {
     /** Mouse sensitivity multiplier relative to config.sensitivity. */
     sens: 1.0,
     pitchMin: -68 * DEG, // looking down at the character from above
+    /**
+     * NOT the ceiling a player looks up to any more — that is per-view, in
+     * `VIEWS[].pitchMax`, and `CAMERA.highLook` is what makes the extra
+     * elevation survivable. This is the fallback used by the one path that is
+     * not a player looking up: the orbit hand-back when you step out of a car
+     * (`camera.setVehicle`), which clamps a boom pitch of about -9 deg and so
+     * never touches it. Left at the historical 34 deg on purpose — widening it
+     * would change where a car hands the orbit back, which nobody asked for.
+     */
     pitchMax: 34 * DEG,
     /** Rest pitch, slightly above the horizon looking down. */
     restPitch: -8 * DEG,
@@ -330,6 +368,61 @@ export const CAMERA = {
     autoTau: 1.1,
     autoSpeed: 3.4, // m/s before auto-centre starts
     autoDelay: 1.35, // s of no look input
+  },
+
+  /**
+   * LOOKING UP AT AN AIRCRAFT. Reported as "cannot shoot at police helicopter
+   * while on foot — the view range is limited and cannot aim that high".
+   *
+   * The police heli orbits at 40-80 m, which puts it 50-70 degrees above the
+   * horizon at the distances you fight it from, and the third-person ceiling
+   * was +34 deg. The reticle physically could not reach it, and since
+   * `weapons` fires down the CAMERA axis, neither could the rounds.
+   *
+   * Why 34 was there is the whole difficulty, and it is geometric rather than
+   * arbitrary: the boom hangs off `-forward`, so pitching the camera up swings
+   * it DOWN and BEHIND. MEASURED on the shipping solver at the old ceiling, the
+   * ideal boom already asks for a camera 0.08 m UNDER the pavement (it is the
+   * sphere cast against the ground, not the clamp, that saves it) and the
+   * character's head then sits ~30 deg above a camera looking 34 deg up — i.e.
+   * the reticle is a hair off the top of his skull. Raise the clamp on its own
+   * and the boom digs a hole, the body fills the middle of the frame, and the
+   * shot you are trying to line up is behind your own character.
+   *
+   * So the ceiling and the tuck are ONE change:
+   *
+   *   knee       below this NOTHING here does anything. Every framing this game
+   *              has ever shipped is under 34 deg, so the tuck cannot regress a
+   *              single existing shot — it is inert until the player asks for
+   *              elevation the game did not have.
+   *   boomFollow how much of the pitch ABOVE the knee the boom placement takes.
+   *              0 would leave the boom at its 34-deg geometry and only rotate
+   *              the lens (cheap, but the camera stays at knee height); 1 is
+   *              today's behaviour and buries it. A small share keeps the sense
+   *              that the camera is swinging under him without paying for it.
+   *   distScale  and the boom shortens as it swings, which is what GTA does and
+   *              what keeps the camera out of the ground: a shorter arm at a
+   *              steeper angle drops less far.
+   *   heightGain metres added to the boom height (in the VIEW basis, so it
+   *              lifts up and back) — this is what puts the lens above the
+   *              shoulder rather than under it.
+   *
+   * The three are solved together against what `src/player/camtest.mjs`
+   * (family `look`) measures off the emitted transform, swept in five-degree
+   * steps through three views with and without ADS. MEASURED in the chase view
+   * at 0 / 34 / 50 / 72 deg of lens: camera 1.76 / 0.36 / 0.59 / 1.44 m above
+   * the feet, head-to-reticle 5.4 / 6.5 / 28.9 / 65.9 deg, lens-to-crown
+   * 3.39 / 2.57 / 2.69 / 1.87 m. Read the middle of that: the boom is at its
+   * LOWEST around the old ceiling and climbs back out above it, which is the
+   * shape the tuck is for — 34 deg was where the shipped camera already skimmed
+   * the pavement, and the gates hold the new angles to no worse than that floor
+   * while requiring chest height by the time the lens is at the ceiling.
+   */
+  highLook: {
+    knee: 34 * DEG,
+    boomFollow: 0.15,
+    distScale: 0.42,
+    heightGain: 0.72,
   },
 
   /** Boom geometry. All lengths in metres from the pivot. */
@@ -689,14 +782,22 @@ CHASE.classFrame = {
  * head (on foot) or the bonnet (in a car), which is what makes the fourth view
  * first-person without a second solver to blend against.
  *
- * `pitchMax` is per-view because the third-person clamp (+34 deg) exists to stop
- * the boom swinging under the character's feet — a constraint that does not
- * apply when the boom is 3 cm long and you want to look up at a tower.
+ * `pitchMax` is per-view because the third-person clamp exists to stop the boom
+ * swinging under the character's feet — a constraint that does not apply when
+ * the boom is 3 cm long and you want to look up at a tower.
+ *
+ * The three third-person ceilings were +34 / +34 / +30 and are now +72 / +72 /
+ * +66, because a police helicopter at 40-80 m sits 50-70 deg up and could not
+ * be put under the reticle at all. `CAMERA.highLook` is the other half of that
+ * change and is not optional: above 34 deg the boom shortens and tucks, or the
+ * camera ends up in the pavement. `far` keeps a lower ceiling than the other
+ * two for the same reason it always did — its boom is 1.62x as long, so it
+ * swings 1.62x as far for the same angle.
  */
 export const VIEWS = [
-  { id: 'chase', dist: 1.00, height: 1.00, lateral: 1.00, near: 0, pitchMax: 34 * DEG },
-  { id: 'close', dist: 0.68, height: 0.80, lateral: 1.10, near: 0, pitchMax: 34 * DEG },
-  { id: 'far', dist: 1.62, height: 1.45, lateral: 0.85, near: 0, pitchMax: 30 * DEG },
+  { id: 'chase', dist: 1.00, height: 1.00, lateral: 1.00, near: 0, pitchMax: 72 * DEG },
+  { id: 'close', dist: 0.68, height: 0.80, lateral: 1.10, near: 0, pitchMax: 72 * DEG },
+  { id: 'far', dist: 1.62, height: 1.45, lateral: 0.85, near: 0, pitchMax: 66 * DEG },
   { id: 'near', dist: 0.02, height: 0.00, lateral: 0.00, near: 1, pitchMax: 76 * DEG },
 ];
 

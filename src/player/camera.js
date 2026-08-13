@@ -17,8 +17,20 @@
  * 2. ORBIT. Mouse yaw/pitch integrate into a *target* pair and the live pair
  *    chases them with a 28 ms time constant. That single filter is what turns a
  *    raw mouse delta into GTA's slightly weighty look. Pitch is clamped
- *    asymmetrically (-68 deg down, +34 up), because in third person you look
- *    down at the character far more than you look up.
+ *    asymmetrically (-68 deg down, and up to the per-view ceiling in `VIEWS`),
+ *    because in third person you look down at the character far more than you
+ *    look up.
+ *
+ *    THE UP CEILING WAS +34 AND IS NOW +72 (chase/close; +66 far, +76 first
+ *    person). A police helicopter orbits 50-70 deg above the horizon and could
+ *    not be put under the reticle at all — and since `weapons` fires down the
+ *    camera axis, that was the elevation limit of every gun in the game rather
+ *    than a framing preference. Above +34 the boom tucks (see `CAMERA.highLook`
+ *    and step 3b of `_solveFoot`) because the raised clamp on its own puts the
+ *    camera in the pavement. `rig.highLook = false` reverts both halves;
+ *    `src/player/camtest.mjs` (family `look`) and
+ *    `src/player/aimhighprobe.mjs` gate it, the second by firing a real round
+ *    at a target 50 m up.
  *
  * 3. BOOM GEOMETRY. The camera sits at
  *
@@ -26,7 +38,9 @@
  *
  *    with `forward/right/up` the pitched view basis. That construction has one
  *    very useful property: the character's SCREEN position is invariant to
- *    pitch, so looking up and down never re-frames him. `distance` grows and
+ *    pitch, so looking up and down never re-frames him — which is also exactly
+ *    why the up-ceiling used to be +34: the same invariance means the boom
+ *    swings a metre under his feet for every 20 deg of elevation. `distance` grows and
  *    `height` shrinks with speed — the camera swings out and drops as you run,
  *    which is most of what makes a GTA sprint feel fast. Aiming collapses both
  *    and pushes `lateral` out to a shoulder offset that can swap sides.
@@ -184,6 +198,18 @@ export class CameraRig {
     this.collideRadius = C.boom.distIdle;
     this.characterFade = 1;
     /**
+     * NEGATIVE CONTROL for the elevation work, and the only switch that turns
+     * it off: false restores the +34 deg third-person ceiling AND the untucked
+     * boom, i.e. exactly the build that could not put a reticle on a police
+     * helicopter. Both halves are one flag on purpose — reverting the clamp
+     * without the tuck is a build nobody shipped, so a control that reverted
+     * only one of them would be measuring a third thing.
+     * `src/player/camtest.mjs --control=look` flips it.
+     */
+    this.highLook = true;
+    /** 0..1 share of the pitch range above the knee. Published for the gates. */
+    this.highLookT = 0;
+    /**
      * Rings of recent free-space measurements. The boom uses the MINIMUM over
      * the window, so a single frame in which the sphere cast happens to miss
      * can never release the camera into a wall. That is the other half of the
@@ -224,7 +250,9 @@ export class CameraRig {
     this._viewDur = VIEW_TIME.min;
     this._viewFrom = { dist: 1, height: 1, lateral: 1, near: 0 };
     this._bonnet = new THREE.Vector3();
-    /** True when the fourth view sits in a cabin. See `_resolveFrame`. */
+    /** True when the fourth view sits in a cabin. See `_resolveFrame`.
+     * Published via `interiorEye` — `player` collapses the head bone off it
+     * so the lens never sits inside a rendered skull. */
     this._interiorEye = false;
 
     this._chasePos = new THREE.Vector3();
@@ -517,9 +545,16 @@ export class CameraRig {
   /* the view cycle                                                       */
   /* ==================================================================== */
 
-  /** How far up this view is allowed to look. See VIEWS in tuning.js. */
+  /**
+   * How far up this view is allowed to look. See VIEWS in tuning.js.
+   *
+   * First person is exempt from the control switch: its 76 deg predates the
+   * elevation work and has nothing to do with the boom, which is 3 cm long.
+   */
   get pitchMax() {
-    return VIEWS[this.view].pitchMax;
+    const pm = VIEWS[this.view].pitchMax;
+    if (this.highLook || VIEWS[this.view].near === 1) return pm;
+    return Math.min(pm, CAMERA.orbit.pitchMax);
   }
 
   get viewSpec() {
@@ -533,6 +568,11 @@ export class CameraRig {
   /** True once the fourth view has actually arrived, not merely been asked for. */
   get firstPerson() {
     return this.nearBlend > 0.72;
+  }
+
+  /** True while the fourth view's eye sits inside a modelled cabin. */
+  get interiorEye() {
+    return this._interiorEye;
   }
 
   /** Snapshot where the channels are NOW and start a fresh timed ease. */
@@ -812,6 +852,38 @@ export class CameraRig {
     wantLateral *= this._viewLateral;
     this.shoulderBlend = approach(this.shoulderBlend, this.shoulder, B.swapTau, dt);
 
+    /**
+     * ---- 3b. HIGH LOOK ----
+     *
+     * The boom hangs off `-forward`, so every degree the lens gains looking up
+     * costs the camera height and pushes it back through the character. Past
+     * `highLook.knee` the arm therefore stops following the lens one-for-one:
+     * it keeps a share of the swing (`boomFollow`), shortens (`distScale`) and
+     * rides up the view basis (`heightGain`). See CAMERA.highLook for why the
+     * three move together and what they are solved against.
+     *
+     * This is a NO-OP below the knee — `above` is zero there and every term
+     * collapses — so no framing this game already ships can move. It is also a
+     * no-op in first person, where the boom is 3 cm and there is nothing to
+     * tuck; `nearBlend` fades it out over the view change rather than at it.
+     *
+     * `boomPitch` is the PLACEMENT only. The lens keeps `this.pitch`, which is
+     * what the reticle and `weapons`' fire direction are built from — the point
+     * of the whole change is that those two reach 72 deg.
+     */
+    const HL = C.highLook;
+    let boomPitch = this.pitch;
+    this.highLookT = 0;
+    if (this.highLook && this.pitch > HL.knee) {
+      const above = this.pitch - HL.knee;
+      const near = 1 - this.nearBlend;
+      const t = clamp01(above / Math.max(1e-3, this.pitchMax - HL.knee)) * near;
+      this.highLookT = t;
+      boomPitch = this.pitch - above * (1 - HL.boomFollow) * near;
+      wantDist *= lerp(1, HL.distScale, t);
+      wantHeight += HL.heightGain * t;
+    }
+
     const viewing = this._viewT < 1;
     const tau = viewing ? B.viewTau : (aim > 0.02 ? B.aimTau : B.tau);
     this.distIdeal = approach(this.distIdeal, wantDist, tau, dt);
@@ -820,7 +892,7 @@ export class CameraRig {
 
     /* ---- 4. basis ---- */
     const sy = Math.sin(this.yaw), cy = Math.cos(this.yaw);
-    const sp = Math.sin(this.pitch), cp = Math.cos(this.pitch);
+    const sp = Math.sin(boomPitch), cp = Math.cos(boomPitch);
     this._fwd.set(-sy * cp, sp, -cy * cp);
     this._right.set(cy, 0, -sy);
     this._up.crossVectors(this._right, this._fwd);

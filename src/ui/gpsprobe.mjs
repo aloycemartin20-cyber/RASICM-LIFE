@@ -42,8 +42,13 @@
  *
  * Negative controls, all of which must fire or the run is meaningless:
  *
- *   nowaypoint   with no pin dropped there is no line. If this is not null the
- *                later "a line appeared" checks are asserting a constant
+ *   norings      with the rings switched off (the live `?owNoRings=1` arm) AND
+ *                no pin dropped there is no line. If this is not null the
+ *                later "a line appeared" checks are asserting a constant.
+ *                "No pin" alone is no longer that state: the player is always
+ *                in free roam and the next chapter stands in the world as a
+ *                ring the GPS routes to, which is what the third section below
+ *                is about
  *   liveobjective  a RUNNING chapter must own the panel. If the NEXT state
  *                showed through a live mission, the "it survives the card"
  *                check would pass on a build where NEXT simply never goes away
@@ -113,6 +118,10 @@ await run(`
       value: String(value ?? ''), card: ui.bigCard.active });
     return notify(text, value, tone);
   };
+  // Every mission:start, off the BUS — the artefact both doors have to produce.
+  window.__GPS__.starts = [];
+  e.ctx.events.on('mission:start', (p) => window.__GPS__.starts.push(
+    { id: p.id, chapter: p.chapter, name: p.name, zone: p.zone, track: p.track }));
   e.input.enabled = true;
   e.input.frozen = false;
   game.missions.abort();
@@ -130,10 +139,54 @@ const ok = (name, cond, detail) => {
 /* 1. the GPS line                                                      */
 /* ==================================================================== */
 
-// NEGATIVE CONTROL: no pin, no line.
+/**
+ * NEGATIVE CONTROL: NOTHING TO NAVIGATE TO -> NO LINE.
+ *
+ * "No pin dropped" is no longer that state. The player is always in free roam
+ * now and the next chapter stands in the world as a ring
+ * (`src/game/freeroam.js:StagingRings`), which the GPS routes to when he has
+ * expressed no preference of his own — so an empty HUD needs BOTH off. The
+ * rings' own `enabled` switch is the live `?owNoRings=1` arm, which is exactly
+ * what makes this a control rather than a special case.
+ */
+await run(`
+  game.freeroam.rings.enabled = false;
+  game.missions.userWaypoint = null;
+  e.ctx.events.emit('ui:waypoint', null);
+  return true;`);
+await page.waitForTimeout(1400);
+await pump(30);
 const idle = await run(`return { route: ui.state.route, wp: ui.state.waypoint };`);
-ok('NEG CONTROL: no waypoint dropped -> no route on the HUD',
+ok('NEG CONTROL: nothing asking for a line -> no route on the HUD',
   idle.route === null || idle.route === undefined, `route ${JSON.stringify(idle.route)}`);
+
+/* -- the ring, and the line to it -------------------------------------- */
+await run(`game.freeroam.rings.enabled = true; return true;`);
+await page.waitForTimeout(1400);
+await pump(30);
+const ringNav = await run(`
+  const s = game.freeroam.rings.slots[0];
+  const pin = game.getHudState().next;
+  const r = ui.state.route ? Array.from(ui.state.route) : null;
+  return {
+    ring: s.on ? { x: s.x, z: s.z, y: s.y, r: s.r } : null,
+    water: s.on ? world.isWater(s.x, s.z) : null,
+    pin: pin ? { x: pin.x, z: pin.z, name: pin.name } : null,
+    surface: s.on ? world.surfaceAt(s.x, s.z) : null,
+    end: r ? { x: r.at(-2), z: r.at(-1) } : null,
+    n: r ? r.length / 2 : 0,
+  };`);
+ok('a ring stands at the next chapter\'s staging point',
+  !!ringNav.ring && !!ringNav.pin &&
+  Math.hypot(ringNav.ring.x - ringNav.pin.x, ringNav.ring.z - ringNav.pin.z) < 1,
+  `ring ${JSON.stringify(ringNav.ring)} against the map pin ${JSON.stringify(ringNav.pin)}`);
+ok('...on dry, reachable ground', ringNav.water === false,
+  `world.isWater ${ringNav.water}, surface "${ringNav.surface}"`);
+ok('...and the GPS routes to it with no pin dropped at all',
+  !!ringNav.end && ringNav.n >= 2 &&
+  Math.hypot(ringNav.end.x - ringNav.ring.x, ringNav.end.z - ringNav.ring.z) <= END_EPS,
+  `${ringNav.n} point(s), the line ends ` +
+  `${ringNav.end ? Math.hypot(ringNav.end.x - ringNav.ring.x, ringNav.end.z - ringNav.ring.z).toFixed(2) : '-'} m from the ring`);
 
 /**
  * Drop the pin through the exact wire the pause map uses (`ui:waypoint`), at a
@@ -231,14 +284,27 @@ const startShift = moved && resolved.now
 ok('the line re-solves from where the car now is (the ~1 Hz poll runs)',
   startShift > 50, `the start moved ${startShift.toFixed(0)} m after the player did`);
 
-/** Clearing the pin clears the line — otherwise a stale route outlives it. */
+/**
+ * Clearing the pin hands the line back to the RING — it must not leave a stale
+ * route to a destination the player has just dismissed, and it must not leave
+ * him with nothing either. The pin the probe dropped is hundreds of metres from
+ * the staging point, so "the line moved back to the ring" is a real change of
+ * destination and not the same array by another name.
+ */
 const cleared = await run(`
   e.ctx.events.emit('ui:waypoint', null);
   return true;`);
-await page.waitForTimeout(1400);
-await pump(20);
-ok('clearing the waypoint clears the line',
-  cleared && (await run(`return ui.state.route;`)) === null, 'route back to null');
+await page.waitForTimeout(1600);
+await pump(30);
+const backToRing = await run(`
+  const s = game.freeroam.rings.slots[0];
+  const r = ui.state.route ? Array.from(ui.state.route) : null;
+  return { end: r ? { x: r.at(-2), z: r.at(-1) } : null,
+    ring: { x: s.x, z: s.z }, wp: ui.state.waypoint };`);
+ok('clearing the waypoint hands the line back to the chapter ring',
+  cleared && !!backToRing.end &&
+  Math.hypot(backToRing.end.x - backToRing.ring.x, backToRing.end.z - backToRing.ring.z) <= END_EPS,
+  `line ends ${backToRing.end ? Math.hypot(backToRing.end.x - backToRing.ring.x, backToRing.end.z - backToRing.ring.z).toFixed(2) : '-'} m from the ring`);
 
 /* ==================================================================== */
 /* 2. the persistent NEXT state                                         */
@@ -251,6 +317,7 @@ ok('clearing the waypoint clears the line',
 const panelOf = `{
   eyebrow: (ui.root.querySelector('.ow-obj-eyebrow')?.textContent ?? '').trim(),
   text: (ui.root.querySelector('.ow-obj-text')?.textContent ?? '').trim(),
+  count: (ui.root.querySelector('.ow-obj-count')?.textContent ?? '').trim(),
   vis: +((ui.root.querySelector('.ow-obj')?.style.opacity) || '0'),
 }`;
 
@@ -279,6 +346,14 @@ ok('...without making game.objective truthy in free roam (hud.js reads that)',
 ok('...and the map carries a chapter pin for it',
   !!nextIdle.next && nextIdle.blips.includes('chapter'),
   `pin ${JSON.stringify(nextIdle.next)}, blip kinds ${JSON.stringify(nextIdle.blips)}`);
+/**
+ * THE PANEL NAMES THE PLACE, NOT THE KEY. `game/index.js:RING_CUE` is the one
+ * string behind this, the SIDE JOB line and both announce toasts, so a build
+ * where the cue drifts between surfaces fails here.
+ */
+ok('...and tells him HOW to start it, in world terms',
+  /RING/.test(nextIdle.panel.count),
+  `the panel's meta line reads "${nextIdle.panel.count}"`);
 
 // NEGATIVE CONTROL: a live chapter owns the panel; NEXT must not show through.
 const live = await run(`
@@ -301,14 +376,25 @@ ok('NEG CONTROL: a running chapter owns the panel, NEXT does not show through',
  * THE DEFECT, EXACTLY. WIN the chapter — the real path, `missions.win` ->
  * `mission:complete` -> `ui`'s own result card — and watch both halves: the
  * panel must go back to NEXT while the card is still up, and the toast must
- * NOT fire underneath it. The outro banter is skipped (`doneHold = 0`) because
- * this file is about the card, not about the dialogue that precedes it.
+ * NOT fire underneath it. The outro banter is skipped because this file is
+ * about the card, not about the dialogue that precedes it.
+ *
+ * SKIPPING IT MEANS SKIPPING THE SCENE, not just the hold. Setting
+ * `doneHold = 0` and `sceneDone = true` does NOT end the outro:
+ * `mission.js:593` returns early for as long as `cut.active`, and only
+ * `_sceneOverran` (26 s of raw time, `SCENE_WATCHDOG`) puts it down. MEASURED
+ * on this exact sequence — `{phase: 'outro', state: 'won', sceneDone: true,
+ * doneHold: 0, cut: true, scale: 0}` twenty seconds after `win()` — so the
+ * three checks below were racing a 26 s watchdog against a 20 s wait and this
+ * file was calling the loser a defect. `skipAll()` is the button the player
+ * has; press it.
  */
 await run(`
   window.__GPS__.notifies.length = 0;
   const M = game.missions.M;
   game.missions.win(M);
   M.doneHold = 0;
+  ui.subs.cut && ui.subs.cut.skipAll && ui.subs.cut.skipAll();
   M.sceneDone = true;
   return true;`);
 await page.waitForFunction(
@@ -316,7 +402,8 @@ await page.waitForFunction(
 ).catch(() => {});
 await pump(20);
 /**
- * `PRESS J` is what identifies the announce toast, and the filter matters: a
+ * `PRESS J` is what identifies the announce toast — it is a SUBSTRING now, the
+ * value reads "FOLLOW THE RING · PRESS J" — and the filter matters: a
  * won chapter legitimately toasts its PAYOUT under the card (`+$700`), and a
  * check that counted every notification would have called that the defect.
  */
@@ -325,7 +412,7 @@ const underCard = await run(`
   const all = window.__GPS__.notifies;
   return { card: ui.bigCard.active, panel: ${panelOf}, running: game.missions.active,
     all: all.map((x) => x.text + ' / ' + x.value),
-    announce: all.filter((x) => x.value === 'PRESS J').map((x) => x.text) };`);
+    announce: all.filter((x) => /PRESS J/.test(x.value)).map((x) => x.text) };`);
 ok('the chapter really ended and the result card really came up (test can fail)',
   underCard.card === true, `card ${underCard.card}, chapter still running ${underCard.running}`);
 ok('the NEXT state is back while the result card is still up',
@@ -346,7 +433,7 @@ await pump(40);
 const afterCard = await run(`
   const all = window.__GPS__.notifies;
   return { panel: ${panelOf}, card: ui.bigCard.active,
-    announce: all.filter((x) => x.value === 'PRESS J')
+    announce: all.filter((x) => /PRESS J/.test(x.value))
       .map((x) => ({ text: x.text, card: x.card })) };`);
 ok('the toast arrives once the screen is the player\'s again',
   afterCard.card === false && afterCard.announce.length > 0 &&
@@ -355,6 +442,119 @@ ok('the toast arrives once the screen is the player\'s again',
 ok('and the panel still says what is next after the card is gone',
   afterCard.panel.eyebrow === 'NEXT CHAPTER',
   `"${afterCard.panel.eyebrow}" / "${afterCard.panel.text}"`);
+
+/* ==================================================================== */
+/* 3. the phone's STORY page reflects what has actually been played     */
+/* ==================================================================== */
+/**
+ * A chapter has just been WON through the real path, so the frontier has
+ * moved. The page is read out of the phone's rendered ROWS — the DOM the
+ * player looks at — and not off `game.getProgress()`, which is the arithmetic
+ * that fed it. `game._pushProgress` is the only thing that ever writes this;
+ * the probe never calls `setState`, so a build where the push is missing
+ * fails here with the constructor's zeroes.
+ *
+ * NEGATIVE CONTROL is built in and is the reason the row texts are compared
+ * rather than merely non-empty: before this wave the page printed a hard-coded
+ * "4 / 24" on every save including a brand new one, so any check that only
+ * asked "is there a number" passed on the dead build.
+ */
+await run(`
+  ui.phone.show();
+  ui.phone.tab = 2;         // STORY
+  ui.phone.index = 0;
+  ui.phone._paint();
+  return true;`);
+await pump(10);
+const story = await run(`
+  const rows = [...ui.root.querySelectorAll('.ow-phone-row')]
+    .filter((r) => r.style.display !== 'none')
+    .map((r) => ({
+      n: (r.querySelector('.n')?.textContent ?? '').trim(),
+      s: (r.querySelector('.s')?.textContent ?? '').trim(),
+      v: (r.querySelector('.v')?.textContent ?? '').trim(),
+    }));
+  return { rows, frontier: game.getHudState().chapter, tabs:
+    [...ui.root.querySelectorAll('.ow-phone-tabs .tab')].map((t) => t.textContent.trim()) };`);
+const done = story.rows.filter((r) => r.v === 'DONE');
+const current = story.rows.filter((r) => r.v === 'CURRENT');
+const completion = story.rows.find((r) => r.n === 'COMPLETION') ?? null;
+const jobsRow = story.rows.find((r) => r.n === 'SIDE JOBS') ?? null;
+ok('the phone has a STORY page', story.tabs.includes('STORY'), story.tabs.join(' · '));
+ok('...listing the chapter just completed as DONE',
+  done.length === story.frontier && story.frontier >= 1,
+  `${done.length} DONE against a frontier of ${story.frontier}: ${done.map((r) => r.n).join(', ')}`);
+ok('...and exactly one CURRENT chapter to go to next',
+  current.length === 1, current.map((r) => `${r.n} ${r.v}`).join(' | ') || 'none');
+ok('...with a completion percent that is neither 0 nor a hard-coded default',
+  !!completion && /^[1-9]\d?%$/.test(completion.v) && /OF 24 CHAPTERS$/.test(completion.s),
+  completion ? `"${completion.n}" ${completion.s} -> ${completion.v}` : 'no COMPLETION row');
+ok('...and a free-roam job tally',
+  !!jobsRow && /^\d+$/.test(jobsRow.v),
+  jobsRow ? `${jobsRow.n} = ${jobsRow.v}` : 'no SIDE JOBS row');
+// PUT THE PHONE DOWN. An open phone is a live `phone` pause claim, and the
+// section below drives the player through a ring — which a stopped world
+// correctly refuses to notice (`game._syncRings` is gated on it).
+await run(`ui.phone.hide(); return true;`);
+await pump(30);
+
+/* ==================================================================== */
+/* 4. THE RING IS THE SAME DOOR AS J                                    */
+/* ==================================================================== */
+/**
+ * Drive the player onto the staging point in steps a car could cover — the
+ * entry test is swept but ignores teleports, so a single `placePlayer` onto
+ * the ring is (correctly) not an entry. Then compare the `mission:start` the
+ * ring produced with the one `game.startMission` produces for the same
+ * chapter: two EMITTED payloads, field by field. Nothing here reads the
+ * runner's own idea of what it started.
+ */
+const walkIn = async () => {
+  const from = await run(`
+    const s = game.freeroam.rings.slots[0];
+    window.__GPS__.starts.length = 0;
+    game.wq.placePlayer(s.x + 60, s.z, 0, null);
+    return { x: s.x, z: s.z };`);
+  await pump(8);
+  for (let i = 1; i <= 6; i++) {
+    await run(`game.wq.placePlayer(ARG.x + 60 * (1 - ARG.t), ARG.z, 0, null); return true;`,
+      { x: from.x, z: from.z, t: i / 6 });
+    await pump(4);
+  }
+  await pump(10);
+  return from;
+};
+await walkIn();
+const ringStart = await run(`
+  return { active: game.missions.active, phase: game.missions.M ? game.missions.M.phase : null,
+    starts: window.__GPS__.starts.slice() };`);
+ok('driving into the ring starts the chapter',
+  ringStart.active === true && ringStart.starts.length === 1,
+  `${ringStart.starts.length} mission:start, phase ${ringStart.phase}`);
+
+// Put the intro cutscene down before the second start: two scenes stacked on
+// one another hold `time.scale` at 0 and the comparison below stops being
+// about the door either of them opened.
+await run(`
+  ui.subs.cut && ui.subs.cut.skipAll && ui.subs.cut.skipAll();
+  game.missions.abort();
+  window.__GPS__.starts.length = 0;
+  return true;`);
+await pump(30);
+await run(`game.startMission(game.nextChapter().index); return true;`);
+await pump(10);
+const keyStart = await run(`return window.__GPS__.starts.slice();`);
+const a = ringStart.starts[0] ?? null;
+const bK = keyStart[0] ?? null;
+ok('...and it is the SAME mission:start the J path emits',
+  !!a && !!bK && a.chapter === bK.chapter && a.name === bK.name &&
+  a.zone === bK.zone && a.track === bK.track,
+  `ring ${JSON.stringify(a)} vs key ${JSON.stringify(bK)}`);
+await run(`
+  ui.subs.cut && ui.subs.cut.skipAll && ui.subs.cut.skipAll();
+  game.missions.abort();
+  return true;`);
+await pump(30);
 
 /* ==================================================================== */
 

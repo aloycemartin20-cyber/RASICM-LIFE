@@ -2,6 +2,7 @@ import { RoadGraph } from './roadgraph.js';
 import {
   RIVERS, DISTRICTS, BRIDGES, BLUFF, ROAD_KIND,
   SAFEHOUSES, SERVICES, DOCKS, LANDMARKS, POI_PAD, LANDMARK_RESERVE,
+  WATER_Y, RIVER_OVERHANG,
   corridorHalfWidth, roadHalfWidth, clamp01, smoothstep, smootherstep, lerp, segDist2,
   nearestSiteDist, corridorStreetName,
 } from './plan.js';
@@ -39,6 +40,79 @@ const MAP_EDGE = 1420;
  */
 const MAX_GRADE = 0.30;
 const _seg = { d2: 0, t: 0 };
+
+/* ----------------------------------------------------------- the rivers -- */
+
+/**
+ * How far a road surface must clear the pool level before the river stops
+ * being drawn over it.
+ *
+ * `applyRoads` sinks the ground `0.55 * w` under the corridor on purpose, so a
+ * deck exactly at `WATER_Y` leaves the GROUND beside its own kerb half a metre
+ * under the pool and `water.js` paints the sheet across it. 1.2 m is that
+ * 0.55 plus the 8 m bake's bilinear error and the two-octave detail band the
+ * corridor does not fully suppress at its fringe, so a corridor this admits
+ * keeps its verge dry as well as its tarmac.
+ */
+const FLOOD_FREEBOARD = 1.2;
+/**
+ * How finely the SPAN between two corridor vertices is tested for water.
+ *
+ * `clipToLand` used to test VERTICES ONLY, and `resample` hands it steps of 22
+ * to 60 m — so a street could keep both ends of a 46 m segment on dry ground
+ * and lay the middle of it across the inside of a river bend. Six metres is
+ * under the narrowest thing the test has to resolve (a road half-width) and
+ * costs one `waterDist` per sample at init.
+ */
+const LAND_SPAN_STEP = 6;
+
+/**
+ * A/B hatch for the flood tests below — the corridor clip, the two link
+ * legality tests and the height-solve floor — same shape as `closureDisabled`.
+ * `?nofloodclip=1` on the page, or `OW_NO_FLOODCLIP=1` from Node.
+ *
+ * This is the negative control `src/game/groundtruthprobe.mjs`'s river sweep is
+ * proved against: with it set the sweep must find submerged carriageway again,
+ * and a run where it does not is a run that measured nothing.
+ */
+function floodClipDisabled() {
+  try {
+    if (typeof location !== 'undefined' && new URLSearchParams(location.search).get('nofloodclip') === '1') return true;
+  } catch { /* no location */ }
+  try {
+    if (typeof process !== 'undefined' && process?.env?.OW_NO_FLOODCLIP === '1') return true;
+  } catch { /* no process */ }
+  return false;
+}
+
+/**
+ * Read once per `generateCity` rather than per sample: `underRiver` is called
+ * tens of thousands of times through `clipToLand`, and parsing a query string
+ * or touching `process.env` inside that loop is not free. Latched at the top of
+ * `generateCity` so a probe can flip the hatch between two generations in one
+ * process, which is exactly what the negative control does.
+ */
+let _floodOff = false;
+
+/**
+ * IS THIS GROUND UNDER THE DRAWN RIVER? Not "is it inside the channel" —
+ * `terrain.isWater` answers that and answers it too narrowly.
+ *
+ * `water.js` draws each sheet out to `RIVER_OVERHANG` past the waterline and
+ * leaves it at pool level wherever the ground there is below the pool, so any
+ * ground under `WATER_Y` within that reach has a river on top of it however far
+ * outside the waterline it is. See `plan.js`'s `RIVER_OVERHANG` for the
+ * measurement and for the street this was written for.
+ *
+ * The bar is `FLOOD_FREEBOARD` rather than the pool level itself because every
+ * caller here is laying a CORRIDOR, and a corridor brings its own sunk verge
+ * with it.
+ */
+function underRiver(terrain, x, z) {
+  if (_floodOff) return false;
+  if (terrain.waterDist(x, z) >= RIVER_OVERHANG) return false;
+  return terrain.heightAt(x, z) < WATER_Y + FLOOD_FREEBOARD;
+}
 
 /* ------------------------------------------------------------- polylines -- */
 
@@ -111,18 +185,47 @@ function pathLength(pts) {
 /**
  * Split a polyline into the runs that are on dry land inside the map.
  * `margin` metres of setback from the waterline.
+ *
+ * DRY IS TWO QUESTIONS, and this used to ask only the first. A setback from the
+ * WATERLINE is a plan distance, and it says nothing about the ground it lands
+ * on: `underRiver` is the second question — is the river being DRAWN over this
+ * point — and 4.51 % of the band it covers is below the pool. See
+ * `plan.js`'s `RIVER_OVERHANG`.
+ *
+ * AND IT IS ASKED OF THE SPAN, not of the vertices. `resample` hands this
+ * polylines stepped at 22-60 m, so two dry vertices are no evidence at all
+ * about the 46 m of carriageway between them — the same class of hole as a gate
+ * that samples a placement at its own centre point (ARCHITECTURE.md rule 12).
+ * The span carries the WATER tests only; the slope test stays on the vertices
+ * it was written for, because a corridor that must clear every intermediate
+ * sample of a slope limit is a different and much harsher road network, and
+ * that is not the defect being fixed here.
  */
 function clipToLand(pts, terrain, margin = 12, maxSlope = 1) {
+  const dry = (x, z) =>
+    Math.abs(x) < MAP_EDGE &&
+    Math.abs(z) < MAP_EDGE &&
+    terrain.waterDist(x, z) > margin &&
+    !underRiver(terrain, x, z);
+  /** Every `LAND_SPAN_STEP` between two kept vertices, ends excluded. */
+  const spanDry = (a, b) => {
+    const d = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    const n = Math.floor(d / LAND_SPAN_STEP);
+    for (let k = 1; k < n; k++) {
+      const t = k / n;
+      if (!dry(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)) return false;
+    }
+    return true;
+  };
   const runs = [];
   let cur = null;
   for (let i = 0; i < pts.length; i++) {
     const [x, z] = pts[i];
-    const ok =
-      Math.abs(x) < MAP_EDGE &&
-      Math.abs(z) < MAP_EDGE &&
-      terrain.waterDist(x, z) > margin &&
-      (maxSlope >= 1 || terrain.slopeAt(x, z, 8) < maxSlope);
+    const ok = dry(x, z) && (maxSlope >= 1 || terrain.slopeAt(x, z, 8) < maxSlope);
     if (ok) {
+      // A wet span does not reject either endpoint — it cuts BETWEEN them, so
+      // the run ends here and the next one starts at this vertex.
+      if (cur && !spanDry(cur[cur.length - 1], pts[i])) cur = null;
       if (!cur) runs.push((cur = []));
       cur.push([x, z]);
     } else cur = null;
@@ -867,6 +970,9 @@ export function generateCity(terrain, rng) {
   const blocks = [];
   const bridgeSpecs = [];
 
+  // Latch the flood hatch for this whole generation — see `_floodOff`.
+  _floodOff = floodClipDisabled();
+
   /* ---- 0. which way does a hill-oriented landmark face? ---------------- */
   // Before anything is laid, so the answer is a fact about the terrain and not
   // about the roads. Everything downstream — the reservation, the ring, and
@@ -1322,8 +1428,40 @@ function buildBridge(b, terrain) {
     }
     return bestS;
   };
-  const a0 = s0 - rampFor(s0, -1);
-  const a1 = s1 + rampFor(s1, 1);
+  /**
+   * A RAMP MAY NOT RUN OUT OVER THE WATER, and one of them did.
+   *
+   * `rampFor` walks out until the ground comes up to the deck, and where it
+   * never does it returns the gentlest run it found — up to 460 m in a straight
+   * line along the bridge's own bearing, wherever that lands. The Fort Duquesne
+   * Bridge lands on The Point, a wedge 250 m wide with the Allegheny on one
+   * side and the Monongahela on the other, so its southern ramp ran straight
+   * off the wedge and into the Mon: MEASURED on the shipped seed, 326 m of deck
+   * over open water against 136-204 m for every other crossing, descending to
+   * a deck of -2.25 m at (-302, 266) — a highway off downtown, under the river.
+   * `linkBridgeTips` was written for this exact bridge and this exact problem
+   * one function down, and it cannot help while the ramp itself is the thing in
+   * the water.
+   *
+   * So walk the ramp end BACK toward its own abutment until it is standing on
+   * ground a road can be built on. A shorter ramp is a steeper ramp, which
+   * `limitGrades` then negotiates like any other street; a ramp in the river is
+   * not a ramp. If there is no dry ground at all between the two, the tip is
+   * the abutment and the bridge is a dead end until `linkBridgeTips` reaches
+   * it — which is the honest outcome, and one this file already handles.
+   */
+  const rampEnd = (sRamp, sAbut) => {
+    if (_floodOff) return sRamp;
+    const step = sRamp < sAbut ? 4 : -4;
+    for (let s = sRamp; step > 0 ? s <= sAbut : s >= sAbut; s += step) {
+      const x = ax + dx * s;
+      const z = az + dz * s;
+      if (terrain.waterDist(x, z) > 8 && !underRiver(terrain, x, z)) return s;
+    }
+    return sAbut;
+  };
+  const a0 = rampEnd(s0 - rampFor(s0, -1), s0);
+  const a1 = rampEnd(s1 + rampFor(s1, 1), s1);
 
   const pts = [];
   const y = [];
@@ -1922,8 +2060,13 @@ function buildGraph(corridors, terrain, blocks) {
   weldLandmarkDeadEnds(graph, terrain);
 
   // --- height relaxation ------------------------------------------------
-  relaxHeights(graph, 3);
-  limitGrades(graph, MAX_GRADE, 160);
+  // A profile may be SMOOTHED; it may not be smoothed under the river. The
+  // floor is applied inside both solvers rather than after them, because a
+  // clamp applied afterwards is a grade violation nobody re-limits — see
+  // `floodFloors`.
+  const floors = floodFloors(graph, terrain);
+  relaxHeights(graph, 3, floors);
+  limitGrades(graph, MAX_GRADE, 160, floors);
 
   // --- one drivable network, no exceptions ------------------------------
   // Bridge every stranded fragment onto the main component, or delete it.
@@ -1993,6 +2136,10 @@ function weldLandmarkDeadEnds(graph, terrain) {
       const x = a.x + (b.x - a.x) * t;
       const z = a.z + (b.z - a.z) * t;
       if (terrain.waterDist(x, z) <= 8) return false;
+      // ...and not on ground the river is DRAWN over — see `underRiver`. The
+      // setback above is a plan distance and passes 24 m out over a bank that
+      // is under the pool.
+      if (underRiver(terrain, x, z)) return false;
       if (nearestSiteDist(x, z) <= 8) return false;
       const yLin = a.y + (b.y - a.y) * t;
       if (Math.abs(terrain.heightAt(x, z) - yLin) > 1.6) return false;
@@ -2118,7 +2265,7 @@ function simplify(pts, tol, maxRun, ytol = 0.35) {
  * reduces its own error. `rasteriseRoads` runs afterwards and brings the ground
  * up to whatever this settles on.
  */
-function limitGrades(graph, maxGrade, passes) {
+function limitGrades(graph, maxGrade, passes, floors = null) {
   const nodes = graph.nodes;
   for (let p = 0; p < passes; p++) {
     let worst = 0;
@@ -2138,6 +2285,10 @@ function limitGrades(graph, maxGrade, passes) {
       if (ma + mb === 0) continue;
       na.y += (s * ma) / (ma + mb);
       nb.y -= (s * mb) / (ma + mb);
+      if (floors) {
+        if (na.y < floors[e.a]) na.y = floors[e.a];
+        if (nb.y < floors[e.b]) nb.y = floors[e.b];
+      }
     }
     if (worst < 0.02) break;
   }
@@ -2166,10 +2317,59 @@ function intersect(sa, sb) {
 }
 
 /**
+ * THE HEIGHT A NODE NEAR THE RIVER MAY NOT BE SMOOTHED BELOW.
+ *
+ * `clipToLand` keeps corridors off ground the river is drawn over, but the node
+ * heights are solved afterwards and the solvers are averagers: `relaxHeights`
+ * pulls a node 32 % of the way toward its neighbours every pass, and a street
+ * that leaves the bank for a basin has neighbours 7 m down. MEASURED on the
+ * shipped seed before this existed, `downtown_v7`'s node at (47, 293): ground
+ * -0.42 m, solved deck -5.23 m — 4.8 m of dig, on a bank 14.7 m from the
+ * Monongahela's waterline, with the sheet drawn at pool level over the lot.
+ *
+ * So the floor is an invariant of the SOLVE, clamped inside both passes rather
+ * than applied after them — a clamp after `limitGrades` is a grade violation
+ * with nobody left to re-limit it. `-Infinity` everywhere it does not apply, so
+ * the clamp is one compare on the hot path and the graph away from the water is
+ * byte-identical.
+ *
+ * PINNED NODES ARE EXEMPT and must be: a bridge deck's height is the whole
+ * point of a bridge, and its abutments are pinned to meet it.
+ */
+function floodFloors(graph, terrain) {
+  const floors = new Float32Array(graph.nodes.length).fill(-Infinity);
+  if (_floodOff) return floors;
+  const y = WATER_Y + FLOOD_FREEBOARD;
+  for (const e of graph.edges) {
+    // THE SPAN, NOT THE ENDS, and the CARRIAGEWAY, not the centreline. Both
+    // holes were measured: a node pair either side of a bend can sit 26 m from
+    // the waterline with 40 m of tarmac between them passing at 19 m, and a
+    // 7 m half-width overhangs the flooded band while the centreline clears
+    // it. Flooring BOTH ends of an edge that comes within reach floors the
+    // whole of it, because the deck between two nodes is the straight line
+    // joining them: if both ends are at or above `y`, so is every point.
+    const na = graph.nodes[e.a];
+    const nb = graph.nodes[e.b];
+    if (na.pinned && nb.pinned) continue;
+    const reach = RIVER_OVERHANG + (e.width ?? 8) * 0.5;
+    const steps = Math.max(2, Math.ceil(e.len / LAND_SPAN_STEP));
+    for (let k = 0; k <= steps; k++) {
+      const t = k / steps;
+      if (terrain.waterDist(na.x + (nb.x - na.x) * t, na.z + (nb.z - na.z) * t) >= reach) continue;
+      if (!na.pinned && floors[e.a] < y) floors[e.a] = y;
+      if (!nb.pinned && floors[e.b] < y) floors[e.b] = y;
+      break;
+    }
+  }
+  return floors;
+}
+
+/**
  * Smooth node heights along the graph so a street does not chase every ripple
  * in the terrain, while pinned bridge decks stay exactly where they were put.
+ * `floors` is `floodFloors`' output — see there for why it is clamped in here.
  */
-function relaxHeights(graph, passes) {
+function relaxHeights(graph, passes, floors = null) {
   const nodes = graph.nodes;
   const acc = new Float32Array(nodes.length);
   const wsum = new Float32Array(nodes.length);
@@ -2187,6 +2387,7 @@ function relaxHeights(graph, passes) {
       const n = nodes[i];
       if (n.pinned || wsum[i] === 0) continue;
       n.y = n.y * 0.68 + (acc[i] / wsum[i]) * 0.32;
+      if (floors && n.y < floors[i]) n.y = floors[i];
     }
   }
 }
@@ -2561,6 +2762,11 @@ function closeNetwork(graph, terrain, blocks) {
       const x = a.x + (b.x - a.x) * t;
       const z = a.z + (b.z - a.z) * t;
       if (terrain.waterDist(x, z) <= 8) return 0;
+      // The setback above is a plan distance from the waterline; this is the
+      // question it does not ask — is the river DRAWN over this ground. Both
+      // are span-sampled on the same 4 m cadence, so a link is legal along its
+      // whole chord and not merely at its two ends. See `underRiver`.
+      if (underRiver(terrain, x, z)) return 0;
       if (nearestSiteDist(x, z) <= 8) return 0;
       if (airfieldAt(x, z) || airbaseAt(x, z)) return 0;
       const yLin = a.y + (b.y - a.y) * t;

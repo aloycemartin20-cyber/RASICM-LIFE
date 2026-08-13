@@ -278,6 +278,29 @@ const CUT_TICK = 4;
  * hold — so 30 s cannot fire on a working scene.
  */
 const CUT_LINE_WATCHDOG = 30;
+/**
+ * THE LONGEST FRAME THIS WIDGET WILL BELIEVE, in unscaled seconds.
+ *
+ * A cutscene is PRESENTATION integrated from `dt`, and `rawDt` is wall clock:
+ * the frame a scene opens on is routinely the most expensive frame in the
+ * session — the world has just stopped, a chapter's spawns are landing, tiles
+ * are still streaming — and handing 2 s of it to the typewriter types the
+ * whole line at once, blows past `CUT_LINE_WATCHDOG` and can consume an entire
+ * two-line scene before it is ever drawn.
+ *
+ * MEASURED: `src/game/onboardprobe.mjs` watched `cut.active` on EVERY frame
+ * after `playBriefing` reported `{took: true}` and never saw it true on 1 run
+ * in 3 — a scene that played and finished inside a single update. `npm run
+ * cutscene`'s open finding is the same defect seen from the other end ("the
+ * typewriter dumps the whole 45-char line on the first sample, 999 cps against
+ * a reference 46").
+ *
+ * 100 ms is ten frames of a 60 Hz budget: a hitch stretches the scene in wall
+ * clock rather than eating it, which is the correct trade for a beat whose
+ * whole job is to be read. It cannot wedge anything — `MissionRunner`'s
+ * `SCENE_WATCHDOG` bounds the whole scene in true raw seconds regardless.
+ */
+const CUT_MAX_DT = 0.1;
 
 export class Cutscene {
   /**
@@ -672,6 +695,10 @@ export class Cutscene {
    */
   update(dt) {
     if (!this.active) return 0;
+    // A FRAME IS NOT A SECOND — see `CUT_MAX_DT`. Everything below integrates
+    // this number, and an un-clamped hitch on the frame a scene opens can play
+    // the whole scene before it is drawn once.
+    if (dt > CUT_MAX_DT) dt = CUT_MAX_DT;
     // Re-assert every frame. Nothing should be writing these while a cut is up
     // (input is off, so no overlay can open and claim the clock), but a scene
     // that silently lost the clock halfway through is the failure this costs

@@ -52,6 +52,31 @@
  *     'vehicle:enter' event) flags the theft and scrambles two pursuit jets —
  *     see `jetchase.js`.
  *
+ * ───────────────────────────────────────────────────────────────────────────
+ * A MACHINE ONLY OPERATES WITH SOMEBODY IN IT
+ * ───────────────────────────────────────────────────────────────────────────
+ * REPORTED, from play: "exiting a tank the tank starts shooting at you right
+ * away". It did, and this file was the cause. `_emplacements` skipped a tank
+ * only when it WAS the car the player is sitting in — a test of OWNERSHIP, not
+ * of occupancy — so the frame the player stepped out, the gun he had just been
+ * firing became an emplacement again and laid itself on him. `_patrol` had the
+ * same shape: the jeeps were spawned with nobody in them at all and drove
+ * anyway, so a stolen jeep left at the fence went back to chasing him.
+ *
+ * The garrison's machines are therefore CREWED, explicitly: `_seed` seats a
+ * crew record on every emplacement and every patrol jeep (`v.aiCrew`, the
+ * field `vehicles/tank.js` reads), and both loops skip anything `_crewed`
+ * says is empty — no aim, no shell, no throttle. Boarding one takes its crew
+ * out for good (`_onEnter`), so a machine the player has stolen is DEAD the
+ * moment he steps out of it and stays that way; nothing in this file ever puts
+ * a crew back. Killing a crew is the same door, and the same result.
+ *
+ * The invariant is ALSO enforced one level down, in `fireShell` itself, so a
+ * future caller cannot re-open it — see the crew-gate note in `tank.js`.
+ * `debugArmAbandoned` restores the pre-fix arming path on a live build; that
+ * is the negative control `airbaseprobe` runs, and `milprobe` runs the
+ * firing-site half node-only.
+ *
  * NEGATIVE-CONTROL HATCH: `?noassault=1` / `OW_NO_ASSAULT=1` leaves the base
  * dressed (parked jets, tanks, jeeps) but inert — nothing arms, nothing
  * chases. Same shape as `?noairbase=1`, under which `world.airbase.pad` is
@@ -177,6 +202,15 @@ export class AirbaseAssault {
     /** Survivability tuning on (false) / reverted to the old lethality (true).
      *  The negative control for the playability gate — see `assaultHard`. */
     this.hard = assaultHard();
+    /**
+     * NEGATIVE CONTROL for the occupancy invariant, read by `airbaseprobe` and
+     * by nothing else. True puts back the pre-fix arming path: an emplacement
+     * or a jeep is live because it is OURS and is not the car the player is
+     * sitting in RIGHT NOW, rather than because somebody is aboard — which is
+     * the build in which a tank the player steps out of turns round and shells
+     * him. It changes nothing else about the encounter.
+     */
+    this.debugArmAbandoned = false;
 
     this.chase = new JetChase(ctx, wq, this.rng.fork());
 
@@ -245,8 +279,11 @@ export class AirbaseAssault {
       guardCap: this._guardCap(),
       guards: this.guardCount,
       tanks: this.tanks.length,
+      // Machines with a live crew aboard — the only ones that may operate.
+      tanksCrewed: this.tanks.reduce((n, t) => n + (this._crewed(t.v) ? 1 : 0), 0),
       jets: this.jets.length,
       jeeps: this.jeeps.length,
+      jeepsCrewed: this.jeeps.reduce((n, j) => n + (this._crewed(j) ? 1 : 0), 0),
       chase: this.chase.active,
       chasePhase: this.chase.phase,
       pursuers: this.chase.count,
@@ -267,6 +304,56 @@ export class AirbaseAssault {
   /** Seconds of spin-up before the guns are lethal — zero under `hard`. */
   _grace() {
     return this.hard ? 0 : GRACE_SPINUP;
+  }
+
+  /**
+   * IS ANYBODY IN IT? The one question both loops below ask before they touch
+   * a machine, and the whole of the fix for "the tank I got out of is shooting
+   * at me".
+   *
+   * It reads the vehicle's OWN published occupancy — the seat, the riders, and
+   * the garrison crew slot this file seats — rather than any list of ours: a
+   * bookkeeping answer is exactly what the pre-fix path had, and a machine's
+   * list membership is not evidence that a man is in it. Deliberately the same
+   * fields (and the same `alive`/`active` rule) as `crewOf` in
+   * `vehicles/tank.js`, because there is one fact here with two readers; it is
+   * duck-typed rather than imported because `game` may not reach into
+   * `src/vehicles/` (ARCHITECTURE.md rule 2).
+   */
+  _crewed(v) {
+    if (!v) return false;
+    const aboard = (a) => !!a && a.alive !== false && a.active !== false;
+    if (aboard(v.driver)) return true;
+    const occ = v.occupants;
+    if (Array.isArray(occ)) {
+      for (let i = 0; i < occ.length; i++) if (aboard(occ[i])) return true;
+    }
+    return aboard(v.aiCrew);
+  }
+
+  /**
+   * The player has taken this machine: its crew is out of it, permanently.
+   * Nothing here ever puts one back, so the vehicle is inert scenery from the
+   * moment he steps out again — which is the reported behaviour, and the
+   * reason this is a one-way door rather than a flag that flips with the seat.
+   */
+  _uncrew(v) {
+    /**
+     * THE NEGATIVE CONTROL LIVES HERE, and it is a restoration rather than a
+     * bypass: under `debugArmAbandoned` the crew is simply never displaced, so
+     * the machine is still manned by its own published state and the firing
+     * gate in `tank.js` passes it honestly. Emitted behaviour is the pre-fix
+     * one — step out of the tank and it shells you — which is what the probe
+     * has to be able to see for the fixed arm to mean anything.
+     */
+    if (this.debugArmAbandoned) return false;
+    if (!v || !v.aiCrew) return false;
+    v.aiCrew = null;
+    v.turretAimActive = false;
+    // Hand the controls back at rest: a jeep whose crew has just been hauled
+    // out must not coast away on the throttle the patrol loop last wrote.
+    this.wq.vehicles?.setInput?.(v, this._zeroInp);
+    return true;
   }
 
   /* ================================================================== */
@@ -501,6 +588,15 @@ export class AirbaseAssault {
       if (!v || v.destroyed) continue;
       // A tank the player has stolen is his, not an emplacement.
       if (v === playerVeh) continue;
+      /**
+       * AND A TANK WITH NOBODY IN IT IS NOT AN EMPLACEMENT EITHER — the line
+       * above is about whose it is, this one is about whether anybody is
+       * aboard, and only the second is the question. Without it, stepping out
+       * of a captured tank handed the gun straight back to the garrison with
+       * the player standing at the hatch. The turret is stood down as well as
+       * the gun, so an abandoned hull does not go on tracking him.
+       */
+      if (!this._crewed(v)) { v.turretAimActive = false; continue; }
       const d = dist(v.position.x, v.position.z, px, pz);
       if (d > TANK_RANGE * 1.4) { v.turretAimActive = false; continue; }
 
@@ -574,6 +670,9 @@ export class AirbaseAssault {
       const j = this.jeeps[i];
       if (!j || j.destroyed) { this.jeeps.splice(i, 1); continue; }
       if (j === playerVeh) continue;
+      // Nobody at the wheel, nobody driving. A jeep the player abandoned by
+      // the fence sits there; it does not resume the chase without its crew.
+      if (!this._crewed(j)) continue;
       if (!inside) { veh.setInput(j, this._zeroInp); continue; }
       driveToward(veh, j, this._jeepInp, px, pz, JEEP_DRIVE);
     }
@@ -599,6 +698,15 @@ export class AirbaseAssault {
     if (e.actor && e.actor !== this.wq.player) return;
     const ab = this.ab;
     const v = e.vehicle;
+    /**
+     * THE CREW COMES OUT WHEN HE GETS IN. He cannot be in the seat and they
+     * cannot still be manning it, and this is the ONE place that says so — so
+     * stepping back out leaves a dead machine rather than an emplacement that
+     * re-arms on the frame the ownership test flips. One way: nothing here
+     * ever crews one again.
+     */
+    for (const t of this.tanks) if (t.v === v) this._uncrew(v);
+    for (const j of this.jeeps) if (j === v) this._uncrew(v);
     if (!ab || v.spec?.id !== 'jet') return;
     if (typeof ab.insidePerimeter !== 'function' ||
       !ab.insidePerimeter(v.position.x, v.position.z)) return;
@@ -645,6 +753,12 @@ export class AirbaseAssault {
       } else if (slot.kind === 'tank' && tanks < TANK_N) {
         const v = at(slot, 'tank');
         if (v) {
+          // MANNED. The crew is what makes it an emplacement rather than a
+          // parked hull, and it is the only thing that does — see `_crewed`.
+          // A record per machine, not a shared one, so killing or displacing
+          // one crew cannot silence the rest. Seeding runs once: allocating
+          // here is an arm-edge cost, never a frame cost (rule 5).
+          v.aiCrew = { tag: 'airbase', role: 'gun', alive: true };
           // A fixed bracket bearing per gun, so the ranging rounds straddle the
           // target from different quarters instead of stacking on one point.
           const a = this.rng.range(-Math.PI, Math.PI);
@@ -653,7 +767,11 @@ export class AirbaseAssault {
         }
       } else if (slot.kind === 'jeep' && jeeps < JEEP_N) {
         const v = at(slot, 'suv', JEEP_OPTS);
-        if (v) { this.jeeps.push(v); jeeps++; }
+        if (v) {
+          v.aiCrew = { tag: 'airbase', role: 'patrol', alive: true };
+          this.jeeps.push(v);
+          jeeps++;
+        }
       }
     }
   }

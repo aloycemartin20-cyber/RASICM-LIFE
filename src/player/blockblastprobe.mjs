@@ -144,7 +144,11 @@
  * `player.position` across 120 rendered frames after a 70-frame run-up. Not
  * `targetSpeed`, not `movement.horizontalSpeed` — the thing that moved.
  *
- * MEASURED, m/s, and the ratio to the jog measured on the same run:
+ * MEASURED, m/s, and the ratio to the jog measured on the same run. The jog row
+ * is taken with `movement.autoRun` off, because a full stick is the RUN since
+ * `MOVE.autoRunMag` and `BLOCK_SLOW` is authored as a fraction of the JOG — see
+ * the note in `run()`. Against the gait a player actually reaches by default
+ * the guard is a harder brake still: 1.506 of 6.400, i.e. 0.235.
  *
  *                              shipping          --control=blockslow
  *     jog (no guard)           3.350             3.350
@@ -623,13 +627,55 @@ try {
     const B = window.__P__;
     const V = Object.getPrototypeOf(pl.position).constructor;
 
+    /**
+     * MOVE OFF THE BLAST SITE FIRST.
+     *
+     * `home` used to be wherever section 1b left the character, which is 2.4 m
+     * from a sedan this file spawned on a live lane — so the four speed rows
+     * ran a man into a parked car and the site guard below (correctly) refused
+     * to grade the ratios. MEASURED there, deterministically over three runs of
+     * one build: jog 2.823, sprint 2.293 m/s, against the 3.350 / 6.400 this
+     * file's header records. The guard is not the bug; staging the measurement
+     * on top of the previous measurement's props is.
+     *
+     * (-60, 250) is the quiet, flat, open square `src/weapons/tracerprobe.mjs`
+     * fires from, and it is the same piece of ground on every run because both
+     * files boot `?capture=1` — see that file's note on why an unseeded boot
+     * regenerates the road graph under a fixed coordinate.
+     */
+    const w = e.ctx.peek('world');
+    const veh = e.ctx.peek('vehicles');
+    const SITE = { x: -60, z: 250 };
+    for (const other of (veh?.active ?? veh?.vehicles ?? []).slice()) {
+      if (!other?.position) continue;
+      const dx = other.position.x - SITE.x, dz = other.position.z - SITE.z;
+      if (dx * dx + dz * dz < 60 * 60 || other._probeCar) veh?.despawn?.(other);
+    }
+    pl.teleport?.(
+      { x: SITE.x, y: (w?.walkableHeightAt?.(SITE.x, SITE.z) ?? 1) + 1.6, z: SITE.z },
+      { x: 0, y: 0, z: 0 }
+    );
+    await window.__PUMP__(60);
+
     /* One run: same site, same heading, same stick magnitude; only the guard
      * and the sprint key change. The character is put back where he started
      * between runs so all four cover the same ground. */
     const home = new V(pl.position.x, pl.position.y, pl.position.z);
-    const run = async (label, script, block) => {
+    const run = async (label, script, block, noAuto = false) => {
       B.rmb(false);
       m.scriptedInput = null;
+      /**
+       * AUTO-RUN AND THE REFERENCE GAIT. `BLOCK_SLOW` is authored as a fraction
+       * of `MOVE.jogSpeed`, so the row this ratio is taken against has to BE
+       * the jog — and since `MOVE.autoRunMag`, a full stick is the RUN. The
+       * unguarded reference therefore turns auto-run off for the length of its
+       * own row (the same switch `feeltest.mjs` uses) instead of quietly
+       * measuring a 6.4 m/s run and calling it a jog: that would have taken the
+       * ratio to 0.235 and this file would have reported the guard as a defect.
+       * The guarded rows leave it ON, because the guard has to beat whatever
+       * gait the player can actually reach.
+       */
+      m.autoRun = !noAuto;
       pl.teleport?.({ x: home.x, y: home.y + 1.6, z: home.z }, { x: 0, y: 0, z: 0 });
       await window.__PUMP__(30);
       if (block) B.rmb(true);
@@ -643,6 +689,7 @@ try {
       const t1 = e.ctx.time.elapsed;
       const blocked = pl.blocking === true;
       m.scriptedInput = null;
+      m.autoRun = true;
       B.rmb(false);
       await window.__PUMP__(10);
       const dt = t1 - t0;
@@ -659,7 +706,7 @@ try {
     wp?.setWeaponImmediate?.('fists', true);
     await window.__PUMP__(60);
     const rows = [];
-    rows.push(await run('jog', { x: 0, y: 1 }, false));
+    rows.push(await run('jog', { x: 0, y: 1 }, false, true));
     rows.push(await run('sprint', { x: 0, y: 1, sprint: true }, false));
     rows.push(await run('guard', { x: 0, y: 1 }, true));
     rows.push(await run('guard+sprint', { x: 0, y: 1, sprint: true }, true));

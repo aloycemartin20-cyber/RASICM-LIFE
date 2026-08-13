@@ -345,6 +345,140 @@ try {
     boom.tankgun >= 1, `${boom.tankgun} tankgun weapon:fire events`);
 
   /* =================================================================== */
+  area = 'crewed';
+  /* =================================================================== */
+
+  /**
+   * REPORTED, from play: "exiting a tank the tank starts shooting at you right
+   * away, which is not realistic (all vehicles should only operate with
+   * someone in them)."
+   *
+   * THE MEASUREMENT is ten seconds of EMITTED muzzle events on the real bus,
+   * attributed to the tank the player just got out of by nearest emplacement —
+   * never a flag, and never the whole salvo, because the other two guns are
+   * still manned and still shooting, which is correct and must not be scored
+   * as a failure.
+   *
+   * Both arms stand the player the SAME 60 m off his own tank, because the
+   * emplacement envelope has a 22 m minimum: measuring silence from a spot no
+   * gun could shoot from would be a gate that cannot fail.
+   */
+  const crewSetup = await run(`
+    const ab = ctx.peek('world').airbase;
+    const enc = game.airbase;
+    const spot = ab.worldAt(-110, 160, {});
+    game.__spot = { x: spot.x, z: spot.z };
+    return { tanks: enc.tanks.length, crewed: enc.stats.tanksCrewed,
+             jeepsCrewed: enc.stats.jeepsCrewed, jeeps: enc.jeeps.length };`);
+  rec('the garrison machines are MANNED when the base seeds them',
+    crewSetup.crewed === crewSetup.tanks && crewSetup.tanks >= 3 &&
+    crewSetup.jeepsCrewed === crewSetup.jeeps,
+    `${crewSetup.crewed}/${crewSetup.tanks} emplacements and ` +
+    `${crewSetup.jeepsCrewed}/${crewSetup.jeeps} jeeps crewed`);
+
+  /**
+   * Board tank `idx`, drive nothing, step back out through the player's own
+   * exit, then stand 60 m off it and hand back the geometry.
+   */
+  const boardAndLeave = async (idx) => {
+    const set = await run(`
+      const enc = game.airbase;
+      const t = enc.tanks[${idx}];
+      if (!t) return { ok: false };
+      game.__tankIdx = ${idx};
+      game.heat.clear('probe');
+      return { ok: game.debugBoard(t.v), x: t.v.position.x, z: t.v.position.z,
+               crewedBefore: !!t.v.aiCrew };`);
+    if (!set.ok) return set;
+    await pump(190);                       // the enter transition runs to the seat
+    const seated = await run(`
+      const t = game.airbase.tanks[game.__tankIdx];
+      return { inIt: game.wq.playerVehicle() === t.v,
+               crewed: !!t.v.aiCrew, aiming: t.v.turretAimActive === true };`);
+    // Out again, through the real exit rather than a teleport.
+    await run(`player.vehicles.tryExit(player.movement); return true;`);
+    await pump(90);
+    const out = await run(`
+      const ab = ctx.peek('world').airbase;
+      const t = game.airbase.tanks[game.__tankIdx];
+      const s = game.__spot;
+      // 60 m off the hull, along the line to the open apron — inside the
+      // envelope (22 m minimum) and somewhere a gun can see.
+      const dx = s.x - t.v.position.x, dz = s.z - t.v.position.z;
+      const L = Math.max(1, Math.hypot(dx, dz));
+      let px = t.v.position.x + (dx / L) * 60;
+      let pz = t.v.position.z + (dz / L) * 60;
+      if (!ab.insidePerimeter(px, pz)) { px = s.x; pz = s.z; }
+      game.wq.placePlayer(px, pz, Math.atan2(-dx, -dz));
+      game.heat.clear('probe');
+      game.__fireMark = window.__FIRES__.length;
+      const p = game.wq.playerPos();
+      return { onFoot: !player.inVehicle, crewed: !!t.v.aiCrew,
+               dist: Math.hypot(t.v.position.x - p.x, t.v.position.z - p.z),
+               inside: !!ab.insidePerimeter(p.x, p.z), armed: game.airbase.armed };`);
+    return { ...set, ...seated, ...out };
+  };
+
+  /** Ten seconds of watching, then the muzzle events that were THIS tank's. */
+  const watch = async () => {
+    let aimedEver = false;
+    for (let i = 0; i < 10; i++) {
+      await pump(60);
+      const a = await run(`
+        const t = game.airbase.tanks[game.__tankIdx];
+        return t.v.turretAimActive === true;`);
+      if (a) aimedEver = true;
+    }
+    const c = await run(`
+      const enc = game.airbase;
+      const tk = enc.tanks[game.__tankIdx].v;
+      let mine = 0, others = 0;
+      for (const f of window.__FIRES__.slice(game.__fireMark)) {
+        if (f.w !== 'tankgun') continue;
+        let best = null, bd = Infinity;
+        for (const t of enc.tanks) {
+          const d = Math.hypot(t.v.position.x - f.x, t.v.position.z - f.z);
+          if (d < bd) { bd = d; best = t.v; }
+        }
+        if (best === tk) mine++; else others++;
+      }
+      return { mine, others, armed: enc.armed, crewed: !!tk.aiCrew };`);
+    return { ...c, aimedEver };
+  };
+
+  const A = await boardAndLeave(0);
+  rec('the player can take an emplacement, and its crew comes out with the seat',
+    A.ok && A.inIt && A.crewedBefore === true && A.crewed === false,
+    `boarded ${A.inIt}, crew ${A.crewedBefore ? 'was aboard' : 'was NOT aboard'} -> ` +
+    `${A.crewed ? 'STILL aboard' : 'displaced'}`);
+  rec('and he can get back out of it', A.onFoot === true,
+    `on foot ${A.onFoot}, standing ${A.dist?.toFixed(0)} m off it, inside the wire ${A.inside}`);
+  const silent = await watch();
+  rec('THE REPORT: the tank he stepped out of fires NOTHING for 10 s',
+    silent.mine === 0 && A.dist > 22 && silent.armed === true,
+    `${silent.mine} shells from it (the rest of the garrison fired ${silent.others}), ` +
+    `at ${A.dist?.toFixed(0)} m, base still armed ${silent.armed}`);
+  rec('...and it does not track him either', silent.aimedEver === false,
+    `turretAimActive was ${silent.aimedEver ? 'RAISED' : 'never raised'} over 10 s`);
+
+  /**
+   * NEGATIVE CONTROL — the pre-fix arming path, on the live build with no
+   * edit. `debugArmAbandoned` stops the crew being displaced when the player
+   * takes the machine, which is exactly the state the encounter used to assume
+   * for every tank that was not the car he is sitting in RIGHT NOW. Same tank
+   * index behaviour, same 60 m, same ten seconds.
+   */
+  await run(`game.airbase.debugArmAbandoned = true; return true;`);
+  const B = await boardAndLeave(1);
+  rec('NEG CONTROL: with the hatch on, the crew is never displaced',
+    B.ok && B.inIt && B.crewed === true,
+    `boarded ${B.inIt}, crew still aboard ${B.crewed}`);
+  const loud = await watch();
+  rec('NEGATIVE CONTROL — the pre-fix path shells him the moment he is out',
+    loud.mine >= 1, `${loud.mine} shells from the tank he just left, at ${B.dist?.toFixed(0)} m`);
+  await run(`game.airbase.debugArmAbandoned = false; return true;`);
+
+  /* =================================================================== */
   area = 'theft';
   /* =================================================================== */
 

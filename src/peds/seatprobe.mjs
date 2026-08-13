@@ -85,6 +85,25 @@
  * figure is a different piece of geometry entirely (the instanced far crowd).
  *
  * ---------------------------------------------------------------------------
+ * ...AND THEN HE HAS TO GET OUT AGAIN — THE CARJACK PULL-OUT
+ * ---------------------------------------------------------------------------
+ * REPORTED, from play: "when I steal a car that is being driven, the occupant
+ * should be pulled out by my character." The final section drives the
+ * PRODUCTION `PedSystem.pullFromVehicle` / `detachDriver` over a real `Ped`
+ * that has been sitting in a real `Vehicle`, and reads the answer off the same
+ * two emitted meshes: he ends AT the door point he was pulled to, on the road,
+ * clear of the car's own emitted flank, with NO skinned vertex left under
+ * bodywork, staggering and then running.
+ *
+ * NEGATIVE CONTROL, and it is emphatic: the same pull with the pre-fix drop
+ * point — `v.position.x + 1.4`, the literal expression `traffic.abandon()`
+ * used while `player/vehicle.js` was calling it — against a car parked along
+ * world x. MEASURED, skinned vertices left under the car's own bodywork:
+ * **sedan 283/302, sports 218/302, muscle 285/302, against 0/302 at the door
+ * point.** The old carjack did not put a man on the road; it left him standing
+ * in the car the player was climbing into.
+ *
+ * ---------------------------------------------------------------------------
  * NEGATIVE CONTROLS — a gate that has never failed is not evidence
  * ---------------------------------------------------------------------------
  * MEASURED, same build, one machine:
@@ -114,6 +133,7 @@ import { VehicleSystem } from '../vehicles/index.js';
 import { buildVehicleModel, setVehicleLod } from '../vehicles/build.js';
 import { RIG } from './rig.js';
 import { Ped, STATE } from './ped.js';
+import { PedSystem } from './index.js';
 import { buildOutfit } from './builder.js';
 import { makeOutfit, SHAPE_IDS } from './wardrobe.js';
 import { FarCrowd } from './crowdfx.js';
@@ -224,7 +244,19 @@ function makeWorld() {
   };
 }
 
-const CTX = { events: { emit() {} }, peek: () => null, time: { elapsed: 0 } };
+/**
+ * The bus. Events are dropped on the floor except while `RECORD` is on, which
+ * is only during the carjack section — everything else in this file runs a
+ * real `Vehicle` through real collisions and would otherwise fill an array
+ * with impacts nothing reads.
+ */
+const EVENTS = [];
+let RECORD = false;
+const CTX = {
+  events: { emit(k, p) { if (RECORD) EVENTS.push({ k, p }); } },
+  peek: () => null,
+  time: { elapsed: 0 },
+};
 /**
  * The material library is the one thing in the vehicle model that wants a
  * canvas. Nothing here shades anything — only positions are read — so every
@@ -714,6 +746,229 @@ for (let ti = 0; ti < TYPES.length; ti++) {
     if (low < worstSole) { worstSole = low; worstSoleAt = `${type}@LOD2`; }
   }
   far.dispose();
+}
+
+/* ------------------------------------------------------------------ */
+/* THE CARJACK PULL-OUT — where the occupant ENDS UP                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * REPORTED, from play: "when I steal a car that is being driven, the occupant
+ * should be pulled out by my character."
+ *
+ * The seated half of that is everything above. This is the other half: once
+ * the door opens, the body has to LEAVE, through the door the player is
+ * standing at, and end up on its feet on the road — not teleport out of the
+ * roof at the chassis centre, which is what `traffic.abandon()`'s
+ * `position.x + 1.4` did while `player/vehicle.js` was still calling it.
+ *
+ * WHAT IS MEASURED, and what is not:
+ *   - the PRODUCTION `PedSystem.pullFromVehicle` / `detachDriver` / `panic` /
+ *     `driverOf`, taken straight off the prototype, driving a real `Ped` that
+ *     has been sitting in a real `Vehicle`.
+ *   - the readings are the SAME two emitted meshes the rest of this file
+ *     measures: skinned vertices against the car's own drawn bodywork. "He is
+ *     out of the car" means no vertex of him has bodywork over it, not that
+ *     some field says he is out.
+ *   - the DOOR POINT IS THE HARNESS'S, chosen off the car's own emitted flank
+ *     rather than off `seatAnchor`, so nothing here compares the seating code
+ *     with itself (rule 12).
+ *
+ * DECLARED STUB: the crowd's spatial index answers empty, so `PedSystem.panic`
+ * runs for real over a street with nobody else in it. The bystander half of a
+ * carjack is `blastprobe`'s; what is under test here is the VICTIM's reaction,
+ * and that is the real `Ped.panic` on the real ped.
+ *
+ * NEGATIVE CONTROL: the same pull with the pre-fix drop point — `v.position.x
+ * + 1.4`, the literal expression `traffic.abandon` used — against a car parked
+ * along world x, so that offset runs down its own length. He lands INSIDE the
+ * bodywork, which is what makes the door-point arm mean something.
+ */
+{
+  const EMPTY = [];
+  /**
+   * The ped's OWN sys object (the one `makePed` gave it, so nothing about the
+   * body, the ground probe or the seat anchor changes), with the production
+   * `PedSystem` carjack methods bolted straight onto it off the prototype.
+   */
+  const jackSys = (ped) => Object.assign(ped.sys, {
+    peds: [ped],
+    _v: new THREE.Vector3(),
+    _free: [],
+    _holds: new Map(),
+    grid: { query: () => EMPTY },              // declared stub — see the note
+    driverOf: PedSystem.prototype.driverOf,
+    pullFromVehicle: PedSystem.prototype.pullFromVehicle,
+    detachDriver: PedSystem.prototype.detachDriver,
+    holdOccupant: PedSystem.prototype.holdOccupant,
+    releaseOccupant: PedSystem.prototype.releaseOccupant,
+    _heldBy: PedSystem.prototype._heldBy,
+    panic: PedSystem.prototype.panic,
+    _despawn: PedSystem.prototype._despawn,
+    _releaseBody: PedSystem.prototype._releaseBody,
+  });
+
+  /** Seat a fresh ped in a fresh car parked along world +x, and settle both. */
+  const seated = (type, shape = 'shirtM', scale = 1.0) => {
+    const { v, model } = spawnVehicle(type);
+    // Yaw PI/2 puts the car's NOSE along world +x, which is what makes the
+    // control's `position.x + 1.4` a point 1.4 m down its own centre line.
+    v.setPose(new THREE.Vector3(0, v.spec.comY, 0), Math.PI / 2);
+    drive(v, { brake: 1 }, 120);
+    const ped = makePed(shape, scale);
+    ped.vehicle = v;
+    ped.seat = 0;
+    ped.isDriver = true;
+    ped.state = STATE.DRIVING;
+    for (let f = 0; f < 6; f++) {
+      drive(v, { brake: 1 }, 2);
+      v.syncTransforms(1, 1 / 60);
+      ped.update(1 / 60);
+      ped.updateVisual(1 / 60, f / 60);
+    }
+    return { v, model, ped };
+  };
+
+  /** The car's own emitted half width, and its right vector, in world space. */
+  const flank = (model, tris) => {
+    carTriangles(model, tris);
+    model.root.updateWorldMatrix(true, false);
+    _p.setFromMatrixPosition(model.root.matrixWorld);
+    _q.setFromRotationMatrix(model.root.matrixWorld);
+    _qi.copy(_q).invert();
+    let halfW = 0;
+    for (let i = 0; i < tris.length; i += 3) {
+      _local.set(tris[i] - _p.x, tris[i + 1] - _p.y, tris[i + 2] - _p.z).applyQuaternion(_qi);
+      if (Math.abs(_local.x) > halfW) halfW = Math.abs(_local.x);
+    }
+    return halfW;
+  };
+
+  /** Skinned vertices of the drawn ped that DO have bodywork over them. */
+  const insideCount = (ped, tris) => {
+    _up.set(0, 1, 0).applyQuaternion(_q);
+    const vo = verticesOutside(ped.mesh, tris, _up, 300);
+    return { inside: vo.tested - vo.outside, tested: vo.tested };
+  };
+
+  const door = new THREE.Vector3();
+  const tris = [];
+
+  for (const type of ['sedan', 'sports', 'muscle']) {
+    /* ---- the fix: pulled out at the door -------------------------- */
+    const { v, model, ped } = seated(type);
+    const sys = jackSys(ped);
+    const halfW = flank(model, tris);
+    const side = ped.seatSide >= 0 ? 1 : -1;
+    // The door the player would be standing at: beside the car's own emitted
+    // flank, on the side the occupant is sitting. Never `seatAnchor.enter`.
+    door.set(side * (halfW + 0.55), 0, 0).applyQuaternion(_q).add(_p);
+    door.y = 0;
+
+    EVENTS.length = 0;
+    RECORD = true;
+    const before = sys.driverOf(v);
+    const out = sys.pullFromVehicle(v, door);
+    RECORD = false;
+    ped.updateVisual(1 / 60, 1);
+
+    ok(`${type}: the occupant is the one pulled out`, out === ped && before === ped,
+      `driverOf ${before === ped ? 'found him' : 'found nobody'}, pull returned ${out === ped}`);
+    ok(`${type}: the seat is free afterwards`,
+      sys.driverOf(v) === null && ped.vehicle === null && ped.state !== STATE.DRIVING,
+      `driverOf ${sys.driverOf(v)}, ped.vehicle ${ped.vehicle}, state ${ped.state}`);
+
+    const dxz = Math.hypot(ped.position.x - door.x, ped.position.z - door.z);
+    ok(`${type}: he ends at the DOOR POINT he was pulled to`, dxz < 0.05,
+      `${dxz.toFixed(3)} m from the door point`);
+    ok(`${type}: on his feet on the ground, not hanging at seat height`,
+      Math.abs(ped.position.y) < 0.05, `root y ${ped.position.y.toFixed(3)} m (ground 0)`);
+
+    _local.copy(ped.position).sub(_p).applyQuaternion(_qi);
+    ok(`${type}: clear of the flank, on the door side`, _local.x * side > halfW,
+      `${(_local.x * side).toFixed(2)} m outboard vs a ${halfW.toFixed(2)} m half width`);
+
+    const now = insideCount(ped, tris);
+    ok(`${type}: no part of him is inside the car any more`, now.inside === 0,
+      `${now.inside}/${now.tested} skinned vertices still under bodywork`);
+
+    const reacted = ped.state === STATE.FLEE || ped.state === STATE.COWER ||
+      ped.state === STATE.FIGHT;
+    ok(`${type}: he reacts — stagger, then run/freeze/square up`,
+      reacted && ped.fear > 0.5 && ped.animator?.flinchT >= 0,
+      `state ${ped.state}, fear ${ped.fear.toFixed(2)}, flinch ${ped.animator?.flinchT >= 0}`);
+    ok(`${type}: the canonical vehicle:exit is raised for HIM`,
+      EVENTS.some((e) => e.k === 'vehicle:exit' && e.p?.actor === ped && e.p?.vehicle === v),
+      EVENTS.map((e) => e.k).join(',') || 'nothing emitted');
+
+    /* ---- NEGATIVE CONTROL: the pre-fix drop point ------------------ */
+    const c = seated(type);
+    const cSys = jackSys(c.ped);
+    flank(c.model, tris);
+    // `traffic.abandon`'s own expression, verbatim.
+    cSys.pullFromVehicle(c.v, {
+      x: c.v.position.x + 1.4, y: c.v.position.y, z: c.v.position.z,
+    });
+    c.ped.updateVisual(1 / 60, 1);
+    const ctrl = insideCount(c.ped, tris);
+    ok(`${type}: NEGATIVE CONTROL — the old drop point leaves him in the car`,
+      ctrl.inside > 0,
+      `${ctrl.inside}/${ctrl.tested} skinned vertices under bodywork at x+1.4`);
+  }
+
+  /* ---- the reservation: whose occupant is he? ------------------------- */
+  /**
+   * `player` reserves the man in the seat on the first frame of a carjack,
+   * because `traffic` clears the seat itself the moment `player.vehicle`
+   * points at the car and would otherwise take him 0.35 s before the animation
+   * arrives. The race is measured end to end in `interactprobe`; this puts the
+   * mechanism itself — refuse everyone but the holder, and lapse rather than
+   * strand a car — where it costs nothing to run.
+   */
+  {
+    const { v, ped } = seated('sedan');
+    const sys = jackSys(ped);
+    const me = { who: 'the player' };
+    const other = { who: 'somebody else' };
+    sys.holdOccupant(v, me);
+    const stranger = sys.pullFromVehicle(v, ped.position, other);
+    const anon = sys.pullFromVehicle(v, ped.position);
+    ok('a reserved occupant is refused to every other caller',
+      stranger === null && anon === null && sys.driverOf(v) === ped,
+      `stranger got ${stranger}, an anonymous caller got ${anon}, still seated ${sys.driverOf(v) === ped}`);
+    const mine = sys.pullFromVehicle(v, ped.position, me);
+    ok('...and handed to the holder', mine === ped && sys.driverOf(v) === null,
+      `holder got ${mine === ped ? 'the ped' : mine}`);
+  }
+  {
+    const { v, ped } = seated('sedan');
+    const sys = jackSys(ped);
+    sys.holdOccupant(v, { who: 'a caller that never came back' });
+    CTX.time.elapsed += 60;               // the hold lapses, it does not strand
+    const late = sys.pullFromVehicle(v, ped.position);
+    ok('a hold LAPSES rather than making a car unjackable for ever',
+      late === ped, `after 60 s the next caller got ${late === ped ? 'the ped' : late}`);
+    CTX.time.elapsed -= 60;
+  }
+
+  /* ---- detachDriver: the QUIET removal `traffic` has been waiting for ---- */
+  {
+    const { v, ped } = seated('sedan');
+    const sys = jackSys(ped);
+    EVENTS.length = 0;
+    RECORD = true;
+    const took = sys.detachDriver(v);
+    const twice = sys.detachDriver(v);
+    RECORD = false;
+    ok('detachDriver takes the body back and leaves nobody in the road',
+      took === true && sys.driverOf(v) === null && ped.active === false &&
+      ped.vehicle === null,
+      `took ${took}, driverOf ${sys.driverOf(v)}, ped.active ${ped.active}`);
+    ok('detachDriver is quiet — no panic, no vehicle:exit',
+      !EVENTS.some((e) => e.k === 'vehicle:exit'),
+      EVENTS.map((e) => e.k).join(',') || 'nothing emitted');
+    ok('detachDriver on an empty car is a no-op', twice === false, `second call ${twice}`);
+  }
 }
 
 /* ------------------------------------------------------------------ */

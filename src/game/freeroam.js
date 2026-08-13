@@ -48,6 +48,7 @@
  *     both of which the police are entitled to have an opinion about.
  */
 
+import * as THREE from 'three';
 import {
   HIDDEN_PACKAGES, SAFEHOUSES, SHOPS, GAS_STATIONS, DOCKS, RACE_TRACKS, R, DIFFS,
   PACKAGE_CASH, PACKAGE_RESPECT, PACKAGE_REWARD_WEAPON, WEAPON_LIB, BOY_ORDER,
@@ -191,6 +192,418 @@ const CREW_REACH = 12;
 const DOCK_MOOR_MIN = 10;
 const DOCK_MOOR_MAX = 30;
 
+/* ======================================================================== */
+/* THE STAGING RINGS — how a free-roaming player FINDS something to do       */
+/* ======================================================================== */
+
+/**
+ * Radius of the chapter ring and of a side-job ring, in metres, and the two
+ * numbers that decide when driving through one counts.
+ *
+ * 11 m is a car and a half either side of the staging point: wide enough to
+ * drive into at speed without aiming, tight enough that it is a place rather
+ * than a district. A job ring is smaller because three of them stand at once
+ * and side work should not out-shout the chapter.
+ *
+ * `RING_REARM` is HYSTERESIS, and it is the whole reason a ring cannot fire
+ * twice: a slot is not live until the player has been `r * RING_REARM` away
+ * from it at least once. Without it a chapter that ends where it started
+ * re-triggers itself on the frame `_announceNext` publishes the next one, and
+ * the player never sees free roam again — which is the exact failure this
+ * whole feature exists to remove.
+ */
+const CHAPTER_RING_R = 11;
+const JOB_RING_R = 8;
+const RING_REARM = 1.6;
+/** 1 chapter + the three standing side-job offers. */
+const RING_SLOTS = 4;
+/**
+ * Seconds between re-samples of the ground under a live ring.
+ *
+ * The collision patch STREAMS, so `surfaceY` honestly changes its answer for a
+ * fixed (x, z) as the city builds in — a ring resolved from two kilometres away
+ * would otherwise sit at the analytic terrain height for ever and end up buried
+ * in a raised plaza or floating over a bridge deck. Once a second is far below
+ * anything a player can perceive and is four raycasts, not sixty.
+ */
+const RING_Y_PERIOD = 1;
+/**
+ * The longest step the swept entry test will believe, in metres.
+ *
+ * A TELEPORT IS NOT A DRIVE. `wq.placePlayer` moves the player instantly —
+ * the respawn, `Director.unstick` after the city streams in, a staged debug
+ * shot, a chapter's `forceBegin` — and the segment between where he was and
+ * where he now is can pass straight through a ring he has never been near.
+ * MEASURED: a capture staged with `game:"clean"` photographed the CH 1 intro
+ * cutscene instead of free roam, because the post-streaming unstick swept the
+ * player across the chapter ring. 120 m is well past a stalled frame at
+ * 180 km/h (50 m in a full second) and well under any teleport worth making.
+ */
+const RING_SWEEP_MAX = 120;
+/** Metres a target may drift and still be the same target — see `_slot`. */
+const SLOT_SAME = 0.5;
+/** Ring colours: the chapter is slag orange, side work is river teal. */
+const RING_CHAPTER_COLOUR = 0xff8a2b;
+const RING_JOB_COLOUR = 0x38c8c8;
+/**
+ * The light column over a ring: metres tall, and how much of the ring's radius
+ * it is wide.
+ *
+ * MEASURED, and the first cut was wrong by a lot. At `0.9 * r` and 26 m the
+ * chapter beacon was a 20 m wide, 26 m tall additive cylinder that filled a
+ * third of the frame and hid the bridge behind it (`shots/ring-day.png`,
+ * first capture) — a wall, not a marker, and a large amount of overdraw for
+ * something the player is meant to look PAST. Long range is the world-space
+ * diamond's job (`ui.setObjectives`, published by `game/index.js`); the column
+ * only has to say "the thing is here" once you are in the street with it.
+ */
+const RING_COLUMN_H = 11;
+const RING_JOB_COLUMN_H = 7;
+const RING_COLUMN_W = 0.2;
+
+/**
+ * ONE RING PER THING THERE IS TO DO, standing in the world in free roam.
+ *
+ * ── Why this exists ───────────────────────────────────────────────────────
+ * The reported bug: "we lost the ability to do freeplay, or it is not clear —
+ * they should always be in freeplay mode and start missions by going to a
+ * certain location or walking onto a glowing ring." Before this, entering the
+ * world STARTED the next chapter outright (`GameSystem._onEnterWorld`), so
+ * free roam was a thing you could only reach by abandoning the story with K.
+ *
+ * ── What it is ────────────────────────────────────────────────────────────
+ * A fixed pool of `RING_SLOTS` markers, each a flat annulus on the ground with
+ * a light column over it, and a swept entry test. It OWNS NO GAMEPLAY: it
+ * answers "did he just drive into one", and `game/index.js` decides what that
+ * means. That split is what lets `flowprobe` drive it with no `GameSystem` at
+ * all.
+ *
+ * ── Why it reads day AND night ────────────────────────────────────────────
+ * The mission-marker ring in `mission.js` is `AdditiveBlending`, which is
+ * correct for a glow over a dark street and invisible over a sunlit one. These
+ * are TWO meshes: a NORMAL-blended annulus that keeps its colour against any
+ * background, and an additive column that does the glowing. Both are
+ * `toneMapped: false`, so the exposure that makes noon noon cannot wash the
+ * marker out — the marker is chrome, not scenery.
+ *
+ * `MeshBasicMaterial` throughout, deliberately: unlit geometry can never move
+ * the visible light count and so can never trigger the shader recompile
+ * ARCHITECTURE.md's permutation section is about.
+ */
+export class StagingRings {
+  constructor(ctx, wq) {
+    this.ctx = ctx;
+    this.wq = wq;
+    /**
+     * NEGATIVE-CONTROL / A-B SWITCH. `?owNoRings=1` builds no geometry and
+     * fires no trigger, so `tools/perfcheck.mjs --ab` can price the feature on
+     * one build and `flowprobe`'s control arm can prove the trigger is what
+     * starts the chapter. Nothing else reads it.
+     */
+    this.enabled = !readFlag('owNoRings');
+    /** Preallocated slots — `update()` allocates nothing (rule 5). */
+    this.slots = [];
+    for (let i = 0; i < RING_SLOTS; i++) {
+      this.slots.push({
+        on: false, kind: '', id: '', name: '', index: -1,
+        x: 0, y: 0, z: 0, r: 0, armed: false, yT: 0,
+        // The target this slot was resolved FROM, before the dry/reachable
+        // fix-up — the identity test compares against this, not against `x/z`.
+        srcX: NaN, srcZ: NaN,
+      });
+    }
+    /** The reused answer from `update()`. Read it, do not retain it. */
+    this._hit = { kind: '', id: '', index: -1, name: '', x: 0, z: 0 };
+    /** Last frame's sample point, for the swept entry test. */
+    this._px = NaN;
+    this._pz = NaN;
+    this._gfx = null;
+    this._t = 0;
+  }
+
+  /**
+   * The chapter ring. `pin` is `game`'s reused `{x, z, name}` record — read
+   * here, never retained — and `null` takes the ring down (story complete, or
+   * a chapter is running).
+   */
+  setChapter(pin, index = -1) {
+    this._slot(0, pin ? 'chapter' : '', pin, index, CHAPTER_RING_R);
+  }
+
+  /** The standing side-job offers, in `jobs.list()`'s shape. */
+  setJobs(list) {
+    for (let i = 1; i < RING_SLOTS; i++) {
+      const j = list?.[i - 1] ?? null;
+      this._slot(i, j && j.id ? 'job' : '', j, -1, JOB_RING_R);
+    }
+  }
+
+  /** Take every ring down — a chapter started, or the world is being torn up. */
+  clear() {
+    for (const s of this.slots) s.on = false;
+    this._hide();
+  }
+
+  /**
+   * Point a slot at a target, re-resolving the ground only when the target
+   * actually changes. Identity is the KIND plus the id/index plus a coarse
+   * coordinate — a job pin that jitters a metre is the same job, a job that
+   * moves across town is not.
+   *
+   * NO STRING KEY, deliberately. `game._syncRings` calls this for four slots on
+   * every free-roam frame, so a template literal here is 240 short-lived
+   * strings a second out of a method whose whole job is to decide that nothing
+   * has changed (hard rule 5). Compare the fields.
+   */
+  _slot(i, kind, src, index, r) {
+    const s = this.slots[i];
+    if (!kind || !src || !Number.isFinite(src.x) || !Number.isFinite(src.z)) {
+      s.on = false;
+      return;
+    }
+    const id = typeof src.id === 'string' ? src.id : '';
+    if (s.on && s.kind === kind && s.id === id && s.index === index &&
+        Math.abs(s.srcX - src.x) < SLOT_SAME && Math.abs(s.srcZ - src.z) < SLOT_SAME) return;
+    s.on = true;
+    s.kind = kind;
+    s.id = id;
+    s.index = index;
+    s.name = typeof src.name === 'string' ? src.name : '';
+    s.r = r;
+    s.yT = 0;
+    s.srcX = src.x;
+    s.srcZ = src.z;
+    this._place(s, src.x, src.z);
+    /**
+     * A NEW RING IS NOT ARMED. See `RING_REARM`: arming here rather than at
+     * construction is what stops a ring that appears under the player's feet —
+     * the frame a chapter ends where the next one stages — from firing before
+     * he has had a chance to be anywhere else.
+     */
+    s.armed = false;
+  }
+
+  /**
+   * Put the ring somewhere a player can actually stand.
+   *
+   * THE STAGED POINT IS ALREADY THE DRY ONE — `game._chapterSite` reads
+   * `poi.stage ?? poi`, the same field `mission.js:_stageOf` resolves the
+   * travel leg with, so a docks chapter stages on the apron rather than on the
+   * pier head that is over water by construction. This is the backstop for
+   * everything else: a job pin cut on the road graph, a POI with no `stage`,
+   * or a `dest`-only fallback. A ring in the river is a chapter the player
+   * cannot start.
+   */
+  _place(s, x, z) {
+    let fx = x;
+    let fz = z;
+    if (this.wq.isWater(fx, fz)) {
+      // A lane centre first — a ring you can drive into beats one you can only
+      // swim to. `nearestLane` refuses rail and stranded fragments for us.
+      const lane = this.wq.nearestLane(fx, fz);
+      if (lane?.ok) {
+        fx = lane.x;
+        fz = lane.z;
+      } else {
+        const g = this.wq.findGroundSpot(8, 60, x, z);
+        if (g && Number.isFinite(g.x)) {
+          fx = g.x;
+          fz = g.z;
+        }
+      }
+    }
+    s.x = fx;
+    s.z = fz;
+    s.y = this.wq.surfaceY(fx, fz);
+  }
+
+  /**
+   * Step the rings and answer whether the player just entered one.
+   *
+   * THE TEST IS SWEPT, not a point sample: at 180 km/h a frame is 0.8 m but a
+   * 20 Hz harness step is 2.5 m and a stall is more, and a ring you can drive
+   * straight through is a ring that does not work in the one situation it was
+   * asked for. Distance from the SEGMENT the player travelled this frame to
+   * the ring centre.
+   *
+   * @returns {?object} the reused hit record, or null. Read it, do not retain.
+   */
+  update(dt, px, pz) {
+    if (!this.enabled) {
+      // The switch has to take the GEOMETRY down too, not just the trigger —
+      // otherwise flipping it at runtime (the negative control in
+      // `src/ui/gpsprobe.mjs` does exactly that) leaves the last frame's rings
+      // standing in a world that no longer has them.
+      this._hide();
+      return null;
+    }
+    this._t += dt;
+    let gx = this._px;
+    let gz = this._pz;
+    this._px = px;
+    this._pz = pz;
+    // A jump this big is a teleport, not a drive — sweep nothing across it.
+    if (Number.isFinite(gx) && Math.hypot(px - gx, pz - gz) > RING_SWEEP_MAX) {
+      gx = NaN;
+      gz = NaN;
+    }
+    const warped = !Number.isFinite(gx);
+    let hit = null;
+    for (const s of this.slots) {
+      if (!s.on) continue;
+      if (this._t >= s.yT) {
+        s.yT = this._t + RING_Y_PERIOD;
+        s.y = this.wq.surfaceY(s.x, s.z);
+      }
+      const far = Math.hypot(px - s.x, pz - s.z);
+      if (!s.armed) {
+        if (far > s.r * RING_REARM) s.armed = true;
+        continue;
+      }
+      /**
+       * BEING PUT SOMEWHERE IS NOT WALKING THERE. A teleport that LANDS inside
+       * a ring disarms it instead of firing it, for the same reason a ring
+       * published under the player's feet starts unarmed: entering has to be a
+       * movement the player made. Otherwise a respawn at a safehouse that
+       * happens to sit inside the chapter ring starts the chapter off the
+       * WASTED card.
+       */
+      if (warped) {
+        if (far <= s.r) s.armed = false;
+        continue;
+      }
+      const d = segDist(gx, gz, px, pz, s.x, s.z);
+      if (d > s.r || hit) continue;
+      s.armed = false;
+      const h = this._hit;
+      h.kind = s.kind;
+      h.id = s.id;
+      h.index = s.index;
+      h.name = s.name;
+      h.x = s.x;
+      h.z = s.z;
+      hit = h;
+    }
+    this._draw();
+    return hit;
+  }
+
+  /** Build the pooled geometry on the first frame a ring is actually wanted. */
+  _ensure() {
+    if (this._gfx) return this._gfx;
+    // Unit ring and unit column, scaled per slot — one geometry, N meshes.
+    const ring = new THREE.RingGeometry(0.82, 1.0, 44);
+    ring.rotateX(-Math.PI / 2);
+    const col = new THREE.CylinderGeometry(1, 1, 1, 24, 1, true);
+    col.translate(0, 0.5, 0);
+    const group = new THREE.Group();
+    group.name = 'game:staging-rings';
+    const mats = [];
+    const meshes = [];
+    for (let i = 0; i < RING_SLOTS; i++) {
+      const hex = i === 0 ? RING_CHAPTER_COLOUR : RING_JOB_COLOUR;
+      // The DISC keeps its colour over sunlit asphalt: normal blending, no
+      // tone mapping. The COLUMN is the glow, and it is additive so it reads
+      // as light rather than as a plastic tube.
+      const dm = new THREE.MeshBasicMaterial({
+        color: hex, transparent: true, opacity: 0.88, depthWrite: false,
+        side: THREE.DoubleSide, fog: false, toneMapped: false,
+      });
+      const cm = new THREE.MeshBasicMaterial({
+        color: hex, transparent: true, opacity: 0.16, depthWrite: false,
+        blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
+        fog: false, toneMapped: false,
+      });
+      const disc = new THREE.Mesh(ring, dm);
+      const beam = new THREE.Mesh(col, cm);
+      for (const m of [disc, beam]) {
+        m.visible = false;
+        m.renderOrder = 4;
+        m.userData.owNoShadow = true;
+        m.userData.owNoPrepass = true;
+        group.add(m);
+      }
+      mats.push(dm, cm);
+      meshes.push({ disc, beam });
+    }
+    this.ctx.scene.add(group);
+    this._gfx = { group, ring, col, mats, meshes };
+    return this._gfx;
+  }
+
+  _draw() {
+    let want = false;
+    for (const s of this.slots) if (s.on) { want = true; break; }
+    if (!want) {
+      this._hide();
+      return;
+    }
+    const g = this._ensure();
+    const t = this.ctx.time.elapsed;
+    for (let i = 0; i < RING_SLOTS; i++) {
+      const s = this.slots[i];
+      const m = g.meshes[i];
+      if (!s.on) {
+        m.disc.visible = false;
+        m.beam.visible = false;
+        continue;
+      }
+      const pulse = 0.5 + 0.5 * Math.sin(t * 2.4 + i * 1.3);
+      const r = s.r * (0.97 + 0.03 * pulse);
+      m.disc.visible = true;
+      m.disc.position.set(s.x, s.y + 0.06, s.z);
+      m.disc.scale.set(r, 1, r);
+      m.disc.material.opacity = 0.72 + 0.2 * pulse;
+      const h = i === 0 ? RING_COLUMN_H : RING_JOB_COLUMN_H;
+      const w = s.r * RING_COLUMN_W;
+      m.beam.visible = true;
+      m.beam.position.set(s.x, s.y + 0.05, s.z);
+      m.beam.scale.set(w, h, w);
+      m.beam.material.opacity = 0.13 + 0.1 * pulse;
+    }
+  }
+
+  _hide() {
+    const g = this._gfx;
+    if (!g) return;
+    for (const m of g.meshes) {
+      m.disc.visible = false;
+      m.beam.visible = false;
+    }
+  }
+
+  /** Rule 6: free everything this built. */
+  dispose() {
+    const g = this._gfx;
+    if (!g) return;
+    g.group.parent?.remove(g.group);
+    g.ring.dispose();
+    g.col.dispose();
+    for (const m of g.mats) m.dispose();
+    this._gfx = null;
+  }
+}
+
+/** Distance from the segment a→b to the point p. No allocation. */
+function segDist(ax, az, bx, bz, px, pz) {
+  const dx = bx - ax;
+  const dz = bz - az;
+  const len2 = dx * dx + dz * dz;
+  let t = len2 > 1e-9 ? ((px - ax) * dx + (pz - az) * dz) / len2 : 0;
+  t = t < 0 ? 0 : t > 1 ? 1 : t;
+  return Math.hypot(ax + dx * t - px, az + dz * t - pz);
+}
+
+/** A `?flag=1` URL hatch, safe on a node bench where there is no location. */
+function readFlag(name) {
+  try {
+    const s = globalThis.location?.search;
+    return typeof s === 'string' && new RegExp(`[?&]${name}=1`).test(s);
+  } catch {
+    return false;
+  }
+}
+
 export class FreeRoam {
   constructor(ctx, deps) {
     this.ctx = ctx;
@@ -244,6 +657,14 @@ export class FreeRoam {
 
     /** Which brothers are riding along in the player's car. */
     this.crew = [];
+
+    /**
+     * THE STAGING RINGS. Built here because they are free-roam furniture — the
+     * same shelf as the packages, the pumps and the moored boats — but DRIVEN
+     * from `game/index.js`, which is the only thing that knows what the next
+     * chapter is and what walking into one should do. See `StagingRings`.
+     */
+    this.rings = new StagingRings(ctx, this.wq);
 
     /**
      * The seated EXIT's landing data — see `_exitPlacement`.
@@ -1656,6 +2077,7 @@ export class FreeRoam {
     this._offWreck?.();
     this._offStation?.();
     this._clearPrompt();
+    this.rings?.dispose();
   }
 }
 

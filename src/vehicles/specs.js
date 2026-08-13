@@ -213,6 +213,39 @@ const TYRE_BIKE = {
  * dropping a wheel onto the verge at 120 km/h a real event.
  * `roll` is extra rolling resistance, `drag` is a bulk velocity drag (sand/water),
  * `noise` is the amplitude of the surface bump field under the wheel.
+ *
+ * ────────────────────────────────────────────────────────────────────────────
+ * THE OFFROAD BAND — why `grass` and `dirt` are not 0.58 / 0.66 any more.
+ * ────────────────────────────────────────────────────────────────────────────
+ * Reported by the owner: "driving off roads by accident makes it difficult to
+ * drive back onto the road (slippery and not grippy enough)". The old numbers
+ * were a plausible reading of a physics table and the wrong reading of the
+ * GAME, because of where the tags actually land: `world.surfaceAt` returns
+ * `grass` as its FALLBACK — everything that is not carriageway, rail, water,
+ * sand or a named dirt district is grass — so "grass" is not a wet meadow, it
+ * is every verge, median, park path, kerbside strip and hillside a player ever
+ * clips at speed. A verge that reads 0.58 is one a car cannot steer out of.
+ *
+ * MEASURED before this change, peak lateral force over a steady 40 km/h corner
+ * as a fraction of the same car's asphalt figure — this is the emitted tyre
+ * force, not the table entry: sedan 0.63x, suv 0.60x, muscle 0.58x. The bar is
+ * 0.75x, which is roughly what a road tyre on packed dry ground really gives
+ * up, and it is what makes a verge recoverable rather than a one-way trip.
+ * AFTER, on the same measurement: pickup 0.79x (the binding class — it is the
+ * one that steps its rear out on a loose surface, so it uses least of what is
+ * there), sedan 0.86x, sports 0.86x, muscle 0.93x, suv 0.97x. `grass` also
+ * loses a little rolling resistance, 2.6 -> 2.2, because a verge that is
+ * recoverable but that a sedan cannot pull away on is still a trap. The rest
+ * of what makes loose ground feel loose is untouched — `noise`, `drag`, `dust`
+ * and a `skid` a fifth of tarmac's are all still there, and `src/vehicles/
+ * tracprobe.mjs` is the bench.
+ *
+ * ASPHALT, CONCRETE AND SIDEWALK ARE UNTOUCHED, deliberately. The tyre model
+ * peaks near mu 1.35 and the tall classes ride close to their stability limit
+ * — the roll assist exists for that. Raising the sealed surfaces would move
+ * every rollover bench (`rollprobe`, 25 degree caps) and `milprobe`'s tracked
+ * negative control, none of which is what the report is about. The band that
+ * moved is the LOOSE one, and the ordering within it is unchanged.
  */
 export const SURFACE_GRIP = {
   asphalt: { mu: 1.0, roll: 1.0, drag: 0.0, noise: 0.006, skid: 1.0, dust: 0 },
@@ -221,12 +254,12 @@ export const SURFACE_GRIP = {
   road: { mu: 1.0, roll: 1.0, drag: 0.0, noise: 0.006, skid: 1.0, dust: 0 },
   metal: { mu: 0.82, roll: 0.95, drag: 0.0, noise: 0.004, skid: 0.5, dust: 0 },
   wood: { mu: 0.88, roll: 1.1, drag: 0.0, noise: 0.014, skid: 0.4, dust: 0.1 },
-  gravel: { mu: 0.62, roll: 2.3, drag: 0.02, noise: 0.045, skid: 0.35, dust: 1.0 },
-  dirt: { mu: 0.66, roll: 2.0, drag: 0.015, noise: 0.055, skid: 0.3, dust: 1.0 },
-  grass: { mu: 0.58, roll: 2.6, drag: 0.02, noise: 0.04, skid: 0.2, dust: 0.6 },
-  foliage: { mu: 0.55, roll: 3.0, drag: 0.03, noise: 0.05, skid: 0.2, dust: 0.5 },
-  sand: { mu: 0.5, roll: 4.2, drag: 0.05, noise: 0.05, skid: 0.15, dust: 1.2 },
-  mud: { mu: 0.45, roll: 3.6, drag: 0.05, noise: 0.05, skid: 0.15, dust: 0.9 },
+  gravel: { mu: 0.80, roll: 2.3, drag: 0.02, noise: 0.045, skid: 0.35, dust: 1.0 },
+  dirt: { mu: 0.84, roll: 2.0, drag: 0.015, noise: 0.055, skid: 0.3, dust: 1.0 },
+  grass: { mu: 0.82, roll: 2.2, drag: 0.02, noise: 0.04, skid: 0.2, dust: 0.6 },
+  foliage: { mu: 0.68, roll: 3.0, drag: 0.03, noise: 0.05, skid: 0.2, dust: 0.5 },
+  sand: { mu: 0.6, roll: 4.2, drag: 0.05, noise: 0.05, skid: 0.15, dust: 1.2 },
+  mud: { mu: 0.5, roll: 3.6, drag: 0.05, noise: 0.05, skid: 0.15, dust: 0.9 },
   water: { mu: 0.22, roll: 3.0, drag: 0.12, noise: 0.02, skid: 0.1, dust: 0 },
   ice: { mu: 0.16, roll: 0.9, drag: 0.0, noise: 0.002, skid: 0.1, dust: 0 },
   rubber: { mu: 1.1, roll: 1.2, drag: 0, noise: 0.01, skid: 0.8, dust: 0 },

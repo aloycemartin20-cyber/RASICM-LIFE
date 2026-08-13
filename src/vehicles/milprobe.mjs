@@ -45,6 +45,15 @@
  *            what `fx`/`audio`/`police` consume) leaves from the emitted
  *            barrel tip, along it.
  *
+ *   CREW     NOBODY IN IT, NOBODY SHOOTING. Ten seconds of the production
+ *            `fixedUpdate` with the trigger pulled every step: a crewed
+ *            machine puts three shells downrange, the same machine with the
+ *            seat emptied emits NOT ONE muzzle event, not one detonation, and
+ *            does not even slew. A garrison crew that is not in the driver's
+ *            seat counts; a crew whose `alive` has gone false does not.
+ *            NEGATIVE CONTROL: `v.debugNoCrewGate` puts the pre-fix path back
+ *            on the live build and the empty tank shells him again.
+ *
  *   MESH     the emitted LOD0 geometry: a turret band above the hull with a
  *            >4 m gun tube, a glacis whose emitted top line FALLS toward the
  *            bow (NEGATIVE CONTROL: flatten `glacis.drop` and the detector
@@ -634,11 +643,130 @@ function testMesh() {
 }
 
 /* ================================================================== */
+/* 7. THE CREW GATE — an empty machine does not shoot                 */
+/* ================================================================== */
+/**
+ * REPORTED, from play: "exiting a tank the tank starts shooting at you right
+ * away ... all vehicles should only operate with someone in them."
+ *
+ * WHAT IS MEASURED (rule 12): the EMITTED muzzle and detonation events on the
+ * real bus, over ten seconds of the PRODUCTION `fixedUpdate` with the gun
+ * commanded at a real target every step — never `fireShell`'s return value
+ * alone, and never a flag. A gate that only read the return value would pass a
+ * build that emitted the shell and then returned null.
+ *
+ * TEN SECONDS is chosen against the machine, not for comfort: the reload is
+ * ~4 s and the encounter's own cadence is 4.2-6.0 s, so ten seconds is two
+ * full firing opportunities. A build with the gate removed uses both.
+ *
+ * NEGATIVE CONTROL, on the live code with no edit: `v.debugNoCrewGate = true`
+ * is the pre-fix firing path, and the same ten seconds must produce shells —
+ * otherwise the silence above is the harness failing to pull the trigger.
+ */
+function testCrew() {
+  /**
+   * Ten seconds of production stepping, with the trigger pulled every step
+   * through the TARGET form — `fireShell(v, aim)`, which lays the gun and then
+   * fires along the barrel. Deliberately the target form and not a separate
+   * `aimTurret`: it puts the aim command behind the same gate as the trigger,
+   * so an uncrewed machine's EMITTED turret angle is a second, independent
+   * reading of the same invariant. (`aimTurret` on its own is not gated and
+   * must not be — the turret section above depends on a parked emplacement
+   * slewing on command while its hull sleeps.)
+   */
+  const salvo = (v, sys, aim) => {
+    const fires = [];
+    const booms = [];
+    sys.ctx.events.on('weapon:fire', (e) => fires.push(e.weapon));
+    sys.ctx.events.on('explosion', (e) => booms.push(e.source));
+    for (let i = 0; i < 10 * 120; i++) {
+      sys.fireShell(v, aim);
+      sys.fixedUpdate(DT, sys.ctx);
+      sys.ctx.time.elapsed += DT;
+    }
+    return { fires: fires.filter((w) => w === 'tankgun').length, booms: booms.length };
+  };
+
+  const aim = new THREE.Vector3(60, 0, 40);
+
+  // 1. CREWED — the yardstick. `spawn` seats an AI marker in the driver's seat.
+  {
+    const sys = makeSys();
+    const v = spawn(sys, 'tank');
+    run(sys, 1);
+    const s = salvo(v, sys, aim);
+    check('crew', 'a CREWED emplacement shells the target (the yardstick)',
+      s.fires >= 2 && s.booms >= 2,
+      `${s.fires} muzzle events, ${s.booms} detonations in 10 s`);
+  }
+
+  // 2. THE REPORT: the player gets out. Same tank, same order, seat emptied.
+  {
+    const sys = makeSys();
+    const v = spawn(sys, 'tank');
+    run(sys, 1);
+    v.driver = null;                    // he stepped out — `clearDriver` does this
+    v.occupants = [];
+    const s = salvo(v, sys, aim);
+    check('crew', 'a tank the player stepped out of fires NOTHING for 10 s',
+      s.fires === 0 && s.booms === 0,
+      `${s.fires} muzzle events, ${s.booms} detonations with nobody aboard`);
+    check('crew', 'and it does not slew itself onto the target either',
+      Math.abs(v.turretYaw) < 1e-6 && v.turretAimActive !== true,
+      `turretYaw ${(v.turretYaw * DEG).toFixed(2)} deg, aiming ${v.turretAimActive === true}`);
+  }
+
+  // 3. A GARRISON CREW that is not in the driver's seat still counts — this is
+  //    the field `game/airbase.js` seats, and the emplacements ride on it.
+  {
+    const sys = makeSys();
+    const v = spawn(sys, 'tank');
+    run(sys, 1);
+    v.driver = null;
+    v.occupants = [];
+    v.aiCrew = { tag: 'airbase', alive: true };
+    const s = salvo(v, sys, aim);
+    check('crew', 'a manned emplacement (aiCrew, no driver) fires normally',
+      s.fires >= 2 && s.booms >= 2,
+      `${s.fires} muzzle events, ${s.booms} detonations`);
+  }
+
+  // 4. A DEAD crew is not a crew. The gun falls silent when the men do, rather
+  //    than when some separate bookkeeping notices.
+  {
+    const sys = makeSys();
+    const v = spawn(sys, 'tank');
+    run(sys, 1);
+    v.driver = null;
+    v.occupants = [];
+    v.aiCrew = { tag: 'airbase', alive: false };
+    const s = salvo(v, sys, aim);
+    check('crew', 'a KILLED crew stops the gun',
+      s.fires === 0 && s.booms === 0, `${s.fires} muzzle events, ${s.booms} detonations`);
+  }
+
+  // 5. NEGATIVE CONTROL — the pre-fix firing path, on the live build.
+  {
+    const sys = makeSys();
+    const v = spawn(sys, 'tank');
+    run(sys, 1);
+    v.driver = null;
+    v.occupants = [];
+    v.debugNoCrewGate = true;
+    const s = salvo(v, sys, aim);
+    check('crew', 'NEGATIVE CONTROL — with the gate off the empty tank shells him',
+      s.fires >= 2 && s.booms >= 2,
+      `${s.fires} muzzle events, ${s.booms} detonations from an EMPTY tank`);
+  }
+}
+
+/* ================================================================== */
 testEnter();
 testDrive();
 testArmour();
 testTurret();
 testShell();
+testCrew();
 testMesh();
 
 console.log(`\nmilprobe: ${pass}/${pass + fail} checks passed`);

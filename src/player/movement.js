@@ -16,6 +16,14 @@
  *   idle · walk · jog · sprint · stop · turn · crouch · jump · fall · stumble ·
  *   mantle · vault · swim · drive
  *
+ * AUTO-RUN. Full deflection IS the run — `sprinting` latches off the movement
+ * magnitude with no key held (`MOVE.autoRunMag`), which is what a gamepad has
+ * always done here and what the keyboard was missing. Shift still forces it,
+ * the WALK modifier (Alt) suppresses it and gives you `walkSpeed`, and ADS
+ * drops it on the frame the button goes down. `_updateSprint` is the whole of
+ * it; `targetSpeed` did not change at all, because the run was already what
+ * `sprinting` meant.
+ *
  * `stop` and `turn` exist purely so the animator has something to key off; they
  * are not gates — every transition here is interruptible on the next step.
  *
@@ -90,6 +98,19 @@ export class Movement {
     this.stanceWant = 'stand';
     this.crouchBlend = 0;
     this.sprinting = false;
+    /**
+     * True when the run engaged off the stick alone, with no key held. Purely
+     * informational — `sprinting` is the state everything else reads — but it
+     * is what a gate needs to tell "the player ran" from "the player held
+     * Shift and ran".
+     */
+    this.autoRunning = false;
+    /**
+     * NEGATIVE CONTROL for auto-run: false puts the keyboard back on the jog
+     * and makes Shift compulsory again, which is the build the owner reported.
+     * `src/player/feeltest.mjs` and `moveprobe.mjs` both drive it.
+     */
+    this.autoRun = true;
     this.walking = false;
     this.grounded = true;
     this.wasGrounded = true;
@@ -328,8 +349,12 @@ export class Movement {
     cmd.crouchPressed = crouch && !prev.crouch;
     cmd.crouchHeld = crouch;
     cmd.usePressed = use && !prev.use;
+    // The pad's own full-deflection term stays on this line even though
+    // `_updateSprint` now auto-runs off `mag`: `sprintHeld` is read by two
+    // other things — the crouch stand-up in `_updateStance` and the swim
+    // sprint — and removing it would quietly change both for a pad.
     cmd.sprintHeld = input.action('sprint') || Math.abs(input.stick.moveY) > 0.94;
-    cmd.walkHeld = input.held('AltLeft') || input.held('AltRight');
+    cmd.walkHeld = input.action('walk');
     cmd.ads = input.ads;
 
     prev.jump = jump;
@@ -632,12 +657,29 @@ export class Movement {
     return this.blocking && this.debugBlockSlow !== false;
   }
 
+  /**
+   * AUTO-RUN: full deflection IS the run, no key held. See `MOVE.autoRunMag`.
+   *
+   * `cmd.ads` and not `this.aiming` is the aim term here, deliberately. The
+   * aim STATE is a ramp — `player._updateAds` walks `adsAmount` toward 1 with a
+   * 0.085 s time constant and `aiming` only turns on past 0.35 — so keying the
+   * suppression off it would leave the run latched for the first ~50 ms of
+   * every right-click. That matters more than it sounds: `weapons` gates its
+   * own ADS blend on `player.sprinting` (`wantAds = st.ads && !st.sprint`), and
+   * with the run engaging on its OWN there is no key to release to break the
+   * tie. The raw button drops the run on the frame it is pressed, and the ramp
+   * then has a clear path up. Holding Shift still wins over the button, exactly
+   * as it did before — that half is unchanged.
+   */
   _updateSprint(cmd, mag) {
     this.walking = cmd.walkHeld;
+    this.autoRunning =
+      this.autoRun && mag > MOVE.autoRunMag && !cmd.walkHeld && !cmd.ads;
     this.sprinting =
-      cmd.sprintHeld && mag > 0.45 && this.stance === 'stand' &&
+      (cmd.sprintHeld || this.autoRunning) && mag > 0.45 && this.stance === 'stand' &&
       !this.aiming && !this.melee && !this._guarding && this.stumbleTime <= 0 &&
       (this.grounded || this.sprinting);
+    this.autoRunning = this.autoRunning && this.sprinting;
   }
 
   /** Speed the character is asking for this step. */
@@ -652,6 +694,10 @@ export class Movement {
     if (this.stance === 'crouch') return MOVE.crouchSpeed * mag;
     if (this.aiming) return MOVE.aimSpeed * mag;
     if (this.sprinting) return this.sprintSpeed;
+    // The WALK modifier (Alt). It is checked AFTER the sprint for the same
+    // reason the sprint is checked after the crouch: `_updateSprint` already
+    // refuses to auto-run while it is held, so the only way to be sprinting and
+    // walking at once is to hold Shift, and an explicit key beats a modifier.
     if (this.walking) return MOVE.walkSpeed * mag;
     // Analog: the first 62 % of stick travel is a walk, the rest ramps to a jog.
     const m = mag;

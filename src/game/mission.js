@@ -358,6 +358,8 @@ export class MissionRunner {
     const cut = this._scene();
     if (!cut?.play) return false;
     M.sceneRaw = this.ctx.time.raw;
+    // This one is the runner's, so `_cancelScene` may take it down. See there.
+    this._sceneMine = true;
     const f = this.wq.focusPos(this._v);
     return cut.play(lines, {
       ctx: this.ctx,
@@ -368,6 +370,50 @@ export class MissionRunner {
       focusY: this.wq.surfaceY(f.x, f.z),
       onDone: () => this._sceneEnded(M),
     }) === true;
+  }
+
+  /**
+   * A SCENE THAT IS NOT A CHAPTER — the free-roam briefing.
+   *
+   * `_playScene` above needs an `M` because it stamps the phase watchdog and
+   * because its `onDone` is a mission transition. This one has neither: it is
+   * the two-line beat `GameSystem._onEnterWorld` plays when the player enters
+   * the world, and it hands back to free roam rather than to a track. It runs
+   * through the SAME cutscene player, so the world stops, `ui`'s `cut` pause
+   * claim is taken and released by the ordinary path, and SKIP works — the
+   * boot journey in `src/ui/pauseprobe.mjs` presses that button.
+   *
+   * There is no watchdog here on purpose. A chapter's intro holds gameplay
+   * state hostage (nothing is spawned until it ends), which is what
+   * `SCENE_WATCHDOG` protects; a wedged briefing costs the player nothing but
+   * an ESC, because free roam is already what is underneath it.
+   *
+   * @returns {boolean} true if the cutscene took the screen. False means the
+   *   caption bar (or nothing) carried it and `onDone` has ALREADY run.
+   */
+  playBriefing(lines, context = '', onDone = null) {
+    const scene = toScene(lines, this.boy);
+    const cut = this._scene();
+    // NOT the runner's scene: a mission cleanup landing a frame later must not
+    // cancel it out from under free roam. See `_cancelScene`.
+    this._sceneMine = false;
+    if (!cut?.play || !scene.length) {
+      this.wq.ui?.playScene?.(scene);
+      onDone?.();
+      return false;
+    }
+    const f = this.wq.focusPos(this._v);
+    const took = cut.play(scene, {
+      ctx: this.ctx,
+      ui: this.wq.ui,
+      context,
+      focusX: f.x,
+      focusZ: f.z,
+      focusY: this.wq.surfaceY(f.x, f.z),
+      onDone: () => onDone?.(),
+    }) === true;
+    if (!took) onDone?.();
+    return took;
   }
 
   /**
@@ -389,8 +435,26 @@ export class MissionRunner {
     M.sceneDone = true;
   }
 
-  /** Take any live scene down without its callback. */
+  /**
+   * Take down the scene THIS RUNNER STARTED, without its callback.
+   *
+   * IT USED TO CANCEL WHATEVER WAS ON SCREEN, and that is one owner too many.
+   * `cleanup()` calls this when a mission record is dropped, which can happen a
+   * frame or several after `abort()` — and `GameSystem._onEnterWorld` plays a
+   * free-roam BRIEFING through the same cutscene player, which the runner does
+   * not own and must not touch. MEASURED with the exits tapped in
+   * `src/game/onboardprobe.mjs`: `play -> next(idx -1) -> cancel(idx 0) ->
+   * finish`, i.e. the briefing was killed on the frame it opened, 1 run in 3,
+   * by the cleanup of a mission that had already been aborted.
+   *
+   * The flag is set by `_playScene` (mine) and cleared by `playBriefing` (not
+   * mine). Nothing is lost by being conservative here: `Cutscene.play` already
+   * cancels whatever is live before it takes the screen, so a chapter starting
+   * over a briefing still replaces it.
+   */
   _cancelScene() {
+    if (!this._sceneMine) return;
+    this._sceneMine = false;
     this._scene()?.cancel?.();
   }
 

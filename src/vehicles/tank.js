@@ -44,6 +44,36 @@
  * which is the event `fx` draws muzzle flashes from and `police`/`peds` price
  * and panic off — a tank shot is heard, seen and booked like any other shot.
  *
+ * ────────────────────────────────────────────────────────────────────────────
+ * NOBODY IN IT, NOBODY SHOOTING — THE CREW GATE
+ * ────────────────────────────────────────────────────────────────────────────
+ * REPORTED, from play: "exiting a tank the tank starts shooting at you right
+ * away, which is not realistic (all vehicles should only operate with someone
+ * in them)". It was true, and the reason is worth writing down because it is
+ * the shape of every occupancy bug: the encounter director decided an
+ * emplacement was LIVE because the tank was ITS tank and was not the car the
+ * player is currently sitting in (`airbase.js`, `v === playerVeh`), which is a
+ * statement about OWNERSHIP, not about whether anybody is aboard. Step out and
+ * the second half of the test flips while the first half does not, so the gun
+ * you were just firing turns round and fires at you.
+ *
+ * The invariant belongs HERE, at the firing site, not only in whichever
+ * director happens to pull the trigger — a rule enforced by one caller is a
+ * rule the next caller does not have. `fireShell` therefore refuses outright
+ * unless `crewOf(v)` finds a LIVE operator aboard:
+ *
+ *   - `v.driver`      the seat: the player, a `Ped`, an AI marker
+ *   - `v.occupants`   anyone else riding it
+ *   - `v.aiCrew`      a garrison gun crew — an emplacement that is manned but
+ *                     has nobody in the DRIVER's seat. Whoever seats them owns
+ *                     the field (`game/airbase.js` does); it is read here and
+ *                     written nowhere in `src/vehicles/`.
+ *
+ * A record whose `alive` or `active` has gone false does not count, so an
+ * emplacement falls silent when its crew is killed rather than when some
+ * separate bookkeeping notices. `v.debugNoCrewGate = true` restores the old
+ * behaviour on a live build — the negative control `milprobe` runs.
+ *
  * `v.afterburner` has a sibling note in `plane.js`; the visual hooks published
  * here are `v.turretYaw`, `v.gunPitch`, `v.gunCool` (seconds of reload left)
  * and the `model.turrets` pivots that `syncTransforms` drives.
@@ -351,15 +381,42 @@ export function muzzleWorld(v, outPos, outDir) {
 /* ====================================================================== */
 
 /**
+ * IS ANYBODY ABOARD? Returns the live operator, or null.
+ *
+ * Duck-typed on purpose: the seat holds a `Ped`, the player system, a pooled
+ * AI marker or a garrison crew record depending on who put them there, and
+ * none of those share a base class. `alive`/`active` are honoured WHEN PRESENT
+ * — an actor that carries neither (the player system) is aboard by virtue of
+ * being in the seat, and one that carries them and has set them false is not.
+ *
+ * See the crew-gate note in this file's header for why this lives at the
+ * firing site rather than in the encounter that pulls the trigger.
+ */
+export function crewOf(v) {
+  if (!v) return null;
+  const aboard = (a) => !!a && a.alive !== false && a.active !== false;
+  if (aboard(v.driver)) return v.driver;
+  const occ = v.occupants;
+  if (Array.isArray(occ)) {
+    for (let i = 0; i < occ.length; i++) if (aboard(occ[i])) return occ[i];
+  }
+  if (aboard(v.aiCrew)) return v.aiCrew;
+  return null;
+}
+
+/**
  * Fire the main gun. `sys` is the VehicleSystem (or a probe's stub carrying
  * `ctx.events`, `physics` and `vehicles`). Returns the live shell, or null
- * while reloading / wrecked. `target` is an optional convenience that also
- * commands the turret — but the shell leaves along the barrel's CURRENT
- * emitted direction, never along a snap to the target.
+ * while reloading / wrecked / UNCREWED. `target` is an optional convenience
+ * that also commands the turret — but the shell leaves along the barrel's
+ * CURRENT emitted direction, never along a snap to the target.
  */
 export function fireShell(sys, v, target = null) {
   const T = v?.spec?.turret;
   if (!T || v.destroyed) return null;
+  // THE CREW GATE, above the aim command as well as the trigger: an abandoned
+  // machine neither shoots nor slews itself onto you. See the header.
+  if (!v.debugNoCrewGate && !crewOf(v)) return null;
   if (target) aimTurret(v, target);
   if (v.gunCool > 0) return null;
   v.gunCool = T.reload;

@@ -44,10 +44,70 @@ const GRAVITY = -9.81;
  * parks the slip AT the target whatever the surface, the gradient or the gear,
  * which is the only setting that actually maximises thrust.
  */
-const TC_TARGET = 1.35;
+const TC_TARGET = 0.92;
 const TC_GAIN = 7.0;
 /** Most of the drive torque it is allowed to take away. */
 const TC_CUT = 0.92;
+
+/**
+ * ────────────────────────────────────────────────────────────────────────────
+ * THE SETPOINT USED TO BE PAST THE PEAK, AND THAT IS "DRIVING ON HUBCAPS".
+ * ────────────────────────────────────────────────────────────────────────────
+ * `TC_TARGET` was 1.35 — i.e. the controller deliberately parked the driven
+ * tyres at 1.35x their own peak slip, on the FALLING side of the magic
+ * formula. Two things follow from that, and both are exactly what the owner
+ * reported ("at full throttle tires seem to spin", "like driving on hubcaps"):
+ *
+ *   IT IS THE SKID STATE. `_stepWheels` flags a wheel as skidding at
+ *   `w.combined > 1.02`, and `combined` is normalised slip over PEAK slip — so
+ *   a setpoint of 1.35 is a permanent, by-design skid. Every squeal, every
+ *   smoke puff and every skid mark a hard launch produced was the traction
+ *   controller hitting its own target.
+ *
+ *   IT COOKS THE TYRE. `tyre.js` builds heat from `combined - 1.0` and takes
+ *   `tyre.fade` (0.16 on a road tyre) of mu back out at heat 1. MEASURED on a
+ *   muscle car launching on grass before this change: heat saturated at 1.000
+ *   within 0.2 s and never came back down, so the car spent the whole launch
+ *   at 84% of the grip it should have had.
+ *
+ * Below 1 the tyre is on the RISING side, where the curve is flat within a
+ * percent of its peak, `combined` stays under the skid threshold, and no heat
+ * is generated at all. It gives up nothing and stops the car sliding.
+ */
+
+/**
+ * ────────────────────────────────────────────────────────────────────────────
+ * LAUNCH CLAMP — a slip-ratio-aware ceiling on drive torque, not a slip-error
+ * integrator chasing one.
+ * ────────────────────────────────────────────────────────────────────────────
+ * The integrator above has zero steady-state error and that is still worth
+ * having, but it has a settling time, and a standing start is nothing BUT
+ * transient. MEASURED on a muscle car launching on grass with the integrator
+ * alone: a 5 Hz limit cycle between slip 0.02 and slip 0.56, `traction`
+ * swinging 0.42..1.00, the contact patch alternating between 3080 N and
+ * 960 N and averaging about two thirds of what it could pull. A sedan pointed
+ * up a 14.5 degree grass bank sat in that cycle for the whole run and moved
+ * 1 cm in 5 seconds.
+ *
+ * So the torque is CLAMPED before it is handed to the wheel, at the largest
+ * value that cannot push this wheel past `_tcTarget` on this step. It is the
+ * wheel-spin integrator of `_stepWheels` solved backwards for the torque:
+ *
+ *     omega1 = omega0 + (T - fx r) dt / (I + dt r kFx)
+ *     omega1 <= (target vRef + vLong) / r
+ *  => T <= (omegaMax - omega0)(I + dt r kFx)/dt + fx r
+ *
+ * `fx`, `kFx` and `vLong` are one step old — the tyre loop runs after the
+ * drivetrain — which at 120 Hz is 8 ms of lag on a quantity that moves slowly.
+ * Nothing here can ever ADD torque, so a stale term can only cost a little
+ * thrust for one step, never produce any.
+ *
+ * It is deliberately the same setpoint the integrator uses, under the same
+ * authority envelope (`_tcAuth`): full below 6 m/s, gone by 14. Above that a
+ * burnout, a power-on drift and a smoky exit are the player's business and
+ * neither controller can touch them.
+ */
+const TC_LEGACY_TARGET = 1.35;
 
 /**
  * ────────────────────────────────────────────────────────────────────────────
@@ -448,8 +508,28 @@ export class Vehicle {
     this.autoReverse = false;
     /** Low-speed traction-control cut, 0 (off) to 1 (full). See `_hookUp`. */
     this.traction = 0;
-    /** Slip ratio the controller holds the driven wheels at. */
-    this._tcTarget = peakSlipRatio(spec.tyre) * TC_TARGET;
+    /**
+     * Slip ratio the controller holds the driven wheels at.
+     *
+     * A SINGLE-TRACK VEHICLE KEEPS THE OLD SETPOINT, for the same reason
+     * `_capLaunch` declines to run on one: the report is about CARS, a bike
+     * launches by lighting up its one rear patch on purpose, and its rider is
+     * the traction control. MEASURED with the road setpoint on it, against
+     * `drivetest.mjs`'s own bars: 50 km/h in 2.58 s (bar 2.54), 71.8 m in the
+     * first 5 s (bar 72.4) and a bicycle that no longer backs over a 15 cm
+     * kerb. Small numbers, but all three the wrong way for no gain — nothing
+     * in the report is about a motorcycle.
+     */
+    this._tcTarget = peakSlipRatio(spec.tyre)
+      * (spec.kind === 'bike' ? TC_LEGACY_TARGET : TC_TARGET);
+    /**
+     * The pre-fix setpoint, past the peak. `debugOldTraction` swaps to it and
+     * disarms the launch clamp on a LIVE vehicle with no edit — the negative
+     * control for `src/vehicles/tracprobe.mjs`.
+     */
+    this._tcTargetLegacy = peakSlipRatio(spec.tyre) * TC_LEGACY_TARGET;
+    /** Traction-control authority this step, 0..1. Written by `_hookUp`. */
+    this._tcAuth = 0;
 
     /**
      * FUEL, 0-100. Only the vehicle the PLAYER is driving actually burns any:
@@ -966,7 +1046,12 @@ export class Vehicle {
    *   - the handbrake disarms it completely, because a handbrake slide is the
    *     player asking for exactly this;
    *   - it takes about a third of a second to wind on, so a hard launch still
-   *     lights them up and squeals before it hooks.
+   *     lights them up and squeals before it hooks. NO LONGER TRUE OF A CAR,
+   *     and deliberately: `_capLaunch` now holds the wheel under its peak from
+   *     the first step, so a road car launches clean — MEASURED, muscle car on
+   *     asphalt, peak `combined` 1.058 -> 0.894, skid time 0.12 s -> 0. That
+   *     chirp was the owner's "tires seem to spin" and it cost real thrust.
+   *     A BIKE still does it: it is excluded from the clamp, see `_capLaunch`.
    *
    * It trims the DRIVE TORQUE AT THE WHEELS, not the throttle pedal. Trimming
    * the pedal was tried first and it bricked every powerful car in the fleet:
@@ -994,6 +1079,10 @@ export class Vehicle {
      * peak-to-peak chassis force on a stationary cruiser with no key pressed.
      */
     if (auth <= 0 || this.input.handbrake || Math.abs(this.slipAngle) > 0.45) {
+      // The launch clamp is disarmed by exactly the same conditions, and it
+      // reads this rather than re-deciding them: a handbrake slide with a
+      // torque ceiling still on it is a handbrake slide the player cannot end.
+      this._tcAuth = 0;
       this.traction = Math.max(0, this.traction - dt * 4);
       return;
     }
@@ -1032,9 +1121,74 @@ export class Vehicle {
     // Winds on at `TC_GAIN`, lets go at twice that. Real traction control is
     // asymmetric for the same reason: being slow to intervene costs a chirp,
     // being slow to release costs the acceleration you intervened to protect.
-    const err = slip - this._tcTarget;
+    const err = slip - (this.debugOldTraction === true ? this._tcTargetLegacy : this._tcTarget);
     const t = this.traction + err * (err > 0 ? TC_GAIN : TC_GAIN * 2) * dt * auth;
     this.traction = t < 0 ? 0 : t > 1 ? 1 : t;
+    // Published for the launch clamp in `_stepWheels`, which runs later in this
+    // same step and must not re-derive it. `debugOldTraction` leaves the
+    // integrator alone and takes the clamp away, which is the build the owner
+    // played.
+    this._tcAuth = this.debugOldTraction === true ? 0 : auth;
+  }
+
+  /**
+   * THE LAUNCH CLAMP. `_stepWheels` calls this the instant the drivetrain has
+   * spoken and before the tyres are asked what they can do about it.
+   *
+   * Per driven wheel, the largest torque that cannot carry it past
+   * `_tcTarget` on this step — `_stepWheels`' own semi-implicit wheel-spin
+   * step solved backwards for T. It can only ever take torque AWAY:
+   *
+   *   - a wheel with no contact patch has no slip to reason about;
+   *   - a torque that opposes the selected gear is engine braking, not drive,
+   *     and cutting that would be a phantom throttle;
+   *   - a ceiling below zero is floored at zero rather than turned into a
+   *     brake, because a driveline that can retard a wheel is a different
+   *     device and it belongs to the pedal, not to this.
+   *
+   * `w.fx`, `w.kFx` and `w.vLong` are last step's, 8 ms old at 120 Hz — see
+   * the header block. `w.hp.inertia + reflectedInertia` is the same rotating
+   * mass the wheel loop integrates, so the two agree by construction rather
+   * than by a constant that has to be kept in sync.
+   */
+  _capLaunch(dt) {
+    /**
+     * NOT ON A SINGLE-TRACK VEHICLE, and this is a measurement rather than a
+     * taste. The inversion above assumes the tyre force the wheel will meet
+     * this step is roughly the one it met last step. On a bike that assumption
+     * fails badly: `TYRE_BIKE` is `Bx` 13 against a car's 11 with the load of
+     * ONE contact patch under it, so the measured `kFx` is ~1410 where the
+     * whole rotating inertia is 0.70 — the linearised damping term is five
+     * times the mass it is damping — and the rear patch's velocity carries the
+     * pitch of a machine that is trying to wheelie. MEASURED with the clamp on
+     * a bike: it left the line at 0.95 m/s after 4 s against a bar of 10, with
+     * the rear tyre's force alternating +1580 / -1701 N on consecutive steps.
+     * The bike keeps the slip-error integrator, which is a rate limiter rather
+     * than a one-step prediction and does not care.
+     */
+    if (this.spec.kind === 'bike') return;
+    const auth = this._tcAuth;
+    const dir = this.drivetrain.gear === 0 ? -1 : 1;
+    const reflected = this.drivetrain.reflectedInertia;
+    for (let k = 0; k < this._driven.length; k++) {
+      const w = this.wheels[this._driven[k]];
+      const t = this._drivenTorque[k];
+      if (!w.grounded || w.load <= 1 || t * dir <= 0) continue;
+      const r = w.hp.radius;
+      // 2.2 is `tyre.js`'s `V_MIN`, spelled the same way `_hookUp` spells it:
+      // a slip normalised against a different reference speed is a different
+      // number, and the two controllers have to mean the same thing by it.
+      const vRef = Math.max(2.2, Math.abs(w.vLong));
+      // The wheel speed that IS the setpoint, in the direction the drive pushes.
+      const omegaMax = (w.vLong + dir * this._tcTarget * vRef) / r;
+      const inertia = w.hp.inertia + reflected;
+      let cap = ((omegaMax - w.omega) * (inertia + dt * r * w.kFx)) / dt + w.fx * r;
+      if (cap * dir < 0) cap = 0;
+      // Authority fades the ceiling out toward the raw torque rather than
+      // switching it off, so nothing steps as a car accelerates past 6 m/s.
+      const lim = cap + (t - cap) * (1 - auth);
+      if ((t - lim) * dir > 0) this._drivenTorque[k] = lim;
+    }
   }
 
   _updateSteering(dt) {
@@ -1329,6 +1483,9 @@ export class Vehicle {
         const keep = 1 - TC_CUT * this.traction;
         for (let i = 0; i < this._drivenTorque.length; i++) this._drivenTorque[i] *= keep;
       }
+      // ...and then the LAUNCH CLAMP, which is what actually makes a standing
+      // start hook up. See the block comment above `TC_LEGACY_TARGET`.
+      if (this._tcAuth > 0) this._capLaunch(dt);
     } else {
       this.drivetrain.omega *= 1 - Math.min(1, dt * 1.6);
       this.drivetrain.rpm = this.drivetrain.omega / (Math.PI / 30);

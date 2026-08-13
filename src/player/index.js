@@ -400,7 +400,7 @@ export class PlayerSystem {
     console.info(
       `[player] ${this.brother.name} · ${tri} tris / ${this.character.boneList.length} bones · ` +
       `spawn ${spawn.feet.x.toFixed(1)}, ${spawn.feet.y.toFixed(2)}, ${spawn.feet.z.toFixed(1)} · ` +
-      `walk ${MOVE.walkSpeed} jog ${MOVE.jogSpeed} sprint ${this.brother.runSpeed} m/s · ` +
+      `run ${this.brother.runSpeed} (default) / jog ${MOVE.jogSpeed} / walk ${MOVE.walkSpeed} m/s · ` +
       `hp ${this.brother.health}/armour ${this.brother.armour} · jump ${JUMP_SPEED.toFixed(2)} m/s`
     );
   }
@@ -599,6 +599,25 @@ export class PlayerSystem {
      * it. See `VehicleHandler.applySeatAttitude`.
      */
     this.vehicles.applySeatAttitude(this.character?.root ?? null);
+    /**
+     * COLLAPSE THE HEAD WHEN THE EYE IS IN IT. The cabin view (V, fourth view)
+     * parks the lens at the seated head; the whole-body near-fade is the wrong
+     * tool there — it would erase the hands on the wheel the cabin was built
+     * to show. Everything head-skinned (skull, face, HAIR SHELLS and the EYE
+     * spheres the C1 rework added — the "floating eyeballs" of the owner's
+     * screenshot) rides one bone, so scaling that bone to nothing removes all
+     * of it and nothing else. After the animator (clips write head rotation,
+     * never scale) and after the seat attitude, so nothing downstream restores
+     * it. `debugKeepHead` is the live negative control.
+     */
+    {
+      const head = this.character?.bones?.head;
+      if (head) {
+        const hide = this.rig.interiorEye === true && this.debugKeepHead !== true;
+        const s = hide ? 1e-3 : 1;
+        if (head.scale.x !== s) head.scale.setScalar(s);
+      }
+    }
     this._drainFootstep();
     this._updateVisibility(dt);
     // After the animator and after `_updateVisibility`: the mark is placed off
@@ -1786,7 +1805,10 @@ export class PlayerSystem {
     this.movement.teleport(posOrEye.x, feetY, posOrEye.z, yaw);
     this.rig.reset(this.movement.anchorHeight, this.movement.position, yaw);
     if (rot && typeof rot !== 'number' && rot.x !== undefined) {
-      this.rig.pitch = this.rig.pitchTarget = clamp(rot.x, CAMERA.orbit.pitchMin, CAMERA.orbit.pitchMax);
+      // `rig.pitchMax` and not `CAMERA.orbit.pitchMax`: the ceiling is per-view
+      // since the elevation fix, and a teleport that framed the player looking
+      // up would otherwise be clamped back to the old +34 deg.
+      this.rig.pitch = this.rig.pitchTarget = clamp(rot.x, CAMERA.orbit.pitchMin, this.rig.pitchMax);
     }
     this.animator?.reset();
     this.vehicles?.abort(this.movement);

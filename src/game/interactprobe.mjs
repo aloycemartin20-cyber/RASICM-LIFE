@@ -11,6 +11,17 @@
  * an interaction handler directly: the point is to prove that standing in the
  * right place and pressing F does the thing, not that a method exists.
  *
+ * The `carjack` area is the deep one, and it exists for a report: "when I steal
+ * a car that is being driven, the occupant should be pulled out by my
+ * character." It stages a car with a body in the seat AND a `traffic` Driver at
+ * the wheel, presses F, and reads WHERE THE MAN CAME OUT off the canonical
+ * `vehicle:exit` — in the car's own frame, so "through the door" is a number.
+ * MEASURED: 1.57 m outboard of a 1.02 m half width and 0.07 m fore and aft,
+ * i.e. at the door; the NEGATIVE CONTROL (`player.vehicles.debugLegacyJack`,
+ * the pre-fix order and the lost race with `traffic`) puts him 0.00 m off the
+ * centre line, inside the car, with the player's own jack carrying no ped at
+ * all.
+ *
  *   npm run build && node src/game/interactprobe.mjs
  *   node src/game/interactprobe.mjs --keep     leave the browser open on failure
  */
@@ -373,6 +384,227 @@ try {
   rec('stealing a police car raises the wanted level',
     jacked.inVehicle && jacked.wanted > jack.before,
     `${jack.before}* -> ${jacked.wanted}* (heat owned by ${jack.owner})`);
+
+  /* =================================================================== */
+  area = 'carjack';
+  /* =================================================================== */
+
+  /**
+   * REPORTED, from play: "when I steal a car that is being driven, the
+   * occupant should be pulled out by my character."
+   *
+   * The car is staged with BOTH halves of what "being driven" means in this
+   * engine, because they are separate facts: a `traffic` Driver (the AI that
+   * steers it) and a `peds` body in the seat (the man you can actually grab —
+   * the seating sweep is budgeted, so a car can have the first without the
+   * second). Its nose is laid along world +x on purpose: the pre-fix drop
+   * point was the literal expression `vehicle.position.x + 1.4`, so with the
+   * car parked this way that offset runs 1.4 m down its own centre line and
+   * the control below can be read as "is he still in the car".
+   *
+   * WHAT IS MEASURED: the ped's position AT THE MOMENT OF THE PULL, taken off
+   * the `vehicle:jack` event rather than sampled later — he runs, so a reading
+   * taken two seconds after the fact would score the flee, not the pull.
+   */
+  await run(`
+    window.__JACK__ = null;
+    window.__CRIMES__ = [];
+    if (police && !police.__crimeTap) {
+      const raw = police.reportCrime.bind(police);
+      police.reportCrime = (kind, at, sev) => {
+        window.__CRIMES__.push(kind);
+        return raw(kind, at, sev);
+      };
+      police.__crimeTap = true;
+    }
+    window.__EJECT__ = null;
+    ctx.events.on('vehicle:exit', (e) => {
+      if (!e || e.actor !== game.__jackPed) return;
+      const v = e.vehicle;
+      const q = v.quaternion;
+      window.__EJECT__ = {
+        px: e.actor.position.x, py: e.actor.position.y, pz: e.actor.position.z,
+        vx: v.position.x, vz: v.position.z,
+        heading: Math.atan2(2 * (q.w * q.y + q.x * q.z), 1 - 2 * (q.y * q.y + q.x * q.x)),
+        hx: v.spec && v.spec.half ? v.spec.half.x : 1, hz: v.spec && v.spec.half ? v.spec.half.z : 2.3,
+      };
+    });
+    ctx.events.on('vehicle:jack', (e) => {
+      const p = e.ped;
+      const v = e.vehicle;
+      const q = v.quaternion;
+      window.__JACK__ = {
+        hasPed: !!p, active: p ? p.active !== false : false,
+        state: p ? String(p.state) : '', inCar: p ? !!p.vehicle : false,
+        px: p ? p.position.x : 0, py: p ? p.position.y : 0, pz: p ? p.position.z : 0,
+        vx: v.position.x, vz: v.position.z,
+        heading: Math.atan2(2 * (q.w * q.y + q.x * q.z), 1 - 2 * (q.y * q.y + q.x * q.x)),
+        hx: v.spec && v.spec.half ? v.spec.half.x : 1, hz: v.spec && v.spec.half ? v.spec.half.z : 2.3,
+      };
+    });
+    return true;`);
+
+  /** Park an OCCUPIED, AI-driven sedan on the clear spot and stand at its door. */
+  const stageJack = (legacy) => run(`
+    if (player.inVehicle) player.vehicles.abort(player.movement);
+    if (game.__probeVeh) game.wq.despawnVehicle(game.__probeVeh);
+    game.heat.clear('probe');
+    window.__JACK__ = null;
+    window.__EJECT__ = null;
+    window.__CRIMES__.length = 0;
+    const peds = ctx.peek('peds');
+    const traffic = ctx.peek('traffic');
+    const c = game.__clear;
+    for (const o of veh.vehicles.slice()) {
+      if (Math.hypot(o.position.x - c.x, o.position.z - c.z) < 60) veh.despawn(o);
+    }
+    const v = game.wq.spawnVehicle('sedan', c.x, c.z, Math.PI * 0.5);
+    game.__probeVeh = v; game.__probeAt = c;
+    // The body in the seat, through the published door traffic itself uses.
+    const ped = peds.attachDriver(v, 0, { archetype: 'street' });
+    game.__jackPed = ped;
+    void traffic;
+    player.vehicles.debugLegacyJack = ${legacy ? 'true' : 'false'};
+    game.wq.placePlayer(c.x, c.z - 2.9, 0);
+    return { ped: !!ped, occupied: !!peds.driverOf(v) };`);
+
+  /**
+   * The AI at the wheel goes on LAST, immediately before the key. A `Driver`
+   * bound to a car parked seventy metres off its own lane is a lost driver,
+   * and `traffic` correctly recycles one — which despawns the car under the
+   * test. Binding it a beat before F is pressed leaves the handover path
+   * exactly what it is in play and nothing else time to intervene.
+   */
+  const bindTraffic = () => run(`
+    const traffic = ctx.peek('traffic');
+    const v = game.__probeVeh;
+    const roads = ctx.peek('world') && ctx.peek('world').roads;
+    const e = roads && roads.nearestEdge ? roads.nearestEdge(v.position.x, v.position.z) : null;
+    let bound = false;
+    if (e && e.edge && traffic && traffic.attach) {
+      bound = !!traffic.attach(v, e.edge, e.lane || 0, e.t || 0);
+    }
+    return { bound, driving: !!traffic.driverOf(v) };`);
+
+  const jk = await stageJack(false);
+  await settle(12);
+  const jkOffer = await run(`
+    const v = game.__probeVeh;
+    return { id: game.getAction().id, target: game.getAction().target === v,
+             pull: player.vehicles.prompt ? player.vehicles.prompt.text : null };`);
+  const jkBound = await bindTraffic();
+  rec('an occupied car is staged: a body in the seat and an AI at the wheel',
+    jk.ped && jk.occupied && jkBound.driving,
+    `ped ${jk.ped}, traffic driver ${jkBound.driving}`);
+  rec('the player reads it as a PULL OUT, not an ENTER',
+    jkOffer.pull === 'PULL OUT' && jkOffer.target,
+    `player prompt "${jkOffer.pull}" · contextual action "${jkOffer.id}"`);
+
+  await tapF();
+  await pump(12);
+  await pump(190);
+  const jackRes = await run(`
+    const v = game.__probeVeh;
+    const peds = ctx.peek('peds');
+    const traffic = ctx.peek('traffic');
+    const j = window.__JACK__;
+    const g = window.__EJECT__;
+    let eject = null;
+    if (g) {
+      const dx = g.px - g.vx, dz = g.pz - g.vz;
+      const ch = Math.cos(g.heading), sh = Math.sin(g.heading);
+      eject = { x: dx * ch - dz * sh, z: dx * sh + dz * ch, hx: g.hx, hz: g.hz };
+    }
+    return {
+      j, eject,
+      seated: game.wq.playerVehicle() === v,
+      pedLeft: peds.driverOf(v) === null,
+      pedAlive: game.__jackPed ? game.__jackPed.active !== false : false,
+      trafficLeft: traffic.driverOf(v) === null,
+      aged: !!(traffic._abandoned || []).some((a) => a.v === v),
+      crimes: window.__CRIMES__.slice(),
+    };`);
+  const L = jackRes.eject;
+  rec('the PLAYER is the one who hauls him out — his own jack carries the ped',
+    !!jackRes.j && jackRes.j.hasPed && jackRes.j.inCar === false && jackRes.j.state !== 'driving',
+    jackRes.j ? `ped ${jackRes.j.hasPed}, still in the car ${jackRes.j.inCar}, state ${jackRes.j.state}`
+      : 'no vehicle:jack event at all');
+  rec('he comes out THROUGH THE DOOR — clear of the flank, beside the car',
+    !!L && Math.abs(L.x) > L.hx && Math.abs(L.z) < L.hz,
+    L ? `${Math.abs(L.x).toFixed(2)} m outboard of a ${L.hx.toFixed(2)} m half width, ` +
+        `${Math.abs(L.z).toFixed(2)} m fore/aft of ${L.hz.toFixed(2)}` : 'never left the car');
+  rec('and he is left standing on the road, not despawned mid-pull',
+    jackRes.pedAlive && jackRes.j?.active === true && Math.abs(jackRes.j.py) < 400,
+    `on his feet ${jackRes.j ? jackRes.j.active : '-'} at the pull, ` +
+    `still in the crowd ${jackRes.pedAlive}`);
+  rec('the player ends up in the seat the occupant left', jackRes.seated && jackRes.pedLeft,
+    `seated ${jackRes.seated}, seat free ${jackRes.pedLeft}`);
+  rec('the car is HANDED OVER by traffic, not abandoned to the ageing list',
+    jackRes.trafficLeft && jackRes.aged === false,
+    `traffic driver ${jackRes.trafficLeft ? 'released' : 'STILL BOUND'}, ` +
+    `in the abandoned list ${jackRes.aged}`);
+  rec('the carjack is still booked by police (the existing hook)',
+    jackRes.crimes.includes('carjack'), `reportCrime saw [${jackRes.crimes.join(', ') || 'nothing'}]`);
+
+  /**
+   * THE RESERVATION ITSELF, put directly. `traffic` clearing the seat under the
+   * animation is a RACE, and a race lost by 350 ms is not something a sampled
+   * assertion can be trusted to catch; this asks the mechanism instead.
+   */
+  const hold = await run(`
+    const peds = ctx.peek('peds');
+    const v = game.wq.spawnVehicle('sedan', game.__clear.x + 14, game.__clear.z, 0);
+    const ped = peds.attachDriver(v, 0, { archetype: 'street' });
+    const mark = { who: 'probe' };
+    peds.holdOccupant(v, mark);
+    const stranger = peds.pullFromVehicle(v, v.position);
+    const stillIn = peds.driverOf(v) === ped;
+    peds.releaseOccupant(v, mark);
+    const holder = peds.pullFromVehicle(v, v.position);
+    const out = peds.driverOf(v) === null;
+    game.wq.despawnVehicle(v);
+    return { seated: !!ped, stranger: !!stranger, stillIn, holder: !!holder, out };`);
+  rec('a reserved occupant cannot be taken by anyone but the holder',
+    hold.seated && hold.stranger === false && hold.stillIn === true &&
+    hold.holder === true && hold.out === true,
+    `while held: pull returned ${hold.stranger ? 'the ped' : 'null'} and he stayed in ` +
+    `(${hold.stillIn}); once released: ${hold.holder ? 'pulled' : 'still refused'}`);
+
+  /**
+   * NEGATIVE CONTROL — the pre-fix carjack, on the live build with no edit.
+   * `traffic.abandon()` first, which ejects the body itself at
+   * `position.x + 1.4` before the player has reached the door and files the
+   * car for ageing. The car is parked nose-along-x, so that offset is 1.4 m
+   * down its own centre line: he ends up INSIDE it.
+   */
+  await stageJack(true);
+  await settle(12);
+  await bindTraffic();
+  await tapF();
+  await pump(190);
+  const legacyJack = await run(`
+    const v = game.__probeVeh;
+    const traffic = ctx.peek('traffic');
+    const j = window.__JACK__;
+    const g = window.__EJECT__;
+    let eject = null;
+    if (g) {
+      const dx = g.px - g.vx, dz = g.pz - g.vz;
+      const ch = Math.cos(g.heading), sh = Math.sin(g.heading);
+      eject = { x: dx * ch - dz * sh, z: dx * sh + dz * ch, hx: g.hx, hz: g.hz };
+    }
+    void traffic;
+    return { eject, jackHadPed: !!(j && j.hasPed),
+             seated: game.wq.playerVehicle() === v };`);
+  const CL = legacyJack.eject;
+  rec('NEGATIVE CONTROL — the old path drops him INSIDE the car he was in',
+    !!CL && Math.abs(CL.x) < CL.hx,
+    CL ? `${Math.abs(CL.x).toFixed(2)} m off centre against a ${CL.hx.toFixed(2)} m half width`
+      : 'he never left the car at all');
+  rec('NEGATIVE CONTROL — and the player never touches him: the jack carries no ped',
+    legacyJack.jackHadPed === false && legacyJack.seated === true,
+    `jack carried a ped ${legacyJack.jackHadPed}, player seated ${legacyJack.seated}`);
+  await run(`player.vehicles.debugLegacyJack = false; return true;`);
 
   /* =================================================================== */
   area = 'gas station';

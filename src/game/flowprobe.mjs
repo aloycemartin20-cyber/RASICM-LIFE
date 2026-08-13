@@ -77,9 +77,10 @@ import { Router } from '../world/route.js';
 import { Rng } from '../core/rng.js';
 import { MissionRunner } from './mission.js';
 import { JobBoard } from './jobs.js';
+import { StagingRings } from './freeroam.js';
 import { HostilePool } from './hostiles.js';
 import { WorldQuery } from './util.js';
-import { BOYZ, POI, R, DIFFS } from './data.js';
+import { BOYZ, POI, R, DIFFS, DOCKS } from './data.js';
 import { blankSave } from './save.js';
 
 const VERBOSE = process.argv.includes('--verbose');
@@ -381,6 +382,26 @@ function drive(s, steps, onStep) {
     onStep?.(n);
   }
   return n;
+}
+
+/**
+ * Move a player across the rings in steps no bigger than a car can travel.
+ *
+ * The step cap matters: `StagingRings` treats a jump past `RING_SWEEP_MAX`
+ * (120 m) as a TELEPORT and refuses to sweep across it, so a harness that
+ * relocated its player in one 400 m hop would be testing the teleport guard
+ * every time instead of the entry test. 40 m is 144 km/h at this file's 20 Hz.
+ *
+ * @returns {?object} the first hit along the way, or null.
+ */
+function walk(rings, x0, z0, x1, z1, step = 40) {
+  const n = Math.max(1, Math.ceil(Math.hypot(x1 - x0, z1 - z0) / step));
+  let hit = null;
+  for (let i = 1; i <= n; i++) {
+    const t = i / n;
+    hit = rings.update(DT, x0 + (x1 - x0) * t, z0 + (z1 - z0) * t) ?? hit;
+  }
+  return hit;
 }
 
 /** Put the player into `v` the way the game's own seat state reads. */
@@ -1024,6 +1045,197 @@ function endTally(s, sinceCards, sinceSfx, frame) {
   check('NEG CONTROL: a second K long after the question does NOT drop it',
     jobs.lite.active === true,
     `active ${jobs.lite.active} after a 30 s gap between presses`);
+}
+
+/* ========================================================================== */
+/* 8 — THE STAGING RINGS: free roam is the default, the ring is the door       */
+/* ========================================================================== */
+/**
+ * THE DESIGN THIS GATES, in the owner's words: "they should always be in
+ * freeplay mode and start missions by going to a certain location or walking
+ * onto a glowing ring to indicate there is something for them to do".
+ *
+ * `StagingRings` (`freeroam.js`) is deliberately gameplay-free — it answers
+ * "did he enter one" and nothing else — which is what lets this section drive
+ * it with the REAL terrain and road graph and no `GameSystem` at all.
+ *
+ * WHY IT IS NOT CIRCULAR (rule 12). Nothing below reads the ring's own idea of
+ * where it is against the number that placed it:
+ *
+ *   · "never in the river" is asserted with `terrain.isWater` at the EMITTED
+ *     ring coordinate, against an input this file chose to be over water (a
+ *     `DOCKS` pier head, which is over the Monongahela by construction);
+ *   · "the ring is the same door as J" compares the `mission:start` PAYLOAD
+ *     from a ring entry with the payload from a direct `missions.start` on a
+ *     second scene — two emitted events, field by field, not two return values;
+ *   · the swept entry test is driven with a JUMP the probe measures itself
+ *     (60 m in one step, which is 108 km/h at this file's 20 Hz), so a
+ *     point-sample implementation fails it.
+ *
+ * NEGATIVE CONTROLS, both of them real rather than synthetic:
+ *   1. `rings.enabled = false` — the `?owNoRings=1` arm — must produce NO hit
+ *      for the identical motion. Without it "walking in started the chapter"
+ *      is a claim about the harness, not the feature.
+ *   2. A ring that APPEARS UNDER THE PLAYER must not fire until he has been
+ *      `RING_REARM` away. That is not a nicety: `_announceNext` publishes the
+ *      next chapter's ring on the frame the last one ends, and chapters stage
+ *      at recurring POIs, so without the latch the player is fired straight
+ *      into the next chapter and never sees free roam — the exact bug the
+ *      whole feature exists to remove.
+ */
+{
+  const s = scene();
+  const rings = new StagingRings(s.ctx, s.wq);
+  const starts = [];
+  s.events.on('mission:start', (p) => starts.push({ ...p }));
+
+  const { boy, idx, c } = chapterOf('carson', 'deliver');
+  const poi = POI.get(c.at ?? c.from ?? '') ?? null;
+  const staged = poi?.stage ?? poi;
+
+  // ---- 1. the ring stands on the STAGED point ---------------------------
+  rings.setChapter({ x: staged.x, z: staged.z, name: c.name }, idx);
+  const slot = rings.slots[0];
+  const offStage = Math.hypot(slot.x - staged.x, slot.z - staged.z);
+  check('a ring stands at the next chapter\'s staged point',
+    slot.on === true && offStage < 0.001 && !terrain.isWater(slot.x, slot.z),
+    `${c.no} ${c.name} at (${slot.x.toFixed(0)}, ${slot.z.toFixed(0)}), ` +
+    `${offStage.toFixed(3)} m off the staging point, water ${terrain.isWater(slot.x, slot.z)}`);
+  check('...standing ON the surface, not under the river bed',
+    Math.abs(slot.y - s.wq.surfaceY(slot.x, slot.z)) < 0.01 && slot.y > -1,
+    `ring y ${slot.y.toFixed(2)}, surface ${s.wq.surfaceY(slot.x, slot.z).toFixed(2)}`);
+
+  // ---- 2. a WET target is moved to dry land -----------------------------
+  // A `DOCKS` record's x/z IS the pier head and is over water on purpose. A
+  // ring there is a chapter nobody can start.
+  const pier = DOCKS.find((d) => terrain.isWater(d.x, d.z)) ?? DOCKS[0];
+  rings.setChapter({ x: pier.x, z: pier.z, name: pier.name }, 0);
+  const wet = rings.slots[0];
+  check('a ring is never left in the river (the pier head is)',
+    terrain.isWater(pier.x, pier.z) === true && terrain.isWater(wet.x, wet.z) === false,
+    `${pier.name} pier (${pier.x}, ${pier.z}) water ${terrain.isWater(pier.x, pier.z)} -> ` +
+    `ring (${wet.x.toFixed(0)}, ${wet.z.toFixed(0)}) water ${terrain.isWater(wet.x, wet.z)}, ` +
+    `moved ${Math.hypot(wet.x - pier.x, wet.z - pier.z).toFixed(0)} m`);
+
+  // ---- 3. arm from a distance, then walk in ------------------------------
+  rings.setChapter({ x: staged.x, z: staged.z, name: c.name }, idx);
+  const far = walk(rings, staged.x + 400, staged.z, staged.x + 200, staged.z);
+  check('NEG CONTROL: a new ring is not armed and does not fire from 400 m',
+    far === null && rings.slots[0].armed === true,
+    `hit ${far === null ? 'none' : far.kind}, armed ${rings.slots[0].armed}`);
+  const walked = walk(rings, staged.x + 200, staged.z, staged.x + 2, staged.z + 2);
+  check('walking into the ring fires exactly one chapter trigger',
+    !!walked && walked.kind === 'chapter' && walked.index === idx,
+    `hit ${walked ? `${walked.kind} #${walked.index}` : 'none'}`);
+  const again = rings.update(DT, staged.x, staged.z);
+  check('...and standing in it does not fire it again',
+    again === null, `second frame in the ring: ${again === null ? 'no hit' : again.kind}`);
+
+  // ---- 4. the swept test — 108 km/h straight through --------------------
+  rings.setChapter({ x: staged.x, z: staged.z, name: c.name }, idx);
+  walk(rings, staged.x - 400, staged.z, staged.x - 30, staged.z);  // arm, then close
+  const swept = rings.update(DT, staged.x + 30, staged.z); // 60 m in one 50 ms step
+  check('driving THROUGH at 108 km/h still counts (the test is swept)',
+    !!swept && swept.kind === 'chapter',
+    `60 m step across the centre: ${swept ? swept.kind : 'MISSED'}`);
+
+  // ---- 4b. ...but a TELEPORT is not a drive ------------------------------
+  /**
+   * MEASURED, and it is why this check exists: a capture staged with
+   * `game:"clean"` photographed the CH 1 intro cutscene instead of the free
+   * roam it asked for, because `Director.unstick` teleports the player once
+   * the city has streamed in and the swept segment ran straight through the
+   * chapter ring. A ring must answer for movement the player made.
+   */
+  rings.setChapter({ x: staged.x, z: staged.z, name: c.name }, idx);
+  walk(rings, staged.x - 400, staged.z, staged.x - 200, staged.z);   // armed, far off
+  const ported = rings.update(DT, staged.x, staged.z);               // 200 m in one step
+  check('NEG CONTROL: a TELEPORT into the ring does not start the chapter',
+    ported === null && rings.slots[0].armed === false,
+    `200 m in one 50 ms step: ${ported === null ? 'no hit' : ported.kind}`);
+
+  // ---- 5. the ring is the SAME DOOR as J --------------------------------
+  rings.setChapter({ x: staged.x, z: staged.z, name: c.name }, idx);
+  const enter = walk(rings, staged.x - 400, staged.z, staged.x, staged.z);
+  if (enter?.kind === 'chapter') {
+    s.player.position.set(staged.x, 0, staged.z);
+    s.missions.start(boy, enter.index);
+  }
+  const viaRing = starts[starts.length - 1] ?? null;
+  // The J path, on its own scene, so neither run can see the other's state.
+  const s2 = scene();
+  const starts2 = [];
+  s2.events.on('mission:start', (p) => starts2.push({ ...p }));
+  s2.player.position.set(staged.x, 0, staged.z);
+  s2.missions.start(boy, idx);
+  const viaKey = starts2[starts2.length - 1] ?? null;
+  check('starting via the ring emits the SAME mission:start as J does',
+    !!viaRing && !!viaKey &&
+    viaRing.chapter === viaKey.chapter && viaRing.name === viaKey.name &&
+    viaRing.track === viaKey.track && viaRing.zone === viaKey.zone,
+    `ring ${JSON.stringify(viaRing && { chapter: viaRing.chapter, track: viaRing.track })} · ` +
+    `key ${JSON.stringify(viaKey && { chapter: viaKey.chapter, track: viaKey.track })}`);
+}
+
+/* ---- NEGATIVE CONTROL: the rings turned off -------------------------- */
+{
+  const s = scene();
+  const rings = new StagingRings(s.ctx, s.wq);
+  rings.enabled = false;                       // the `?owNoRings=1` arm
+  const { idx, c } = chapterOf('carson', 'deliver');
+  const poi = POI.get(c.at ?? c.from ?? '');
+  const staged = poi?.stage ?? poi;
+  rings.setChapter({ x: staged.x, z: staged.z, name: c.name }, idx);
+  rings.update(DT, staged.x - 400, staged.z);
+  const hit = rings.update(DT, staged.x, staged.z);
+  check('NEG CONTROL: with the rings off the same walk starts nothing',
+    hit === null, `hit ${hit === null ? 'none' : hit.kind}`);
+}
+
+/* ---- NEGATIVE CONTROL: a ring that appears under his feet ------------- */
+{
+  const s = scene();
+  const rings = new StagingRings(s.ctx, s.wq);
+  const { idx, c } = chapterOf('carson', 'deliver');
+  const poi = POI.get(c.at ?? c.from ?? '');
+  const staged = poi?.stage ?? poi;
+  // The frame a chapter ends: he is standing on the point the NEXT one stages.
+  rings.setChapter({ x: staged.x, z: staged.z, name: c.name }, idx);
+  const onTop = rings.update(DT, staged.x, staged.z);
+  const stillOn = rings.update(DT, staged.x + 1, staged.z);
+  check('NEG CONTROL: a ring published under the player cannot fire on the spot',
+    onTop === null && stillOn === null && rings.slots[0].armed === false,
+    `frame 1 ${onTop === null ? 'no hit' : onTop.kind}, frame 2 ${stillOn === null ? 'no hit' : stillOn.kind}`);
+  // ...and it works normally once he has actually been somewhere else.
+  const back = walk(rings, staged.x, staged.z, staged.x + 400, staged.z) ??
+    walk(rings, staged.x + 400, staged.z, staged.x, staged.z);
+  check('...and it arms the moment he leaves, so the ring still works',
+    !!back && back.kind === 'chapter', `after leaving and returning: ${back ? back.kind : 'no hit'}`);
+}
+
+/* ---- the side-job rings ----------------------------------------------- */
+{
+  const s = scene();
+  const rings = new StagingRings(s.ctx, s.wq);
+  const jobs = new JobBoard(s.ctx, {
+    wq: s.wq, economy: s.economy, missions: s.missions, save: s.save,
+  });
+  jobs.boy = BOYZ.aidan;
+  jobs.refresh(true);
+  const list = jobs.list();
+  rings.setJobs(list);
+  const live = rings.slots.slice(1).filter((r) => r.on);
+  check('every standing side job gets its own ring',
+    live.length === list.length && list.length === 3,
+    `${live.length} rings for ${list.length} offers: ${live.map((r) => r.id).join(', ')}`);
+  check('...and none of them is in the water either',
+    live.every((r) => !terrain.isWater(r.x, r.z)),
+    live.map((r) => `${r.id}@(${r.x.toFixed(0)},${r.z.toFixed(0)})`).join(' '));
+  const j = live[0];
+  const took = walk(rings, j.x + 400, j.z + 400, j.x, j.z);
+  check('driving into a job ring offers THAT job, by id',
+    !!took && took.kind === 'job' && took.id === j.id,
+    `hit ${took ? `${took.kind}:${took.id}` : 'none'} against ring ${j.id}`);
 }
 
 /* ========================================================================== */

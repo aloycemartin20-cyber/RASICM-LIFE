@@ -29,6 +29,32 @@ export const RIVER_BED = -11;
 export const RIVER_SHORE = 44;
 /** Height of the top of the bank above the pool. */
 export const RIVER_BANK = 5.2;
+/**
+ * HOW FAR PAST ITS OWN WATERLINE THE RIVER IS DRAWN.
+ *
+ * `water.js` builds each river's sheet `width/2 + OVER` either side of the
+ * centreline so there is never a seam where it meets the bank, and every vertex
+ * of that overhang whose ground stands ABOVE `WATER_Y` is pushed under it. The
+ * ones whose ground is BELOW the pool are left at pool level — correctly, that
+ * is what a river does — so the visible water is the contour where the terrain
+ * crosses `WATER_Y`, out to this distance from the waterline.
+ *
+ * THAT CONTOUR IS NOT `terrain.isWater`, and the gap is a road defect.
+ * `isWater` answers `waterDist <= 6 && height < WATER_Y - 0.25`, so between 6
+ * and 24 m outside a waterline it says DRY while the sheet is drawn over the
+ * ground at pool level. MEASURED on the analytic field at 4 m: 4.51 % of that
+ * band is below the pool — 801 of 17 755 samples — and `netgen` was laying
+ * streets across it on a plan-distance setback alone. `downtown_v7` came out
+ * 5.54 m under the Monongahela's surface 23 m from its waterline on the shipped
+ * seed, which is the "road from downtown goes into the river" the owner drove
+ * into. `netgen.underRiver` is the one test both the corridor clip and the
+ * closing links now apply, and `src/game/groundtruthprobe.mjs` gates it.
+ *
+ * ONE OWNER, because two subsystems deciding one fact is how the Point Fountain
+ * ended up 8.7 m under the Ohio (ARCHITECTURE.md rule 12). `water.js` still
+ * spells the same 24 as its own `OVER`; it should import this instead.
+ */
+export const RIVER_OVERHANG = 24;
 
 const p4 = (pts) => pts.map(([x, z]) => [x * K, z * K]);
 

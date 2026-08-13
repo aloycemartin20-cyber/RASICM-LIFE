@@ -35,6 +35,52 @@
  *    driver is a PED: `peds.pullFromVehicle(vehicle, doorPoint)` is the call,
  *    and it also panics the street, which is the half of a carjack you see.
  *
+ * 2b. ...AND THEN THE WRONG SUBSYSTEM PULLED HIM OUT, IN THE WRONG PLACE.
+ *    REPORTED, from play: "when I steal a car that is being driven, the
+ *    occupant should be pulled out by my character". The call above was here,
+ *    but it ran SECOND and it almost always found an empty car, because
+ *    `_haulOut` opened by handing the vehicle to `traffic.abandon()` — and
+ *    `abandon` is `traffic`'s FLEEING-DRIVER path: it ejects the body itself,
+ *    at `vehicle.position.x + 1.4` (the middle of the car, plus a metre and a
+ *    half of nothing), stands the car on its handbrake and files it in the
+ *    ageing list that `_ageAbandoned` is entitled to delete from. So the
+ *    occupant teleported out of the roof while the player was still walking to
+ *    the door, and the car the player then inherited was one `traffic` had
+ *    written off. `traffic`'s own header says so in as many words, beside
+ *    `release()`: "This is deliberately NOT abandon()".
+ *
+ *    The order is now the one the fiction requires and the APIs were built
+ *    for: PULL THE OCCUPANT OUT FIRST, at `doorPos` — the live door anchor
+ *    this file already tracks against a moving car — and only then hand the
+ *    car over with `traffic.release(v, 'enter')`, which lets go and touches
+ *    nothing else. A car the AI is driving with no body in it yet (the seating
+ *    sweep is budgeted, so a car can be under AI control with nobody rendered
+ *    in it) has one materialised through `peds.attachDriver` and dragged out
+ *    the same way, so the verb never silently does nothing. `peds` owns what
+ *    he does next — the stagger, then the roll between running, freezing and
+ *    squaring up.
+ *
+ * 2c. AND IT IS A RACE, WHICH REORDERING ALONE DOES NOT WIN. `traffic` does not
+ *    wait for `vehicle:enter`: `TrafficSystem.fixedUpdate` compares every
+ *    driver's car against `playerVehicle()` each tick and releases on the spot,
+ *    and `release()` clears the seat itself. `player.vehicle` starts pointing
+ *    at the car on the FIRST frame of the jack (`m.setDriving(true)` in
+ *    `tryEnter`), so `traffic` got there ~0.35 s before the actor's hand did,
+ *    every time — traced live on the real bus:
+ *
+ *      TrafficSystem.fixedUpdate -> release -> pullFromVehicle  => ped
+ *      VehicleHandler._haulOut   ->           pullFromVehicle  => null
+ *
+ *    So `tryEnter` now RESERVES the occupant — `peds.holdOccupant(v, player)`
+ *    — and `peds.pullFromVehicle` refuses anyone but the holder while that
+ *    stands. `traffic` still hands the CAR over on its own schedule, which is
+ *    its business; the BODY is the player's, and it stays in the seat until the
+ *    animation reaches it. Every exit from the transition drops the hold, and
+ *    `peds` lapses one anyway, so it cannot strand a car.
+ *    `debugLegacyJack` restores the old order, the old call and the lost race
+ *    on a live build: the negative control for `interactprobe`'s carjack
+ *    section, which measures where the occupant ends up.
+ *
  * 3. THE BODY DID NOT RIDE THE CAR. The live seat solve looked for
  *    `v.object3D ?? v.mesh ?? v.root`; a Vehicle exposes `model.root`, so the
  *    lookup returned null, the solve returned early, and the driver stayed
@@ -123,6 +169,8 @@ export class VehicleHandler {
     this.candidate = null;
     this.dive = false;
     this._jacked = false;
+    /** The car whose occupant we have reserved for this jack. See `_holdOccupant`. */
+    this._held = null;
 
     this.doorPos = new THREE.Vector3();
     this.seatPos = new THREE.Vector3();
@@ -203,6 +251,14 @@ export class VehicleHandler {
      * drove the driver bolt upright through the roof on every slope.
      */
     this.debugSeatTilt = true;
+    /**
+     * NEGATIVE CONTROL, read by `src/game/interactprobe.mjs` and by nothing
+     * else: true restores the pre-fix carjack — `traffic.abandon()` first, so
+     * the occupant is ejected by `traffic` into the middle of the car before
+     * the player reaches the door and the car arrives with the handbrake on.
+     * See note 2b in the header.
+     */
+    this.debugLegacyJack = false;
     /** Local-space exit candidates, filled in `_pickExit`. */
     this._exitTry = [];
     for (let i = 0; i < 6; i++) this._exitTry.push(new THREE.Vector3());
@@ -402,16 +458,26 @@ export class VehicleHandler {
    * `traffic.fixedUpdate` drives every entry in `drivers` unconditionally and
    * its `isPlayerVehicle` check is only wired to the horn.
    *
-   * `abandon()` is the right public call rather than `recycle()`: it releases
-   * the driver, hands a BODY to `peds` and has them dragged out at the kerb,
-   * and leaves the car in the world. Which is to say it is already, exactly, a
-   * carjack — `traffic` uses it when a driver flees a wreck.
+   * `release(v, 'enter')` is the HANDOVER door and it is the right one: it
+   * drops the driver, forgets the parking claim and touches nothing else. The
+   * call this used to make — `abandon()` — is `traffic`'s fleeing-driver path,
+   * which puts the handbrake on and files the car for ageing, and it took the
+   * body out of the roof before the player had reached the door. See note 2b
+   * in the header; `debugLegacyJack` puts it back for the negative control.
+   *
+   * Idempotent, and false when `traffic` never owned the car.
    */
   _releaseTraffic(v) {
     const d = this._trafficDriver(v);
     if (!d) return false;
     const traffic = this.ctx.peek('traffic');
-    try { traffic.abandon(d, this.ctx); return true; } catch { return false; }
+    try {
+      if (this.debugLegacyJack !== true && typeof traffic.release === 'function') {
+        return traffic.release(v, 'enter') === true;
+      }
+      traffic.abandon(d, this.ctx);
+      return true;
+    } catch { return false; }
   }
 
   /* ==================================================================== */
@@ -439,6 +505,20 @@ export class VehicleHandler {
     if (this._occupied(v, this.seat)) {
       this.phase = PHASE.jack;
       this.duration = T.jack;
+      /**
+       * CLAIM THE MAN IN THE SEAT, on the frame the verb starts.
+       *
+       * `m.setDriving(true)` one line up is what makes `player.vehicle` point
+       * at this car, and `traffic.fixedUpdate` releases a car the instant it
+       * sees that — clearing the seat ITSELF, at the chassis centre, a third of
+       * a second before the actor's hand reaches the door. Traced live:
+       * `TrafficSystem.fixedUpdate -> release -> pullFromVehicle => ped`, then
+       * `_haulOut -> pullFromVehicle => null`. The hold makes the occupant
+       * ours until `_haulOut` takes him; `traffic` still hands the CAR over on
+       * its own schedule, which is what it is for. Skipped under
+       * `debugLegacyJack`, because losing that race IS the pre-fix behaviour.
+       */
+      this._holdOccupant(v);
     } else {
       this.phase = PHASE.open;
       // Cover the ground at a believable rate rather than in a fixed time: a
@@ -699,22 +779,67 @@ export class VehicleHandler {
   }
 
   /**
+   * Claim the occupant for the duration of the jack, and give the claim back.
+   * `_dropHold` is called from every exit out of the transition — the pull
+   * itself, `abort`, and the door closing — so a cancelled jack can never
+   * strand a car. (`peds` also lapses a hold on its own, which is the belt to
+   * this brace: a leak here would be silent and permanent.)
+   */
+  _holdOccupant(v) {
+    if (this.debugLegacyJack === true) return false;
+    const peds = this.ctx.peek('peds');
+    if (!peds?.holdOccupant) return false;
+    try { this._held = peds.holdOccupant(v, this.player) ? v : null; } catch { this._held = null; }
+    return !!this._held;
+  }
+
+  _dropHold() {
+    const v = this._held;
+    if (!v) return;
+    this._held = null;
+    const peds = this.ctx.peek('peds');
+    try { peds?.releaseOccupant?.(v, this.player); } catch { /* stub */ }
+  }
+
+  /**
    * The actual carjack. `peds` owns the driver, so `peds` takes him out of the
-   * car and leaves him on the road; `vehicles` is told the seat is free.
+   * car — at the DOOR the player is standing at, not at the car's centre — and
+   * leaves him on the road; only then does `traffic` hand the car over and
+   * `vehicles` get told the seat is free. The order is the fix; see note 2b.
    */
   _haulOut() {
     const v = this.vehicle;
     const peds = this.ctx.peek('peds');
     const vehicles = this.ctx.peek('vehicles');
-    // `traffic` first: it owns the AI driver, and abandoning gives `peds` a
-    // body to drag out, so the two halves of a carjack happen in one call.
-    const hadTraffic = this._releaseTraffic(v);
+    const legacy = this.debugLegacyJack === true;
+    // THE PRE-FIX ORDER, and only for the negative control: `traffic` first,
+    // which ejects the body itself, in the wrong place, before we get there.
+    const jumped = legacy ? this._releaseTraffic(v) : false;
+
     let ped = null;
     if (peds?.pullFromVehicle) {
-      try { ped = peds.pullFromVehicle(v, this.doorPos); } catch { ped = null; }
+      try { ped = peds.pullFromVehicle(v, this.doorPos, this.player); } catch { ped = null; }
     }
+    /**
+     * A CAR UNDER AI CONTROL WITH NOBODY DRAWN IN IT. `traffic`'s seating
+     * sweep is budgeted out of `q.pedBudget` and only bodies the cars near the
+     * player, so "being driven" and "has a driver you can grab" are different
+     * facts. Materialise one through the published door and drag him out the
+     * same way, rather than letting the headline verb quietly do nothing —
+     * this is the one useful thing `abandon()` used to do for us.
+     */
+    if (!ped && !legacy && peds?.attachDriver && this._trafficDriver(v)) {
+      try {
+        if (peds.attachDriver(v, 0, JACK_ARCH)) {
+          ped = peds.pullFromVehicle(v, this.doorPos, this.player);
+        }
+      } catch { ped = null; }
+    }
+    this._dropHold();
+    const hadTraffic = this._releaseTraffic(v) || jumped;
     if (hadTraffic && !ped) {
-      // `traffic.abandon` already ejected him; count it as the jack it is.
+      // Nobody to grab (the pool was spent, or the legacy path beat us to it):
+      // it is still a jack, and the car has still changed hands.
       ped = peds?.driverOf?.(v) ?? null;
       this._jacked = true;
     }
@@ -921,6 +1046,7 @@ export class VehicleHandler {
 
   _forceOut(m) {
     const v = this.vehicle;
+    this._dropHold();
     const phys = this.ctx.peek('physics');
     if (v) this._exitWorld(v, this._exitLocal ?? this.doorLocal, this.exitPos);
     let y = this.exitPos.y;
@@ -1006,6 +1132,7 @@ export class VehicleHandler {
   /** Drop out of any vehicle immediately (death, teleport, control loss). */
   abort(m) {
     if (this.phase === PHASE.none) return;
+    this._dropHold();
     const v = this.vehicle;
     const vehicles = this.ctx.peek('vehicles');
     let released = false;
@@ -1027,5 +1154,8 @@ export class VehicleHandler {
     m?.setDriving(false);
   }
 }
+
+/** The body materialised for a jack of an AI car that had none. See `_haulOut`. */
+const JACK_ARCH = Object.freeze({ archetype: 'street' });
 
 export { PHASE };

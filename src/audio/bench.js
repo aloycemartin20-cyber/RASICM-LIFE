@@ -124,8 +124,10 @@ function applyControls(mixer, opts) {
 /* ------------------------------------------------------------------ */
 
 /**
- * Every scene: { seconds, build({actx, rng, bank, mixer, field}) -> tick(t,dt) }
- * `tick` may be null for scenes that are entirely scheduled up front.
+ * Every scene: { seconds, build({actx, rng, bank, mixer, field, opts}) -> tick(t,dt) }
+ * `tick` may be null for scenes that are entirely scheduled up front. `opts` is
+ * whatever the caller passed to `renderScene`, so a scene can carry a negative
+ * control arm without a second scene that could drift away from the first.
  */
 export const SCENES = {};
 
@@ -433,6 +435,108 @@ SCENES.sirenPass = {
   },
 };
 
+/**
+ * THE PUMPING SCENE — ONE cruiser, and the three things that used to make it
+ * fade in and out.
+ *
+ * A pursuit unit on your bumper: 150 m out to 138 m past at 24 m/s with a 14 m
+ * closest approach, sirens at three stars. Scripted onto that:
+ *
+ *   t 4.8-5.9  OCCLUSION at 37 m closing to 16 m — a cruiser passing behind a
+ *              building. Worth -8.4 dB of gain, a lowpass down to 420 Hz and a
+ *              -26 dB shelf, all of it arriving in about a tenth of a second
+ *              and leaving again just as fast.
+ *   t 8.0-8.6  SOURCE CYCLING: the unit stops being reported for six frames'
+ *              worth of time. In the live game that is a vehicle record lapsing
+ *              between engine events, a despawn/respawn, or a fifth cruiser
+ *              taking the last of four slots. It used to release the emitter on
+ *              the spot — `releaseTracked` disconnects the panner, so the siren
+ *              stopped mid-note — and then fade back in over 80 ms.
+ *
+ * WHY ONE UNIT AND NOT A PACK. Both. This scene measures the property "a siren
+ * does not lurch", which is a property of a SOURCE, and a five-cruiser version
+ * of it measured nothing: the attenuation curve is deliberately flat past 40 m,
+ * so four units at 90 m sit within a few dB of each other, cutting one moves
+ * the sum by 3 dB, and that is the same size as the sirens' own sweep. MEASURED
+ * on that version: 11.3 dB/s fixed against 17.9 legacy, a defect the gate could
+ * barely see. Density is a different property with a different failure — three
+ * cruisers being three times as loud — and `sirenPack` below measures that one
+ * on its own terms.
+ *
+ * THE ONE STUB, stated because a stub is an assertion that nothing downstream
+ * of it can be wrong: `raycast`. There is no physics offline, so the scene
+ * decides WHEN geometry is in the way. Everything downstream of that answer is
+ * production code — `occlusionAt`'s two rays and its thickness rule, the
+ * emitter's occlusion glide, its gain slew, the attenuation curve, the panner,
+ * the bus and its compressor — and it is the emitted buffer that is measured.
+ */
+SCENES.sirenFlyby = {
+  seconds: 12,
+  build({ actx, rng, bank, mixer, field, opts = {} }) {
+    const pa = new PoliceAudio(actx, bank, mixer, field, rng.fork(), {
+      smooth: opts.legacySiren ? false : undefined,
+    });
+    pa.setWanted(3, 0);
+    let blocked = false;
+    field.ctx = {
+      peek: (id) => (id === 'physics' ? {
+        MASK: { SIGHT: 1 },
+        raycast: (o, dir, len) => (blocked ? { hit: true, distance: len * 0.5 } : null),
+      } : null),
+    };
+    field.occlusionEnabled = true;
+
+    const A = { vehicle: { id: 'A' }, kind: 'police', x: 14, y: 1, z: 150, dist: 150 };
+    const live = [A];
+    const gone = [];
+    return (t, dt) => {
+      A.z = 150 - t * 24;
+      A.dist = Math.hypot(A.x, A.y - 1.6, A.z);
+      blocked = t > 4.8 && t < 5.9;
+      field.setListener(0, 1.6, 0, 0, 0, -1, 0, 1, 0, dt);
+      pa.update(dt, t > 8.0 && t < 8.6 ? gone : live);
+      mixer.update(dt);
+      field.update(dt);
+    };
+  },
+};
+
+/**
+ * DENSITY — the same cruiser, one of it or four of it, so "three cruisers must
+ * not be three times one cruiser" is a subtraction of two measured RMSs rather
+ * than an opinion. `packUnits` picks the arm; `legacySiren` removes the shared
+ * cap (and the LFO scatter), which is what the pile-up sounded like.
+ *
+ * They sit at the same distance in different directions, which is the honest
+ * arrangement: four units converging on one junction is exactly when a pursuit
+ * gets unbearable.
+ */
+SCENES.sirenPack = {
+  seconds: 7,
+  build({ actx, rng, bank, mixer, field, opts = {} }) {
+    const pa = new PoliceAudio(actx, bank, mixer, field, rng.fork(), {
+      smooth: opts.legacySiren ? false : undefined,
+    });
+    pa.setWanted(3, 0);
+    const n = opts.packUnits ?? 4;
+    const units = [];
+    for (let i = 0; i < n; i++) {
+      const a = (i / 4) * Math.PI * 2 + 0.4;
+      units.push({
+        vehicle: { id: `p${i}` }, kind: 'police',
+        x: Math.cos(a) * 55, y: 1, z: Math.sin(a) * 55, dist: 55,
+      });
+    }
+    field.setListener(0, 1.6, 0, 0, 0, -1, 0, 1, 0, 0);
+    void rng; void bank;
+    return (t, dt) => {
+      pa.update(dt, units);
+      mixer.update(dt);
+      field.update(dt);
+    };
+  },
+};
+
 /** Wanted escalation 0 -> 5, to hear the pursuit layer build. */
 SCENES.wanted = {
   seconds: 20,
@@ -641,7 +745,7 @@ export async function renderScene(name, opts = {}) {
   const seconds = opts.seconds ?? scene.seconds;
   const actx = new OfflineAudioContext(2, Math.ceil(SR * seconds), SR);
   const h = harness(actx, opts.seed ?? 0xB0A7 + name.length * 7919);
-  const tick = scene.build({ actx, ...h });
+  const tick = scene.build({ actx, ...h, opts });
   if (opts.solo) soloBus(h.mixer, opts.solo);
   applyControls(h.mixer, opts);
   const buf = tick ? await renderDriven(actx, seconds, tick) : await actx.startRendering();

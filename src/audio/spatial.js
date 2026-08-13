@@ -28,6 +28,50 @@ const MAX_EMITTERS = 52;
 /** Reference distance for the attenuation curve, in metres. */
 const REF = 2.0;
 
+/*
+ * SMOOTHING FOR CONTINUOUS SOURCES — opt-in, and off for everything else.
+ *
+ * A one-shot wants its attenuation applied instantly: a gunshot 80 m away is
+ * 80 m away at the sample it starts. A source that SUSTAINS for a minute while
+ * the geometry between it and the player changes is a different problem, and
+ * the shipped chain treated them the same way. The owner's report was "police
+ * sirens are annoying ... when they fade in and out", and there are three
+ * separate mechanisms behind it, all of them here:
+ *
+ *   1. OCCLUSION IS A STEP. `refresh` round-robins two emitters a frame and
+ *      writes whatever the two rays came back with. Behind a bus: -8.4 dB of
+ *      gain, the lowpass down to 420 Hz and a -26 dB shelf, in ~0.12 s. Out
+ *      from behind it: all of that back. A cruiser weaving through traffic
+ *      does that twice a second.
+ *   2. A RE-ACQUIRED EMITTER SNAPS. `acquire` writes the gain with
+ *      `setValueAtTime`, so a source that lost its slot for one frame comes
+ *      back at full level in one sample.
+ *   3. NOTHING BOUNDS THE RATE. Distance alone is well behaved, but distance
+ *      plus occlusion plus a re-acquire is not, and the sum is what a listener
+ *      hears as pumping.
+ *
+ * So a `smooth` emitter glides its occlusion instead of stepping it, and
+ * rate-limits its gain in dB/s — asymmetric, because arriving late is worse
+ * than leaving late. The numbers are set so a genuine pass-by is untouched: a
+ * cruiser crossing at 25 m/s with a 12 m closest approach moves the level about
+ * 8 dB/s at its fastest, well inside both limits, while an occlusion step or a
+ * re-acquire is the thing that gets held back.
+ */
+/** dB per second a `smooth` emitter's distance gain may move. */
+const SLEW_UP_DB = 22;
+const SLEW_DOWN_DB = 11;
+/** How far below the target a `smooth` emitter may start: caps the fade-in. */
+const SLEW_FLOOR = 0.06;              // -24 dB, so at most ~1.1 s to arrive
+/**
+ * Seconds for a `smooth` emitter's occlusion to travel the whole 0..1 range.
+ *
+ * MEASURED rather than chosen: full occlusion is about 28 dB of level once the
+ * -8.4 dB of gain, the lowpass down to 420 Hz and the -26 dB shelf are all in,
+ * so anything under about 1.4 s here still reads as a gate rather than a duck.
+ * At 0.9 s the emitted flyby recovered at 51 dB/s and sounded switched on.
+ */
+const OCC_GLIDE = 1.5;
+
 class Emitter {
   constructor(actx, mixer) {
     this.actx = actx;
@@ -64,6 +108,12 @@ class Emitter {
     this.pos = { x: 0, y: 0, z: 0 };
     this.vel = { x: 0, y: 0, z: 0 };
     this.occ = 0;
+    /** Where `occ` is heading. Only a `smooth` emitter is ever behind it. */
+    this.occTarget = 0;
+    /** 0 = step (one-shots), 1 = glide + slew (continuous sources). */
+    this.smooth = 0;
+    /** The distance gain last APPLIED, which is what the slew works from. */
+    this._g = 0;
     this.hrtf = true;
     this._hasPrev = false;
     this._connected = false;
@@ -279,7 +329,7 @@ export class SpatialField {
    * Grab an emitter. Returns null when the budget is full and the new sound is
    * less important than everything already playing.
    *
-   * opts: { x,y,z, bus, send, priority, endTime, occlusion, dist, atten }
+   * opts: { x,y,z, bus, send, priority, endTime, occlusion, dist, atten, smooth }
    */
   acquire(opts) {
     const now = this.actx.currentTime;
@@ -321,6 +371,8 @@ export class SpatialField {
     em.userSend = opts.send ?? 0.25;
     em.wantHrtf = opts.hrtf !== false;
     em.occ = occ;
+    em.occTarget = occ;
+    em.smooth = opts.smooth ? 1 : 0;
     em._setPos(opts.x, opts.y, opts.z, t);
 
     // Air absorption + occlusion filtering.
@@ -328,7 +380,13 @@ export class SpatialField {
     const occCut = 20000 * Math.pow(0.021, occ); // 1.0 -> ~420 Hz
     em.occLP.frequency.setValueAtTime(clamp(occCut, 300, 20000), t);
     em.occHS.gain.setValueAtTime(-26 * occ, t);
-    em.distGain.gain.setValueAtTime(clamp(atten * (opts.gain ?? 1), 0, 4), t);
+    // A `smooth` source ARRIVES rather than switching on: seeded 24 dB under
+    // its target, `motion` slews it up over about a second. That is the fix for
+    // mechanism 2 above — a siren that lost its slot for one frame used to come
+    // back at full level in one sample.
+    const g0 = clamp(atten * (opts.gain ?? 1), 0, 4);
+    em._g = em.smooth ? g0 * SLEW_FLOOR : g0;
+    em.distGain.gain.setValueAtTime(em._g, t);
 
     // Farther and more occluded => proportionally wetter.
     const send = (opts.send ?? 0.25) * (0.5 + Math.min(dist, 90) * 0.022) * (1 + occ * 0.7);
@@ -342,6 +400,12 @@ export class SpatialField {
    * Claim a long-lived emitter for a continuous source (an engine, a siren, a
    * bed). Tracked emitters are never stolen by one-shots and are moved with
    * `motion()` every frame. Returns null only when everything is busy.
+   *
+   * `smooth: true` additionally glides the occlusion and rate-limits the gain
+   * (see the block above `SLEW_UP_DB`). It is only correct for a source whose
+   * owner calls `motion()` EVERY FRAME — that is where the glide is stepped —
+   * so a bed that relies on the `refresh` round-robin alone must not ask for
+   * it. Sirens use it; nothing else does yet.
    */
   acquireTracked(opts) {
     const em = this.acquire({ ...opts, tracked: true, endTime: Infinity, occlusion: 0 });
@@ -413,15 +477,48 @@ export class SpatialField {
 
     /* ---- position, attenuation, air -------------------------------- */
     em.moveTo(x, y, z, 0.035);
+    if (em.smooth) this._glideOcc(em, dt, t);
     const atten = this.attenuation(dist) * (1 - 0.62 * em.occ);
     em.airLP.frequency.setTargetAtTime(airCutoff(dist), t, 0.09);
-    em.distGain.gain.setTargetAtTime(clamp(atten * (em.userGain ?? 1), 0, 4), t, 0.05);
+    const want = clamp(atten * (em.userGain ?? 1), 0, 4);
+    if (em.smooth) em.distGain.gain.setTargetAtTime(this._slew(em, want, dt), t, 0.08);
+    else em.distGain.gain.setTargetAtTime(want, t, 0.05);
     // Far sources are wetter, and HRTF is wasted on them.
     em.sendGain.gain.setTargetAtTime(
       clamp((em.userSend ?? 0.25) * (0.5 + Math.min(dist, 90) * 0.02) * (1 + em.occ * 0.7), 0, 3), t, 0.15);
     if (dist > 42 && em.hrtf) em.setHrtf(false);
     else if (dist < 34 && !em.hrtf && em.wantHrtf !== false) em.setHrtf(true);
     return ratio;
+  }
+
+  /**
+   * Rate-limit a `smooth` emitter's distance gain, in dB per second. Returns
+   * the value to write. Works in dB rather than in linear gain because the same
+   * emitter has to behave the same way at -6 dBFS and at -40: a linear rate
+   * limit is a different musical speed at every distance.
+   */
+  _slew(em, want, dt) {
+    const tgt = Math.max(want, 1e-6);
+    const cur = Math.max(em._g, tgt * SLEW_FLOOR, 1e-6);
+    const step = 20 * Math.log10(tgt / cur);
+    const lim = clamp(step, -SLEW_DOWN_DB * dt, SLEW_UP_DB * dt);
+    em._g = cur * Math.pow(10, lim / 20);
+    return em._g;
+  }
+
+  /**
+   * Walk a `smooth` emitter's occlusion toward what the rays last saw, and move
+   * the filters with it. Everything derived from `occ` therefore travels
+   * together — gain, lowpass and shelf — which matters: gliding the gain while
+   * the lowpass still snapped would leave the step perfectly audible.
+   */
+  _glideOcc(em, dt, t) {
+    const d = em.occTarget - em.occ;
+    if (Math.abs(d) < 1e-4) return;
+    em.occ = clamp(em.occ + clamp(d, -dt / OCC_GLIDE, dt / OCC_GLIDE), 0, 1);
+    em.occLP.frequency.setTargetAtTime(
+      clamp(20000 * Math.pow(0.021, em.occ), 300, 20000), t, 0.08);
+    em.occHS.gain.setTargetAtTime(-26 * em.occ, t, 0.08);
   }
 
   /** Update an in-flight tracked emitter's occlusion/distance (beds, voices). */
@@ -431,6 +528,11 @@ export class SpatialField {
     const p = em.pos;
     const dist = this.distanceTo(p.x, p.y, p.z);
     const occ = this.occlusionAt(p.x, p.y, p.z);
+    em.occTarget = occ;
+    // A `smooth` emitter is driven by `motion` every frame and owns its own
+    // glide and slew. Writing the raw ray result here as well would step over
+    // the very ramp that stops it pumping — this round-robin IS the step.
+    if (em.smooth) return;
     em.occ = occ;
     const atten = this.attenuation(dist) * (1 - 0.62 * occ);
     em.airLP.frequency.setTargetAtTime(airCutoff(dist), t, 0.12);

@@ -77,6 +77,18 @@
  * shooter directly ahead is almost collinear with the camera-to-body axis, so
  * that is the one direction the parallax bug could not corrupt.
  *
+ * The table is longer than 54 now — the gait block was re-baselined when full
+ * deflection became the RUN (`MOVE.autoRunMag`), and the counts above are the
+ * three-bug control as it was measured, not a claim about today's total. That
+ * control has NOT been re-run since; treat the eight named rows as the live
+ * part of it and the 46/54 as history.
+ *
+ * The gait block carries its own control INSIDE the run, which is the pattern
+ * to copy: `NEG CONTROL: auto-run off = jog` drives the identical key at the
+ * identical site with `movement.autoRun = false` and requires 3.35 m/s. Between
+ * that row and `W alone runs` (6.4 m/s), no single edit to `tuning.js` can make
+ * both green — which is what the pair is for.
+ *
  * ──────────────────────────────────────────────────────────────────────────
  * WHY THIS IS NOT IN THE GATE
  *
@@ -199,22 +211,36 @@ function report(r, wallSeconds) {
    * 4.57 / 4.2 / 3.66 / 7.01 / 8.38 / 2.44 numbers were the inherited CoD
    * ladder and are gone. tuning.js authors walk 1.72 / jog 3.35 / crouch 1.48
    * / aim 1.9, and DESIGN.md gives the sprint per brother. ------------------ */
-  row('jog top speed', r.gait.jog, '3.35 m/s', near(r.gait.jog, 3.35, 0.12));
-  row('sprint top speed', r.gait.sprint, '6.4 m/s (Carson)', near(r.gait.sprint, 6.4, 0.15),
-    'DESIGN.md run speed for the DEFAULT brother. Fails loudly if the default changes — which is a review, not a bug.');
-  row('right = jog speed', r.gait.right, '= jog +-0.1', near(r.gait.right, r.gait.jog, 0.1),
+  row('W alone runs', r.gait.run, '6.4 m/s (Carson)', near(r.gait.run, 6.4, 0.15),
+    'THE row this section exists for: "I always need to hold in the run button to move fast enough". ' +
+    'W and no modifier now emits DESIGN.md\'s run speed for the default brother. Fails loudly if the ' +
+    'default brother changes — which is a review, not a bug.');
+  row('NEG CONTROL: auto-run off = jog', r.gait.jogNoAuto, '3.35 m/s',
+    near(r.gait.jogNoAuto, 3.35, 0.12),
+    'Same key, same site, `movement.autoRun = false`. This is what makes the row above mean ' +
+    'something: raising `jogSpeed` would pass that one and fail this one.');
+  row('Shift agrees with the default', r.gait.shift - r.gait.run, '0 +-0.05 m/s',
+    near(r.gait.shift, r.gait.run, 0.05),
+    'Shift is still bound and still forces the run — it is now never WRONG to hold and never required.');
+  row('walk modifier speed', r.gait.walk, '1.72 m/s', near(r.gait.walk, 1.72, 0.12),
+    'Alt (ACTIONS.walk). Where the slow gait went when full deflection became the run.');
+  row('right = run speed', r.gait.right, '= run +-0.1', near(r.gait.right, r.gait.run, 0.1),
     'GTA re-facing: the body turns and runs, there is no strafe penalty unless aiming.');
-  row('back = jog speed', r.gait.back, '= jog +-0.1', near(r.gait.back, r.gait.jog, 0.1));
+  row('back = run speed', r.gait.back, '= run +-0.1', near(r.gait.back, r.gait.run, 0.1));
   row('crouch speed', r.gait.crouch, '1.48 m/s', near(r.gait.crouch, 1.48, 0.12));
   row('aim speed', r.gait.aim, '1.90 m/s', near(r.gait.aim, 1.9, 0.12));
   row('time to 3.0 m/s', r.gait.t30, '0.09-0.30 s', r.gait.t30 > 0.09 && r.gait.t30 < 0.3,
-    'Replaces a "time to 90%" row that measured -1 (never reached) and PASSED on the sentinel.');
-  row('stop time from jog', r.gait.stopJog, '0.08-0.30 s', r.gait.stopJog > 0.08 && r.gait.stopJog < 0.3);
-  row('stop time from sprint', r.gait.stopSprint, '0.40-0.85 s',
-    r.gait.stopSprint > 0.4 && r.gait.stopSprint < 0.85);
-  row('sprint stop has weight', r.gait.stopSprint - r.gait.stopJog, '> +0.20 s',
-    r.gait.stopSprint - r.gait.stopJog > 0.2,
-    'A sprint must roll off, not stop dead — the difference IS the weight.');
+    'Replaces a "time to 90%" row that measured -1 (never reached) and PASSED on the sentinel. ' +
+    'Unmoved by auto-run: `groundAccel` is the same 22 m/s^2 whatever the target speed is.');
+  row('stop time from a walk', r.gait.stopWalk, '0.08-0.30 s',
+    r.gait.stopWalk > 0.08 && r.gait.stopWalk < 0.3);
+  row('stop time from the run', r.gait.stopRun, '0.40-0.85 s',
+    r.gait.stopRun > 0.4 && r.gait.stopRun < 0.85,
+    'Re-baselined, not relaxed: this is the old "stop time from sprint" band, and it now applies to ' +
+    'the DEFAULT gait because the default gait is the run. `hardStopSpeed` (4.2) is what selects it.');
+  row('the run stop has weight', r.gait.stopRun - r.gait.stopWalk, '> +0.20 s',
+    r.gait.stopRun - r.gait.stopWalk > 0.2,
+    'A run must roll off, not stop dead — the difference IS the weight.');
   row('air control ratio', r.air.controlRatio, '0.15-0.40', r.air.controlRatio > 0.15 && r.air.controlRatio < 0.4);
 
   /* ---- FOV, read off the EMITTED camera. Third person wants ~62 deg from an
@@ -252,25 +278,35 @@ function report(r, wallSeconds) {
   row('land event speed', r.land.eventSpeed, '> 4 m/s', r.land.eventSpeed > 4);
 
   /* ---- footsteps + camera bob ------------------------------------------- */
-  row('footsteps / 10 m jog', r.steps.jog, '9-12', r.steps.jog >= 9 && r.steps.jog <= 12,
-    'The old 6-8 band was a 4.57 m/s CoD walk. A 3.35 m/s jog has a 1.86 m stride, i.e. ~10.8 steps per 10 m.');
-  row('footsteps / 10 m sprint', r.steps.sprint, '6-10', r.steps.sprint >= 6 && r.steps.sprint <= 10);
-  row('jog step gap', r.steps.jogGap, '0.75-1.20 m', r.steps.jogGap > 0.75 && r.steps.jogGap < 1.2,
-    'RATCHET on the upper bound. Goal is 0.93 m — GAIT.jog authors a 1.86 m stride, i.e. two plants per ' +
-    'stride. The emitted plants come 1.07 m apart, ~15 % long, which means the foot is covering more ' +
-    'ground between plants than the gait says it should: the same family as the foot-slide RATCHETs in ' +
-    'src/peds/gaitprobe.mjs, and content work rather than maths. Lower the 1.20 as the plants tighten. ' +
-    'The measurement itself (mean distance between consecutive EMITTED footstep positions) is far ' +
-    'steadier than a raw count, which gains or loses a whole step at the 10 m cutoff.');
-  row('sprint step gap is longer', r.steps.sprintGap - r.steps.jogGap, '> +0.20 m',
-    r.steps.sprintGap - r.steps.jogGap > 0.2,
+  row('footsteps / 10 m walking', r.steps.walk, '9-15', r.steps.walk >= 9 && r.steps.walk <= 15,
+    'The WALK modifier. GAIT.walk authors a 1.42 m stride at 1.72 m/s, i.e. ~14 plants per 10 m.');
+  row('footsteps / 10 m running', r.steps.run, '6-10', r.steps.run >= 6 && r.steps.run <= 10,
+    'W alone. This is the old "/ 10 m sprint" row: the default gait is the run now, so the default ' +
+    'gait is what has the sprint\'s stride.');
+  row('run step gap', r.steps.runGap, '1.00-1.60 m', r.steps.runGap > 1.0 && r.steps.runGap < 1.6,
+    'RATCHET on the upper bound. Goal is 1.32 m — GAIT.sprint authors a 2.64 m stride, i.e. two plants ' +
+    'per stride. Same family as the foot-slide RATCHETs in src/peds/gaitprobe.mjs (jog and run share the ' +
+    'walk lobe shapes, so a run has no flight phase): content work rather than maths. Lower the 1.60 as ' +
+    'the plants tighten. The measurement itself (mean distance between consecutive EMITTED footstep ' +
+    'positions) is far steadier than a raw count, which gains or loses a whole step at the 10 m cutoff.');
+  row('the run stride is longer than the walk', r.steps.runGap - r.steps.walkGap, '> +0.20 m',
+    r.steps.runGap - r.steps.walkGap > 0.2,
     'Two emitted signals against each other: the footstep event stream against the emitted body position. ' +
-    'Authored strides are 1.86 m jogging and 2.64 m sprinting, i.e. gaps of 0.93 and 1.32.');
+    'Authored strides are 1.42 m walking and 2.64 m running, i.e. gaps of 0.71 and 1.32.');
   row('footstep surfaces', r.steps.surfaces.join(','), 'non-empty', r.steps.surfaces.length > 0);
-  row('camera bob while jogging', r.bob.jog, '0.005-0.05 m', r.bob.jog > 0.005 && r.bob.jog < 0.05,
-    'Emitted camera height over the emitted feet, detrended with a 21-frame moving average so road camber cancels.');
+  row('camera bob at the jog', r.bob.jogNoAuto, '0.005-0.05 m',
+    r.bob.jogNoAuto > 0.005 && r.bob.jogNoAuto < 0.05,
+    'Emitted camera height over the emitted feet, detrended with a 21-frame moving average so road camber ' +
+    'cancels. THE SAME MEASUREMENT AND THE SAME BAND as before auto-run — the gait is now pinned with ' +
+    '`movement.autoRun = false` instead of by the key, because the detrend window covers 2.2 m at the run ' +
+    'and above CAMERA.orbit.autoSpeed the orbit auto-centres, so at the default gait this number stops ' +
+    'being the footstep channel at all. Measured: 0.019 here, 0.003 at the walk, 0.134 at the run.');
+  row('the run bobs harder than the jog', r.bob.run - r.bob.jogNoAuto, '> 0 m',
+    r.bob.run > r.bob.jogNoAuto,
+    'POSITIVE CONTROL for the row above, and the gate on CAMERA.step.sprintScale: a faster gait must move ' +
+    'the lens more, not less.');
   row('no bob standing still', r.bob.idle, '< 0.004 m', r.bob.idle < 0.004,
-    'NEGATIVE CONTROL for the row above.');
+    'NEGATIVE CONTROL for both rows above.');
 
   /* ---- stance, proven behaviourally instead of by reading rig.eye -------- */
   row('standing blocked by 1.35 m soffit', r.stance.standTravel, 'stops short', r.stance.standBlocked,
@@ -616,23 +652,47 @@ function runBench() {
   out.gait = {};
   place(0);
   {
+    /* THE DEFAULT GAIT — W and nothing else. It used to be the jog; auto-run
+     * makes it the brother's run speed, which is what "I always need to hold in
+     * the run button to move fast enough" was asking for. Every row that used
+     * to be labelled `jog` here is this measurement re-baselined, not a
+     * threshold moved to suit a build. */
     let t30 = -1;
     const t = eng.time.elapsed;
-    out.gait.jog = topSpeed(['KeyW'], 80, () => {
+    out.gait.run = topSpeed(['KeyW'], 120, () => {
       if (t30 < 0 && p.horizontalSpeed >= 3.0) t30 = eng.time.elapsed - t;
     });
     out.gait.t30 = t30;
-    out.gait.stopJog = stopTime(120);
+    out.gait.stopRun = stopTime(200);
   }
   settle(); place(0);
-  out.gait.right = topSpeed(['KeyD'], 70);
+  out.gait.right = topSpeed(['KeyD'], 120);
   settle(); place(0);
-  out.gait.back = topSpeed(['KeyS'], 70);
+  out.gait.back = topSpeed(['KeyS'], 120);
   settle(); place(0);
   {
-    out.gait.sprint = topSpeed(['KeyW', 'ShiftLeft'], 120);
+    // Shift is still bound and still forces the run. With auto-run it can only
+    // ever agree with the default; the row exists to prove it does not FIGHT
+    // it, which is the failure mode of a half-applied change.
+    out.gait.shift = topSpeed(['KeyW', 'ShiftLeft'], 120);
     out.fov = { sprint: cam.fov };
-    out.gait.stopSprint = stopTime(200);
+  }
+  settle(); place(0);
+  {
+    // The WALK modifier (Alt). This is where the former default speed went.
+    out.gait.walk = topSpeed(['KeyW', 'AltLeft'], 90);
+    out.gait.stopWalk = stopTime(120);
+  }
+  settle(); place(0);
+  {
+    /* NEGATIVE CONTROL, in the bench rather than in a separate run: with
+     * auto-run switched off, W has to fall back to exactly the jog the build
+     * shipped with. It is what makes the 6.4 above attributable — if the run
+     * row went green because somebody raised `jogSpeed`, this row goes red. */
+    p.movement.autoRun = false;
+    out.gait.jogNoAuto = topSpeed(['KeyW'], 90);
+    settle();
+    p.movement.autoRun = true;
   }
   settle(); place(0);
   {
@@ -761,24 +821,48 @@ function runBench() {
       surfaces: [...new Set(events.steps.map((s) => s.surface))],
     };
   };
+  /* The two gaits a keyboard can now produce. It used to be W against
+   * Shift+W; with auto-run those are the same gait, so the stride comparison
+   * has to be the RUN against the WALK modifier or it compares a thing to
+   * itself and can only ever report zero. */
   settle(); place(0); step(20);
-  const jogSteps = stepsPer10m(['KeyW']);
+  const walkSteps = stepsPer10m(['KeyW', 'AltLeft']);
   settle(); place(0); step(20);
-  const sprintSteps = stepsPer10m(['KeyW', 'ShiftLeft']);
+  const runSteps = stepsPer10m(['KeyW']);
   out.steps = {
-    jog: jogSteps.count, sprint: sprintSteps.count,
-    jogGap: jogSteps.gap, sprintGap: sprintSteps.gap,
-    jogDist: jogSteps.dist, sprintDist: sprintSteps.dist,
-    surfaces: [...new Set([...jogSteps.surfaces, ...sprintSteps.surfaces])],
+    walk: walkSteps.count, run: runSteps.count,
+    walkGap: walkSteps.gap, runGap: runSteps.gap,
+    walkDist: walkSteps.dist, runDist: runSteps.dist,
+    surfaces: [...new Set([...walkSteps.surfaces, ...runSteps.surfaces])],
   };
-  notes.push(`footsteps: jog ${jogSteps.count} over ${jogSteps.dist.toFixed(2)}m ` +
-    `(mean gap ${jogSteps.gap.toFixed(2)}m), sprint ${sprintSteps.count} over ` +
-    `${sprintSteps.dist.toFixed(2)}m (mean gap ${sprintSteps.gap.toFixed(2)}m)`);
+  notes.push(`footsteps: walk ${walkSteps.count} over ${walkSteps.dist.toFixed(2)}m ` +
+    `(mean gap ${walkSteps.gap.toFixed(2)}m), run ${runSteps.count} over ` +
+    `${runSteps.dist.toFixed(2)}m (mean gap ${runSteps.gap.toFixed(2)}m)`);
 
+  /* The bob is measured at the WALK, not at the default gait, and the reason is
+   * worth writing down. `camResidual` detrends with a 21-frame (0.35 s) moving
+   * average, which is 0.6 m of travel at a walk and 2.2 m at a run — and above
+   * `CAMERA.orbit.autoSpeed` (3.4 m/s) the orbit ALSO starts auto-centring,
+   * which moves the boom vertically for reasons that have nothing to do with
+   * footsteps. Measured on this build: 0.019 m at the jog with auto-run off,
+   * 0.134 m at the run. The 0.134 is not a defect and it is not new — it is
+   * what this row would always have read had it been pointed at a sprint — but
+   * it is not the footstep channel either. The walk is where that channel is
+   * observable on its own, and the ordering row below is what keeps the fast
+   * gait honest. */
   settle(); place(0); step(25);
-  out.bob = { jog: camResidual(170, ['KeyW']) };
+  out.bob = { walk: camResidual(170, ['KeyW', 'AltLeft']) };
+  settle(); place(0); step(25);
+  out.bob.run = camResidual(170, ['KeyW']);
   settle(); place(0); step(25);
   out.bob.idle = camResidual(170, []);
+  settle(); place(0); step(25);
+  p.movement.autoRun = false;
+  out.bob.jogNoAuto = camResidual(170, ['KeyW']);
+  p.movement.autoRun = true;
+  notes.push(`camera bob (detrended, half peak-to-peak): walk ${out.bob.walk.toFixed(3)}m · ` +
+    `jog with auto-run off ${out.bob.jogNoAuto.toFixed(3)}m · run ${out.bob.run.toFixed(3)}m · ` +
+    `idle ${out.bob.idle.toFixed(3)}m`);
 
   /* ---- stance, proven by geometry the body either fits through or not --- */
   settle();
@@ -1055,6 +1139,19 @@ function runBench() {
   /* ---- recoil: A/B on the emitted camera ------------------------------- */
   const recoilRun = (kick) => {
     settle(); place(0); step(50);
+    /**
+     * THE CONTROL ARM HAS TO BE A CONTROL. `CameraRig.breathPhase` free-runs
+     * for the whole bench, so the two arms of this A/B used to start at
+     * whatever phase the preceding rows happened to leave — and the breath
+     * pitch is worth several hundredths of a degree at the sample point. The
+     * residual therefore moved with UNRELATED edits earlier in the file:
+     * measured 0.004, 0.030 and 0.059 deg on three builds against a 0.05
+     * threshold, i.e. a row that could go red because somebody added a
+     * measurement above it. Phase-locking the two arms is what makes the
+     * difference attributable to the kick, which is the only thing this row
+     * claims to measure.
+     */
+    p.rig.breathPhase = 0;
     const trace = [];
     if (kick) p.addRecoil(2.4 * Math.PI / 180, 0.6 * Math.PI / 180, 0.4 * Math.PI / 180, 0.01);
     for (let i = 0; i < 100; i++) {

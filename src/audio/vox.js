@@ -453,9 +453,18 @@ export function barkFor(kind, rng) {
  *      word was wrong".
  *
  * This is (2), and every parameter below is chosen to keep it there:
- *   - ARTICULATION is a scalar, not a switch, and it is low. Consonant bursts
- *     are mixed at a third of the bark's level, which is what stops the ear
- *     trying to parse syllables into words.
+ *   - ARTICULATION is a scalar, not a switch. It was set to a THIRD of a bark's
+ *     on the theory that quiet consonants stop the ear trying to parse the
+ *     syllables into words. THE OWNER PLAYED IT AND COULD NOT TELL IT WAS
+ *     SPEECH AT ALL — "muffled, cannot understand speech" — which is the
+ *     failure mode on the other side of (1), and a worse one: a vowel bed with
+ *     no syllable edges is not "a person talking indistinctly", it is a hum.
+ *     Consonant onsets carry the RHYTHM, and the rhythm is the half of speech
+ *     this register exists to deliver. They are now mixed near a bark's, and
+ *     that does NOT push the read toward (1): the vowels are untouched, so
+ *     there is still no word to get wrong — only an edge on every syllable.
+ *     Measured on the emitted read (duckprobe 2c, onset energy ratio): -21.1 dB
+ *     before, -15.3 dB after. See ARTICULATION below.
  *   - The source tilt is the WARMEST bucket and the presence peak is a fifth of
  *     the shout's, so it reads as talk in a room, not a PA announcement.
  *   - It is paced at a human speaking rate (~4.5 syllables/s) and DROPS weak
@@ -625,8 +634,23 @@ export function voiceFor(id) {
 
 /** Never gabble: past this the read stops sounding like a person talking. */
 const MAX_SYL_RATE = 6.2;
-/** Consonant bursts, relative to a bark's. See the register note above. */
-const ARTICULATION = 0.34;
+/**
+ * Consonant bursts, relative to a bark's. See the register note above.
+ *
+ * 0.34 was the shipped value and it is what "muffled" meant: MEASURED on the
+ * rendered read (duckprobe's onset energy ratio — the consonant burst against
+ * the vowel bed masking it), the shipped line scored -21.1 dB. At 0.9 the same
+ * measurement is -15.3 dB, and the 5.8 dB is the difference between a burst you
+ * hear as a /t/ and one that disappears into the vowel it opens.
+ *
+ * RATCHET (rule 13) in the other direction from most: this is a floor on
+ * intelligibility, not a ceiling on loudness. If a later pass finds a way to
+ * make the onsets clearer at a LOWER burst level — sharper bursts, a shorter
+ * closure — take this down and lower duckprobe's ONSET_RATIO_MIN with it. Do
+ * not push it up chasing the metric: past about 1.2 the bursts start reading as
+ * a separate percussion track running alongside the voice.
+ */
+const ARTICULATION = 0.9;
 /**
  * Output trim, MEASURED on the rendered mix rather than chosen (duckprobe arms
  * 2 and 2b). A dialogue line has to sit ABOVE the bed it is ducking, or the
@@ -647,8 +671,22 @@ const ARTICULATION = 0.34;
  * lever for "louder than the bed" is therefore the DUCK, not the voice: see
  * DIALOGUE_DUCK. At 7.0 the read is -23.1 dBFS peak 0.32, 8.2 dB over the
  * ducked bed, and still modulating 14.4 dB.
+ *
+ * 7.0 WAS TOO LOUD IN THE ROOM. The owner: "louder and more prominent than
+ * before". 8.2 dB over a bed that has itself just been pushed down 12.4 dB is
+ * not "audible over the bed", it is the only thing in the mix — and every dB of
+ * that was being spent making an unintelligible read more prominent, which is
+ * the worst possible trade. The margin to aim at is the one a film mix uses for
+ * dialogue over score: a few dB, not a decade. 5.5 here, with the voice bus
+ * trim down from 0.85 to 0.65 (`mixer.js`) doing the other half, lands the read
+ * about 4.5 dB over the ducked bed — still comfortably clear of duckprobe's
+ * VOICE_OVER_BED_DB floor of 3, and no longer shouting.
+ *
+ * Note which lever moved and which did not: the DUCK is unchanged, so the bed
+ * still gets out of the way by the same 12.4 dB. What changed is that the read
+ * no longer fills the hole it makes.
  */
-const LINE_TRIM = 7.0;
+const LINE_TRIM = 5.5;
 
 /**
  * Synthesize a spoken read of `o.text` in `o.voice`'s larynx.
@@ -720,6 +758,10 @@ export function voiceLine(actx, bank, rng, o = {}) {
   const tract = V.tract ?? 1;
   const f0 = V.f0 ?? 110;
   const level = o.level ?? 1;
+  // `o.articulation` exists for one caller only: duckprobe's negative control,
+  // which renders the pre-fix consonant level through this same code path so
+  // section 2c's metric is shown to move with the thing it claims to measure.
+  const art = Number.isFinite(o.articulation) ? o.articulation : ARTICULATION;
   const out = gain(actx, LINE_TRIM);
   const sources = [];
 
@@ -783,12 +825,33 @@ export function voiceLine(actx, bank, rng, o = {}) {
   }
 
   /* ---- tract output -------------------------------------------------- */
-  const throat = biquad(actx, 'peaking', 450, 1.0, 4.4);
-  // A fifth of a shout's presence: the peak that makes a bark cut through at
-  // 30 m is exactly what makes a spoken line sound like a tannoy up close.
-  const presence = biquad(actx, 'peaking', 2450, 1.2, clamp(dr * 1.6 - 0.5, 0.8, 2.2));
-  const hp = biquad(actx, 'highpass', 115, 0.7);
-  const lp = biquad(actx, 'lowpass', 4300, 0.7);
+  /*
+   * THE EQ IS AN INTELLIGIBILITY CHAIN, not a warmth chain, and it used to be
+   * the other way round. Shipped: +4.4 dB of chest at 450 Hz, +0.9 dB of
+   * presence, a 115 Hz high-pass and a 4.3 kHz lowpass — a curve that piles
+   * energy exactly where speech is masked (the 300-500 Hz mud) and takes it out
+   * of the two bands consonants live in. Every move below is the same move a
+   * dialogue engineer makes to a boom track:
+   *
+   *   high-pass 115 -> 180 Hz   nothing under the first formant is speech; it
+   *                             is chest rumble, and it is what makes a read
+   *                             sound like it is coming through a wall.
+   *   throat 4.4 -> 1.8 dB      the low-mid mud. Carson still reads as Carson —
+   *                             the larynx (f0 92 Hz, tract 1.06) is what makes
+   *                             him him, not a peaking filter at 450 Hz.
+   *   presence 2450 -> 2900 Hz, +0.9 -> +3.6 dB   the consonant band. A shout's
+   *                             is 4-5 dB at 2.55 kHz and reads as a tannoy at
+   *                             a metre; this is under that and it is what
+   *                             makes the bursts above legible rather than
+   *                             merely present.
+   *   lowpass 4300 -> 5600 Hz   a fricative is 4-6 kHz. Rolling it off at 4.3k
+   *                             removed the top half of every /s/ and /f/ in
+   *                             the line.
+   */
+  const throat = biquad(actx, 'peaking', 450, 1.0, 1.8);
+  const presence = biquad(actx, 'peaking', 2900, 1.0, clamp(dr * 2.4 + 1.5, 2.6, 4.6));
+  const hp = biquad(actx, 'highpass', 180, 0.7);
+  const lp = biquad(actx, 'lowpass', 5600, 0.7);
   const drv = shaper(actx, saturationCurve(0.85 * dr, 0.22), '2x');
   const body = gain(actx, 1.5 * level);
   for (const f of fs) f.g.connect(throat);
@@ -821,7 +884,7 @@ export function voiceLine(actx, bank, rng, o = {}) {
       const cg = gain(actx, 0);
       series(cs, cbp, cg).connect(out);
       sources.push(cs);
-      const a = ARTICULATION * level;
+      const a = art * level;
       if (s.on === 'f') { ad(cg.gain, ct, 0.1 * a, 0.012, 0.05); cs.start(ct, cs._offset, 0.12); }
       else if (s.on === 'n') { ad(cg.gain, ct, 0.02 * a, 0.01, 0.04); cs.start(ct, cs._offset, 0.08); }
       else { hit(cg.gain, ct, 0.16 * a, 0.014); cs.start(ct, cs._offset, 0.05); }
@@ -883,12 +946,14 @@ export function voiceLine(actx, bank, rng, o = {}) {
     const rlp = biquad(actx, 'lowpass', 3000, 0.9);
     const rdrv = shaper(actx, saturationCurve(5, 0.28), '2x');
     series(out, rhp, rlp, rdrv, gain(actx, 1.15)).connect(rout);
-    return { node: rout, end: end + 0.1, send: 0.06, sources };
+    // A dispatch voice arrives out of a speaker in the car with you. It has no
+    // business having a street on it at all; 0.02 is a hint of the cabin.
+    return { node: rout, end: end + 0.1, send: 0.02, sources };
   }
   /*
-   * NEARLY DRY, and this is the single largest quality lever in the whole read.
-   * A bark is a shout across a street and wants the room (0.45); a story line is
-   * a man talking to you.
+   * DRY. Not nearly dry — DRY — and this is the single largest quality lever in
+   * the whole read. A bark is a shout across a street and wants the room (0.45);
+   * a story line is a man talking to you.
    *
    * MEASURED, envelope modulation depth of the rendered line — the property that
    * separates "a person talking" from "a hum with swells", and the thing the
@@ -901,8 +966,18 @@ export function voiceLine(actx, bank, rng, o = {}) {
    *
    * The rhythm work in the envelope above was worth 0 dB until this came down:
    * the closures were all there and the room was filling them back in.
+   *
+   * IT WENT ALL THE WAY DOWN when the owner played it: "the voices are muffled
+   * and ECHO — cannot understand speech". 0.035 is a small number and it was
+   * still a 2.8 s convolution smeared across every stop closure and every
+   * consonant burst in the line, i.e. across exactly the events section 2c of
+   * duckprobe now measures. The table above already said what to do and the
+   * previous pass stopped one row short of it. A voice in a cutscene does not
+   * need a room: the character is talking to the player, not shouting down a
+   * street, and the ROOM the player is standing in is already on every other
+   * bus. Nothing else in this subsystem is fully dry, and that is the point.
    */
-  return { node: out, end: end + 0.1, send: 0.035, sources };
+  return { node: out, end: end + 0.1, send: 0, sources };
 }
 
 /**
@@ -1008,7 +1083,7 @@ export class DialogueVoice {
     syllabify(t, this._syl);
     const v = voiceLine(actx, this.bank, this.rng, {
       when, text: t, id, voice: opts.voice, dur, level: opts.level ?? 1,
-      syllables: this._syl, radio: opts.radio,
+      syllables: this._syl, radio: opts.radio, articulation: opts.articulation,
     });
     if (!v) return false;
 

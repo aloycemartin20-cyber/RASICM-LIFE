@@ -54,7 +54,7 @@ import { VehicleSystem } from '../vehicles/index.js';
 import { Movement } from './movement.js';
 import { VehicleHandler } from './vehicle.js';
 import { CameraRig, EXTRA_FRAMES, FLIGHT } from './camera.js';
-import { CAMERA, CHASE } from './tuning.js';
+import { CAMERA, CHASE, STANCE } from './tuning.js';
 import { Animator } from './anim/animator.js';
 import { buildCharacter } from './character/mesh.js';
 import { BROTHERS } from './brothers.js';
@@ -1308,6 +1308,222 @@ function testShake() {
 }
 
 /* ====================================================================== */
+/* LOOK — how far up a man on foot can put the reticle, and what it costs  */
+/* ====================================================================== */
+
+/**
+ * "cannot shoot at police helicopter while on foot — the view range is limited
+ * and cannot aim that high."
+ *
+ * The heli orbits at 40-80 m, i.e. 50-70 degrees above the horizon at the
+ * ranges you fight it from, and the ceiling was +34 deg. `weapons` fires down
+ * the CAMERA axis (`weapons/index.js`, "aim: camera forward + the spread
+ * cone"), so the reticle and the rounds hit the same wall at the same angle:
+ * raising the clamp is the whole of the fire-direction fix, and the tuck in
+ * `CAMERA.highLook` is what makes the raised clamp survivable.
+ *
+ * WHAT IS MEASURED (rule 12). Every number below comes off `cam.position` and
+ * `cam.quaternion` after the rig has been driven through `addLook` — the same
+ * entry point a mouse uses — and off a ground plane the boom can really be
+ * stopped by. Nothing reads `pitchTarget`, `highLookT`, `distIdeal` or any
+ * other value the solver assigned itself; the elevation is `asin(forward.y)`
+ * of the emitted quaternion and the clearance is an angle between two emitted
+ * vectors. A build that clamped the pitch and then lied about it in
+ * `pitchTarget` would fail every row here.
+ *
+ * What would make each fail:
+ *   look.reach   the ceiling back under a heli's elevation (the shipped +34).
+ *   look.clear   the character's head inside the reticle's cone — the failure
+ *                mode of raising the clamp WITHOUT the tuck, and the reason
+ *                +34 was chosen in the first place.
+ *   look.ground  the boom digging into the pavement at any angle.
+ *   look.noflip  the rig inverting, or the emitted elevation not tracking the
+ *                request monotonically.
+ *   look.body    the lens ending up inside the character's head.
+ *   look.inert   ANY framing under the knee moving by a micron. This is the
+ *                claim that the change cannot regress a shot the game already
+ *                takes, and it is checked against the emitted position of a
+ *                second rig with the fix switched off.
+ */
+
+/** Flipped by `--control=look`; the rigs below read it when they are built. */
+let HIGH_LOOK = true;
+
+/**
+ * The camtest world is open sky (`fakePhysics.sphereCast` never hits), which is
+ * right for framing and wrong here — half of what the ceiling protects is the
+ * boom hitting the ground. This is the same flat plane the rest of the file
+ * uses for the raycast, given to the sphere cast.
+ */
+const groundPhysics = {
+  ...fakePhysics,
+  sphereCast(origin, dir, radius, maxDist) {
+    if (dir.y >= -1e-6) return { hit: false, distance: Infinity };
+    const t = (origin.y - radius) / -dir.y;
+    if (t < 0 || t > maxDist) return { hit: false, distance: Infinity };
+    return { hit: true, distance: t };
+  },
+};
+
+const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
+
+const _lookFwd = new THREE.Vector3();
+const _lookUp = new THREE.Vector3();
+const _lookHead = new THREE.Vector3();
+const _lookToHead = new THREE.Vector3();
+
+/**
+ * Drive the orbit up to `deg` through the real look path and read the pose.
+ *
+ * `head` is the top of the skull relative to the pivot the camera actually
+ * uses: `STANCE.stand.anchor` is the base of the neck and the crown sits about
+ * 0.2 m above it (`UNITS.playerHeight` 1.78 against a 1.44 anchor leaves 0.34;
+ * 0.2 is the conservative half of that, so the clearance gate is measured
+ * against a point higher than the head really reaches).
+ */
+function lookAt(deg, { view = 0, aim = false, high = null } = {}) {
+  const rig = makeCamRig(groundPhysics);
+  rig.cam.highLook = high === null ? HIGH_LOOK : high;
+  if (view) rig.cam.setView(view);
+  if (aim) { rig.m.adsAmount = 1; rig.m.aiming = true; }
+  camFrames(rig, 90);
+  // A mouse delta at a time, exactly as `player._updateLook` feeds it.
+  for (let i = 0; i < 500; i++) {
+    rig.cam.addLook(0, 0.02);
+    camFrames(rig, 1);
+    if (rig.cam.pitch * RAD >= deg - 0.05) break;
+  }
+  camFrames(rig, 120); // let every filtered channel settle
+  const p = rig.cam.position;
+  _lookFwd.set(0, 0, -1).applyQuaternion(rig.cam.quaternion);
+  _lookUp.set(0, 1, 0).applyQuaternion(rig.cam.quaternion);
+  _lookHead.set(rig.m.position.x, rig.m.position.y + STANCE.stand.anchor + 0.2, rig.m.position.z);
+  _lookToHead.subVectors(_lookHead, p);
+  const dHead = _lookToHead.length();
+  _lookToHead.multiplyScalar(1 / Math.max(1e-6, dHead));
+  return {
+    ask: deg,
+    /** The orbit angle the rig settled on — used to prove two runs match. */
+    pitch: rig.cam.pitch * RAD,
+    elev: Math.asin(clamp(_lookFwd.y, -1, 1)) * RAD,
+    camY: p.y,
+    dHead,
+    offAxis: Math.acos(clamp(_lookToHead.dot(_lookFwd), -1, 1)) * RAD,
+    upY: _lookUp.y,
+    pos: p.clone(),
+  };
+}
+
+/**
+ * A police helicopter's elevation from a man standing under it. The orbit
+ * radius and altitude are the police system's business; these are the two ends
+ * of the band it flies, and the shallowest of them is what the ceiling has to
+ * clear.
+ */
+const HELI_ELEV = 60;
+
+function testLook() {
+  const SWEEP = [0, 10, 20, 30, 34, 40, 45, 50, 55, 60, 66, 70, 74];
+  const chase = SWEEP.map((d) => lookAt(d));
+  const far = SWEEP.map((d) => lookAt(d, { view: 2 }));
+  const ads = SWEEP.map((d) => lookAt(d, { aim: true }));
+
+  const top = (rows) => rows[rows.length - 1];
+  const ceil = { chase: top(chase), close: top(SWEEP.slice(-1).map((d) => lookAt(d, { view: 1 }))), far: top(far) };
+
+  /* --- 1. can the reticle reach a helicopter at all? -------------------- */
+  const reach = ceil.chase.elev >= HELI_ELEV && ceil.close.elev >= HELI_ELEV &&
+    ceil.far.elev >= HELI_ELEV - 6;
+  rec('look.reach', 'look',
+    `on foot the reticle reaches ${HELI_ELEV} deg — a police heli is targetable`,
+    reach,
+    `emitted elevation at the ceiling: chase ${f2(ceil.chase.elev)}, close ${f2(ceil.close.elev)}, ` +
+    `far ${f2(ceil.far.elev)} deg (want >= ${HELI_ELEV}, far >= ${HELI_ELEV - 6})`);
+
+  /* --- 2. ...with the reticle on sky rather than on your own skull ------ */
+  const above = chase.filter((r) => r.ask >= 34);
+  const clearAtTop = ceil.chase.offAxis;
+  let monotone = true;
+  for (let i = 1; i < above.length; i++) if (above[i].offAxis < above[i - 1].offAxis - 0.5) monotone = false;
+  rec('look.clear', 'look',
+    'the character never comes within 25 deg of the reticle, and clears it further the higher you look',
+    clearAtTop >= 25 && monotone && ceil.far.offAxis >= 25,
+    `head-to-reticle at the ceiling: chase ${f2(clearAtTop)} deg, far ${f2(ceil.far.offAxis)} deg; ` +
+    `above the knee ${above.map((r) => f2(r.offAxis)).join(' -> ')} deg` +
+    (monotone ? '' : ' — NOT monotone'));
+
+  /* --- 3. the boom does not dig -------------------------------------- */
+  /* The floor is compared against THE SHIPPED BUILD'S OWN FLOOR rather than
+   * against a number somebody liked: the boom already skims the pavement in the
+   * 20-34 deg band (the far view bottoms out at 0.33 m and always has), so an
+   * absolute bar here would either be a pass by construction or a red for a
+   * behaviour this change did not introduce. What must be true is that the
+   * angles the fix ADDS never dig deeper than the angles the game already had. */
+  const all = [...chase, ...far, ...ads];
+  const lowest = all.reduce((a, b) => (b.camY < a.camY ? b : a));
+  const shippedFloor = [0, 10, 20, 30, 34]
+    .flatMap((d) => [lookAt(d, { high: false }), lookAt(d, { view: 2, high: false })])
+    .reduce((a, b) => Math.min(a, b.camY), Infinity);
+  const climbs = ceil.chase.camY >= 1.0 && ceil.far.camY >= 0.8;
+  rec('look.ground', 'look',
+    'the extra elevation never puts the boom lower than the shipped build already does, and it climbs back to chest height at the ceiling',
+    lowest.camY >= shippedFloor - 1e-6 && climbs,
+    `lowest emitted camera ${f2(lowest.camY)} m (at ${lowest.ask} deg) against the shipped ` +
+    `floor ${f2(shippedFloor)} m · at the ceiling chase ${f2(ceil.chase.camY)} m, far ${f2(ceil.far.camY)} m`);
+
+  /* --- 4. no inversion, and the lens tracks the request ----------------- */
+  const upright = all.every((r) => r.upY > 0.05);
+  let tracks = true;
+  // 0.25 deg of slack: the two rows past the ceiling both settle ON the clamp
+  // and differ by the last hundredth of the orbit filter, not by a direction.
+  for (let i = 1; i < chase.length; i++) if (chase[i].elev < chase[i - 1].elev - 0.25) tracks = false;
+  rec('look.noflip', 'look',
+    'the rig never inverts and the emitted elevation never goes backwards',
+    upright && tracks,
+    `min emitted up.y ${f3(Math.min(...all.map((r) => r.upY)))} (want > 0.05) · ` +
+    `chase elevation ${chase.map((r) => f2(r.elev)).join(' -> ')} deg`);
+
+  /* --- 5. and never ends up inside him --------------------------------- */
+  const nearest = all.reduce((a, b) => (b.dHead < a.dHead ? b : a));
+  rec('look.body', 'look',
+    'the lens never ends up inside the character, in any view, aiming or not',
+    nearest.dHead >= 0.6,
+    `closest emitted approach to the crown ${f2(nearest.dHead)} m (want >= 0.6; ` +
+    `the character fades out under ${f2(CAMERA.collide.fadeEnd)} m)`);
+
+  /* --- 6. INERT below the knee ----------------------------------------- */
+  /* The strongest thing this family asserts: every framing the game already
+   * ships is under 34 deg, so with the fix ON and OFF the emitted camera has to
+   * be the same point to the micron. Both rigs are built with an explicit flag
+   * so `--control=look` cannot make this row pass by turning the fix off. */
+  let worst = 0;
+  let worstAt = 0;
+  let sameOrbit = true;
+  // Asks, not emitted angles: the orbit filter overshoots the ask by about
+  // 2 deg, so 30 is the highest request that still settles under the 34 the
+  // reverted rig would clamp at (measured 32.08).
+  for (const d of [0, 10, 20, 30]) {
+    const on = lookAt(d, { high: true });
+    const off = lookAt(d, { high: false });
+    // Both rigs must have taken the SAME orbit angle, or the comparison is
+    // between two different shots. (Ask for 34 and they do not: the reverted
+    // rig clamps at 34.00 while the fixed one settles at 35.53, which is the
+    // fix working rather than a framing moving.)
+    if (Math.abs(on.pitch - off.pitch) > 1e-9) sameOrbit = false;
+    const e = on.pos.distanceTo(off.pos);
+    if (e > worst) { worst = e; worstAt = d; }
+  }
+  rec('look.inert', 'look',
+    'below the knee the change moves the camera by nothing at all',
+    worst < 1e-6 && sameOrbit,
+    `worst emitted position difference with the fix on vs off, 0-33 deg: ` +
+    `${worst.toExponential(1)} m at ${worstAt} deg (want < 1e-6)` +
+    (sameOrbit ? '' : ' — THE TWO RIGS TOOK DIFFERENT ORBIT ANGLES'));
+
+  return { chase, far, ads, ceil };
+}
+
+/* ====================================================================== */
 /* NEGATIVE CONTROLS — revert the behaviour, confirm the gates go red      */
 /* ====================================================================== */
 
@@ -1390,6 +1606,15 @@ const CONTROLS = {
       return () => { CHASE.fullKick = s; };
     },
   },
+  look: {
+    what: 'the +34 deg third-person ceiling and the untucked boom (the build that could not aim at a heli)',
+    expect: ['look.reach', 'look.clear'],
+    run: testLook,
+    apply() {
+      HIGH_LOOK = false;
+      return () => { HIGH_LOOK = true; };
+    },
+  },
   shake: {
     what: 'no crash trauma at all (nothing listening, as before)',
     expect: ['shake.ram', 'shake.building', 'shake.vehicle', 'shake.order', 'shake.onfoot'],
@@ -1454,6 +1679,7 @@ function main() {
   testTilt();
   testRecoil();
   testShake();
+  const look = testLook();
 
   const pass = report(OUT);
 
@@ -1479,6 +1705,15 @@ function main() {
         '   <- look held down throughout'
       );
     }
+  }
+
+  console.log('\n  ON-FOOT ELEVATION (chase view, over a flat pavement)');
+  console.log('   asked   emitted    camera Y   head off   boom-to-head');
+  for (const r of look.chase) {
+    console.log(
+      `   ${String(r.ask).padStart(3)}deg  ${f2(r.elev).padStart(7)}deg  ` +
+      `${f2(r.camY).padStart(8)} m  ${f2(r.offAxis).padStart(7)}deg  ${f2(r.dHead).padStart(9)} m`
+    );
   }
 
   console.log('\n  SHIPPING FRAMING (camera-to-vehicle distance, at rest, open sky)');

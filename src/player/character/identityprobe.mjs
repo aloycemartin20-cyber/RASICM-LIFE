@@ -21,6 +21,8 @@
  *                 sleeve is rolled below the elbow, aidan's stops on the
  *                 bicep, dylan's runs to the wrist — and as the fraction of
  *                 each arm that is left bare.
+ *   4 ELBOW       the arm HINGES THE WAY AN ARM DOES, on all three builds. See
+ *                 the block above the gate.
  *
  * NEGATIVE CONTROL, mandatory: `build.noIdentity` removes every per-brother
  * facial and wardrobe choice — this module's identity table AND brothers.js's
@@ -29,10 +31,16 @@
  * collapse, or the probe is reading the size difference it was told to divide
  * out rather than the identity it claims to measure.
  *
+ * Gate 4 carries its OWN control, `build.legacyElbow`, because it is not an
+ * identity measurement and `noIdentity` says nothing about it.
+ *
  *   node src/player/character/identityprobe.mjs
  *   node src/player/character/identityprobe.mjs --grid=40
+ *   node src/player/character/identityprobe.mjs --legacyelbow  # control, red
  */
-import { buildBody, MAT } from './mesh.js';
+import * as THREE from 'three';
+import { buildBody, buildCharacter, MAT } from './mesh.js';
+import { Animator } from '../anim/animator.js';
 import { BROTHERS } from '../brothers.js';
 
 const args = Object.fromEntries(
@@ -76,6 +84,134 @@ const FACE_CONTROL_MAX = 0.06;
 
 /** Shoulder span margins, as a fraction. Carson broadest, dylan leanest. */
 const SPAN_MARGIN = 0.06;
+
+/* ---------------------------------------------------------------------- */
+/* 4 ELBOW                                                                 */
+/* ---------------------------------------------------------------------- */
+
+/**
+ * "CARSON'S ARMS ARE BENT THE WRONG WAY (SEEMS CONTORTED)" — the owner, playing.
+ *
+ * An elbow is the ANTI-KNEE: a knee's middle joint sits in FRONT of the
+ * root->end chord, an elbow's sits BEHIND it, and that offset is the only thing
+ * that tells a viewer which way a nearly-straight limb hinges. `mesh.js`'s arm
+ * chain was authored with the LEG's signs — MEASURED on the shipped table, the
+ * elbow sat 15.0 mm in FRONT of its own chord, hyperextended, while the ped rig
+ * next door (`src/peds/rig.js`) has the same joint 10.6 mm behind it.
+ *
+ * Three things are asserted, and none of them is a number this probe also
+ * supplies (ARCHITECTURE.md rule 12): the geometry is read off the EMITTED
+ * skeleton, and the posed angles come from driving the real `Animator`.
+ *
+ *   4a SIGN         the bind elbow is posterior to the shoulder->wrist chord,
+ *                   and the bind pose therefore carries FLEXION, not extension.
+ *   4b BUILD-INVARIANT  the elbow's axis is the same on all three brothers.
+ *                   `bindPositions` used to scale every arm bone's absolute x
+ *                   by `build.shoulder`, which scaled the lateral drift BETWEEN
+ *                   shoulder, elbow and wrist too — so the broadest brother's
+ *                   hinge sat at a different angle from the leanest's (5.50 vs
+ *                   4.66 degrees out of vertical) and the bulk deltas sheared
+ *                   the very axis the elbow turns about.
+ *   4c POSED SIGN   driving the real animator through the core states, every
+ *                   elbow on every brother flexes POSITIVE about the hinge the
+ *                   FK path turns it on — no state ever drives it through
+ *                   straight into hyperextension — and carson matches his
+ *                   brothers, who are the controls.
+ *
+ * NEGATIVE CONTROL: `build.legacyElbow` restores the leg-shaped bow AND the old
+ * x scaling. 4a must go NEGATIVE and 4b must blow out, or this gate is reading
+ * something other than the fix.
+ */
+
+/** Bind elbow offset from the chord, mm of the reference body. + = posterior. */
+const ELBOW_DEV_MIN = 6.0;
+/** Bind flexion the arm hangs with, degrees. + = flexed. */
+const ELBOW_FLEX_MIN = 3.0;
+/** How far the three builds' arm axes may disagree, degrees. */
+const AXIS_SPREAD_MAX = 0.05;
+/** Floor on the posed elbow angle. Anything <= 0 is a reversed hinge. */
+const POSED_FLEX_MIN = 2.0;
+/** How far carson may differ from his brothers in any posed state, degrees. */
+const BROTHER_MATCH_MAX = 1.0;
+
+/** The states the player is in for essentially all of his screen time. */
+const CORE_STATES = {
+  idle: {},
+  walk: { speed: 1.72 },
+  run: { speed: 6.4 },
+  drive: { driving: true },
+};
+
+const fakeCtx = { peek: () => null, get: () => null, config: { q: {} } };
+
+function poseState(over) {
+  return {
+    x: 0, y: 0, z: 0, faceYaw: 0, aimYaw: 0, aimPitch: 0,
+    speed: 0, grounded: true, crouch: false, aim: 0, swim: false, driving: false,
+    stumble: 0, turning: 0, strafe: 0, forwardSign: 1, verticalVel: 0,
+    landImpulse: 0, steer: 0, lateral: 0, surface: 'concrete', groundDist: 0,
+    swing: 0, swingSide: 1, swingWeight: 0, submerged: 0, dead: 0, guard: 0,
+    topSpeed: 6, sprinting: false, ...over,
+  };
+}
+
+/**
+ * Bind-pose elbow geometry from the EMITTED skeleton. Bind space is +Y up,
+ * -Z forward, +X the character's right, so POSTERIOR is +z.
+ */
+function elbowBind(build) {
+  const { skeleton } = buildBody(build);
+  const P = skeleton.positions;
+  const S = build.scale ?? 1;
+  const sh = P.armR, el = P.forearmR, wr = P.handR;
+  // Where the chord shoulder->wrist is at the elbow's height.
+  const t = (sh[1] - el[1]) / (sh[1] - wr[1]);
+  const chordZ = sh[2] + (wr[2] - sh[2]) * t;
+  const deg = (a, b) => [
+    Math.atan2(b[0] - a[0], a[1] - b[1]) * 180 / Math.PI,   // frontal, + outward
+    Math.atan2(a[2] - b[2], a[1] - b[1]) * 180 / Math.PI,   // sagittal, + forward
+  ];
+  const [uF, uS] = deg(sh, el);
+  const [fF, fS] = deg(el, wr);
+  return { dev: ((el[2] - chordZ) / S) * 1000, flex: fS - uS, upperFrontal: uF, foreFrontal: fF };
+}
+
+/**
+ * Signed elbow flexion of the POSED skeleton, degrees, about the upper arm's
+ * own world +X — which is the axis the FK path actually turns the forearm on,
+ * so a positive reading is flexion and a negative one is a reversed hinge.
+ */
+function elbowPosed(spec, extra) {
+  const mats = new Array(8).fill(0).map(() => new THREE.MeshBasicMaterial());
+  const built = buildCharacter({ ...spec.build, id: spec.id, ...extra }, mats);
+  const rig = {
+    root: built.root, mesh: built.mesh, skeleton: built.skeleton,
+    bones: built.bones, geometry: built.geometry,
+    bindPositions: built.bindPositions, scale: spec.build.scale ?? 1, side: 1,
+  };
+  const wp = (b) => new THREE.Vector3().setFromMatrixPosition(b.matrixWorld);
+  const out = {};
+  for (const [name, over] of Object.entries(CORE_STATES)) {
+    // A fresh animator per state: the smoothed channels must settle INTO the
+    // state being measured, not out of the previous one.
+    const an = new Animator(fakeCtx, rig);
+    const s = poseState(over);
+    for (let f = 0; f < 200; f++) an.update(1 / 60, s);
+    rig.root.updateMatrixWorld(true);
+    out[name] = ['R', 'L'].map((sfx) => {
+      const a = wp(rig.bones['arm' + sfx]);
+      const e = wp(rig.bones['forearm' + sfx]);
+      const h = wp(rig.bones['hand' + sfx]);
+      const u = e.clone().sub(a).normalize();
+      const f = h.clone().sub(e).normalize();
+      const m = rig.bones['arm' + sfx].matrixWorld.elements;
+      const axis = new THREE.Vector3(m[0], m[1], m[2]).normalize();
+      const c = new THREE.Vector3().crossVectors(u, f);
+      return Math.atan2(c.dot(axis), u.dot(f)) * 180 / Math.PI;
+    });
+  }
+  return out;
+}
 
 function rayTri(ox, oy, oz, dx, dy, dz, t) {
   const e1x = t[3] - t[0], e1y = t[4] - t[1], e1z = t[5] - t[2];
@@ -274,6 +410,78 @@ for (const id of IDS) {
   const ok = gaps.every((g) => g >= 0.12);
   if (!ok) failures++;
   console.log(`  ${ok ? 'ok  ' : 'FAIL'} sleeve lengths separated by ${gaps.map((g) => (g * 100).toFixed(1) + '%').join(' and ')}  (want >= 12% each)`);
+}
+
+/* ---- 4 ELBOW ---- */
+console.log('\n=== 4 ELBOW — an elbow is the anti-knee ===');
+{
+  // `--legacyelbow` shoots the whole gate through the control, so the red run
+  // can be read line by line instead of only as a verdict.
+  const extra = args.legacyelbow ? { legacyElbow: true } : {};
+  const bind = {};
+  const posed = {};
+  for (const id of IDS) {
+    bind[id] = elbowBind({ ...BROTHERS[id].build, id, ...extra });
+    posed[id] = elbowPosed(BROTHERS[id], extra);
+  }
+
+  /* 4a sign */
+  let ok = true;
+  for (const id of IDS) {
+    const b = bind[id];
+    const good = b.dev >= ELBOW_DEV_MIN && b.flex >= ELBOW_FLEX_MIN;
+    if (!good) ok = false;
+    console.log(`  ${good ? 'ok  ' : 'FAIL'} ${id.padEnd(7)} bind elbow ${b.dev >= 0 ? 'BEHIND' : 'IN FRONT OF'} the chord by ` +
+      `${Math.abs(b.dev).toFixed(1)} mm, bind flexion ${b.flex.toFixed(2)} deg  ` +
+      `(want >= ${ELBOW_DEV_MIN} mm and >= ${ELBOW_FLEX_MIN} deg)`);
+  }
+  if (!ok) failures++;
+
+  /* 4b build-invariance of the axis */
+  {
+    const spreadOf = (k) => Math.max(...IDS.map((i) => bind[i][k])) - Math.min(...IDS.map((i) => bind[i][k]));
+    const up = spreadOf('upperFrontal'), fo = spreadOf('foreFrontal');
+    const good = up <= AXIS_SPREAD_MAX && fo <= AXIS_SPREAD_MAX;
+    if (!good) failures++;
+    console.log(`  ${good ? 'ok  ' : 'FAIL'} the three builds' arm axes agree: upper arm spread ${up.toFixed(3)} deg, ` +
+      `forearm ${fo.toFixed(3)} deg  (want <= ${AXIS_SPREAD_MAX})`);
+  }
+
+  /* 4c posed sign, and carson against his brothers */
+  {
+    let worst = Infinity, worstWhere = '', gap = 0, gapWhere = '';
+    for (const st of Object.keys(CORE_STATES)) {
+      for (let i = 0; i < 2; i++) {
+        for (const id of IDS) {
+          const v = posed[id][st][i];
+          if (v < worst) { worst = v; worstWhere = `${id} ${st} ${i ? 'L' : 'R'}`; }
+        }
+        for (const id of ['aidan', 'dylan']) {
+          const d = Math.abs(posed.carson[st][i] - posed[id][st][i]);
+          if (d > gap) { gap = d; gapWhere = `${st} ${i ? 'L' : 'R'} vs ${id}`; }
+        }
+      }
+      console.log(`     ${st.padEnd(6)} ` + IDS.map((id) =>
+        `${id.slice(0, 3)} ${posed[id][st].map((v) => v.toFixed(1).padStart(6)).join('/')}`).join('  '));
+    }
+    const signOk = worst >= POSED_FLEX_MIN;
+    const matchOk = gap <= BROTHER_MATCH_MAX;
+    if (!signOk || !matchOk) failures++;
+    console.log(`  ${signOk ? 'ok  ' : 'FAIL'} every posed elbow flexes positive: worst ${worst.toFixed(1)} deg at ${worstWhere}  (want >= ${POSED_FLEX_MIN})`);
+    console.log(`  ${matchOk ? 'ok  ' : 'FAIL'} carson matches his brothers to ${gap.toFixed(2)} deg (${gapWhere})  (want <= ${BROTHER_MATCH_MAX})`);
+  }
+
+  /* control */
+  const ctrlBind = IDS.map((id) => elbowBind({ ...BROTHERS[id].build, id, legacyElbow: true }));
+  const flipped = ctrlBind.every((b) => b.dev < 0 && b.flex < 0);
+  const sheared = (Math.max(...ctrlBind.map((b) => b.upperFrontal)) -
+    Math.min(...ctrlBind.map((b) => b.upperFrontal))) > AXIS_SPREAD_MAX;
+  if (!(flipped && sheared)) failures++;
+  console.log(`  ${flipped && sheared ? 'ok  ' : 'FAIL'} control build.legacyElbow: elbow dev ` +
+    `${ctrlBind.map((b) => b.dev.toFixed(1)).join(' / ')} mm, flexion ` +
+    `${ctrlBind.map((b) => b.flex.toFixed(2)).join(' / ')} deg, axis spread ` +
+    `${(Math.max(...ctrlBind.map((b) => b.upperFrontal)) - Math.min(...ctrlBind.map((b) => b.upperFrontal))).toFixed(3)} deg` +
+    `  (want all negative, and the spread over ${AXIS_SPREAD_MAX})`);
 }
 
 /* ---- negative control ---- */

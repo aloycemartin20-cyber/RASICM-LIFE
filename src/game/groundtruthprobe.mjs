@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 /**
- * GAME — "can the player actually stand where the story says he does?"
+ * GAME — "can the player actually stand where the story says he does?" — and,
+ * since the wave that added the river sweep, "is there any road he can drive
+ * into the river at all?"
  *
  * SYMPTOM. Mission geometry is authored by hand in `src/game/data.js` and was
  * never checked against the world the generator emits, so several chapters
@@ -53,6 +55,46 @@
  *               stages a brute with `findGroundSpot` around this point and
  *               teleports the player to another one 25-60 m away
  *   services    every entry in `SHOPS` and `GAS_STATIONS` — see below
+ *   rivers      no drivable carriageway anywhere in the city is under a river —
+ *               see below
+ *
+ * RIVERS, AND WHY A SWEEP OF AUTHORED POINTS COULD NEVER HAVE FOUND THIS. The
+ * four assertions above read a TABLE: a few hundred hand-written coordinates,
+ * measured one at a time. The owner drove off the Golden Triangle and into the
+ * Monongahela on a street nobody had ever written down — `downtown_v7`, a
+ * generated grid rail, 5.54 m under the river's surface 23 m outside its
+ * waterline. No authored point was within 200 m of it.
+ *
+ * So the river sweep reads the EMITTED GRAPH instead and walks every span of
+ * every drivable edge, across the carriageway, at `RIVER_STEP`:
+ *
+ *   wet         no sample stands on ground `terrain.isWater` calls water,
+ *               unless the edge is a bridge — a deck over a channel is what a
+ *               bridge IS
+ *   submerged   no sample's DECK is below `WATER_Y` while it is inside
+ *               `RIVER_OVERHANG` of a waterline, which is the band `water.js`
+ *               draws the sheet across at pool level. This is the one that
+ *               fires on the defect: `isWater` answers `waterDist <= 6`, so
+ *               between 6 and 24 m out it says DRY while the river is drawn
+ *               over the tarmac
+ *
+ * The river field is written out in this file from the published `RIVERS`
+ * polylines rather than read off `terrain.waterDist`, the same discipline
+ * `world/lmsweep.mjs` applies to the landmark site field: if `plan.js` and this
+ * file disagree about where a river is, this goes red rather than agreeing with
+ * the generator about a shared mistake (ARCHITECTURE.md rule 12).
+ *
+ * TWO NEGATIVE CONTROLS, because the two halves fail differently:
+ *
+ *   - a SYNTHETIC edge planted across the Monongahela at The Point, swept by
+ *     the same code as the real graph, which must be reported by both
+ *     assertions. A measurement that cannot say no is decorative;
+ *   - the REAL defect: one seed is regenerated with `OW_NO_FLOODCLIP=1`, the
+ *     hatch over `netgen`'s corridor clip, its two link legality tests and its
+ *     height-solve floor. `submerged` must fire on that arm. MEASURED over
+ *     these six seeds with the hatch set: 4, 10, 11, 8, 11 and 13 submerged
+ *     edges, 0.12-0.65 km, worst 7.54 m under the pool; with it clear, zero on
+ *     every seed.
  *
  * SERVICES, AND WHY THEY ARE SWEPT AT ALL. The staging sweep above walks the
  * POIs a CHAPTER NAMES, and no chapter names a fuel pump. So Rustbelt Respray
@@ -91,6 +133,7 @@ import { dirname, resolve } from 'node:path';
 import { Terrain } from '../world/terrain.js';
 import { generateCity } from '../world/netgen.js';
 import { Rng } from '../core/rng.js';
+import { RIVERS, WATER_Y, RIVER_OVERHANG } from '../world/plan.js';
 import { RACE_TRACKS, POI, BOSSES, BOYZ, SHOPS, GAS_STATIONS, R } from './data.js';
 
 const args = Object.fromEntries(
@@ -158,6 +201,132 @@ const worlds = SEEDS.map((seed) => {
   const graph = generateCity(terrain, new Rng(seed).fork().fork()).graph;
   return { seed, terrain, graph };
 });
+
+/**
+ * THE CONTROL ARM for the river sweep: the same first seed with `netgen`'s
+ * flood tests switched off. Built here, next to the live worlds, so the two are
+ * the same code on the same terrain and the only difference is the hatch.
+ */
+const controlWorld = (() => {
+  process.env.OW_NO_FLOODCLIP = '1';
+  try {
+    const terrain = new Terrain({ cell: 8, extent: 1792 }).bake();
+    const graph = generateCity(terrain, new Rng(SEEDS[0]).fork().fork()).graph;
+    return { seed: SEEDS[0], terrain, graph };
+  } finally {
+    delete process.env.OW_NO_FLOODCLIP;
+  }
+})();
+
+/* --------------------------------------------------------- the rivers --- */
+
+/** How finely a carriageway is walked, metres. Under a lane width. */
+const RIVER_STEP = 2;
+
+/**
+ * Signed distance to the nearest waterline, negative inside the channel.
+ *
+ * Written out here from the published `RIVERS` polylines rather than read off
+ * `terrain.waterDist`, so this sweep is an independent reading of where the
+ * rivers are and not an echo of the field the generator clipped against. Same
+ * confluence rule the plan states: the most-inside river wins, so three
+ * overlapping channels are one basin.
+ */
+function riverDist(x, z) {
+  let best = 1e9;
+  for (const riv of RIVERS) {
+    const hw = riv.width / 2;
+    for (let i = 0; i < riv.pts.length - 1; i++) {
+      const [ax, az] = riv.pts[i];
+      const [bx, bz] = riv.pts[i + 1];
+      const dx = bx - ax;
+      const dz = bz - az;
+      const l2 = dx * dx + dz * dz || 1;
+      let t = ((x - ax) * dx + (z - az) * dz) / l2;
+      t = t < 0 ? 0 : t > 1 ? 1 : t;
+      const s = Math.hypot(ax + dx * t - x, az + dz * t - z) - hw;
+      if (s < best) best = s;
+    }
+  }
+  return best;
+}
+
+/**
+ * Walk one edge's whole carriageway and report the worst water reading on it.
+ *
+ * THE SPAN AND THE WIDTH, not the endpoints and not the centreline. Two dry
+ * nodes either side of a bend say nothing about the tarmac between them, and a
+ * centreline that clears the flooded band by a metre still has three metres of
+ * kerb inside it — both were live defects when this was written.
+ *
+ * `deck` is the road surface, interpolated along the edge exactly as
+ * `roadmesh` builds it: the solved node heights, NOT `heightAt`, which
+ * `applyRoads` deliberately sinks 0.55 m under the corridor.
+ */
+function sweepEdge(world, e) {
+  const { terrain, graph } = world;
+  const a = graph.nodes[e.a];
+  const b = graph.nodes[e.b];
+  const len = Math.hypot(b.x - a.x, b.z - a.z);
+  if (len < 0.5) return null;
+  const half = (e.width ?? 8) * 0.5;
+  // Cheap reject: nothing more than a river's own half-width plus this edge
+  // away from a waterline can be over one.
+  const midS = riverDist((a.x + b.x) * 0.5, (a.z + b.z) * 0.5);
+  if (midS > len * 0.5 + half + RIVER_OVERHANG + 4) return null;
+  const ux = -(b.z - a.z) / len;
+  const uz = (b.x - a.x) / len;
+  const n = Math.max(2, Math.ceil(len / RIVER_STEP));
+  let wet = null;
+  let sub = null;
+  for (let i = 0; i <= n; i++) {
+    const t = i / n;
+    const cx = a.x + (b.x - a.x) * t;
+    const cz = a.z + (b.z - a.z) * t;
+    const y = a.y + (b.y - a.y) * t;
+    for (const o of [-half, 0, half]) {
+      const x = cx + ux * o;
+      const z = cz + uz * o;
+      if (terrain.isWater(x, z)) {
+        const h = terrain.heightAt(x, z);
+        if (!wet || h < wet.h) wet = { x, z, h, y, t };
+      }
+      // The band `water.js` paints at pool level: inside `RIVER_OVERHANG` of a
+      // waterline, wherever the ground is under `WATER_Y`. A deck under the
+      // pool in there has a river drawn on top of it.
+      if (y < WATER_Y && riverDist(x, z) < RIVER_OVERHANG) {
+        const under = WATER_Y - y;
+        if (!sub || under > sub.under) sub = { x, z, y, under, t };
+      }
+    }
+  }
+  if (!wet && !sub) return null;
+  return { id: e.id, kind: e.kind, corridor: e.corridor ?? null, bridge: !!e.bridge, len, wet, sub };
+}
+
+/** Every drivable edge of one world, plus the total kilometres it holds. */
+function sweepRivers(world) {
+  const wet = [];
+  const submerged = [];
+  let km = 0;
+  let edges = 0;
+  for (const e of world.graph.edges) {
+    if (e.rail) continue;
+    edges++;
+    km += e.len ?? 0;
+    const hit = sweepEdge(world, e);
+    if (!hit) continue;
+    // A bridge deck over a channel is the whole point of a bridge, and its
+    // span is pinned above the pool by `netgen` — so `wet` forgives a bridge
+    // and `submerged` does not need to, because a submerged deck is a defect
+    // on a bridge too.
+    if (hit.wet && !hit.bridge) wet.push(hit);
+    if (hit.sub) submerged.push(hit);
+  }
+  wet.sort((p, q) => p.wet.h - q.wet.h);
+  submerged.sort((p, q) => q.sub.under - p.sub.under);
+  return { seed: world.seed, edges, km: +(km / 1000).toFixed(2), wet, submerged };
+}
 
 /**
  * Nearest DRIVABLE edge to (x, z), by brute force over the emitted node
@@ -297,8 +466,45 @@ function checkService(label, x, z) {
 
 const report = {
   seeds: SEEDS.map((s) => s.toString(16)),
-  control: [], race: [], staging: [], arenas: [], services: [],
+  control: [], race: [], staging: [], arenas: [], services: [], rivers: [],
 };
+
+/* ---- 5. every drivable edge span, against the rivers -------------------- */
+for (const w of worlds) report.rivers.push(sweepRivers(w));
+report.riverControl = sweepRivers(controlWorld);
+
+/**
+ * SYNTHETIC NEGATIVE CONTROL — a two-lane street laid straight across the
+ * Monongahela at The Point, handed to the SAME `sweepEdge` the real graph is
+ * swept with. Both assertions must report it — `wet` because the ground under
+ * it is the riverbed, `submerged` because its deck is half a metre under the
+ * pool, which is where a street laid across a river ends up.
+ */
+const riverSelftest = (() => {
+  const w = worlds[0];
+  const base = w.graph.nodes.length;
+  const fake = {
+    id: -1, kind: 'street', corridor: 'SYNTHETIC across the Mon', bridge: false,
+    width: 8, len: 0, rail: false,
+    a: base, b: base + 1,
+  };
+  // A private two-node graph so nothing is added to the emitted one.
+  const probeWorld = {
+    terrain: w.terrain,
+    graph: {
+      nodes: { [base]: { x: -260, z: 120, y: -0.5 }, [base + 1]: { x: -160, z: 260, y: -0.5 } },
+      edges: [],
+    },
+  };
+  fake.len = Math.hypot(-160 - -260, 260 - 120);
+  const hit = sweepEdge(probeWorld, fake);
+  return {
+    wet: !!hit?.wet,
+    submerged: !!hit?.sub,
+    under: hit?.sub ? +hit.sub.under.toFixed(2) : 0,
+    h: hit?.wet ? +hit.wet.h.toFixed(2) : 0,
+  };
+})();
 
 /* ---- NEGATIVE CONTROL: the authored defect must still read as one -------- */
 for (const p of REVERTED) {
@@ -393,14 +599,59 @@ console.log('');
 console.log(`  SERVICES — SHOPS + GAS_STATIONS, reach ${SERVICE_ROAD_MAX} m (RATCHET), no bridge-deck exemption`);
 for (const c of report.services) console.log(row(c));
 
+/* ---- the rivers --------------------------------------------------------- */
+const riverRow = (r, tag) => {
+  const worst = r.submerged[0];
+  const wettest = r.wet[0];
+  return `    ${tag.padEnd(12)} ${String(r.edges).padStart(5)} drivable edges / ${r.km.toFixed(2).padStart(7)} km   ` +
+    `wet ${String(r.wet.length).padStart(3)}   submerged ${String(r.submerged.length).padStart(3)}` +
+    (worst ? `  worst ${worst.under !== undefined ? '' : ''}${worst.sub.under.toFixed(2)} m under the pool ` +
+      `on ${worst.kind} "${worst.corridor}" @(${worst.sub.x.toFixed(0)},${worst.sub.z.toFixed(0)})` : '') +
+    (wettest ? `  wettest ground ${wettest.wet.h.toFixed(2)} m on "${wettest.corridor}"` : '');
+};
+console.log('');
+console.log(`  RIVERS — every drivable edge SPAN, across the carriageway, at ${RIVER_STEP} m`);
+console.log(`    a deck under WATER_Y (${WATER_Y} m) within ${RIVER_OVERHANG} m of a waterline has the river drawn over it`);
+for (const r of report.rivers) console.log(riverRow(r, `seed ${r.seed.toString(16)}`));
+console.log('    NEGATIVE CONTROLS:');
+console.log(riverRow(report.riverControl, 'OW_NO_FLOODCLIP') +
+  (report.riverControl.submerged.length ? '   <-- the defect, as it shipped' : '   <-- NOT CAUGHT'));
+for (const h of report.riverControl.submerged.slice(0, 6)) {
+  console.log(`        ${h.sub.under.toFixed(2)} m under the pool  ${h.kind} "${h.corridor}" ` +
+    `edge ${h.id} @(${h.sub.x.toFixed(0)},${h.sub.z.toFixed(0)}) deck ${h.sub.y.toFixed(2)} m`);
+}
+console.log(`    synthetic street across the Mon: wet ${riverSelftest.wet ? `YES (ground ${riverSelftest.h} m)` : 'NO'}, ` +
+  `submerged ${riverSelftest.submerged ? `YES (${riverSelftest.under} m under)` : 'NO'}` +
+  (riverSelftest.wet && riverSelftest.submerged ? '' : '   <-- this sweep cannot say no'));
+
 const uncaught = report.control.filter((c) => !c.caught);
 const broken = [...report.race, ...report.staging, ...report.arenas, ...report.services]
   .filter((c) => c.fails.length);
+const riverBroken = [];
+for (const r of report.rivers) {
+  for (const h of r.submerged) {
+    riverBroken.push(`seed ${r.seed.toString(16)}: ${h.kind} "${h.corridor}" edge ${h.id} is ` +
+      `${h.sub.under.toFixed(2)} m under the pool at (${h.sub.x.toFixed(0)},${h.sub.z.toFixed(0)}) — the river is drawn over it`);
+  }
+  for (const h of r.wet) {
+    riverBroken.push(`seed ${r.seed.toString(16)}: ${h.kind} "${h.corridor}" edge ${h.id} stands on water at ` +
+      `(${h.wet.x.toFixed(0)},${h.wet.z.toFixed(0)}), ground ${h.wet.h.toFixed(2)} m, and is not a bridge`);
+  }
+}
+// A control that comes back clean means the sweep measured nothing — see the
+// header. Both halves have to be provable, so both are asserted.
+const riverControlDead = [];
+if (!report.riverControl.submerged.length) {
+  riverControlDead.push('OW_NO_FLOODCLIP=1 produced no submerged carriageway — the river sweep is decorative');
+}
+if (!riverSelftest.wet || !riverSelftest.submerged) {
+  riverControlDead.push('a street planted across the Monongahela is not reported as wet AND submerged');
+}
 
 console.log('');
-if (uncaught.length) {
-  console.log(`GROUND TRUTH GATE FAILED — the negative control did not fire on ` +
-    `${uncaught.map((c) => c.label).join(', ')}: this gate is decorative`);
+if (uncaught.length || riverControlDead.length) {
+  console.log(`GROUND TRUTH GATE FAILED — a negative control did not fire: ` +
+    `${[...uncaught.map((c) => c.label), ...riverControlDead].join('; ')}. This gate is decorative`);
   process.exit(1);
 }
 if (broken.length) {
@@ -408,7 +659,15 @@ if (broken.length) {
   for (const c of broken) console.log(`  ${c.label}: ${c.fails.join('; ')}`);
   process.exit(1);
 }
+if (riverBroken.length) {
+  console.log(`GROUND TRUTH GATE FAILED — ${riverBroken.length} drivable edge(s) are in a river:`);
+  for (const s of riverBroken.slice(0, 20)) console.log(`  ${s}`);
+  process.exit(1);
+}
+const sweptKm = report.rivers.reduce((s, r) => s + r.km, 0) / report.rivers.length;
 console.log(`GROUND TRUTH GATE PASSED — ${report.race.length} race gates, ${report.staging.length} chapter ` +
   `staging points, ${report.arenas.length} boss arenas and ${report.services.length} services are all on ` +
-  `ground a car can reach, across ${SEEDS.length} seeds, and all ${report.control.length} authored ` +
-  `river coordinates still read as violations.`);
+  `ground a car can reach, across ${SEEDS.length} seeds; all ${report.control.length} authored ` +
+  `river coordinates still read as violations; and every span of every drivable edge — ` +
+  `${sweptKm.toFixed(2)} km a seed — is out of the water, while the same sweep finds ` +
+  `${report.riverControl.submerged.length} submerged edge(s) with the fix switched off.`);

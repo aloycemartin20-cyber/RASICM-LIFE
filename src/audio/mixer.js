@@ -36,12 +36,21 @@ const BUS_DEFS = {
   weapons:  { trim: 0.95, exterior: true, comp: { threshold: -7, knee: 8, ratio: 2.6, attack: 0.003, release: 0.16 } },
   foley:    { trim: 0.9, exterior: true, comp: { threshold: -14, knee: 10, ratio: 2.0, attack: 0.004, release: 0.2 } },
   ambience: { trim: 0.5, exterior: true, comp: { threshold: -24, knee: 12, ratio: 2.0, attack: 0.05, release: 0.5 } },
-  sirens:   { trim: 0.8, exterior: true, comp: { threshold: -16, knee: 10, ratio: 2.4, attack: 0.01, release: 0.3 } },
+  // A pursuit is heard for minutes at a time, which is a different job from a
+  // gunshot: -2.8 dB off the shipped 0.8, because the thing the owner reported
+  // about the sirens was that they dominated. `sirens.js` shares this level
+  // across every unit sounding, so the cap holds however many cruisers arrive.
+  sirens:   { trim: 0.58, exterior: true, comp: { threshold: -16, knee: 10, ratio: 2.4, attack: 0.01, release: 0.3 } },
   // The engine bus carries a lot of sustained low end; it is compressed harder
   // than anything else so a redline pass does not swallow the rest of the mix.
   vehicles: { trim: 0.72, exterior: false, comp: { threshold: -18, knee: 10, ratio: 3.2, attack: 0.02, release: 0.28 } },
   music:    { trim: 0.62, exterior: false, comp: { threshold: -15, knee: 12, ratio: 2.6, attack: 0.012, release: 0.3 } },
-  voice:    { trim: 0.85, exterior: false, comp: { threshold: -18, knee: 8, ratio: 3.0, attack: 0.006, release: 0.22 } },
+  // Dialogue and barks. 0.85 shipped and the owner's report on it was "louder
+  // and more prominent than before ... distracting": a story line ducks the
+  // whole bed 12.4 dB and then sat 8.2 dB on top of the hole it had made. This
+  // is the bus half of the fix (-2.3 dB); `LINE_TRIM` in vox.js is the other
+  // half, and duckprobe measures the resulting margin over the ducked bed.
+  voice:    { trim: 0.65, exterior: false, comp: { threshold: -18, knee: 8, ratio: 3.0, attack: 0.006, release: 0.22 } },
   ui:       { trim: 1.6, exterior: false, comp: null },
 };
 

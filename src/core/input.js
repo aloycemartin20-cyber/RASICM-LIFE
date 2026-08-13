@@ -42,6 +42,23 @@ export const ACTIONS = {
   jump: ['Space'],              // on foot: jump · in a vehicle: handbrake
   crouch: ['KeyC'],
   sprint: ['ShiftLeft', 'ShiftRight'],
+  /**
+   * HOLD TO WALK — GTA's own binding, and the counterpart to auto-run.
+   *
+   * Full deflection is now the RUN (`MOVE.autoRunMag`), so the slow gait needs
+   * a control of its own on a keyboard, which has no half-pressed W. Alt is
+   * where GTA V puts "character walk slowly" and it collides with nothing here.
+   * It was already read as a raw `input.held('AltLeft')` inside
+   * `movement.latchInput` — bound here so it is one of the scheme's actions
+   * rather than a string buried in the state machine, and so `CONTROLS.md` and
+   * the pause legend have something to name.
+   *
+   * On the modifier-key rule above: Alt is not Ctrl. `_onKeyDown` exempts only
+   * `ctrlKey`/`metaKey` from `preventDefault`, so an Alt-modified key is still
+   * swallowed before the browser sees it, and Alt on its own opens no menu that
+   * a cancelled keydown does not close.
+   */
+  walk: ['AltLeft', 'AltRight'],
   reload: ['KeyR'],
   use: ['KeyF'],                // enter / exit / carjack / interact
   nextWeapon: ['KeyE'],

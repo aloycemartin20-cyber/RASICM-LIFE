@@ -23,6 +23,31 @@
  *   3*  yelp          3.6 Hz, urgent
  *   4*  yelp + hi-lo  alternating two-tone across units
  *   5*  + air horn    they are trying to move you off the road
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * A PURSUIT HAS TO SURVIVE MINUTE TEN, and the shipped one did not
+ * ─────────────────────────────────────────────────────────────────────────────
+ * The owner's report: "police sirens are annoying and make it distracting to
+ * play when they fade in and out". Four separate mechanisms were producing that
+ * one symptom, and every one of them was a STEP applied to a CONTINUOUS source:
+ *
+ *   - a unit dropped from the assignment (out of range, or fifth-nearest of
+ *     five) had its emitter released the same frame, which disconnects the
+ *     panner outright: a hard cut, then an 80 ms fade-in when it came back;
+ *   - the range test was a single threshold at 220 m, so a cruiser holding
+ *     station near it switched on and off with the noise on its own distance;
+ *   - `_pattern` was indexed by this frame's distance RANK, so two cruisers
+ *     overtaking each other swapped sirens;
+ *   - N cruisers were N times the level, and the bus compressor then pumped the
+ *     whole mix in sympathy every time one arrived or left.
+ *
+ * The fixes are, in order: a linger + a level envelope (`LVL_ATTACK`), range
+ * hysteresis (`NEAR_ON` / `FAR_OFF`), a slot claimed for a unit's lifetime
+ * (`_claimSlot`), and a shared cap in `update`. Underneath all of them,
+ * `spatial.js`'s `smooth` emitter glides occlusion and rate-limits gain, which
+ * is the fifth mechanism and the one no amount of bookkeeping here could fix.
+ * `src/audio/muteprobe.mjs` measures the result on the emitted siren bus and
+ * carries `smooth: false` as its negative control.
  */
 
 import {
@@ -51,18 +76,47 @@ const PATTERNS = {
   piercer: { rate: 8.5, shape: 'sawtooth', centre: 1350, depth: 260, duty: 1 },
 };
 
+/**
+ * Level envelope, in DECIBELS per second. A siren's LOUDNESS has to move slowly
+ * even when its bookkeeping does not: a unit that loses its slot to a closer
+ * cruiser for half a second, or crosses the range boundary, or is handed a
+ * different pattern, must read as a swell rather than as a re-trigger.
+ *
+ * dB and not a linear ramp, which is what this was first written as: a linear
+ * 1.1-per-second attack crosses -26 dB to -6 dB in a tenth of a second, so the
+ * quietest part of every fade-in — the part that decides whether it reads as a
+ * swell or as a switch — was the fastest. MEASURED on the emitted flyby, the
+ * linear version recovered from a dropout at 31 dB/s. In dB the rate is the
+ * same wherever the envelope happens to be, which is what "slow" has to mean.
+ */
+const LVL_UP_DB = 13;
+const LVL_DOWN_DB = 12;
+/** How far under the target the envelope may sit: caps the arrival at ~2 s. */
+const LVL_FLOOR = 0.04;
+
 /** One unit's siren. Built once and reused from a pool. */
 class SirenVoice {
-  constructor(actx, bank, rng) {
+  constructor(actx, bank, rng, smooth = true) {
     this.actx = actx;
     this.rng = rng;
+    /** false = the pre-fix behaviour, for the negative control. */
+    this.smooth = smooth !== false;
     this.nodes = [];
     this.out = gain(actx, 0);
 
     /* ---- frequency drive ------------------------------------------- */
+    // NO TWO UNITS SWEEP IN LOCK. Every siren was built from the same table
+    // with the same LFO rate and started at the same instant, so four cruisers
+    // ran phase-locked: their level swings — a swept tone under a fixed horn
+    // formant is several dB of amplitude modulation — added COHERENTLY, which
+    // is both louder than four sirens should be and unmistakably synthetic. A
+    // few per cent of rate scatter drifts them apart permanently, and starting
+    // the sweep a fraction of a second late scatters the phase from the first
+    // note. Real units are two separate motors; they were never in sync.
+    this._jit = rng.range(0.93, 1.07);
     const centre = actx.createConstantSource();
     centre.offset.value = PATTERNS.wail.centre;
-    const lfo = osc(actx, 'triangle', PATTERNS.wail.rate);
+    const lfo = osc(actx, 'triangle', PATTERNS.wail.rate * this._jit);
     const depth = gain(actx, PATTERNS.wail.depth);
     lfo.connect(depth);
     const freqSum = gain(actx, 1);
@@ -71,7 +125,10 @@ class SirenVoice {
     const dop = gain(actx, 1);
     freqSum.connect(dop);
     centre.start(0);
-    lfo.start(0);
+    // Up to a third of a second late: the other half of the de-locking above.
+    // A rate difference takes seconds to separate two units; a start offset
+    // separates them from the first sweep.
+    lfo.start(actx.currentTime + rng.range(0, 0.34));
     this._centre = centre;
     this._lfo = lfo;
     this._depth = depth;
@@ -98,8 +155,19 @@ class SirenVoice {
     // them. That fixed formant over a moving tone is the sound.
     const hp = biquad(actx, 'highpass', 620, 0.9);
     const r1 = biquad(actx, 'peaking', 1500, 2.2, 9);
-    const r2 = biquad(actx, 'peaking', 3100, 2.8, 6);
-    const lp = biquad(actx, 'lowpass', 6800, 0.7);
+    // THE PIERCING BAND. 2.5-4 kHz is where the ear is most sensitive and it is
+    // where a siren stops being urgent and starts being painful — it is also
+    // exactly where this second throat resonance sat, at +6 dB, with a 6.8 kHz
+    // lowpass leaving another octave of driver fizz above it. The horn still
+    // needs the resonance (a swept tone under a FIXED formant is the sound), so
+    // it stays; it is 4 dB quieter and the fizz above it is gone. MEASURED on
+    // the rendered siren, share of power in 2.5-4 kHz: 9.0% -> 6.5%, i.e. 1.4 dB
+    // of the band's weight — less than the 4 dB the filter moved, because most
+    // of what is in that band is harmonics of the swept tone rather than the
+    // resonance itself. With the bus trim it is 4.2 dB of absolute piercing
+    // energy. Urgent at minute one, bearable at minute ten.
+    const r2 = biquad(actx, 'peaking', 3100, 2.8, 2);
+    const lp = biquad(actx, 'lowpass', 5600, 0.7);
     const drv = shaper(actx, saturationCurve(3.5, 0.4), '2x');
     series(horn, hp, r1, r2, lp, drv, this.out);
     this.nodes.push(horn, hp, r1, r2, lp);
@@ -126,15 +194,25 @@ class SirenVoice {
     if (this.pattern === name) return;
     this.pattern = name;
     this._lfo.type = p.shape;
-    to(this._lfo.frequency, p.rate, t, 0.05);
+    to(this._lfo.frequency, p.rate * this._jit, t, 0.05);
     to(this._centre.offset, p.centre, t, 0.08);
     to(this._depth.gain, p.depth, t, 0.08);
   }
 
   /** @param {number} doppler ratio from the tracked emitter */
   setState(level, doppler, dt, t) {
-    this._level = level;
-    to(this.out.gain, level, t, 0.08);
+    // The level is SLEWED, not set. Everything upstream of this — the slot
+    // assignment, the range test, the shared cap — is allowed to be a step
+    // function; this is what stops any of them being audible as one.
+    if (this.smooth) {
+      const tgt = Math.max(level, 1e-5);
+      const cur = Math.max(this._level, tgt * LVL_FLOOR, 1e-5);
+      const step = clamp(20 * Math.log10(tgt / cur), -LVL_DOWN_DB * dt, LVL_UP_DB * dt);
+      this._level = cur * Math.pow(10, step / 20);
+    } else {
+      this._level = level;
+    }
+    to(this.out.gain, this._level, t, 0.08);
     to(this._dop.gain, doppler, t, 0.03);
     // The horn's throat resonances are a property of the horn, not the tone, so
     // they doppler-shift with it but do not sweep with the pattern.
@@ -156,7 +234,10 @@ class SirenVoice {
 
   stop() {
     this._level = 0;
-    to(this.out.gain, 0, this.actx.currentTime, 0.12);
+    // Long enough that a unit being retired is a siren going away, not a siren
+    // being switched off. The manager has normally already walked the level
+    // down with the envelope above by the time this is reached.
+    to(this.out.gain, 0, this.actx.currentTime, this.smooth ? 0.3 : 0.12);
   }
 
   dispose() {
@@ -307,20 +388,56 @@ class Tension {
 
 const MAX_SIRENS = 4;
 
+/**
+ * RANGE HYSTERESIS. A single threshold on a distance that is itself noisy — the
+ * unit is driving, the player is driving — is a switch that chatters, and every
+ * chatter used to be a hard cut followed by an 80 ms fade-in. A unit now joins
+ * inside NEAR_ON and is not let go until FAR_OFF, so the boundary cannot be
+ * crossed twice by the same 60 m of road.
+ */
+const NEAR_ON = 190;
+const FAR_OFF = 250;
+
+/**
+ * How long a unit that stopped being assigned keeps its emitter while its level
+ * walks down. Covers the common case completely: a cruiser that loses its slot
+ * to a closer one for a few frames never stops sounding at all, it just dips.
+ *
+ * 2 s, because that is what the envelope above needs to get from full to 24 dB
+ * down — release the emitter before then and the truncation is the very step
+ * this is here to remove. An emitter is cheap (52 of them, four sirens).
+ */
+const LINGER = 2.0;
+
+/** One unit's siren level, before the shared cap in `update`. */
+const SIREN_LEVEL = 0.5;
+
 export class PoliceAudio {
-  constructor(actx, bank, mixer, field, rng) {
+  /**
+   * @param {object} opts { smooth } — `smooth: false` is the negative control
+   *   `src/audio/muteprobe.mjs` runs against the LIVE code with no edit (same
+   *   pattern as `DialogueVoice`'s `duck: false`). It restores the pre-fix
+   *   behaviour in one switch: no level envelope, no range hysteresis, no
+   *   linger on release, no shared cap, and emitters that step their occlusion
+   *   and snap their gain.
+   */
+  constructor(actx, bank, mixer, field, rng, opts = {}) {
     this.actx = actx;
     this.bank = bank;
     this.mixer = mixer;
     this.field = field;
     this.rng = rng;
     this.wanted = 0;
+    this.smooth = opts.smooth !== false;
     this.tension = new Tension(actx, bank, mixer, rng.fork());
     this._pool = [];
-    /** vehicle -> { voice, em, ttl } */
+    /** vehicle -> { voice, em, slot, hold, ratio, dist, seen } */
     this.units = new Map();
+    /** Pattern slots, claimed for a unit's lifetime. See `_claimSlot`. */
+    this._slots = [false, false, false, false];
     this._chatterTimer = 6;
     this._nearest = 1e9;
+    this._nearSm = 1e9;
     this.stats = { sirens: 0, wanted: 0 };
   }
 
@@ -350,8 +467,24 @@ export class PoliceAudio {
     return i % 3 === 0 ? 'piercer' : i % 3 === 1 ? 'yelp' : 'hilo';
   }
 
+  /**
+   * The lowest free pattern slot, held for the unit's whole life.
+   *
+   * `_pattern` used to be indexed by this frame's DISTANCE RANK, so two
+   * cruisers overtaking each other at four stars swapped sirens with each other
+   * — a yelp became a hi-lo and back, on the ranking, several times a chase.
+   * The slot is now a property of the unit, and a pattern only changes when the
+   * wanted level does.
+   */
+  _claimSlot() {
+    for (let i = 0; i < this._slots.length; i++) {
+      if (!this._slots[i]) { this._slots[i] = true; return i; }
+    }
+    return 0;
+  }
+
   _take() {
-    return this._pool.pop() ?? new SirenVoice(this.actx, this.bank, this.rng.fork());
+    return this._pool.pop() ?? new SirenVoice(this.actx, this.bank, this.rng.fork(), this.smooth);
   }
 
   _give(voice) {
@@ -368,53 +501,86 @@ export class PoliceAudio {
     const t = this.actx.currentTime;
     this.tension.update(dt);
 
-    /* ---- retire units that are gone -------------------------------- */
-    for (const [veh, u] of this.units) {
-      u.seen = false;
-      void veh;
-    }
+    for (const u of this.units.values()) u.seen = false;
 
+    /* ---- assign the nearest units a siren -------------------------- */
     let assigned = 0;
-    this._nearest = 1e9;
+    let nearest = 1e9;
     if (this.wanted > 0 && units) {
       for (let i = 0; i < units.length && assigned < MAX_SIRENS; i++) {
         const r = units[i];
         if (r.kind !== 'police') continue;
-        if (r.dist > 220) continue;
-        assigned++;
-        this._nearest = Math.min(this._nearest, r.dist);
         let u = this.units.get(r.vehicle);
+        if (r.dist > (u && this.smooth ? FAR_OFF : NEAR_ON)) continue;
         if (!u) {
           const voice = this._take();
           const em = this.field.acquireTracked({
             x: r.x, y: r.y, z: r.z, bus: 'sirens', send: 0.5, gain: 1, priority: 0.9,
+            smooth: this.smooth,
           });
           if (!em) { this._give(voice); continue; }
           this.field.attach(em, voice.out);
-          u = { voice, em, seen: true };
+          u = { voice, em, seen: true, slot: this._claimSlot(), hold: 0, ratio: 1, dist: r.dist };
           this.units.set(r.vehicle, u);
         }
+        assigned++;
+        nearest = Math.min(nearest, r.dist);
         u.seen = true;
-        u.voice.setPattern(this._pattern(assigned - 1), t);
-        const ratio = this.field.motion(u.em, r.x, r.y, r.z, dt);
-        u.voice.setState(0.5, ratio, dt, t);
-        if (this.wanted >= 5 && r.dist < 40 && this.rng.float() < dt * 0.25) {
-          u.voice.airHorn(t, 1);
-        }
+        u.hold = 0;
+        u.dist = r.dist;
+        u.ratio = this.field.motion(u.em, r.x, r.y, r.z, dt);
       }
     }
 
+    /*
+     * THE SHARED CAP. Three cruisers converging on you used to be three times
+     * one cruiser, and the bus compressor then pumped the whole pursuit in
+     * sympathy. Every sounding unit gets a share instead: MEASURED as power,
+     * four units at equal distance now sum to within 0.3 dB of one, so the
+     * fleet reads as denser rather than louder. Units still fading out are
+     * counted, deliberately — otherwise one leaving shoves the rest up as it
+     * goes, which is the pumping this whole pass exists to remove.
+     */
+    const n = this.units.size;
+    const share = this.smooth ? SIREN_LEVEL / (1 + 0.35 * Math.max(0, n - 1)) : SIREN_LEVEL;
+
     for (const [veh, u] of this.units) {
-      if (u.seen) continue;
+      if (u.seen) {
+        u.voice.setPattern(this._pattern(u.slot), t);
+        u.voice.setState(share, u.ratio, dt, t);
+        if (this.wanted >= 5 && u.dist < 40 && this.rng.float() < dt * 0.25) {
+          u.voice.airHorn(t, 1);
+        }
+        continue;
+      }
+      // Lost its slot, left the range, or despawned. It keeps its emitter and
+      // walks its level down; if it is assigned again inside LINGER it never
+      // stopped sounding at all. Releasing on the frame it was dropped — which
+      // is what happened before, and `releaseTracked` disconnects the panner
+      // outright — is a HARD CUT, and it is most of what "fade in and out" was.
+      u.hold += dt;
+      if (this.smooth && u.hold < LINGER) {
+        u.voice.setState(0, u.ratio, dt, t);
+        continue;
+      }
       this.field.releaseTracked(u.em);
       this._give(u.voice);
+      this._slots[u.slot] = false;
       this.units.delete(veh);
     }
     this.stats.sirens = this.units.size;
 
     /* ---- the radio ducks under a close siren ----------------------- */
-    if (this._nearest < 90) {
-      this.mixer.duckBus('music', clamp(0.6 * (1 - this._nearest / 90), 0, 0.6), 0.25);
+    // Smoothed first. The raw nearest jumps whenever the nearest UNIT changes,
+    // so the duck it drives stepped every time two cruisers swapped places.
+    this._nearest = nearest;
+    if (!this.smooth || nearest > 1e8 || this._nearSm > 1e8) {
+      this._nearSm = nearest;
+    } else {
+      this._nearSm += (nearest - this._nearSm) * clamp(dt * (nearest < this._nearSm ? 3.5 : 1.2), 0, 1);
+    }
+    if (this._nearSm < 90) {
+      this.mixer.duckBus('music', clamp(0.6 * (1 - this._nearSm / 90), 0, 0.6), 0.25);
     }
 
     /* ---- dispatch chatter ------------------------------------------ */
@@ -452,6 +618,7 @@ export class PoliceAudio {
       u.voice.dispose();
     }
     this.units.clear();
+    this._slots.fill(false);
     for (const v of this._pool) v.dispose();
     this._pool.length = 0;
     this.tension.dispose();

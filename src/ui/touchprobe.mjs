@@ -616,6 +616,34 @@ try {
     `${startBtn.w | 0}x${startBtn.h | 0} px`);
   await tap('.ow-boot-intro .ow-btn.primary', 24, startBtn.x, startBtn.y);
   await pump(40);
+  /**
+   * START OPENS A CUTSCENE, AND A CUTSCENE STOPS THE CLOCK. This used to be
+   * sampled 40 frames after the tap and asserted `time.scale === 1`, which
+   * cannot hold: `ui`'s pause arbiter takes a `cut` claim at 0 for the whole of
+   * a narrative beat, and one is on screen at that moment.
+   *
+   * MEASURED on the live build, both contracts, sampled at exactly this point
+   * (`scratchpad/bootclock.mjs`): the FREE-ROAM briefing beat reports
+   * `{scale: 0, cut: true, mission: false}` and the OLD auto-start contract it
+   * replaced — `game.startMission(index)`, which opened the chapter's intro
+   * cutscene — reports `{scale: 0, cut: true, mission: true}`. Same clock,
+   * same reason; this check has been red for as long as START has opened a
+   * scene at all, and it was red for the harness's reason rather than the
+   * build's.
+   *
+   * So do what a player does: skip it, then assert the hand-over. That is the
+   * same journey `src/ui/pauseprobe.mjs` drives, and it is the claim worth
+   * making — START gives the screen back, with control and a running clock.
+   */
+  const beat = await page.evaluate(() => {
+    const c = window.__ENGINE__.ctx.peek('ui')?.subs?.cut;
+    const played = !!c?.active;
+    c?.skipAll?.();
+    return played;
+  });
+  await page.waitForFunction(() => window.__ENGINE__.time.scale === 1, null, { timeout: 15000 })
+    .catch(() => {});
+  await pump(20);
   const started = await page.evaluate(() => {
     const e = window.__ENGINE__;
     const ui = e.ctx.peek('ui');
@@ -633,9 +661,9 @@ try {
   rec('boot', 'START enters the game as the brother you picked',
     started.character === target || started.hudCharacter === target,
     `picked ${target} · game ${started.character} · hud ${started.hudCharacter}`);
-  rec('boot', 'START hands back a running game with control',
-    started.scale === 1 && started.control,
-    `time.scale ${started.scale}, control ${started.control}`);
+  rec('boot', 'START opens a skippable beat, then hands back a running game with control',
+    beat && started.scale === 1 && started.control,
+    `beat played ${beat} · time.scale ${started.scale}, control ${started.control}`);
 
   // ---- desktop parity ---------------------------------------------------
   const desktop = await page.evaluate(() => {

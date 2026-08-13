@@ -49,7 +49,14 @@
  * PUBLIC API — `const peds = ctx.get('peds')`
  *   peds.nearest(x, y, z, radius)          nearest live ped, for melee/carjack
  *   peds.panic(position, radius, severity) scare everyone in a radius
- *   peds.pullFromVehicle(vehicle, point)   drag the driver out — `player` calls this
+ *   peds.pullFromVehicle(vehicle, point, by?) drag the driver out — `player` calls this
+ *   peds.holdOccupant(vehicle, holder)     "I am walking over to pull this man
+ *   peds.releaseOccupant(vehicle, holder?)  out" — nobody else may take him
+ *                                          until you do, or the hold lapses
+ *   peds.detachDriver(vehicle)             take the body back QUIETLY (no panic,
+ *                                          nobody left in the road) — `traffic`
+ *                                          calls this when a seated car leaves
+ *   peds.attachDriver(vehicle, seat, opts) put a body in one
  *   peds.driverOf(vehicle)                 who is behind the wheel
  *   peds.debugStage('crowd'|'firefight'|'panic'|'none')
  *   peds.prewarmMaterials(ctx)
@@ -149,6 +156,27 @@ const DESPAWN = 145;
  */
 const HUD_BLIP_RADIUS = 140;
 const HUD_BLIP_MAX = 24;
+
+/**
+ * How frightened being hauled out of your own car leaves you.
+ *
+ * Deliberately under `Ped.panic`'s 1.2 "squaring up" ceiling: above it every
+ * victim runs, and the one in thirty who turns round and swings at the man who
+ * just took his car is the reaction people remember. Above 0.55 as well, so it
+ * is a panic and not a startle. See `pullFromVehicle`.
+ */
+const CARJACK_FEAR = 1.1;
+
+/**
+ * Seconds an occupant reservation stands before it lapses. See `holdOccupant`.
+ *
+ * A hold is a promise to come and take somebody out, and a promise nobody can
+ * keep is worse than no promise: a leaked hold would make a car permanently
+ * unjackable, silently. `player`'s jack transition is 0.85 s and every path out
+ * of it releases explicitly, so four seconds is well past any honest hold and
+ * short enough that the worst case is one car that is briefly awkward.
+ */
+const OCCUPANT_HOLD_TTL = 4;
 
 export class PedSystem {
   static id = 'peds';
@@ -316,6 +344,13 @@ export class PedSystem {
     this._netTimer = 0;
     this._hour = 12;
     this._rain = 0;
+    /**
+     * Occupant reservations, `vehicle -> { holder, t }`. At most one or two are
+     * ever live (one actor, one car), they are dropped explicitly by whoever
+     * took them, and `_stream` sweeps anything that has lapsed. See
+     * `holdOccupant`.
+     */
+    this._holds = new Map();
 
     /* ---- geometry: every silhouette, once, at boot ----
      * A pedestrian geometry is 3-6k vertices and takes single-digit
@@ -681,6 +716,15 @@ export class PedSystem {
     this._streamTimer -= dt;
     if (this._streamTimer > 0) return;
     this._streamTimer = 0.28;
+
+    // Lapsed occupant reservations. `_heldBy` expires them lazily too; this is
+    // what stops the map itself growing when a holder never comes back.
+    if (this._holds.size) {
+      const now = this.ctx.time?.elapsed ?? 0;
+      for (const [v, h] of this._holds) {
+        if (now - h.t > OCCUPANT_HOLD_TTL) this._holds.delete(v);
+      }
+    }
 
     // despawn anything that has walked out of the world we care about, and turn
     // anyone who has walked INTO the fountain back towards the apron
@@ -1114,14 +1158,117 @@ export class PedSystem {
    * Drag whoever is driving `vehicle` out of it and leave them terrified on the
    * road. Returns the ped, or null when the car was empty. Safe to call with a
    * car nobody is in.
+   *
+   * ──────────────────────────────────────────────────────────────────────────
+   * THE CARJACK REACTION — three things happen, in this order, and the order
+   * is the whole performance:
+   *
+   *   1. HE COMES OUT WHERE THE HAND IS. `ejectFrom` puts him at `doorPoint`
+   *      and clamps him to the ground there. The caller owns that point:
+   *      `player/vehicle.js` passes its live door anchor, which tracks a car
+   *      that is still rolling, so he leaves through the door the player is
+   *      standing at rather than out of the roof at the chassis centre.
+   *   2. A STAGGER. `animator.flinch` is the existing whole-body reaction —
+   *      the same one a near miss uses — so this needs no new clip and no new
+   *      state: a beat of being off balance as he is hauled clear.
+   *   3. THEN HE DECIDES. `Ped.panic` is the existing roll, so a jacking is
+   *      priced exactly like any other terror: most run, about one in seven
+   *      freezes, and a very few of the ones with something to prove square up
+   *      and come back at you. The threat is the door, so the ones who run,
+   *      run away from the car rather than round it.
+   *
+   * The street's own reaction goes out first (`this.panic`), so that a
+   * bystander's roll cannot be re-rolled over the victim's by the area sweep
+   * catching him at radius zero.
    */
-  pullFromVehicle(vehicle, doorPoint) {
+  pullFromVehicle(vehicle, doorPoint, by = null) {
+    const held = this._heldBy(vehicle);
+    if (held && held !== by) return null;
     const ped = this.driverOf(vehicle);
     if (!ped) return null;
+    if (held) this._holds.delete(vehicle);
     this._v.copy(doorPoint ?? ped.position);
     ped.ejectFrom(vehicle, this._v);
     this.panic(this._v, 20, 1.1);
+    // His own reaction, last, so it is the one that stands. `flinch` is a
+    // whole-body layer rather than a hand act — it composes with the flee.
+    ped.animator?.flinch?.(1);
+    ped.panic(this._v, CARJACK_FEAR);
     return ped;
+  }
+
+  /**
+   * RESERVE the occupant of `vehicle` for `holder` — "I am walking over there
+   * to pull this man out; nobody else take him."
+   *
+   * MEASURED, and it is why this exists. `player`'s carjack is a transition:
+   * the actor steps to the door, reaches in, and only then does the body come
+   * out — that beat IS the verb. But `traffic.fixedUpdate` releases a car the
+   * instant `player.vehicle` points at it, which is the FIRST frame of that
+   * transition, and its `release()` clears the seat itself at
+   * `vehicle.position.x + 1.4`. So the occupant was ejected into the middle of
+   * the car a third of a second before the player's hand arrived, every time,
+   * and `player`'s own pull then found an empty seat and did nothing. Traced
+   * live: `TrafficSystem.fixedUpdate -> release -> pullFromVehicle => ped`,
+   * followed by `VehicleHandler._haulOut -> pullFromVehicle => null`.
+   *
+   * A hold makes `pullFromVehicle` refuse ANY other caller, so the seat is
+   * still occupied when the animation gets there — while leaving `driverOf`
+   * truthful, so the prompt still reads PULL OUT and `traffic` still hands the
+   * car over on its own schedule. It lapses after `OCCUPANT_HOLD_TTL` so a
+   * caller that dies mid-transition cannot strand a car for the session.
+   */
+  holdOccupant(vehicle, holder) {
+    if (!vehicle || !holder) return false;
+    this._holds.set(vehicle, { holder, t: this.ctx.time?.elapsed ?? 0 });
+    return true;
+  }
+
+  /** Drop a reservation. `holder` null releases whoever holds it. */
+  releaseOccupant(vehicle, holder = null) {
+    const h = this._holds.get(vehicle);
+    if (!h) return false;
+    if (holder && h.holder !== holder) return false;
+    this._holds.delete(vehicle);
+    return true;
+  }
+
+  /** Who has reserved this car's occupant, or null. Expired holds are dropped. */
+  _heldBy(vehicle) {
+    const h = vehicle ? this._holds.get(vehicle) : null;
+    if (!h) return null;
+    const now = this.ctx.time?.elapsed ?? 0;
+    if (now - h.t > OCCUPANT_HOLD_TTL) { this._holds.delete(vehicle); return null; }
+    return h.holder;
+  }
+
+  /**
+   * Take the body out of `vehicle` and off the street — the QUIET counterpart
+   * to `pullFromVehicle`, and the hook `traffic._unseatPed` has been
+   * duck-typing for as long as it has existed ("There is no `detachDriver` in
+   * the `peds` API yet").
+   *
+   * Nobody dragged him anywhere, so nobody panics and nothing is left standing
+   * in the road: this is the car driving out of the seating radius, or being
+   * recycled, and the body simply goes back to the pool. Without it `traffic`
+   * fell through to `pullFromVehicle`, which put a terrified stranger on the
+   * carriageway every time a seated car drove far enough away — a panicking
+   * pedestrian with no cause, holding a `q.pedBudget` slot until the streamer
+   * happened to notice him.
+   *
+   * @returns {boolean} true when a body was actually taken back.
+   */
+  detachDriver(vehicle) {
+    const ped = this.driverOf(vehicle);
+    if (!ped) return false;
+    // Clear the seat before the despawn so nothing can pose him against a car
+    // he is no longer in on the way out.
+    ped.vehicle = null;
+    ped._seatFor = null;
+    ped.isDriver = false;
+    ped.seat = -1;
+    this._despawn(ped);
+    return true;
   }
 
   /* ---- THE CREW: what `game` and `player` drive ---- */
@@ -1970,6 +2117,7 @@ export class PedSystem {
 
   dispose() {
     for (const off of this._off ?? []) off();
+    this._holds.clear();
     this.crew?.dispose();
     this.hostiles?.dispose();
     for (const p of this.peds) if (p.active) this._despawn(p);

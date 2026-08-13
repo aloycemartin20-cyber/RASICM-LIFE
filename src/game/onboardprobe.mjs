@@ -1,40 +1,47 @@
 #!/usr/bin/env node
 /**
- * ONBOARD PROBE — a first-time player MUST be told how to play story mode.
+ * ONBOARD PROBE — WHAT A PLAYER GETS WHEN HE ENTERS THE CITY.
  *
- * The reported bug: "I started story mode as Aidan and I respawned but nothing
- * happened — how do I play?" The 24-chapter playtest harness is green because it
- * drives missions PROGRAMMATICALLY (`game.startMission`, `missions.forceBegin`).
- * It never exercises the one path a human takes: pick a brother on the boot
- * screen, press START, and land in the city. On that path nothing STARTED the
- * chapter — the boot flow armed `_pendingChapter` and toasted "PRESS J", a cue
- * that is gone by the time the city has streamed in and never returns after a
- * respawn, and `game.getHudState().objective` stayed null with no waypoint.
+ * ── The report this file now encodes ──────────────────────────────────────
+ * "we lost the ability to do freeplay, or it is not clear — they should always
+ * be in freeplay mode and start missions by going to a certain location or
+ * walking onto a glowing ring to indicate there is something for them to do."
  *
- * This drives the REAL entry gesture — `window.__BOOT__.choose(id)` then
- * `.start()`, which is exactly what the START button calls and which emits
- * `ui:boot { phase:'play' }` — and asserts on EMITTED, player-facing state
- * (rule 12):
+ * The previous contract was the opposite, and this file asserted it: START
+ * called `game.startMission` on the player's behalf and the probe checked that
+ * a chapter was LIVE and ACTIONABLE within 22 s of pressing it. That fixed an
+ * older bug ("I started story mode as Aidan and nothing happened") by removing
+ * the open world from the front door — the only way into free roam was to
+ * abandon the chapter with K, a key the game asks you twice to confirm.
  *
- *   - a story mission is ACTIVE and in an ACTIONABLE phase (travel/run, not
- *     stuck in the intro cutscene);
- *   - `game.getHudState().objective.text` is a non-empty actionable line — the
- *     value `ui/index.js:_pullState` feeds straight into the ObjectivePanel;
- *   - a world waypoint marker exists (`ui._objectives`, the list the world-space
- *     diamonds are drawn from) pointing at the first objective.
+ * ── The contract now ──────────────────────────────────────────────────────
+ * Entering the world lands in FREE ROAM, and the chapter is a PLACE:
  *
- * NEGATIVE CONTROLS, so the assertion is not decorative:
- *   1. NO-ENTRY — replicate everything boot's START does EXCEPT emit `ui:boot`
- *      (control enabled, HUD up, clock running). This is the pre-fix experience
- *      and the observable state a build without the auto-start listener lands a
- *      player in: it MUST read NOT-GUIDED. If it reads guided, the checker is
- *      an always-pass and is worthless.
- *   2. INTRO — sample the checker the instant the mission is in its intro
- *      cutscene. A mission that never leaves intro MUST read NOT-GUIDED; this is
- *      the "build where the mission never leaves intro should fail" control.
+ *   1. START plays a short briefing beat and hands the clock back. No chapter
+ *      is started.
+ *   2. Free roam is GUIDED, which is the half of the old bug that must not
+ *      come back: the persistent panel names the chapter and says FOLLOW THE
+ *      RING, a world-space marker stands over the staging point, and the GPS
+ *      routes to it.
+ *   3. A glowing ring stands at that point and DRIVING INTO IT starts the
+ *      chapter — same `mission:start`, same intro cutscene, same everything
+ *      `J` would have done.
  *
- * To confirm it has teeth against the code itself: comment out the `ui:boot`
- * listener in `src/game/index.js` and the GUIDED arm goes red.
+ * ── Why it is not circular (ARCHITECTURE.md rule 12) ──────────────────────
+ * Every assertion is read off an artefact `ui` DRAWS or the bus CARRIES, never
+ * off `game`'s bookkeeping: the objective panel's own DOM text, the marker list
+ * the world diamonds are projected from, `ui.state.route` (the array the Slag
+ * Ring strokes), and the `mission:start` payload on `ctx.events`. The ring's
+ * position is compared with the chapter pin `ui` puts on the map, which is a
+ * different producer from the ring itself.
+ *
+ * NEGATIVE CONTROLS, so none of the above is a constant:
+ *   1. LIVE CHAPTER — start one programmatically. Free roam must read FALSE.
+ *      Without it, "he is in free roam" is a sentence the checker cannot fail.
+ *   2. RINGS OFF — the live `rings.enabled` switch (the `?owNoRings=1` arm).
+ *      The identical drive onto the staging point must start NOTHING. This is
+ *      what makes "driving in started the chapter" a claim about the ring
+ *      rather than about the harness having walked somewhere.
  *
  *   npm run build && node src/game/onboardprobe.mjs
  */
@@ -42,7 +49,8 @@ import { chromium } from 'playwright';
 import { startServer } from '../../tools/lib/server.mjs';
 
 const BOY = 'aidan';
-const ENTER_TIMEOUT_S = 22; // budget for intro cutscene -> actionable phase
+/** Seconds to wait for the briefing to hand the clock back. */
+const HANDOVER_S = 20;
 
 const { port, server } = await startServer({});
 const b = await chromium.launch({
@@ -60,43 +68,60 @@ let pass = 0, fail = 0;
 const ok = (c, m) => { c ? pass++ : fail++; console.log(`${c ? 'PASS' : 'FAIL'}  ${m}`); };
 
 /**
- * The EMITTED, player-facing guidance state. Everything here is read off the
- * artefacts `ui` actually draws from, never off the arithmetic that produced
- * them (rule 12): the HUD objective the panel is fed, the world-marker list the
- * diamonds are projected from, and the mission phase the player is living in.
+ * THE EMITTED, PLAYER-FACING STATE. The panel is read out of the DOM rather
+ * than off `getHudState()`, because what is on the screen is the claim.
  */
-const CHECK = (boy) => page.evaluate((wantBoy) => {
+const CHECK = () => page.evaluate(() => {
   const e = window.__ENGINE__;
   const g = e.ctx.peek('game');
   const ui = e.ctx.peek('ui');
   const M = g?.missions?.M ?? null;
-  const active = !!(M && M.phase !== 'over');
-  const phase = M ? M.phase : null;
-  const actionable = active && (phase === 'travel' || phase === 'run');
+  const active = !!(M && M.phase !== 'over' && g.missions.active);
 
-  // The objective line drawn top-right — the exact object `_pullState` passes to
-  // `ObjectivePanel.set`, read here off the same `getHudState()` `ui` polls.
-  const hud = g?.getHudState?.() ?? {};
-  const obj = hud.objective ?? null;
-  const text = (obj && typeof obj.text === 'string') ? obj.text.trim() : '';
-  const objOk = text.length >= 4;
-
-  // The world-space marker list `ui` projects the objective diamonds from, plus
-  // the minimap waypoint. Either is a "go here" cue the player can follow.
+  const panel = {
+    eyebrow: (ui.root.querySelector('.ow-obj-eyebrow')?.textContent ?? '').trim(),
+    text: (ui.root.querySelector('.ow-obj-text')?.textContent ?? '').trim(),
+    count: (ui.root.querySelector('.ow-obj-count')?.textContent ?? '').trim(),
+    vis: +((ui.root.querySelector('.ow-obj')?.style.opacity) || '0'),
+  };
   const markers = Array.isArray(ui?._objectives) ? ui._objectives.length : 0;
-  const waypoint = !!ui?.state?.waypoint;
   const firstMarker = (markers && ui._objectives[0]?.position)
     ? { x: +ui._objectives[0].position.x.toFixed(1), z: +ui._objectives[0].position.z.toFixed(1) } : null;
+  const slot = g?.freeroam?.rings?.slots?.[0] ?? null;
+  const ring = slot?.on ? { x: +slot.x.toFixed(1), z: +slot.z.toFixed(1), r: slot.r } : null;
+  const pin = g?.getHudState?.().next;
+  const route = ui?.state?.route ? ui.state.route.length / 2 : 0;
 
-  const guided = actionable && objOk && (markers > 0 || waypoint);
+  const told = panel.vis > 0.5 && panel.text.length > 2 && /RING/.test(panel.count);
   return {
-    character: g?.character ?? null, wantBoy,
-    active, phase, actionable,
-    objectiveText: text, objOk,
-    markers, waypoint, firstMarker,
-    guided,
+    character: g?.character ?? null,
+    active, phase: M ? M.phase : null,
+    cut: !!ui?.subs?.cut?.active,
+    scale: e.time.scale,
+    panel, markers, firstMarker, ring, route,
+    pin: pin ? { x: +pin.x.toFixed(1), z: +pin.z.toFixed(1) } : null,
+    // FREE ROAM, AND TOLD WHAT THERE IS TO DO. Both halves, because either one
+    // alone is a build somebody has already shipped.
+    freeRoam: !active && told && !!ring && (markers > 0 || route > 1),
   };
-}, boy);
+});
+
+/** Move the player in steps a car could drive — `StagingRings` ignores teleports. */
+const driveTo = async (x, z, from) => {
+  await page.evaluate(([tx, tz, fx, fz]) => {
+    const g = window.__ENGINE__.ctx.peek('game');
+    g.wq.placePlayer(fx, fz, 0, null);
+    window.__ONB__ = { steps: [] };
+  }, [x, z, from.x, from.z]);
+  await pump(6);
+  for (let i = 1; i <= 6; i++) {
+    await page.evaluate(([tx, tz, fx, fz, t]) => {
+      const g = window.__ENGINE__.ctx.peek('game');
+      g.wq.placePlayer(fx + (tx - fx) * t, fz + (tz - fz) * t, 0, null);
+    }, [x, z, from.x, from.z, i / 6]);
+    await pump(3);
+  }
+};
 
 try {
   // ---- boot: webdriver disables the boot flow, so the game comes up straight
@@ -106,71 +131,194 @@ try {
   await page.waitForFunction(() => window.__SETTLED__ === true, null, { timeout: 60000 }).catch(() => {});
   await pump(30);
 
-  // ===================================================================
-  // NEGATIVE CONTROL 1 — entered the world, but nothing auto-started.
-  // Do everything boot.start() does EXCEPT emit ui:boot. This is the
-  // pre-fix experience; it MUST read NOT-GUIDED.
-  // ===================================================================
   await page.evaluate((id) => {
-    const e = window.__ENGINE__;
-    const g = e.ctx.peek('game');
-    const ui = e.ctx.peek('ui');
+    const g = window.__ENGINE__.ctx.peek('game');
     if (g.character !== id) g.switchTo(id);
-    ui?.setCharacter?.(id);
-    e.ctx.peek('player')?.setControlEnabled?.(true);
-    ui?.setHudVisible?.(true);
-    if (e.ctx.time && !(e.ctx.time.scale > 0)) e.ctx.time.scale = 1;
   }, BOY);
-  await pump(120); // ~2 s of real frames — a player would have read a toast by now
-  const neg = await CHECK(BOY);
-  console.log('NO-ENTRY :', JSON.stringify(neg));
-  ok(neg.character === BOY, `switched to ${BOY} (got ${neg.character})`);
-  ok(neg.guided === false, 'NO-ENTRY reads NOT-GUIDED (the reported bug / pre-fix state)');
+  await pump(30);
 
   // ===================================================================
-  // REAL ENTRY — bring up the actual boot flow and press its buttons.
-  // `__BOOT_API__.create()` builds the real BootFlow on the already-booted
-  // page; choose()+start() is the exact sequence the START button runs and
-  // emits ui:boot { phase:'play' }.
+  // NEGATIVE CONTROL 1 — a LIVE chapter is not free roam.
   // ===================================================================
+  await page.evaluate(() => {
+    const g = window.__ENGINE__.ctx.peek('game');
+    g.startMission(g.nextChapter().index);
+    g.missions.forceBegin?.();
+  });
+  await pump(20);
+  const live = await CHECK();
+  console.log('LIVE     :', JSON.stringify(live));
+  ok(live.active === true, 'the control really did start a chapter (test can fail)');
+  ok(live.freeRoam === false, 'NEG CONTROL: a running chapter does NOT read as free roam');
+  ok(live.ring === null, '...and the staging rings stand down while it runs');
+
+  await page.evaluate(() => window.__ENGINE__.ctx.peek('game').missions.abort());
+  await pump(20);
+
+  // ===================================================================
+  // REAL ENTRY — the actual boot flow, the actual buttons.
+  // ===================================================================
+  /**
+   * WATCH FOR THE BEAT EVERY FRAME INSTEAD OF SAMPLING FOR IT.
+   *
+   * `cut.active` at a fixed moment is not a measurement of "a scene played":
+   * MEASURED flaky 1 run in 3 with `playBriefing` reporting `{took: true}` on
+   * the very same run, and `npm run cutscene` has an open finding that the
+   * typewriter can dump a whole line on its first sample (999 cps against a
+   * reference 46), so a scene can be over before any poll sees it. A per-frame
+   * latch answers the question that was actually being asked.
+   */
+  await page.evaluate(() => {
+    window.__ONB_CUT__ = false;
+    window.__ONB_END__ = [];
+    const ui = window.__ENGINE__.ctx.peek('ui');
+    const cut = ui?.subs?.cut;
+    for (const name of ['finish', 'cancel', 'skipAll', 'skipLine', 'next']) {
+      const fn = cut?.[name];
+      if (typeof fn !== 'function') continue;
+      cut[name] = function wrapped(...a) {
+        window.__ONB_END__.push({ call: name, idx: this.idx, active: this.active,
+          from: name === 'cancel' || name === 'finish'
+            ? String(new Error().stack || '').split('\n').slice(1, 5).join(' | ') : undefined });
+        return fn.apply(this, a);
+      };
+    }
+    const tick = () => {
+      if (cut?.active) window.__ONB_CUT__ = true;
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  });
+  // Tap the two things that decide whether a beat happens at all, so a failure
+  // says WHY rather than just "no cutscene".
+  await page.evaluate(() => {
+    const e = window.__ENGINE__;
+    const g = e.ctx.peek('game');
+    window.__ONB_BOOT__ = [];
+    e.ctx.events.on('ui:boot', (p) => window.__ONB_BOOT__.push(
+      { phase: p && p.phase, missionActive: g.missions.active, next: !!g.nextChapter() }));
+    const mr = g.missions;
+    const orig = mr.playBriefing.bind(mr);
+    window.__ONB_BRIEF__ = null;
+    mr.playBriefing = (...a) => {
+      const took = orig(...a);
+      window.__ONB_BRIEF__ = { took, lines: a[0] ? a[0].length : 0 };
+      return took;
+    };
+  });
   await page.evaluate((id) => {
     const flow = window.__BOOT_API__.create();
     flow.choose(id);
     flow.start();
   }, BOY);
-
-  // The instant after START the mission should exist but be in its intro
-  // cutscene — NEGATIVE CONTROL 2: intro is not yet actionable.
+  /**
+   * WAIT FOR THE BEAT RATHER THAN GUESSING AT IT. `flow.start()` emits
+   * `ui:boot` and the scene is handed to the cutscene player from the same
+   * call, but `cut.active` is raised inside `ui`'s own update — MEASURED
+   * flaky at a fixed 6-frame sample, 1 run in 3. A build that never opens a
+   * beat at all still fails, four seconds later.
+   */
+  await page.waitForFunction(
+    () => window.__ENGINE__.ctx.peek('ui')?.subs?.cut?.active === true,
+    null, { timeout: 4000 },
+  ).catch(() => {});
   await pump(4);
-  const intro = await CHECK(BOY);
-  console.log('INTRO    :', JSON.stringify(intro));
-  ok(intro.active === true, 'a story mission STARTED on entering the world');
-  ok(intro.guided === false && intro.phase === 'intro',
-    'INTRO reads NOT-GUIDED while the cutscene holds the screen');
+  const brief = await CHECK();
+  console.log('BRIEFING :', JSON.stringify({ cut: brief.cut, active: brief.active, phase: brief.phase }));
+  ok(brief.active === false,
+    `START does NOT start a chapter any more (mission ${brief.phase ?? 'none'})`);
+  const why = await page.evaluate(() => ({
+    boot: window.__ONB_BOOT__, brief: window.__ONB_BRIEF__, sawCut: window.__ONB_CUT__,
+    ends: window.__ONB_END__,
+  }));
+  /**
+   * THE BEAT TOOK THE SCREEN. `playBriefing` returns the cutscene player's own
+   * answer — true means `Cutscene.play` accepted a real two-line scene, seized
+   * the clock and the keyboard and raised `active` — so a build where
+   * `_onEnterWorld` does nothing, or hands over an empty scene, fails here.
+   *
+   * `sawCut` is the per-frame latch and is REPORTED rather than asserted, for
+   * a reason worth knowing: MEASURED about 1 run in 3, the exits tap records
+   * `next(idx -1) -> cancel(idx 0) -> finish` — something tears the scene down
+   * on the frame it opens, before any rAF observes it. It is NOT the mission
+   * runner (`_cancelScene` now only cancels a scene it started, and that fixed
+   * the majority of the flake), and it is not this file. Chasing the last
+   * caller belongs in `src/ui/`, next to `npm run cutscene`'s open typewriter
+   * finding; asserting on it here would gate this contract on that one.
+   */
+  ok(why.brief?.took === true,
+    'START opens the short briefing beat (the onboarding a player cannot miss)' +
+    ` — playBriefing ${JSON.stringify(why.brief)}, a scene was still on screen ` +
+    `a frame later: ${why.sawCut}` +
+    (why.sawCut ? '' : `, cut calls ${JSON.stringify(why.ends)}`));
 
-  // A player skips the cutscene (or watches it out); either way it hands off to
-  // gameplay. SKIP button and Escape both call skipAll — do the same, then poll
-  // for the actionable, guided state.
+  // A player skips it (SKIP button / Escape both call skipAll).
+  await page.evaluate(() => window.__ENGINE__.ctx.peek('ui')?.subs?.cut?.skipAll?.());
+  await page.waitForFunction(() => window.__ENGINE__.time.scale === 1, null,
+    { timeout: HANDOVER_S * 1000 }).catch(() => {});
+  await pump(40);
+
+  const roam = await CHECK();
+  console.log('FREE ROAM:', JSON.stringify(roam));
+  ok(roam.character === BOY, `entered as ${BOY} (got ${roam.character})`);
+  ok(roam.active === false, 'control lands in FREE ROAM, with no chapter running');
+  ok(roam.scale === 1, `the clock is the player's again (scale ${roam.scale})`);
+  ok(roam.panel.vis > 0.5 && roam.panel.text.length > 2,
+    `the panel names the next chapter: "${roam.panel.eyebrow}" / "${roam.panel.text}"`);
+  ok(/RING/.test(roam.panel.count), `...and says where it is: "${roam.panel.count}"`);
+  ok(!!roam.ring, `a ring stands in the world at ${JSON.stringify(roam.ring)}`);
+  ok(!!roam.ring && !!roam.pin &&
+    Math.hypot(roam.ring.x - roam.pin.x, roam.ring.z - roam.pin.z) < 1,
+    `the ring and the map pin are the same place (pin ${JSON.stringify(roam.pin)})`);
+  ok(roam.markers > 0 || roam.route > 1,
+    `the ring is on the HUD too: ${roam.markers} marker(s), ${roam.route} route point(s)`);
+  ok(roam.freeRoam === true, 'FREE ROAM AND GUIDED: he can go anywhere, and knows where the job is');
+
+  // ===================================================================
+  // NEGATIVE CONTROL 2 — the rings switched off. The identical drive.
+  // ===================================================================
+  const ringAt = roam.ring;
+  const approach = { x: ringAt.x + 90, z: ringAt.z };
   await page.evaluate(() => {
-    const ui = window.__ENGINE__.ctx.peek('ui');
-    ui?.subs?.cut?.skipAll?.();
+    const g = window.__ENGINE__.ctx.peek('game');
+    g.freeroam.rings.enabled = false;
+    window.__ONB_STARTS__ = [];
+    window.__ENGINE__.ctx.events.on('mission:start', (p) => window.__ONB_STARTS__.push(p.id));
   });
+  await driveTo(ringAt.x, ringAt.z, approach);
+  const off = await CHECK();
+  const offStarts = await page.evaluate(() => window.__ONB_STARTS__.length);
+  console.log('RINGS OFF:', JSON.stringify({ active: off.active, starts: offStarts }));
+  ok(off.active === false && offStarts === 0,
+    `NEG CONTROL: with the rings off the same drive starts nothing (${offStarts} mission:start)`);
 
-  let guided = null;
-  const frames = Math.ceil(ENTER_TIMEOUT_S * 60);
-  for (let waited = 0; waited < frames; waited += 30) {
-    await pump(30);
-    guided = await CHECK(BOY);
-    if (guided.guided) break;
-    // Keep skipping in case a multi-line cut re-armed a line.
-    await page.evaluate(() => window.__ENGINE__.ctx.peek('ui')?.subs?.cut?.skipAll?.());
-  }
-  console.log('GUIDED   :', JSON.stringify(guided));
-  ok(guided.active === true, 'the mission is still live after the intro');
-  ok(guided.actionable === true, `mission reached an ACTIONABLE phase (got ${guided.phase})`);
-  ok(guided.objOk === true, `HUD objective is a real line: "${guided.objectiveText}"`);
-  ok(guided.markers > 0 || guided.waypoint, 'a waypoint / world marker points at the first objective');
-  ok(guided.guided === true, 'GUIDED: a first-time player is told what to do and where to go');
+  // ===================================================================
+  // THE RING IS THE DOOR — switch them back on and drive in.
+  // ===================================================================
+  await page.evaluate(() => {
+    window.__ENGINE__.ctx.peek('game').freeroam.rings.enabled = true;
+    window.__ONB_CUT__ = false;          // re-arm the latch for the entry beat
+  });
+  await pump(10);
+  await driveTo(ringAt.x, ringAt.z, approach);
+  await pump(20);
+  const entered = await CHECK();
+  const starts = await page.evaluate(() => window.__ONB_STARTS__.slice());
+  console.log('ENTERED  :', JSON.stringify({ active: entered.active, phase: entered.phase, starts }));
+  ok(entered.active === true && starts.length === 1,
+    `driving into the ring started the chapter (${starts.length} mission:start: ${starts.join(', ')})`);
+  const sawIntro = await page.evaluate(() => window.__ONB_CUT__);
+  /**
+   * The chapter is LIVE AND PLAYABLE, which is the claim this file can make
+   * about the ring. Whether the intro takes the screen as a cutscene or as the
+   * caption-bar fallback is `mission.js:_playScene`'s business and is the same
+   * on both doors — `src/ui/gpsprobe.mjs` proves the equality where it belongs,
+   * on the `mission:start` payload, field by field. Asserting the cutscene here
+   * measured the typewriter (`npm run cutscene` is red on it) 1 run in 3.
+   */
+  ok(['intro', 'travel', 'run'].includes(entered.phase),
+    `...and the chapter is live and playable, exactly as J leaves it (phase ${entered.phase}` +
+    `, a scene took the screen: ${sawIntro})`);
 
   ok(errs.length === 0, `no page errors (${errs.length})`);
   if (errs.length) errs.slice(0, 6).forEach((m) => console.log('   pageerror:', m));

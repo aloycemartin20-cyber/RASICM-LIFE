@@ -63,7 +63,8 @@ const SFX_BUSES = ['weapons', 'foley', 'ambience', 'sirens', 'vehicles', 'voice'
 const CONTROL_GROUPS = [
   ['ON FOOT', [
     [['W', 'A', 'S', 'D'], '', 'Move'],
-    [['SHIFT'], '', 'Sprint'],
+    [['SHIFT'], '', 'Run (optional — W already runs)'],
+    [['ALT'], '', 'Walk'],
     [['ALT'], '', 'Walk'],
     [['SPACE'], '', 'Jump'],
     [['C'], '', 'Crouch'],
@@ -122,13 +123,30 @@ const CONTROL_GROUPS = [
     [['M'], '', 'Map'],
     [['P'], '', 'Phone'],
     [['O'], '', 'Story'],
-    [['J'], '', 'Start the next job'],
+    [['J'], '', 'Start the next chapter now (or drive into its ring)'],
     [['K'], '', 'Drop the job (press twice, or Shift+K)'],
     [['N'], '', 'Radio station'],
     [['X'], '', 'Switch brother (hold)'],
     [['SHIFT', 'B'], '+', 'Minimap north up / heading up'],
     [['↑', '↓', '←', '→'], '', 'Move in a list'],
     [['ENTER'], '', 'Choose'],
+  ]],
+  /**
+   * THE LEGEND — and it deliberately names NO KEYS.
+   *
+   * You are always in free roam; the way into a chapter is to drive into the
+   * ring standing at its staging point (`src/game/freeroam.js:StagingRings`).
+   * That is a control in every sense that matters and it appears on no
+   * keyboard, so it belongs on the panel a lost player opens — but every
+   * `<kbd>` in this menu is harvested and PRESSED at the real engine by
+   * `src/ui/controlsprobe.mjs`, so a legend row must never invent one. Empty
+   * `keys` renders the key column blank and leaves that gate alone.
+   */
+  ['MARKERS', [
+    [[], '', 'Orange ring — the next chapter. Drive in to start it.'],
+    [[], '', 'Teal rings — side jobs. Drive in to take one.'],
+    [[], '', 'Green ring — a mission objective, while one is running.'],
+    [[], '', 'The GPS line leads to whichever of those is next.'],
   ]],
 ];
 
@@ -325,6 +343,23 @@ export class PauseMenu {
     const h = el('h1', null, inner, 'Paused');
     h.textContent = 'PAUSED';
     el('div', 'sub', inner, 'DECARLO BOYZ — STEEL CITY');
+    /**
+     * THE PROGRESS LINE — "there is no way to tell what your progress is in
+     * the missions or in the game", answered on the screen everybody opens.
+     *
+     * ONE LINE, and that is a constraint rather than laziness: the header of
+     * this file records that `.ow-menu-inner` is already 606 px tall in a
+     * 720 px viewport and only becomes scrollable under the 760 px breakpoint,
+     * so rows added here push Resume off the bottom of the screen. The phone's
+     * STORY page (`src/ui/phone.js`) is where the chapter-by-chapter breakdown
+     * lives; this is the headline.
+     *
+     * It reads `game.getProgress()` and computes nothing itself — one owner
+     * for the arithmetic, reached through `ctx.peek` and never an import.
+     */
+    this.progress = el('div', 'sub', inner, '');
+    setStyle(this.progress, 'color', 'var(--gold)');
+    setStyle(this.progress, 'margin-top', 'calc(var(--u) * .8)');
     el('div', 'rule', inner);
 
     this.rows = el('div', null, inner);
@@ -904,9 +939,36 @@ export class PauseMenu {
     this.open ? this.close() : this.show();
   }
 
+  /**
+   * Repaint the progress line. Called from `show()` — the menu is a modal, so
+   * "when it opens" is every moment it can be read, and polling `game` from
+   * `update()` would run it sixty times a second behind a screen nobody is
+   * looking at.
+   *
+   * Duck-typed and failure-tolerant for the same reason `setDifficulty` is:
+   * `ui` comes up before `game`, and benches boot with no `game` at all. No
+   * game means no line, not a throw.
+   */
+  refreshProgress() {
+    let text = '';
+    try {
+      const p = this.ctx.peek('game')?.getProgress?.();
+      if (p && Number.isFinite(p.total) && p.total > 0) {
+        const cash = Math.round(p.earned).toLocaleString('en-US');
+        text = `${p.chapters} / ${p.total} CHAPTERS · ${p.percent}% · $${cash} EARNED` +
+          (p.jobs > 0 ? ` · ${p.jobs} SIDE JOB${p.jobs === 1 ? '' : 'S'}` : '');
+      }
+    } catch {
+      /* game still initialising — the line simply stays empty */
+    }
+    setText(this.progress, text);
+    setStyle(this.progress, 'display', text ? '' : 'none');
+  }
+
   show() {
     if (this.open) return;
     this.open = true;
+    this.refreshProgress();
     this.syncFromConfig();
     setStyle(this.root, 'display', '');
     document.exitPointerLock?.();
